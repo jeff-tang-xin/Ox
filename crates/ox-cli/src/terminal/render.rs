@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::app::App;
+use super::markdown::MarkdownRenderer;
 use super::output_pane::OutputLine;
 
 /// Render the Split-View layout: output pane (top) + input pane (bottom).
@@ -34,26 +35,29 @@ fn render_output_pane(frame: &mut Frame, app: &App, area: Rect) {
         .title(title)
         .border_style(Style::default().fg(Color::DarkGray));
 
+    let md_renderer = MarkdownRenderer::new();
+
     // Convert output lines to ratatui Lines.
     let lines: Vec<Line> = app
         .output
         .lines
         .iter()
-        .map(|ol| match ol {
-            OutputLine::Plain(s) => Line::from(s.as_str()),
-            OutputLine::Styled { prefix, content } => Line::from(vec![
+        .flat_map(|ol| match ol {
+            OutputLine::Plain(s) => vec![Line::from(s.as_str().to_string())],
+            OutputLine::Styled { prefix, content } => vec![Line::from(vec![
                 Span::styled(
                     format!("{} ", prefix),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(content.as_str()),
-            ]),
-            OutputLine::StreamingPartial(s) => Line::from(vec![
-                Span::raw(s.as_str()),
-                Span::styled("█", Style::default().fg(Color::Green)),
-            ]),
+                Span::raw(content.clone()),
+            ])],
+            OutputLine::StreamingPartial(s) => vec![Line::from(vec![
+                Span::raw(s.clone()),
+                Span::styled("█".to_string(), Style::default().fg(Color::Green)),
+            ])],
+            OutputLine::Markdown(s) => md_renderer.render_lines(s),
         })
         .collect();
 

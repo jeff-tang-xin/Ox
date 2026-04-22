@@ -13,6 +13,7 @@ ox-core = { workspace = true }
 tokio = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
+syntect = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

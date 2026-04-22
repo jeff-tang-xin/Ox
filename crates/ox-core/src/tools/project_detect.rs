@@ -1,0 +1,98 @@
+use serde_json::{json, Value};
+
+use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
+
+pub struct ProjectDetectTool;
+
+#[async_trait::async_trait]
+impl Tool for ProjectDetectTool {
+    fn name(&self) -> &str {
+        "project_detect"
+    }
+
+    fn description(&self) -> &str {
+        "Detect the project type, language, and framework by examining marker files in the project root."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory to analyze (default: working directory)"
+                }
+            }
+        })
+    }
+
+    fn safety_level(&self) -> SafetyLevel {
+        SafetyLevel::Safe
+    }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
+        let base = args
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(|p| ctx.working_dir.join(p))
+            .unwrap_or_else(|| ctx.working_dir.to_path_buf());
+
+        let mut info = Vec::new();
+
+        let markers: &[(&str, &str, &str)] = &[
+            ("Cargo.toml", "Rust", "Cargo"),
+            ("package.json", "JavaScript/TypeScript", "npm/yarn"),
+            ("go.mod", "Go", "Go Modules"),
+            ("pyproject.toml", "Python", "pyproject"),
+            ("setup.py", "Python", "setuptools"),
+            ("requirements.txt", "Python", "pip"),
+            ("pom.xml", "Java", "Maven"),
+            ("build.gradle", "Java/Kotlin", "Gradle"),
+            ("CMakeLists.txt", "C/C++", "CMake"),
+            ("Makefile", "C/C++/Mixed", "Make"),
+            ("Gemfile", "Ruby", "Bundler"),
+            ("composer.json", "PHP", "Composer"),
+            (".csproj", "C#", ".NET"),
+            ("pubspec.yaml", "Dart", "Flutter/Dart"),
+        ];
+
+        for (file, lang, build) in markers {
+            if base.join(file).exists() {
+                info.push(format!("Language: {lang} (build: {build})"));
+            }
+        }
+
+        // Check for VCS.
+        if base.join(".git").exists() {
+            info.push("VCS: Git".to_string());
+        }
+
+        // Check for config files.
+        let configs: &[(&str, &str)] = &[
+            (".eslintrc.json", "ESLint"),
+            (".prettierrc", "Prettier"),
+            ("tsconfig.json", "TypeScript"),
+            ("rustfmt.toml", "rustfmt"),
+            (".clippy.toml", "Clippy"),
+            ("docker-compose.yml", "Docker Compose"),
+            ("Dockerfile", "Docker"),
+            (".github/workflows", "GitHub Actions"),
+        ];
+
+        for (file, tool) in configs {
+            if base.join(file).exists() {
+                info.push(format!("Tool: {tool}"));
+            }
+        }
+
+        if info.is_empty() {
+            ToolOutput::success(format!(
+                "No recognized project markers found in {}",
+                base.display()
+            ))
+        } else {
+            info.insert(0, format!("Project root: {}", base.display()));
+            ToolOutput::success(info.join("\n"))
+        }
+    }
+}

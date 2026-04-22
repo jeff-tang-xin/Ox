@@ -1,8 +1,8 @@
-use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
+use tokio::sync::mpsc;
 
 /// Events that flow from the crossterm polling thread to the main event loop.
 #[derive(Debug)]
@@ -19,33 +19,31 @@ pub enum Event {
 ///
 /// crossterm's `event::read()` is blocking — it cannot run on the tokio runtime
 /// without starving other tasks. A dedicated OS thread solves this cleanly.
+/// Uses `tokio::sync::mpsc` so the receiver can be used in `tokio::select!`.
 pub struct EventHandler {
-    rx: mpsc::Receiver<Event>,
+    rx: mpsc::UnboundedReceiver<Event>,
     _thread: thread::JoinHandle<()>,
 }
 
 impl EventHandler {
     pub fn new(tick_rate: Duration) -> Self {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::unbounded_channel();
 
         let thread = thread::spawn(move || {
             loop {
                 // Poll with the tick rate as timeout.
                 if event::poll(tick_rate).unwrap_or(false) {
                     match event::read() {
-                        Ok(CrosstermEvent::Key(key)) => {
+                        Ok(CrosstermEvent::Key(key))
                             // Only forward actual key presses, not release/repeat.
-                            if key.kind == KeyEventKind::Press {
-                                if tx.send(Event::Key(key)).is_err() {
+                            if key.kind == KeyEventKind::Press
+                                && tx.send(Event::Key(key)).is_err() => {
                                     break; // receiver dropped, main loop exited
                                 }
-                            }
-                        }
-                        Ok(CrosstermEvent::Resize(w, h)) => {
-                            if tx.send(Event::Resize(w, h)).is_err() {
+                        Ok(CrosstermEvent::Resize(w, h))
+                            if tx.send(Event::Resize(w, h)).is_err() => {
                                 break;
                             }
-                        }
                         _ => {}
                     }
                 } else {
@@ -57,19 +55,11 @@ impl EventHandler {
             }
         });
 
-        Self {
-            rx,
-            _thread: thread,
-        }
+        Self { rx, _thread: thread }
     }
 
-    /// Non-blocking receive. Returns `None` if no event is available.
-    pub fn try_recv(&self) -> Option<Event> {
-        self.rx.try_recv().ok()
-    }
-
-    /// Blocking receive with timeout.
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<Event> {
-        self.rx.recv_timeout(timeout).ok()
+    /// Async receive — use in `tokio::select!`.
+    pub async fn recv(&mut self) -> Option<Event> {
+        self.rx.recv().await
     }
 }

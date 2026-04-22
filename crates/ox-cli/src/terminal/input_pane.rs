@@ -125,7 +125,7 @@ impl InputPane {
     /// Navigate to the next history entry (Down arrow).
     pub fn history_down(&mut self) {
         match self.history_index {
-            None => return,
+            None => (),
             Some(idx) => {
                 if idx + 1 < self.history.len() {
                     self.history_index = Some(idx + 1);

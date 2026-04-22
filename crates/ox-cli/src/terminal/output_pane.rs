@@ -3,10 +3,12 @@
 pub enum OutputLine {
     /// Plain text line (user input echo, system messages).
     Plain(String),
-    /// Styled line (will be extended for markdown in M10).
+    /// Styled line (prefix + content).
     Styled { prefix: String, content: String },
-    /// Streaming partial — not yet finalized (LLM streaming in M3).
+    /// Streaming partial — not yet finalized (LLM streaming).
     StreamingPartial(String),
+    /// Markdown content — will be rendered with syntax highlighting.
+    Markdown(String),
 }
 
 impl OutputLine {
@@ -15,6 +17,7 @@ impl OutputLine {
             Self::Plain(s) => s,
             Self::Styled { content, .. } => content,
             Self::StreamingPartial(s) => s,
+            Self::Markdown(s) => s,
         }
     }
 }
@@ -53,7 +56,7 @@ impl OutputPane {
                 self.finalize_streaming();
             } else {
                 match self.lines.last_mut() {
-                    Some(OutputLine::StreamingPartial(ref mut s)) => {
+                    Some(OutputLine::StreamingPartial(s)) => {
                         s.push(ch);
                     }
                     _ => {
@@ -64,10 +67,10 @@ impl OutputPane {
         }
     }
 
-    /// Convert any trailing StreamingPartial to a Plain line.
+    /// Convert any trailing StreamingPartial to a Markdown line.
     pub fn finalize_streaming(&mut self) {
         if let Some(OutputLine::StreamingPartial(s)) = self.lines.last() {
-            let finalized = OutputLine::Plain(s.clone());
+            let finalized = OutputLine::Markdown(s.clone());
             *self.lines.last_mut().unwrap() = finalized;
         }
         // Always ensure next chunk starts a fresh StreamingPartial.
@@ -75,5 +78,9 @@ impl OutputPane {
 
     pub fn line_count(&self) -> usize {
         self.lines.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.lines.clear();
     }
 }
