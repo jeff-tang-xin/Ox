@@ -99,6 +99,8 @@ impl LlmProvider for AnthropicProvider {
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
         let mut current_event_type = String::new();
+        let mut block_index_to_id: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -121,7 +123,12 @@ impl LlmProvider for AnthropicProvider {
 
                 if let Some(data) = line.strip_prefix("data: ")
                     && let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        process_anthropic_event(&current_event_type, &json, &tx);
+                        process_anthropic_event(
+                            &current_event_type,
+                            &json,
+                            &tx,
+                            &mut block_index_to_id,
+                        );
                     }
             }
         }
@@ -146,6 +153,7 @@ fn process_anthropic_event(
     event_type: &str,
     json: &serde_json::Value,
     tx: &mpsc::UnboundedSender<LlmStreamEvent>,
+    block_index_to_id: &mut std::collections::HashMap<u64, String>,
 ) {
     match event_type {
         "message_start" => {
@@ -158,6 +166,7 @@ fn process_anthropic_event(
             }
         }
         "content_block_start" => {
+            let index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
             // Could be text or tool_use.
             if let Some(content_block) = json.get("content_block") {
                 let block_type = content_block
@@ -175,11 +184,13 @@ fn process_anthropic_event(
                         .and_then(|n| n.as_str())
                         .unwrap_or("")
                         .to_string();
+                    block_index_to_id.insert(index, id.clone());
                     let _ = tx.send(LlmStreamEvent::ToolCallStart { id, name });
                 }
             }
         }
         "content_block_delta" => {
+            let index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
             if let Some(delta) = json.get("delta") {
                 let delta_type = delta
                     .get("type")
@@ -196,10 +207,12 @@ fn process_anthropic_event(
                         if let Some(partial) =
                             delta.get("partial_json").and_then(|p| p.as_str())
                         {
-                            // We need the block index to map back to tool call id.
-                            // For now, use the index from the parent event.
+                            let id = block_index_to_id
+                                .get(&index)
+                                .cloned()
+                                .unwrap_or_default();
                             let _ = tx.send(LlmStreamEvent::ToolCallArgumentsDelta {
-                                id: String::new(), // Will be matched by index in agent turn loop.
+                                id,
                                 delta: partial.to_string(),
                             });
                         }
@@ -209,7 +222,10 @@ fn process_anthropic_event(
             }
         }
         "content_block_stop" => {
-            // Could signal end of a tool call block.
+            let index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+            if let Some(id) = block_index_to_id.get(&index) {
+                let _ = tx.send(LlmStreamEvent::ToolCallEnd { id: id.clone() });
+            }
         }
         "message_delta" => {
             // Final usage info.

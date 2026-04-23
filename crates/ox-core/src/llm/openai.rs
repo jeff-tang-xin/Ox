@@ -90,6 +90,8 @@ impl LlmProvider for OpenAiProvider {
 
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
+        let mut tool_call_index_to_id: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -110,7 +112,7 @@ impl LlmProvider for OpenAiProvider {
                     }
 
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        process_openai_chunk(&json, &tx);
+                        process_openai_chunk(&json, &tx, &mut tool_call_index_to_id);
                     }
                 }
             }
@@ -132,7 +134,11 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
-fn process_openai_chunk(json: &serde_json::Value, tx: &mpsc::UnboundedSender<LlmStreamEvent>) {
+fn process_openai_chunk(
+    json: &serde_json::Value,
+    tx: &mpsc::UnboundedSender<LlmStreamEvent>,
+    index_to_id: &mut std::collections::HashMap<u64, String>,
+) {
     // Check for usage in the final chunk.
     if let Some(usage) = json.get("usage").filter(|u| !u.is_null()) {
         let _ = tx.send(LlmStreamEvent::Done {
@@ -163,11 +169,24 @@ fn process_openai_chunk(json: &serde_json::Value, tx: &mpsc::UnboundedSender<Llm
         // Tool calls.
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tool_calls {
-                let id = tc
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+
+                // First chunk for this tool call includes "id" and "function.name".
+                if let Some(id) = tc.get("id").and_then(|i| i.as_str())
+                    && !id.is_empty() {
+                        index_to_id.insert(index, id.to_string());
+                    }
+
+                // Resolve the tool call id from the index map.
+                let id = match index_to_id.get(&index) {
+                    Some(id) => id.clone(),
+                    None => {
+                        // No id mapped for this index yet — skip.
+                        tracing::warn!("Tool call delta with unknown index {index}, skipping");
+                        continue;
+                    }
+                };
+
                 if let Some(func) = tc.get("function") {
                     // If name is present, it's a new tool call start.
                     if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
@@ -188,7 +207,7 @@ fn process_openai_chunk(json: &serde_json::Value, tx: &mpsc::UnboundedSender<Llm
 
                 // finish_reason == "tool_calls" signals end (checked at choice level).
                 if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str())
-                    && finish == "tool_calls" && !id.is_empty() {
+                    && finish == "tool_calls" {
                         let _ = tx.send(LlmStreamEvent::ToolCallEnd { id });
                     }
             }

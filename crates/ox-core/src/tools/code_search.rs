@@ -44,7 +44,7 @@ impl Tool for CodeSearchTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let pattern = match args.get("pattern").and_then(|p| p.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::error("Missing required parameter: pattern"),
+            None => return ToolOutput::error("Missing required parameter: pattern. Usage: {\"pattern\": \"<search text>\"}"),
         };
         let base = args
             .get("path")

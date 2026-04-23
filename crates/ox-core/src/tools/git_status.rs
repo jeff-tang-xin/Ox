@@ -117,7 +117,7 @@ impl Tool for GitCommitTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let message = match args.get("message").and_then(|m| m.as_str()) {
             Some(m) => m,
-            None => return ToolOutput::error("Missing required parameter: message"),
+            None => return ToolOutput::error("Missing required parameter: message. Usage: {\"message\": \"<commit message>\"}"),
         };
 
         // Stage files.

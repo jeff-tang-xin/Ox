@@ -39,11 +39,11 @@ impl Tool for FileWriteTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let path = match args.get("path").and_then(|p| p.as_str()) {
             Some(p) => ctx.working_dir.join(p),
-            None => return ToolOutput::error("Missing required parameter: path"),
+            None => return ToolOutput::error("Missing required parameter: path. Usage: {\"path\": \"<file path>\", \"content\": \"<content>\"}"),
         };
         let content = match args.get("content").and_then(|c| c.as_str()) {
             Some(c) => c,
-            None => return ToolOutput::error("Missing required parameter: content"),
+            None => return ToolOutput::error("Missing required parameter: content. Usage: {\"path\": \"<file path>\", \"content\": \"<content>\"}"),
         };
 
         // Create parent directories.

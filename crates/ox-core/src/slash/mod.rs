@@ -12,6 +12,7 @@ pub enum SlashCommand {
     Model { name: Option<String> },
     Cd { path: Option<String> },
     Debug,
+    Init,
     Unknown { cmd: String },
 }
 
@@ -60,6 +61,7 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
             },
         },
         "debug" => SlashCommand::Debug,
+        "init" => SlashCommand::Init,
         _ => SlashCommand::Unknown {
             cmd: cmd.to_string(),
         },
@@ -94,6 +96,7 @@ Commands:
   /untrust          Revoke all trust
   /model [name]     Show or switch model
   /cd [path]        Show or change working directory
+  /init             Create default config (~/.ox/config.toml)
   /debug            Show debug info"
             .to_string(),
     }
@@ -130,5 +133,11 @@ mod tests {
     fn parse_unknown() {
         let cmd = parse_slash_command("foobar", "");
         assert!(matches!(cmd, SlashCommand::Unknown { .. }));
+    }
+
+    #[test]
+    fn parse_init() {
+        let cmd = parse_slash_command("init", "");
+        assert!(matches!(cmd, SlashCommand::Init));
     }
 }

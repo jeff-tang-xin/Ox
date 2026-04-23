@@ -43,15 +43,15 @@ impl Tool for FilePatchTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let path = match args.get("path").and_then(|p| p.as_str()) {
             Some(p) => ctx.working_dir.join(p),
-            None => return ToolOutput::error("Missing required parameter: path"),
+            None => return ToolOutput::error("Missing required parameter: path. Usage: {\"path\": \"<file>\", \"search\": \"<text>\", \"replace\": \"<text>\"}"),
         };
         let search = match args.get("search").and_then(|s| s.as_str()) {
             Some(s) => s,
-            None => return ToolOutput::error("Missing required parameter: search"),
+            None => return ToolOutput::error("Missing required parameter: search. Usage: {\"path\": \"<file>\", \"search\": \"<text>\", \"replace\": \"<text>\"}"),
         };
         let replace = match args.get("replace").and_then(|r| r.as_str()) {
             Some(r) => r,
-            None => return ToolOutput::error("Missing required parameter: replace"),
+            None => return ToolOutput::error("Missing required parameter: replace. Usage: {\"path\": \"<file>\", \"search\": \"<text>\", \"replace\": \"<text>\"}"),
         };
 
         let content = match fs::read_to_string(&path) {

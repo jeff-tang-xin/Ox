@@ -41,7 +41,7 @@ impl Tool for ShellExecTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let command = match args.get("command").and_then(|c| c.as_str()) {
             Some(c) => c,
-            None => return ToolOutput::error("Missing required parameter: command"),
+            None => return ToolOutput::error("Missing required parameter: command. Usage: {\"command\": \"<shell command>\"}"),
         };
         let timeout_ms = args
             .get("timeout_ms")

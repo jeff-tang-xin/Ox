@@ -188,8 +188,36 @@ pub async fn run_agent_turn(
                 }
             };
 
-            let args: serde_json::Value = serde_json::from_str(&tc.arguments)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            let args: serde_json::Value = if tc.arguments.trim().is_empty() {
+                // LLM sent no arguments — treat as empty object (common for no-param tools).
+                serde_json::Value::Object(serde_json::Map::new())
+            } else {
+                match serde_json::from_str(&tc.arguments) {
+                    Ok(v) => v,
+                    Err(parse_err) => {
+                        let error_msg = format!(
+                            "Invalid tool arguments JSON: {parse_err}. Raw: {}",
+                            if tc.arguments.len() > 200 {
+                                format!("{}...(truncated)", &tc.arguments[..200])
+                            } else {
+                                tc.arguments.clone()
+                            }
+                        );
+                        let result_msg = Message::ToolResult {
+                            tool_call_id: tc.id.clone(),
+                            content: error_msg.clone(),
+                        };
+                        new_messages.push(result_msg.clone());
+                        messages.push(result_msg);
+                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                            name: tc.name.clone(),
+                            output: error_msg,
+                            is_error: true,
+                        });
+                        continue;
+                    }
+                }
+            };
 
             let result = tool.execute(args, &tool_ctx).await;
 

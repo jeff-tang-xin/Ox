@@ -102,6 +102,13 @@ async fn run_app(
     app.output
         .push_line(OutputLine::Plain(rt_env.banner_summary()));
 
+    // Startup check: warn if no config file exists.
+    if !OxConfig::config_exists() {
+        app.output.push_system(
+            "No config file found. Run /init to create ~/.ox/config.toml with default settings.",
+        );
+    }
+
     if provider.is_some() {
         app.output.push_line(OutputLine::Plain(
             "Type a message or /help for commands. /exit to quit.".to_string(),
@@ -569,6 +576,19 @@ fn handle_slash_command(
                     "Working directory: {}",
                     rt_env.working_dir.display()
                 )));
+            }
+        }
+        SlashCommand::Init => {
+            match OxConfig::init_default_config() {
+                Ok(path) => {
+                    app.output.push_system(&format!(
+                        "Config created at {}. Edit it to add your API keys.",
+                        path.display()
+                    ));
+                }
+                Err(e) => {
+                    app.output.push_system(&format!("Init failed: {e}"));
+                }
             }
         }
         SlashCommand::Debug => {

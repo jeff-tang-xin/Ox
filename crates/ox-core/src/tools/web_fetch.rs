@@ -34,7 +34,7 @@ impl Tool for WebFetchTool {
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolOutput {
         let url = match args.get("url").and_then(|u| u.as_str()) {
             Some(u) => u,
-            None => return ToolOutput::error("Missing required parameter: url"),
+            None => return ToolOutput::error("Missing required parameter: url. Usage: {\"url\": \"<url>\"}"),
         };
 
         let client = reqwest::Client::builder()

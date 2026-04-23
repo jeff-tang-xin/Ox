@@ -35,7 +35,7 @@ impl Tool for FileListTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let path_str = match args.get("path").and_then(|p| p.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::error("Missing required parameter: path"),
+            None => return ToolOutput::error("Missing required parameter: path. Usage: {\"path\": \"<directory or glob pattern>\"}"),
         };
 
         // Check if it's a glob pattern.

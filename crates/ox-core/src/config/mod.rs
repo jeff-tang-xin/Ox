@@ -53,7 +53,7 @@ impl OxConfig {
 
     /// Default config path: `~/.ox/config.toml`.
     /// Falls back to legacy `~/.config/ox/config.toml` if the new path doesn't exist.
-    fn default_config_path() -> PathBuf {
+    pub fn default_config_path() -> PathBuf {
         let primary = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".ox")
@@ -80,7 +80,91 @@ impl OxConfig {
 
         primary
     }
+
+    /// Check whether the default config file exists.
+    pub fn config_exists() -> bool {
+        let path = Self::default_config_path();
+        path.exists()
+    }
+
+    /// Create a default config file at `~/.ox/config.toml` with commented examples.
+    /// Returns the path written to, or an error if it already exists or IO fails.
+    pub fn init_default_config() -> anyhow::Result<PathBuf> {
+        let path = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".ox")
+            .join("config.toml");
+
+        if path.exists() {
+            anyhow::bail!("Config already exists at {}", path.display());
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        std::fs::write(&path, DEFAULT_CONFIG_TEMPLATE)?;
+        Ok(path)
+    }
 }
+
+/// Default config.toml template with commented examples.
+const DEFAULT_CONFIG_TEMPLATE: &str = r##"# Ox CLI Configuration
+# Location: ~/.ox/config.toml
+
+[general]
+# version = "2.1"
+# debug_mode = false
+# verbose = false
+# lang = "en"
+
+[models]
+default = "gpt-4o"
+# backup = ["claude-sonnet-4", "gpt-4-turbo"]
+# adaptive_thinking = true
+# effort_level = "high"
+
+# ── Provider configuration ──
+# Each provider has its own section under [models.providers.<name>].
+# api_key can also be set via environment variable: OX_OPENAI_API_KEY, OX_ANTHROPIC_API_KEY, etc.
+# Environment variables take priority over config file values.
+
+[models.providers.openai]
+api_key = ""
+# base_url = "https://api.openai.com/v1"
+# max_tokens = 4096
+
+[models.providers.anthropic]
+api_key = ""
+# base_url = "https://api.anthropic.com/v1"
+# max_tokens = 8192
+
+[models.providers.deepseek]
+api_key = ""
+# base_url = "https://api.deepseek.com/v1"
+# max_tokens = 4096
+
+[terminal]
+# split_view = true
+# output_ratio = 85
+
+[tools]
+# auto_confirm_safe = true
+# confirm_writes = true
+# confirm_shell = true
+# shell_timeout_ms = 30000
+
+[session]
+# auto_restore = true
+# max_archived_sessions = 50
+# session_dir = ".ox"
+
+[cost]
+# max_monthly_cost = 5.0
+# max_daily_cost = 2.0
+# budget_alert_threshold = 0.8
+# cost_transparency = true
+"##;
 
 // ──────────────────────────── Sections ────────────────────────────
 
@@ -605,5 +689,30 @@ api_key = "sk-new"
 
         let openai = config.models.providers.get("openai").unwrap();
         assert_eq!(openai.api_key, "sk-new", "New config should not be overwritten by legacy");
+    }
+
+    #[test]
+    fn test_init_default_config() {
+        let dir = std::env::temp_dir().join("ox_test_init");
+        let path = dir.join("config.toml");
+
+        // Clean up from any prior run.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+
+        // Manually test the template is valid TOML that parses into OxConfig.
+        let config: OxConfig = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        assert_eq!(config.models.default, "gpt-4o");
+        assert!(config.models.providers.contains_key("openai"));
+        assert!(config.models.providers.contains_key("anthropic"));
+        assert!(config.models.providers.contains_key("deepseek"));
+    }
+
+    #[test]
+    fn test_config_template_round_trip() {
+        // Ensure the template can be serialized back without losing structure.
+        let config: OxConfig = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        let re_serialized = toml::to_string(&config).unwrap();
+        assert!(re_serialized.contains("gpt-4o"));
     }
 }

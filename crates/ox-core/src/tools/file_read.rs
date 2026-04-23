@@ -42,7 +42,7 @@ impl Tool for FileReadTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let path = match args.get("path").and_then(|p| p.as_str()) {
             Some(p) => ctx.working_dir.join(p),
-            None => return ToolOutput::error("Missing required parameter: path"),
+            None => return ToolOutput::error("Missing required parameter: path. Usage: {\"path\": \"<file path>\"}"),
         };
 
         let offset = args
