@@ -49,19 +49,48 @@ impl OutputPane {
     /// Append a streaming text chunk to the current partial line.
     /// If there's no active streaming line, start one.
     /// When a `\n` is encountered, finalize the current line and start a new one.
+    /// Optimized: splits by `\n` in bulk instead of iterating char-by-char.
     pub fn push_streaming_chunk(&mut self, chunk: &str) {
-        for ch in chunk.chars() {
-            if ch == '\n' {
-                // Finalize current streaming line.
-                self.finalize_streaming();
-            } else {
-                match self.lines.last_mut() {
-                    Some(OutputLine::StreamingPartial(s)) => {
-                        s.push(ch);
+        // Fast path: no newline in chunk — just append to current streaming line.
+        if !chunk.contains('\n') {
+            match self.lines.last_mut() {
+                Some(OutputLine::StreamingPartial(s)) => {
+                    s.push_str(chunk);
+                }
+                _ => {
+                    self.lines.push(OutputLine::StreamingPartial(chunk.to_string()));
+                }
+            }
+            return;
+        }
+
+        // Slow path: split by newlines and finalize each complete line.
+        let mut remaining = chunk;
+        while let Some(pos) = remaining.find('\n') {
+            let before = &remaining[..pos];
+            // Append before-newline text to current streaming line.
+            match self.lines.last_mut() {
+                Some(OutputLine::StreamingPartial(s)) => {
+                    s.push_str(before);
+                }
+                _ => {
+                    if !before.is_empty() {
+                        self.lines.push(OutputLine::StreamingPartial(before.to_string()));
                     }
-                    _ => {
-                        self.lines.push(OutputLine::StreamingPartial(ch.to_string()));
-                    }
+                }
+            }
+            // Finalize the line at the newline.
+            self.finalize_streaming();
+            remaining = &remaining[pos + 1..];
+        }
+        // Handle trailing text after the last newline.
+        if !remaining.is_empty() {
+            match self.lines.last_mut() {
+                Some(OutputLine::StreamingPartial(s)) => {
+                    s.push_str(remaining);
+                }
+                _ => {
+                    self.lines.push(OutputLine::StreamingPartial(remaining.to_string()));
                 }
             }
         }

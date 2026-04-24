@@ -1,4 +1,5 @@
 use super::input_pane::InputPane;
+use super::markdown::MarkdownRenderer;
 use super::output_pane::{OutputLine, OutputPane};
 
 /// What the user submitted from the input pane.
@@ -16,6 +17,8 @@ pub enum UserInput {
 pub struct App {
     pub output: OutputPane,
     pub input: InputPane,
+    /// Markdown renderer — created once, reused across all frames.
+    pub md_renderer: MarkdownRenderer,
     /// Scroll offset for the output pane (0 = bottom / most recent).
     pub scroll_offset: u16,
     /// Whether the app should quit.
@@ -24,6 +27,8 @@ pub struct App {
     pub agent_running: bool,
     /// Status bar text.
     pub status: String,
+    /// Whether the UI needs re-rendering (dirty flag).
+    pub dirty: bool,
 }
 
 impl App {
@@ -31,10 +36,12 @@ impl App {
         Self {
             output: OutputPane::new(),
             input: InputPane::new(),
+            md_renderer: MarkdownRenderer::new(),
             scroll_offset: 0,
             should_quit: false,
             agent_running: false,
             status: String::from("Ox v0.1.0"),
+            dirty: true,
         }
     }
 

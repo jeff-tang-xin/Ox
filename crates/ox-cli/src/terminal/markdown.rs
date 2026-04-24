@@ -27,7 +27,8 @@ impl MarkdownRenderer {
     }
 
     /// Render a block of markdown text into ratatui Lines.
-    pub fn render_lines(&self, text: &str) -> Vec<Line<'static>> {
+    /// `output_width` is the available width for the code block borders.
+    pub fn render_lines(&self, text: &str, output_width: usize) -> Vec<Line<'static>> {
         let mut result: Vec<Line<'static>> = Vec::new();
         let mut in_code_block = false;
         let mut code_lang = String::new();
@@ -37,7 +38,7 @@ impl MarkdownRenderer {
             if line.starts_with("```") {
                 if in_code_block {
                     // End of code block — highlight and emit.
-                    let highlighted = self.highlight_code(&code_buffer.join("\n"), &code_lang);
+                    let highlighted = self.highlight_code(&code_buffer.join("\n"), &code_lang, output_width);
                     result.extend(highlighted);
                     code_buffer.clear();
                     code_lang.clear();
@@ -61,7 +62,7 @@ impl MarkdownRenderer {
 
         // If code block was never closed, render what we have.
         if in_code_block && !code_buffer.is_empty() {
-            let highlighted = self.highlight_code(&code_buffer.join("\n"), &code_lang);
+            let highlighted = self.highlight_code(&code_buffer.join("\n"), &code_lang, output_width);
             result.extend(highlighted);
         }
 
@@ -232,17 +233,20 @@ impl MarkdownRenderer {
     }
 
     /// Syntax-highlight a code block using syntect.
-    fn highlight_code(&self, code: &str, lang: &str) -> Vec<Line<'static>> {
+    /// `available_width` controls the border line length.
+    fn highlight_code(&self, code: &str, lang: &str, available_width: usize) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        // Border line.
+        // Border line — adapt to available width.
         let lang_label = if lang.is_empty() {
             String::new()
         } else {
             format!(" {lang} ")
         };
+        let border_content_len = 3 + lang_label.len(); // "├──" + label
+        let dash_count = available_width.saturating_sub(border_content_len).max(3);
         lines.push(Line::from(Span::styled(
-            format!("┌──{lang_label}{}", "─".repeat(40_usize.saturating_sub(lang_label.len() + 3))),
+            format!("┌──{lang_label}{}", "─".repeat(dash_count)),
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -277,7 +281,7 @@ impl MarkdownRenderer {
         }
 
         lines.push(Line::from(Span::styled(
-            format!("└{}", "─".repeat(42)),
+            format!("└{}", "─".repeat(available_width.saturating_sub(1).max(3))),
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -292,7 +296,7 @@ mod tests {
     #[test]
     fn heading_rendering() {
         let md = MarkdownRenderer::new();
-        let lines = md.render_lines("# Title\n## Subtitle\nHello");
+        let lines = md.render_lines("# Title\n## Subtitle\nHello", 80);
         assert_eq!(lines.len(), 3);
     }
 
@@ -300,7 +304,7 @@ mod tests {
     fn code_block_rendering() {
         let md = MarkdownRenderer::new();
         let input = "text\n```rust\nfn main() {}\n```\nend";
-        let lines = md.render_lines(input);
+        let lines = md.render_lines(input, 80);
         // text + top-border + code-line + bottom-border + end = 5 lines
         assert_eq!(lines.len(), 5);
     }
@@ -308,7 +312,7 @@ mod tests {
     #[test]
     fn inline_code_rendering() {
         let md = MarkdownRenderer::new();
-        let lines = md.render_lines("Use `cargo build` to compile");
+        let lines = md.render_lines("Use `cargo build` to compile", 80);
         assert_eq!(lines.len(), 1);
         // Should have 3 spans: "Use ", "cargo build" (styled), " to compile"
         assert!(lines[0].spans.len() >= 3);
@@ -317,7 +321,7 @@ mod tests {
     #[test]
     fn bold_italic_rendering() {
         let md = MarkdownRenderer::new();
-        let lines = md.render_lines("This is **bold** and *italic* text");
+        let lines = md.render_lines("This is **bold** and *italic* text", 80);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].spans.len() >= 4);
     }

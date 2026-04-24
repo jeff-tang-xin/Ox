@@ -1,15 +1,51 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::app::App;
-use super::markdown::MarkdownRenderer;
 use super::output_pane::OutputLine;
 
+// ── Ox semantic color palette ──────────────────────────────────────
+
+/// Semantic colors for the Ox UI. All rendering goes through this palette.
+struct OxTheme {
+    // Borders
+    border: Color,
+    border_input: Color,
+    // Message prefixes
+    user_prefix: Color,
+    tool_prefix: Color,
+    system_prefix: Color,
+    // Content
+    ai_text: Color,
+    streaming_cursor: Color,
+    // Status
+    accent: Color,
+    dim: Color,
+    error: Color,
+}
+
+const THEME: OxTheme = OxTheme {
+    border: Color::DarkGray,
+    border_input: Color::Rgb(88, 130, 210),       // muted blue
+    user_prefix: Color::Rgb(110, 210, 160),        // soft green
+    tool_prefix: Color::Rgb(180, 140, 100),        // warm amber
+    system_prefix: Color::Rgb(140, 140, 160),      // cool gray
+    ai_text: Color::Rgb(210, 210, 230),            // light lavender
+    streaming_cursor: Color::Rgb(100, 220, 100),   // bright green
+    accent: Color::Rgb(130, 180, 255),             // sky blue
+    dim: Color::Rgb(100, 100, 120),                // dim gray
+    error: Color::Rgb(230, 90, 90),                // soft red
+};
+
+// ── Spinner animation ──────────────────────────────────────────────
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// Render the Split-View layout: output pane (top) + input pane (bottom).
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &App, tick_count: u64) {
     let area = frame.area();
 
     // Split: 85% output, rest input (minimum 3 lines for input).
@@ -20,22 +56,24 @@ pub fn render(frame: &mut Frame, app: &App) {
     .split(area);
 
     render_output_pane(frame, app, chunks[0]);
-    render_input_pane(frame, app, chunks[1]);
+    render_input_pane(frame, app, chunks[1], tick_count);
 }
 
 fn render_output_pane(frame: &mut Frame, app: &App, area: Rect) {
     let title = if app.agent_running {
-        " Agent Output [working...] "
+        " ◉ Agent "
     } else {
-        " Agent Output "
+        " Ox "
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(title)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .title_style(Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(THEME.border));
 
-    let md_renderer = MarkdownRenderer::new();
+    let output_width = area.width.saturating_sub(4) as usize; // -2 border, -2 padding
 
     // Convert output lines to ratatui Lines.
     let lines: Vec<Line> = app
@@ -43,21 +81,36 @@ fn render_output_pane(frame: &mut Frame, app: &App, area: Rect) {
         .lines
         .iter()
         .flat_map(|ol| match ol {
-            OutputLine::Plain(s) => vec![Line::from(s.as_str().to_string())],
-            OutputLine::Styled { prefix, content } => vec![Line::from(vec![
-                Span::styled(
-                    format!("{} ", prefix),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(content.clone()),
-            ])],
+            OutputLine::Plain(s) => vec![Line::from(Span::styled(
+                s.clone(),
+                Style::default().fg(THEME.ai_text),
+            ))],
+            OutputLine::Styled { prefix, content } => {
+                let prefix_color = if prefix == "You" || prefix == "ox>" {
+                    THEME.user_prefix
+                } else if prefix == "Tool" {
+                    THEME.tool_prefix
+                } else if prefix == "[system]" {
+                    THEME.system_prefix
+                } else {
+                    THEME.accent
+                };
+                vec![Line::from(vec![
+                    Span::styled(
+                        format!("{prefix} "),
+                        Style::default().fg(prefix_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(content.clone(), Style::default().fg(THEME.ai_text)),
+                ])]
+            }
             OutputLine::StreamingPartial(s) => vec![Line::from(vec![
-                Span::raw(s.clone()),
-                Span::styled("█".to_string(), Style::default().fg(Color::Green)),
+                Span::styled(s.clone(), Style::default().fg(THEME.ai_text)),
+                Span::styled(
+                    "▌".to_string(),
+                    Style::default().fg(THEME.streaming_cursor),
+                ),
             ])],
-            OutputLine::Markdown(s) => md_renderer.render_lines(s),
+            OutputLine::Markdown(s) => app.md_renderer.render_lines(s, output_width),
         })
         .collect();
 
@@ -75,28 +128,44 @@ fn render_output_pane(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_input_pane(frame: &mut Frame, app: &App, area: Rect) {
-    let status_hint = if app.agent_running {
-        " [Tab: focus] [Ctrl+C: interrupt] "
+fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, tick_count: u64) {
+    let (title, title_style) = if app.agent_running {
+        let spinner = SPINNER_FRAMES[(tick_count as usize) % SPINNER_FRAMES.len()];
+        (
+            format!(" {spinner} Working… "),
+            Style::default().fg(THEME.streaming_cursor),
+        )
     } else {
-        " Input "
+        (" Input ".to_string(), Style::default().fg(THEME.border_input))
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(status_hint)
-        .border_style(Style::default().fg(Color::Blue));
+        .border_type(BorderType::Rounded)
+        .title(title.as_str())
+        .title_style(title_style)
+        .border_style(Style::default().fg(THEME.border_input));
 
-    let prompt = "ox> ";
-    let display_text = format!("{}{}", prompt, &app.input.buffer);
+    let prompt = "ox❯ ";
 
-    let paragraph = Paragraph::new(display_text.as_str()).block(block);
+    let prompt_len = prompt.len();
+    let paragraph = Paragraph::new(Line::from(vec![
+        Span::styled(
+            prompt.to_string(),
+            Style::default().fg(THEME.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            app.input.buffer.clone(),
+            Style::default().fg(Color::White),
+        ),
+    ]))
+    .block(block);
 
     frame.render_widget(paragraph, area);
 
     // Position the cursor inside the input pane.
     // +1 for left border, +prompt length, +cursor char position.
-    let cursor_x = area.x + 1 + prompt.len() as u16 + app.input.cursor_char_pos() as u16;
+    let cursor_x = area.x + 1 + prompt_len as u16 + app.input.cursor_char_pos() as u16;
     let cursor_y = area.y + 1; // +1 for top border
     if cursor_x < area.x + area.width - 1 {
         frame.set_cursor_position((cursor_x, cursor_y));

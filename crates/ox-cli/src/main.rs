@@ -184,6 +184,9 @@ async fn run_app(
     // Agent event channel.
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<AgentToUiEvent>();
 
+    // Tick counter for spinner animation.
+    let mut tick_count: u64 = 0;
+
     // Conversation history (user + assistant messages, no system prompt — that's added by ContextBuilder).
     let mut history: Vec<Message> = Vec::new();
     for msg in &session.messages {
@@ -191,8 +194,11 @@ async fn run_app(
     }
 
     loop {
-        // Render.
-        terminal.draw(|frame| render::render(frame, &app))?;
+        // Only re-render when dirty or agent is running (for spinner animation).
+        if app.dirty || app.agent_running {
+            terminal.draw(|frame| render::render(frame, &app, tick_count))?;
+            app.dirty = false;
+        }
 
         // Async event loop: wait for crossterm event OR agent event.
         tokio::select! {
@@ -219,8 +225,16 @@ async fn run_app(
                             &mut interjection_buf,
                         );
                     }
-                    Some(Event::Resize(_, _)) => {}
-                    Some(Event::Tick) | None => {}
+                    Some(Event::Resize(_, _)) => {
+                        app.dirty = true;
+                    }
+                    Some(Event::Tick) | None => {
+                        tick_count = tick_count.wrapping_add(1);
+                        // Agent running needs spinner animation updates.
+                        if app.agent_running {
+                            app.dirty = true;
+                        }
+                    }
                 }
             }
             agent_ev = agent_rx.recv() => {
@@ -229,6 +243,7 @@ async fn run_app(
                         AgentToUiEvent::TextChunk(text) => {
                             app.output.push_streaming_chunk(&text);
                             app.scroll_to_bottom();
+                            app.dirty = true;
                         }
                         AgentToUiEvent::ToolStart { name, id } => {
                             app.output.push_line(OutputLine::Styled {
@@ -236,6 +251,7 @@ async fn run_app(
                                 content: format!("{name} [{id}]"),
                             });
                             app.scroll_to_bottom();
+                            app.dirty = true;
                         }
                         AgentToUiEvent::ToolResult { name, output, is_error } => {
                             let status = if is_error { "ERROR" } else { "OK" };
@@ -248,6 +264,7 @@ async fn run_app(
                                 format!("  [{name} {status}] {display_output}")
                             ));
                             app.scroll_to_bottom();
+                            app.dirty = true;
                         }
                         AgentToUiEvent::TurnDone { new_messages, usage } => {
                             app.output.finalize_streaming();
@@ -288,6 +305,7 @@ async fn run_app(
                             }
 
                             app.scroll_to_bottom();
+                            app.dirty = true;
                         }
                         AgentToUiEvent::Error(err) => {
                             app.output.finalize_streaming();
@@ -295,9 +313,11 @@ async fn run_app(
                             app.agent_running = false;
                             app.status = String::new();
                             app.scroll_to_bottom();
+                            app.dirty = true;
                         }
                         AgentToUiEvent::Status(status) => {
                             app.status = status;
+                            app.dirty = true;
                         }
                     }
                 }
@@ -344,6 +364,7 @@ fn handle_key_event(
                     app.status = "Interrupting...".to_string();
                 }
             }
+            app.dirty = true;
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
@@ -430,18 +451,19 @@ fn handle_key_event(
                 app.scroll_to_bottom();
             }
         }
-        (KeyCode::Backspace, _) => app.input.backspace(),
-        (KeyCode::Delete, _) => app.input.delete(),
-        (KeyCode::Left, _) => app.input.move_left(),
-        (KeyCode::Right, _) => app.input.move_right(),
-        (KeyCode::Up, _) => app.input.history_up(),
-        (KeyCode::Down, _) => app.input.history_down(),
-        (KeyCode::Home, _) => app.input.move_home(),
-        (KeyCode::End, _) => app.input.move_end(),
-        (KeyCode::PageUp, _) => app.scroll_up(10),
-        (KeyCode::PageDown, _) => app.scroll_down(10),
+        (KeyCode::Backspace, _) => { app.input.backspace(); app.dirty = true; }
+        (KeyCode::Delete, _) => { app.input.delete(); app.dirty = true; }
+        (KeyCode::Left, _) => { app.input.move_left(); app.dirty = true; }
+        (KeyCode::Right, _) => { app.input.move_right(); app.dirty = true; }
+        (KeyCode::Up, _) => { app.input.history_up(); app.dirty = true; }
+        (KeyCode::Down, _) => { app.input.history_down(); app.dirty = true; }
+        (KeyCode::Home, _) => { app.input.move_home(); app.dirty = true; }
+        (KeyCode::End, _) => { app.input.move_end(); app.dirty = true; }
+        (KeyCode::PageUp, _) => { app.scroll_up(10); app.dirty = true; }
+        (KeyCode::PageDown, _) => { app.scroll_down(10); app.dirty = true; }
         (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
             app.input.insert_char(ch);
+            app.dirty = true;
         }
         _ => {}
     }
