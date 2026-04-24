@@ -29,6 +29,17 @@ pub struct App {
     pub status: String,
     /// Whether the UI needs re-rendering (dirty flag).
     pub dirty: bool,
+    /// Spinner animation frame counter.
+    pub spinner_frame: u64,
+    // ── Status bar info ──
+    /// Current model name (for status bar display).
+    pub model_name: String,
+    /// Working directory short display.
+    pub working_dir: String,
+    /// Token cost summary string.
+    pub cost_summary: String,
+    /// Message count in current session.
+    pub message_count: usize,
 }
 
 impl App {
@@ -42,6 +53,11 @@ impl App {
             agent_running: false,
             status: String::from("Ox v0.1.0"),
             dirty: true,
+            spinner_frame: 0,
+            model_name: String::new(),
+            working_dir: String::new(),
+            cost_summary: String::new(),
+            message_count: 0,
         }
     }
 
@@ -56,7 +72,7 @@ impl App {
 
         // Echo user input to output pane.
         self.output.push_line(OutputLine::Styled {
-            prefix: "ox>".to_string(),
+            prefix: "You".to_string(),
             content: trimmed.to_string(),
         });
 

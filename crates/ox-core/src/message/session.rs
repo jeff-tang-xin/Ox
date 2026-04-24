@@ -170,6 +170,120 @@ impl Session {
     pub fn dir(&self) -> &Path {
         self.file_path.parent().unwrap_or(Path::new("."))
     }
+
+    /// List archived sessions in the sessions/ directory.
+    /// Returns (filename, display_info) pairs sorted by most recent first.
+    pub fn list_archived(session_dir: &Path) -> Vec<(String, String)> {
+        let archive_dir = session_dir.join("sessions");
+        if !archive_dir.exists() {
+            return Vec::new();
+        }
+
+        let mut entries: Vec<_> = fs::read_dir(&archive_dir)
+            .ok()
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .is_some_and(|ext| ext == "jsonl")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Sort by modification time, most recent first.
+        entries.sort_by(|a, b| {
+            b.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                .cmp(
+                    &a.metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                )
+        });
+
+        entries
+            .iter()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                // Try to read first line for meta info.
+                let file = File::open(e.path()).ok()?;
+                let reader = BufReader::new(file);
+                let first_line = reader.lines().next()?.ok()?;
+                let val: serde_json::Value = serde_json::from_str(&first_line).ok()?;
+                let meta = val.get("_meta")?;
+                let id = meta.get("id")?.as_str().unwrap_or("?");
+                let count = meta.get("message_count")?.as_u64().unwrap_or(0);
+                let created = meta.get("created_at")?.as_str().unwrap_or("?");
+                // Shorten the timestamp for display.
+                let short_time = if created.len() >= 16 {
+                    &created[..16]
+                } else {
+                    created
+                };
+                Some((name, format!("{short_time}  [{count} msgs]  id:{:.8}", id)))
+            })
+            .collect()
+    }
+
+    /// Load an archived session by filename.
+    pub fn load_archived(session_dir: &Path, filename: &str) -> anyhow::Result<Option<Self>> {
+        let archive_path = session_dir.join("sessions").join(filename);
+        if !archive_path.exists() {
+            return Ok(None);
+        }
+
+        let file = File::open(&archive_path)?;
+        let reader = BufReader::new(file);
+        let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
+
+        if lines.is_empty() {
+            return Ok(None);
+        }
+
+        let mut meta: Option<SessionMeta> = None;
+        let mut messages = Vec::new();
+        let total_lines = lines.len();
+
+        for (i, line) in lines.iter().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(m) = val.get("_meta")
+                    && let Ok(m) = serde_json::from_value::<SessionMeta>(m.clone()) {
+                        meta = Some(m);
+                        continue;
+                    }
+
+            match serde_json::from_str::<Message>(line) {
+                Ok(msg) => messages.push(msg),
+                Err(e) => {
+                    if i == total_lines - 1 {
+                        tracing::warn!("Skipping malformed last line: {e}");
+                    }
+                }
+            }
+        }
+
+        let meta = meta.unwrap_or_else(|| SessionMeta {
+            id: Uuid::new_v4().to_string(),
+            project_id: String::new(),
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+            message_count: messages.len(),
+        });
+
+        Ok(Some(Self {
+            meta,
+            messages,
+            file_path: archive_path,
+        }))
+    }
 }
 
 #[cfg(test)]

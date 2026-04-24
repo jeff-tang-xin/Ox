@@ -125,6 +125,16 @@ impl CostTracker {
         )
     }
 
+    /// Short one-line summary for the status bar.
+    pub fn summary_short(&self) -> String {
+        let daily_tokens = self.daily_prompt_tokens + self.daily_completion_tokens;
+        if self.monthly_cost_usd > 0.0 {
+            format!("${:.2}/mo · {}tk today", self.monthly_cost_usd, daily_tokens / 1000)
+        } else {
+            format!("{}tk today", daily_tokens / 1000)
+        }
+    }
+
     fn save(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.file_path.parent() {
             std::fs::create_dir_all(parent)?;

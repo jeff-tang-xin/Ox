@@ -29,13 +29,17 @@ pub struct OutputPane {
 }
 
 impl OutputPane {
+    /// Maximum lines to keep in the output buffer to prevent unbounded memory growth.
+    const MAX_LINES: usize = 5000;
+
     pub fn new() -> Self {
         Self { lines: Vec::new() }
     }
 
-    /// Push a complete line.
+    /// Push a complete line, trimming excess if necessary.
     pub fn push_line(&mut self, line: OutputLine) {
         self.lines.push(line);
+        self.trim_excess();
     }
 
     /// Push a system-style message.
@@ -44,6 +48,7 @@ impl OutputPane {
             prefix: "[system]".to_string(),
             content: msg.to_string(),
         });
+        self.trim_excess();
     }
 
     /// Append a streaming text chunk to the current partial line.
@@ -94,6 +99,7 @@ impl OutputPane {
                 }
             }
         }
+        self.trim_excess();
     }
 
     /// Convert any trailing StreamingPartial to a Markdown line.
@@ -103,6 +109,13 @@ impl OutputPane {
             *self.lines.last_mut().unwrap() = finalized;
         }
         // Always ensure next chunk starts a fresh StreamingPartial.
+    }
+
+    /// Prevents unbounded memory growth by trimming oldest lines.
+    fn trim_excess(&mut self) {
+        if self.lines.len() > Self::MAX_LINES {
+            self.lines.drain(..self.lines.len() - Self::MAX_LINES);
+        }
     }
 
     pub fn line_count(&self) -> usize {

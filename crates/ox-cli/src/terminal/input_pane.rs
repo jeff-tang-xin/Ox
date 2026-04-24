@@ -149,4 +149,39 @@ impl InputPane {
     pub fn cursor_char_pos(&self) -> usize {
         self.buffer[..self.cursor].chars().count()
     }
+
+    /// Clear from cursor to beginning of line (Ctrl+U style).
+    pub fn clear_to_home(&mut self) {
+        self.buffer.drain(..self.cursor);
+        self.cursor = 0;
+    }
+
+    /// Clear from cursor to end of line (Ctrl+K style).
+    pub fn clear_to_end(&mut self) {
+        self.buffer.drain(self.cursor..);
+    }
+
+    /// Delete the word before the cursor (Ctrl+W style).
+    pub fn delete_word(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        // Find the start of the current word by scanning backwards.
+        let before_cursor = &self.buffer[..self.cursor];
+        let chars: Vec<(usize, char)> = before_cursor.char_indices().collect();
+        let mut idx = chars.len();
+
+        // Skip trailing whitespace.
+        while idx > 0 && chars[idx - 1].1.is_whitespace() {
+            idx -= 1;
+        }
+        // Skip non-whitespace characters (the word itself).
+        while idx > 0 && !chars[idx - 1].1.is_whitespace() {
+            idx -= 1;
+        }
+
+        let delete_start = if idx < chars.len() { chars[idx].0 } else { 0 };
+        self.buffer.drain(delete_start..self.cursor);
+        self.cursor = delete_start;
+    }
 }

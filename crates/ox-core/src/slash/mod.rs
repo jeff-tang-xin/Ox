@@ -13,6 +13,8 @@ pub enum SlashCommand {
     Cd { path: Option<String> },
     Debug,
     Init,
+    Sessions,
+    Resume { filename: String },
     Unknown { cmd: String },
 }
 
@@ -62,6 +64,10 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
         },
         "debug" => SlashCommand::Debug,
         "init" => SlashCommand::Init,
+        "sessions" => SlashCommand::Sessions,
+        "resume" => SlashCommand::Resume {
+            filename: args.to_string(),
+        },
         _ => SlashCommand::Unknown {
             cmd: cmd.to_string(),
         },
@@ -87,10 +93,12 @@ pub fn help_text(topic: Option<&str>) -> String {
 Commands:
   /help [topic]     Show help (topics: trust, cost, plan)
   /exit             Exit Ox
-  /new              Start a new session
+  /new              Start a new session (archives current)
   /clear            Clear the screen
   /cost             Show token usage and cost summary
   /plan             Show current task plan
+  /sessions         List archived sessions
+  /resume <file>    Resume an archived session
   /trust <tool>     Trust a tool (skip confirmation this session)
   /trust --all      Trust all non-dangerous tools
   /untrust          Revoke all trust

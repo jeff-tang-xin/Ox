@@ -94,6 +94,18 @@ async fn run_app(
 ) -> anyhow::Result<()> {
     let mut app = App::new();
 
+    // Set status bar info.
+    app.model_name = provider
+        .as_ref()
+        .map(|p| p.model_name().to_string())
+        .unwrap_or_else(|| "echo".to_string());
+    app.working_dir = rt_env
+        .working_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| rt_env.working_dir.display().to_string());
+    app.message_count = 0;
+
     // Show startup banner with runtime info.
     app.output.push_line(OutputLine::Styled {
         prefix: "Ox".to_string(),
@@ -230,6 +242,7 @@ async fn run_app(
                     }
                     Some(Event::Tick) | None => {
                         tick_count = tick_count.wrapping_add(1);
+                        app.spinner_frame = tick_count;
                         // Agent running needs spinner animation updates.
                         if app.agent_running {
                             app.dirty = true;
@@ -280,6 +293,9 @@ async fn run_app(
                             cost_tracker.record(&model_name, &usage);
                             app.agent_running = false;
                             app.status = String::new();
+                            // Update status bar info.
+                            app.message_count = history.len();
+                            app.cost_summary = cost_tracker.summary_short();
 
                             // Reset interrupt controller for next turn.
                             interrupt_ctrl.reset();
@@ -353,6 +369,11 @@ fn handle_key_event(
     interjection_buf: &mut InterjectionBuffer,
 ) {
     match (key.code, key.modifiers) {
+        (KeyCode::Char('a'), KeyModifiers::CONTROL) => { app.input.move_home(); app.dirty = true; }
+        (KeyCode::Char('e'), KeyModifiers::CONTROL) => { app.input.move_end(); app.dirty = true; }
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => { app.input.clear_to_home(); app.dirty = true; }
+        (KeyCode::Char('k'), KeyModifiers::CONTROL) => { app.input.clear_to_end(); app.dirty = true; }
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) => { app.input.delete_word(); app.dirty = true; }
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             let action = interrupt_ctrl.on_ctrl_c(app.agent_running);
             match action {
@@ -495,13 +516,17 @@ fn handle_slash_command(
             app.should_quit = true;
         }
         SlashCommand::New => {
-            history.clear();
+            // Archive current session before starting new one.
             let session_dir = session.dir().to_path_buf();
+            if let Err(e) = session.archive(&session_dir) {
+                tracing::warn!("Failed to archive session: {e}");
+            }
+            history.clear();
             let project_id = rt_env.project_id.clone();
             match Session::new(&session_dir, &project_id) {
                 Ok(s) => {
                     *session = s;
-                    app.output.push_system("New session started.");
+                    app.output.push_system("New session started. (Previous session archived.)");
                 }
                 Err(e) => {
                     app.output
@@ -649,6 +674,59 @@ fn handle_slash_command(
                     trusted.join(", ")
                 }
             )));
+        }
+        SlashCommand::Sessions => {
+            let session_dir = session.dir().to_path_buf();
+            let archived = Session::list_archived(&session_dir);
+            if archived.is_empty() {
+                app.output.push_system("No archived sessions found. Use /new to start and archive sessions.");
+            } else {
+                app.output.push_line(OutputLine::Plain("Archived sessions:".to_string()));
+                for (i, (filename, info)) in archived.iter().enumerate() {
+                    app.output.push_line(OutputLine::Plain(format!(
+                        "  {}. {}  ({})",
+                        i + 1,
+                        info,
+                        filename
+                    )));
+                }
+                app.output.push_line(OutputLine::Plain(
+                    "Use /resume <filename> to restore a session.".to_string(),
+                ));
+            }
+        }
+        SlashCommand::Resume { filename } => {
+            if filename.is_empty() {
+                app.output.push_system("Usage: /resume <filename>  (use /sessions to list)");
+            } else {
+                let session_dir = session.dir().to_path_buf();
+                match Session::load_archived(&session_dir, &filename) {
+                    Ok(Some(archived_session)) => {
+                        // Archive current session first.
+                        if let Err(e) = session.archive(&session_dir) {
+                            tracing::warn!("Failed to archive current session: {e}");
+                        }
+                        // Restore archived session.
+                        let msg_count = archived_session.messages.len();
+                        *history = archived_session.messages.clone();
+                        *session = archived_session;
+                        app.output.push_system(&format!(
+                            "Session restored: {} messages from {}",
+                            msg_count, filename
+                        ));
+                        app.message_count = history.len();
+                    }
+                    Ok(None) => {
+                        app.output.push_system(&format!(
+                            "Session '{}' not found. Use /sessions to list.",
+                            filename
+                        ));
+                    }
+                    Err(e) => {
+                        app.output.push_system(&format!("Failed to resume session: {e}"));
+                    }
+                }
+            }
         }
         SlashCommand::Unknown { cmd } => {
             app.output
