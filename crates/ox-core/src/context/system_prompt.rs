@@ -49,4 +49,5 @@ const CORE_PRINCIPLES: &str = "\
 - **P1: Think before acting** — Understand the full context before making changes.
 - **P2: Minimal changes** — Only modify what is necessary. Avoid unnecessary refactoring.
 - **P3: Safety first** — Never execute destructive actions without confirmation.
-- **P4: Transparency** — Explain what you're doing and why.";
+- **P4: Transparency** — Explain what you're doing and why.
+- **P5: OS-aware commands** — Always check the Environment section above before writing shell commands. Use OS-appropriate syntax (PowerShell on Windows, bash on Linux/macOS). Never use Unix commands on Windows or vice versa.";

@@ -11,9 +11,16 @@ pub struct InputPane {
     pub history_index: Option<usize>,
     /// Saved buffer when navigating history.
     saved_buffer: String,
+    /// Whether multiline mode is active.
+    pub multiline_mode: bool,
 }
 
 impl InputPane {
+    /// Maximum history entries to keep.
+    const MAX_HISTORY: usize = 1000;
+    /// Maximum length per history entry.
+    const MAX_ENTRY_LEN: usize = 10000;
+
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
@@ -21,6 +28,7 @@ impl InputPane {
             history: Vec::new(),
             history_index: None,
             saved_buffer: String::new(),
+            multiline_mode: true, // Enable multiline by default.
         }
     }
 
@@ -89,11 +97,27 @@ impl InputPane {
         self.cursor = self.buffer.len();
     }
 
+    /// Insert a newline character at the cursor position (for multiline mode).
+    pub fn insert_newline(&mut self) {
+        self.buffer.insert(self.cursor, '\n');
+        self.cursor += 1;
+    }
+
     /// Submit the current buffer. Returns the text and clears the buffer.
     pub fn submit(&mut self) -> String {
         let text = self.buffer.clone();
         if !text.is_empty() {
-            self.history.push(text.clone());
+            // Truncate if too long.
+            let entry = if text.len() > Self::MAX_ENTRY_LEN {
+                text[..Self::MAX_ENTRY_LEN].to_string()
+            } else {
+                text.clone()
+            };
+            self.history.push(entry);
+            // Trim oldest if over limit.
+            if self.history.len() > Self::MAX_HISTORY {
+                self.history.drain(..self.history.len() - Self::MAX_HISTORY);
+            }
         }
         self.buffer.clear();
         self.cursor = 0;

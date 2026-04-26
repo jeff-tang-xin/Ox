@@ -41,9 +41,14 @@ impl Tool for FilePatchTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
-        let path = match args.get("path").and_then(|p| p.as_str()) {
-            Some(p) => ctx.working_dir.join(p),
+        let raw_path = match args.get("path").and_then(|p| p.as_str()) {
+            Some(p) => p,
             None => return ToolOutput::error("Missing required parameter: path. Usage: {\"path\": \"<file>\", \"search\": \"<text>\", \"replace\": \"<text>\"}"),
+        };
+        let resolved_path = ctx.working_dir.join(raw_path);
+        let path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
         };
         let search = match args.get("search").and_then(|s| s.as_str()) {
             Some(s) => s,

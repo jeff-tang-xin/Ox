@@ -1,5 +1,6 @@
 pub mod interjection;
 pub mod interrupt;
+pub mod ui_event;
 
 use std::sync::Arc;
 
@@ -8,7 +9,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::llm::{LlmProvider, LlmStreamEvent};
 use crate::message::{Message, ToolCall, TokenUsage};
-use crate::tools::{ToolContext, ToolRegistry};
+use crate::safety::TrustManager;
+use crate::tools::{SafetyLevel, ToolContext, ToolRegistry};
+use crate::config::AgentConfig;
 
 /// Events sent from the agent to the UI.
 #[derive(Debug, Clone)]
@@ -32,6 +35,26 @@ pub enum AgentToUiEvent {
     Error(String),
     /// Status update (e.g. "Thinking...", "Running tool...").
     Status(String),
+    /// Request user confirmation for tool execution.
+    ToolConfirmationRequest {
+        tool_call_id: String,
+        tool_name: String,
+        /// Argument summary (sanitized, truncated).
+        args_summary: String,
+        safety_level: SafetyLevel,
+        /// High-risk command warning (only for shell_exec).
+        high_risk_warning: Option<String>,
+    },
+    /// Incremental tool output chunk (for streaming tools like shell_exec).
+    ToolOutputChunk {
+        tool_call_id: String,
+        chunk: String,
+    },
+    /// Budget exceeded — request user confirmation to continue.
+    BudgetExceeded {
+        total_tokens: u32,
+        estimated_cost: String,
+    },
 }
 
 /// Run a complete agent turn: LLM -> tool_calls -> execute -> loop -> text.
@@ -44,10 +67,13 @@ pub async fn run_agent_turn(
     tool_registry: Arc<ToolRegistry>,
     tool_ctx: Arc<ToolContext>,
     ui_tx: mpsc::UnboundedSender<AgentToUiEvent>,
+    mut ui_rx: mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
     cancel_token: CancellationToken,
+    trust_manager: Arc<tokio::sync::Mutex<TrustManager>>,
+    agent_config: Arc<AgentConfig>,
 ) {
     let tool_schemas = tool_registry.schemas();
-    let max_iterations = 25; // Safety limit to prevent infinite loops.
+    let max_iterations = agent_config.max_iterations;
 
     // Track new messages produced during this turn for returning to the caller.
     let mut new_messages: Vec<Message> = Vec::new();
@@ -72,9 +98,20 @@ pub async fn run_agent_turn(
         let provider_clone = Arc::clone(&provider);
         let msgs = messages.clone();
         let schemas = tool_schemas.clone();
-        let stream_handle = tokio::spawn(async move {
-            if let Err(e) = provider_clone.stream_chat(&msgs, &schemas, llm_tx).await {
-                tracing::error!("LLM stream error: {e}");
+        let cancel_clone = cancel_token.clone();
+        let llm_tx_err = llm_tx.clone();
+        let mut stream_handle = tokio::spawn(async move {
+            tokio::select! {
+                result = provider_clone.stream_chat(&msgs, &schemas, llm_tx) => {
+                    if let Err(e) = result {
+                        tracing::error!("LLM stream error: {e}");
+                        // Propagate the error so the agent loop can handle it.
+                        let _ = llm_tx_err.send(LlmStreamEvent::Error(format!("Stream failed: {e}")));
+                    }
+                }
+                _ = cancel_clone.cancelled() => {
+                    tracing::info!("LLM stream task cancelled");
+                }
             }
         });
 
@@ -125,13 +162,25 @@ pub async fn run_agent_turn(
                 }
                 LlmStreamEvent::Error(err) => {
                     let _ = ui_tx.send(AgentToUiEvent::Error(err));
-                    let _ = stream_handle.await;
+                    // Abort the stream task if still running, don't block on it.
+                    stream_handle.abort();
+                    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                        new_messages,
+                        usage: total_usage,
+                    });
                     return;
                 }
             }
         }
 
-        let _ = stream_handle.await;
+        // Wait for the stream task to finish, but don't block forever.
+        // If cancelled, abort the stream task immediately.
+        tokio::select! {
+            _ = &mut stream_handle => {}
+            _ = cancel_token.cancelled() => {
+                stream_handle.abort();
+            }
+        }
 
         // If no tool calls, the turn is complete.
         if tool_calls.is_empty() {
@@ -172,7 +221,8 @@ pub async fn run_agent_turn(
             let tool = match tool_registry.get(&tc.name) {
                 Some(t) => t,
                 None => {
-                    let error_msg = format!("Unknown tool: {}", tc.name);
+                    let available = tool_registry.names().join(", ");
+                    let error_msg = format!("Unknown tool: '{}'. Available tools: {}", tc.name, available);
                     let result_msg = Message::ToolResult {
                         tool_call_id: tc.id.clone(),
                         content: error_msg.clone(),
@@ -187,6 +237,126 @@ pub async fn run_agent_turn(
                     continue;
                 }
             };
+
+            // ── Safety check before execution ──
+            let safety_level = tool.safety_level();
+
+            // Check if tool args reference a path outside working directory.
+            let path_outside = if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                if let Some(path_str) = args_val.get("path").and_then(|v| v.as_str()) {
+                    let resolved = tool_ctx.working_dir.join(path_str);
+                    !crate::safety::is_path_within_workdir(&resolved, &tool_ctx.working_dir)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            let should_confirm = if path_outside {
+                true // Path outside workdir always requires confirmation.
+            } else {
+                match safety_level {
+                    SafetyLevel::Safe => false,
+                    SafetyLevel::RequiresConfirmation => {
+                        let tm = trust_manager.lock().await;
+                        !tm.can_skip_confirmation(&tc.name, safety_level)
+                    }
+                    SafetyLevel::Dangerous => true,
+                }
+            };
+
+            if should_confirm {
+                // Build args_summary (truncated, sanitized).
+                let args_summary = if tc.arguments.len() > 200 {
+                    format!("{}...(truncated)", &tc.arguments[..200])
+                } else {
+                    tc.arguments.clone()
+                };
+
+                // Check for high-risk command (shell_exec only).
+                let high_risk_warning = if tc.name == "shell_exec" {
+                    // Try to extract command from args JSON.
+                    if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                        if let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
+                            if crate::safety::is_high_risk_command(cmd) {
+                                Some("HIGH RISK COMMAND".to_string())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Send confirmation request to UI.
+                let _ = ui_tx.send(AgentToUiEvent::ToolConfirmationRequest {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.name.clone(),
+                    args_summary,
+                    safety_level,
+                    high_risk_warning,
+                });
+
+                // Wait for user response.
+                let decision = loop {
+                    tokio::select! {
+                        ev = ui_rx.recv() => {
+                            match ev {
+                                Some(ui_event::UiToAgentEvent::ToolConfirmation { tool_call_id, decision })
+                                    if tool_call_id == tc.id => {
+                                    break decision;
+                                }
+                                Some(ui_event::UiToAgentEvent::Interjection(text)) => {
+                                    // Buffer interjection while waiting for confirmation.
+                                    let _ = ui_tx.send(AgentToUiEvent::Status(
+                                        format!("(interjection queued: {})", text.trim())
+                                    ));
+                                }
+                                _ => continue,
+                            }
+                        }
+                        _ = cancel_token.cancelled() => {
+                            // Cancelled while waiting for confirmation.
+                            let _ = ui_tx.send(AgentToUiEvent::Status("Interrupted.".to_string()));
+                            // Return early with what we have.
+                            let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                                new_messages,
+                                usage: total_usage,
+                            });
+                            return;
+                        }
+                    }
+                };
+
+                match decision {
+                    ui_event::ConfirmationDecision::Deny => {
+                        let error_msg = "User denied tool execution".to_string();
+                        let result_msg = Message::ToolResult {
+                            tool_call_id: tc.id.clone(),
+                            content: error_msg.clone(),
+                        };
+                        new_messages.push(result_msg.clone());
+                        messages.push(result_msg);
+                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                            name: tc.name.clone(),
+                            output: error_msg,
+                            is_error: true,
+                        });
+                        continue;
+                    }
+                    ui_event::ConfirmationDecision::TrustAlways => {
+                        let mut tm = trust_manager.lock().await;
+                        tm.trust(&tc.name);
+                    }
+                    ui_event::ConfirmationDecision::Allow => {}
+                }
+            }
 
             let args: serde_json::Value = if tc.arguments.trim().is_empty() {
                 // LLM sent no arguments — treat as empty object (common for no-param tools).

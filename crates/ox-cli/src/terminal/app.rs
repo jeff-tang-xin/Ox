@@ -13,6 +13,13 @@ pub enum UserInput {
     Exit,
 }
 
+/// Pending tool confirmation request from the agent.
+#[derive(Debug, Clone)]
+pub struct PendingConfirmation {
+    pub tool_call_id: String,
+    pub tool_name: String,
+}
+
 /// Central UI state. All terminal state flows through this struct.
 pub struct App {
     pub output: OutputPane,
@@ -40,6 +47,11 @@ pub struct App {
     pub cost_summary: String,
     /// Message count in current session.
     pub message_count: usize,
+    // ── Confirmation state ──
+    /// Pending tool confirmation request (if any).
+    pub pending_confirmation: Option<PendingConfirmation>,
+    /// UI→Agent channel sender for sending confirmations.
+    pub ui_to_agent_tx: Option<tokio::sync::mpsc::UnboundedSender<ox_core::agent::ui_event::UiToAgentEvent>>,
 }
 
 impl App {
@@ -58,6 +70,8 @@ impl App {
             working_dir: String::new(),
             cost_summary: String::new(),
             message_count: 0,
+            pending_confirmation: None,
+            ui_to_agent_tx: None,
         }
     }
 

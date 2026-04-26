@@ -92,6 +92,7 @@ impl LlmProvider for OpenAiProvider {
         let mut buffer = String::new();
         let mut tool_call_index_to_id: std::collections::HashMap<u64, String> =
             std::collections::HashMap::new();
+        let mut done_sent = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -112,15 +113,21 @@ impl LlmProvider for OpenAiProvider {
                     }
 
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        process_openai_chunk(&json, &tx, &mut tool_call_index_to_id);
+                        if process_openai_chunk(&json, &tx, &mut tool_call_index_to_id) {
+                            done_sent = true;
+                        }
                     }
                 }
             }
         }
 
-        let _ = tx.send(LlmStreamEvent::Done {
-            usage: TokenUsage::default(),
-        });
+        // Only send Done if process_openai_chunk didn't already send one
+        // (e.g. API didn't include usage in stream, or non-OpenAI compatible API).
+        if !done_sent {
+            let _ = tx.send(LlmStreamEvent::Done {
+                usage: TokenUsage::default(),
+            });
+        }
 
         Ok(())
     }
@@ -134,11 +141,12 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+/// Returns `true` if a `LlmStreamEvent::Done` was sent (i.e. usage chunk detected).
 fn process_openai_chunk(
     json: &serde_json::Value,
     tx: &mpsc::UnboundedSender<LlmStreamEvent>,
     index_to_id: &mut std::collections::HashMap<u64, String>,
-) {
+) -> bool {
     // Check for usage in the final chunk.
     if let Some(usage) = json.get("usage").filter(|u| !u.is_null()) {
         let _ = tx.send(LlmStreamEvent::Done {
@@ -148,15 +156,17 @@ fn process_openai_chunk(
                 total_tokens: usage["total_tokens"].as_u64().unwrap_or(0) as u32,
             },
         });
-        return;
+        return true;
     }
 
     let Some(choices) = json.get("choices").and_then(|c| c.as_array()) else {
-        return;
+        return false;
     };
 
     for choice in choices {
-        let Some(delta) = choice.get("delta") else {
+        // Some compatible APIs use "message" instead of "delta" (e.g. non-streaming mixed in).
+        let delta = choice.get("delta").or_else(|| choice.get("message"));
+        let Some(delta) = delta else {
             continue;
         };
 
@@ -170,6 +180,7 @@ fn process_openai_chunk(
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tool_calls {
                 let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                tracing::debug!("Tool call chunk index={index}: {}", serde_json::to_string(tc).unwrap_or_default());
 
                 // First chunk for this tool call includes "id" and "function.name".
                 if let Some(id) = tc.get("id").and_then(|i| i.as_str())
@@ -177,33 +188,41 @@ fn process_openai_chunk(
                         index_to_id.insert(index, id.to_string());
                     }
 
-                // Resolve the tool call id from the index map.
-                let id = match index_to_id.get(&index) {
-                    Some(id) => id.clone(),
-                    None => {
-                        // No id mapped for this index yet — skip.
-                        tracing::warn!("Tool call delta with unknown index {index}, skipping");
-                        continue;
-                    }
+                // Ensure an id exists for this index (fallback to generated id).
+                let id = if let Some(id) = index_to_id.get(&index) {
+                    id.clone()
+                } else {
+                    let fallback_id = format!("tc_{index}");
+                    tracing::debug!("No tool call id for index {index}, using fallback: {fallback_id}");
+                    index_to_id.insert(index, fallback_id.clone());
+                    fallback_id
                 };
 
-                if let Some(func) = tc.get("function") {
-                    // If name is present, it's a new tool call start.
-                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                // Check for tool call name/arguments.
+                // Standard OpenAI format: tc.function.name / tc.function.arguments
+                // Some compatible APIs: tc.name / tc.arguments (flat)
+                let func = tc.get("function");
+                let name_src = func.and_then(|f| f.get("name")).or_else(|| tc.get("name"));
+                let args_src = func.and_then(|f| f.get("arguments")).or_else(|| tc.get("arguments"));
+
+                if let Some(name_val) = name_src.and_then(|n| n.as_str()) {
+                    if !name_val.is_empty() {
                         let _ = tx.send(LlmStreamEvent::ToolCallStart {
                             id: id.clone(),
-                            name: name.to_string(),
+                            name: name_val.to_string(),
+                        });
+                    } else {
+                        tracing::warn!("Tool call with empty name at index {index}, skipping");
+                    }
+                }
+                // Arguments delta.
+                if let Some(args) = args_src.and_then(|a| a.as_str())
+                    && !args.is_empty() {
+                        let _ = tx.send(LlmStreamEvent::ToolCallArgumentsDelta {
+                            id: id.clone(),
+                            delta: args.to_string(),
                         });
                     }
-                    // Arguments delta.
-                    if let Some(args) = func.get("arguments").and_then(|a| a.as_str())
-                        && !args.is_empty() {
-                            let _ = tx.send(LlmStreamEvent::ToolCallArgumentsDelta {
-                                id: id.clone(),
-                                delta: args.to_string(),
-                            });
-                        }
-                }
 
                 // finish_reason == "tool_calls" signals end (checked at choice level).
                 if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str())
@@ -213,6 +232,7 @@ fn process_openai_chunk(
             }
         }
     }
+    false
 }
 
 fn message_to_openai(msg: &Message) -> serde_json::Value {

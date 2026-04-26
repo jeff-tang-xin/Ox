@@ -38,9 +38,16 @@ impl Tool for FileListTool {
             None => return ToolOutput::error("Missing required parameter: path. Usage: {\"path\": \"<directory or glob pattern>\"}"),
         };
 
+        // Path traversal protection.
+        let resolved_path = ctx.working_dir.join(path_str);
+        let validated_path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
+        };
+
         // Check if it's a glob pattern.
         if path_str.contains('*') || path_str.contains('?') {
-            let full_pattern = ctx.working_dir.join(path_str);
+            let full_pattern = validated_path;
             match glob::glob(&full_pattern.to_string_lossy()) {
                 Ok(entries) => {
                     let mut results = Vec::new();
@@ -66,7 +73,7 @@ impl Tool for FileListTool {
                 Err(e) => ToolOutput::error(format!("Invalid glob pattern: {e}")),
             }
         } else {
-            let full_path = ctx.working_dir.join(path_str);
+            let full_path = validated_path;
             match fs::read_dir(&full_path) {
                 Ok(entries) => {
                     let mut items: Vec<String> = Vec::new();

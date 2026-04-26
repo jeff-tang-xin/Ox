@@ -91,63 +91,122 @@ fn default_base_url(provider: &str) -> &'static str {
     }
 }
 
-/// Create the appropriate LLM provider based on model name and config.
+/// Resolve provider name from model string, using explicit mapping first.
+/// Priority: config.model_providers exact match > prefix inference > config.default_provider.
+pub fn resolve_provider_name_with_config<'a>(
+    model: &str,
+    config: &'a crate::config::ModelsConfig,
+) -> &'a str {
+    // Priority 1: explicit model→provider mapping
+    if let Some(provider) = config.model_providers.get(model) {
+        return provider.as_str();
+    }
+    // Priority 2: prefix inference
+    let inferred = resolve_provider_name(model);
+    // If prefix inference returned "openai" as default (no match), try default_provider.
+    if inferred == "openai" && !config.default_provider.is_empty() {
+        // Check if the model name actually matches a known prefix; if not, use default_provider.
+        let known_prefixes = ["gpt", "o1", "chatgpt", "claude", "deepseek", "gemini", "qwen", "glm"];
+        let lower = model.to_lowercase();
+        if !known_prefixes.iter().any(|p| lower.starts_with(p)) {
+            return config.default_provider.as_str();
+        }
+    }
+    inferred
+}
+
+/// Source of the API key, for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeySource {
+    /// API key found in environment variable (named).
+    EnvVar(String),
+    /// API key found in config file.
+    ConfigFile,
+    /// API key not found.
+    NotFound,
+}
+
+/// Source of the base URL, for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseUrlSource {
+    /// Base URL from config file.
+    ConfigFile,
+    /// Base URL from provider default.
+    Default,
+}
+
+/// Provider resolution result with diagnostic information.
+#[derive(Debug, Clone)]
+pub struct ProviderResolveInfo {
+    pub provider_name: String,
+    pub api_key_source: ApiKeySource,
+    pub base_url_source: BaseUrlSource,
+}
+
+/// Create the appropriate LLM provider based on model name and config,
+/// returning both the provider and resolution diagnostics.
 ///
 /// API key priority: env var `OX_{PROVIDER}_API_KEY` > config `[models.providers.{provider}] api_key`.
+/// Provider resolution: `model_providers` explicit mapping > prefix inference.
 /// base_url: config > provider default.
 /// max_tokens: config > provider default (8192 for Anthropic, None/omit for OpenAI).
-pub fn create_provider(
+pub fn create_provider_with_info(
     model: &str,
     config: &crate::config::ModelsConfig,
-) -> anyhow::Result<Box<dyn LlmProvider>> {
-    let provider_name = resolve_provider_name(model);
+) -> anyhow::Result<(Box<dyn LlmProvider>, ProviderResolveInfo)> {
+    let provider_name = resolve_provider_name_with_config(model, config).to_string();
     let provider_cfg = config
         .providers
-        .get(provider_name)
+        .get(&provider_name)
         .cloned()
         .unwrap_or_default();
 
     // Resolve API key: env var overrides config.
     let env_key = format!("OX_{}_API_KEY", provider_name.to_uppercase());
-    let api_key = std::env::var(&env_key)
+    let (api_key, api_key_source) = if let Some(key) = std::env::var(&env_key)
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            if provider_cfg.api_key.is_empty() {
-                None
-            } else {
-                Some(provider_cfg.api_key.clone())
-            }
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{provider_name} API key not set. Set {env_key} env var or \
-                 [models.providers.{provider_name}] api_key in ~/.ox/config.toml"
-            )
-        })?;
-
-    // Resolve base_url: config > provider default.
-    let base_url = if provider_cfg.base_url.is_empty() {
-        default_base_url(provider_name).to_string()
+    {
+        (key, ApiKeySource::EnvVar(env_key))
+    } else if !provider_cfg.api_key.is_empty() {
+        (provider_cfg.api_key.clone(), ApiKeySource::ConfigFile)
     } else {
-        provider_cfg.base_url.clone()
+        return Err(anyhow::anyhow!(
+            "{provider_name} API key not set. Set {env_key} env var or \
+             [models.providers.{provider_name}] api_key in ~/.ox/config.toml"
+        ));
     };
 
-    match provider_name {
-        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(
+    // Resolve base_url: config > provider default.
+    let (base_url, base_url_source) = if provider_cfg.base_url.is_empty() {
+        (default_base_url(&provider_name).to_string(), BaseUrlSource::Default)
+    } else {
+        (provider_cfg.base_url.clone(), BaseUrlSource::ConfigFile)
+    };
+
+    let resolve_info = ProviderResolveInfo {
+        provider_name: provider_name.clone(),
+        api_key_source,
+        base_url_source,
+    };
+
+    let provider = match provider_name.as_str() {
+        "anthropic" => Box::new(anthropic::AnthropicProvider::new(
             model.to_string(),
             api_key,
             base_url,
             provider_cfg.max_tokens.unwrap_or(8192),
-        ))),
+        )) as Box<dyn LlmProvider>,
         // OpenAI and DeepSeek (OpenAI-compatible) both use OpenAiProvider.
-        _ => Ok(Box::new(openai::OpenAiProvider::new(
+        _ => Box::new(openai::OpenAiProvider::new(
             model.to_string(),
             api_key,
             base_url,
             provider_cfg.max_tokens,
-        ))),
-    }
+        )),
+    };
+
+    Ok((provider, resolve_info))
 }
 
 #[cfg(test)]
@@ -179,5 +238,40 @@ mod tests {
         assert_eq!(default_base_url("anthropic"), "https://api.anthropic.com/v1");
         assert_eq!(default_base_url("deepseek"), "https://api.deepseek.com/v1");
         assert_eq!(default_base_url("unknown"), "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn test_resolve_provider_name_with_config_explicit_mapping() {
+        use crate::config::ModelsConfig;
+        let mut config = ModelsConfig::default();
+        config.model_providers.insert("deepseek-v4-pro".to_string(), "openai".to_string());
+
+        // Explicit mapping takes priority.
+        assert_eq!(resolve_provider_name_with_config("deepseek-v4-pro", &config), "openai");
+        // Unmapped model falls back to prefix inference.
+        assert_eq!(resolve_provider_name_with_config("gpt-4o", &config), "openai");
+        assert_eq!(resolve_provider_name_with_config("claude-sonnet-4", &config), "anthropic");
+    }
+
+    #[test]
+    fn test_resolve_provider_name_with_config_empty_mapping() {
+        use crate::config::ModelsConfig;
+        let config = ModelsConfig::default();
+        assert_eq!(resolve_provider_name_with_config("deepseek-coder", &config), "deepseek");
+        assert_eq!(resolve_provider_name_with_config("gpt-4o", &config), "openai");
+    }
+
+    #[test]
+    fn test_resolve_provider_name_with_config_default_provider() {
+        use crate::config::ModelsConfig;
+        let mut config = ModelsConfig::default();
+        config.default_provider = "openai".to_string();
+
+        // Unknown model prefix falls back to default_provider.
+        assert_eq!(resolve_provider_name_with_config("my-custom-model", &config), "openai");
+        // Known prefix still uses prefix inference.
+        assert_eq!(resolve_provider_name_with_config("gpt-4o", &config), "openai");
+        assert_eq!(resolve_provider_name_with_config("claude-sonnet-4", &config), "anthropic");
+        assert_eq!(resolve_provider_name_with_config("deepseek-coder", &config), "deepseek");
     }
 }

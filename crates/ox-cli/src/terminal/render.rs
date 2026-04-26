@@ -243,7 +243,11 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         }))
         .style(Style::default().bg(THEME.bg_input));
 
-    let prompt = "ox❯ ";
+    let prompt = if app.pending_confirmation.is_some() {
+        "confirm [Y/N/T] ❯ "
+    } else {
+        "ox❯ "
+    };
     let prompt_len = prompt.len();
 
     let paragraph = Paragraph::new(Line::from(vec![

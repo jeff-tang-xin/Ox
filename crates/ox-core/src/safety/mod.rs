@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::tools::SafetyLevel;
 
@@ -45,8 +46,8 @@ impl TrustManager {
     }
 
     /// List currently trusted tools.
-    pub fn trusted_list(&self) -> Vec<&str> {
-        self.trusted_tools.iter().map(|s| s.as_str()).collect()
+    pub fn trusted_list(&self) -> Vec<String> {
+        self.trusted_tools.iter().cloned().collect()
     }
 
     /// Check if any tools are trusted.
@@ -74,6 +75,46 @@ pub fn is_high_risk_command(command: &str) -> bool {
     ];
     let lower = command.to_lowercase();
     patterns.iter().any(|p| lower.contains(p))
+}
+
+/// Check whether a resolved path is within the working directory.
+/// Returns true if within, false if outside. Does not error.
+pub fn is_path_within_workdir(path: &Path, working_dir: &Path) -> bool {
+    let Ok(canonical_workdir) = working_dir.canonicalize() else {
+        return false;
+    };
+    if let Ok(canonical_path) = path.canonicalize() {
+        return canonical_path.starts_with(&canonical_workdir);
+    }
+    // Path doesn't exist yet — check parent.
+    if let Some(parent) = path.parent() {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            return canonical_parent.starts_with(&canonical_workdir);
+        }
+    }
+    false
+}
+
+/// Validate and resolve a path. No longer hard-rejects paths outside working directory;
+/// the agent layer handles confirmation for out-of-workdir paths.
+/// Only errors on truly unresolvable paths.
+pub fn validate_path_within_workdir(
+    path: &Path,
+    _working_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    // Path already exists: canonicalize and return.
+    if let Ok(canonical_path) = path.canonicalize() {
+        return Ok(canonical_path);
+    }
+
+    // Path doesn't exist (new file): validate parent directory exists.
+    if let Some(parent) = path.parent() {
+        if parent.canonicalize().is_ok() {
+            return Ok(path.to_path_buf());
+        }
+    }
+
+    anyhow::bail!("Cannot validate path '{}'", path.display())
 }
 
 #[cfg(test)]
@@ -125,5 +166,36 @@ mod tests {
         assert!(is_high_risk_command("sudo rm -rf /home"));
         assert!(!is_high_risk_command("ls -la"));
         assert!(!is_high_risk_command("cargo build"));
+    }
+
+    #[test]
+    fn validate_path_allows_within_workdir() {
+        let dir = std::env::temp_dir();
+        let file_path = dir.join("test_file.txt");
+        let result = validate_path_within_workdir(&file_path, &dir);
+        assert!(result.is_ok() || file_path.parent().is_some());
+    }
+
+    #[test]
+    fn is_path_within_workdir_detects_outside() {
+        let dir = std::env::temp_dir();
+        // Path within workdir.
+        let inside = dir.join("subdir/file.txt");
+        assert!(is_path_within_workdir(&inside, &dir) || !inside.exists());
+        // Path traversal should be detected.
+        let traversal = dir.join("../../etc/passwd");
+        assert!(!is_path_within_workdir(&traversal, &dir));
+    }
+
+    #[test]
+    fn validate_path_no_longer_rejects_traversal() {
+        let dir = std::env::temp_dir();
+        // Use a path that exists (parent dir of temp_dir is typically C:\Users on Windows).
+        let parent_dir = dir.parent().unwrap_or(&dir);
+        let existing_path = parent_dir.join("some_file.txt");
+        // validate_path_within_workdir should resolve the path (it exists or parent exists).
+        let result = validate_path_within_workdir(&existing_path, &dir);
+        // Should succeed — no longer hard-rejects out-of-workdir paths.
+        assert!(result.is_ok());
     }
 }

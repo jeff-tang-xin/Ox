@@ -18,6 +18,7 @@ pub struct OxConfig {
     pub context: ContextConfig,
     pub tools: ToolsConfig,
     pub models: ModelsConfig,
+    pub agent: AgentConfig,
     pub council: CouncilConfig,
     pub memory: MemoryConfig,
     pub persona: PersonaConfig,
@@ -143,6 +144,19 @@ api_key = ""
 api_key = ""
 # base_url = "https://api.deepseek.com/v1"
 # max_tokens = 4096
+
+# ── Explicit model→provider mapping ──
+# Fallback provider when model name doesn't match any known prefix.
+# Example: default_provider = "openai"  (for OpenAI-compatible APIs like DashScope)
+# default_provider = "openai"
+
+# Explicit model→provider mapping (overrides prefix inference and default_provider).
+# [models.model_providers]
+# "deepseek-v4-pro" = "openai"
+
+[agent]
+# max_iterations = 25
+# max_per_turn_tokens = 500000
 
 [terminal]
 # split_view = true
@@ -312,6 +326,14 @@ pub struct ModelsConfig {
     pub effort_level: String,
     /// Per-provider configuration, keyed by provider name ("openai", "anthropic", "deepseek").
     pub providers: HashMap<String, ProviderConfig>,
+    /// Fallback provider when prefix inference fails. Example: "openai".
+    /// Set via `[models] default_provider = "openai"`.
+    #[serde(default)]
+    pub default_provider: String,
+    /// Explicit model→provider mapping. Key = model name, Value = provider name.
+    /// Takes priority over `resolve_provider_name()` prefix inference and `default_provider`.
+    #[serde(default)]
+    pub model_providers: HashMap<String, String>,
 }
 
 impl Default for ModelsConfig {
@@ -322,6 +344,8 @@ impl Default for ModelsConfig {
             adaptive_thinking: true,
             effort_level: "high".into(),
             providers: HashMap::new(),
+            default_provider: String::new(),
+            model_providers: HashMap::new(),
         }
     }
 }
@@ -588,6 +612,26 @@ impl Default for CostConfig {
             max_daily_cost: 2.0,
             budget_alert_threshold: 0.8,
             cost_transparency: true,
+        }
+    }
+}
+
+// ──────────────────── Agent ────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// Maximum agent loop iterations per turn (safety limit).
+    pub max_iterations: u32,
+    /// Maximum total tokens per turn before requesting user confirmation.
+    pub max_per_turn_tokens: u32,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: 25,
+            max_per_turn_tokens: 500_000,
         }
     }
 }

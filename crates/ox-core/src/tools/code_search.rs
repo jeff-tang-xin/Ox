@@ -46,11 +46,15 @@ impl Tool for CodeSearchTool {
             Some(p) => p,
             None => return ToolOutput::error("Missing required parameter: pattern. Usage: {\"pattern\": \"<search text>\"}"),
         };
-        let base = args
-            .get("path")
-            .and_then(|p| p.as_str())
-            .map(|p| ctx.working_dir.join(p))
-            .unwrap_or_else(|| ctx.working_dir.to_path_buf());
+        let base = if let Some(p) = args.get("path").and_then(|p| p.as_str()) {
+            let resolved = ctx.working_dir.join(p);
+            match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
+                Ok(validated) => validated,
+                Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
+            }
+        } else {
+            ctx.working_dir.to_path_buf()
+        };
         let file_pattern = args
             .get("file_pattern")
             .and_then(|p| p.as_str())

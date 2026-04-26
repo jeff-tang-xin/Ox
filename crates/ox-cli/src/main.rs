@@ -16,16 +16,18 @@ use tokio::sync::mpsc;
 use ox_core::agent::{self, AgentToUiEvent};
 use ox_core::agent::interjection::{InterjectionBuffer, InterjectionPriority};
 use ox_core::agent::interrupt::{InterruptAction, InterruptController};
+use ox_core::agent::ui_event::{UiToAgentEvent, ConfirmationDecision};
 use ox_core::config::OxConfig;
+use ox_core::config::AgentConfig;
 use ox_core::context::{self, ContextBuilder};
 use ox_core::cost::CostTracker;
-use ox_core::llm::{self, LlmProvider};
+use ox_core::llm::{self, LlmProvider, ProviderResolveInfo};
 use ox_core::message::{Message, Session};
 use ox_core::runtime;
 use ox_core::safety::TrustManager;
 use ox_core::slash::{self, SlashCommand};
 use ox_core::tools::{ToolContext, ToolRegistry};
-use terminal::app::{App, UserInput};
+use terminal::app::{App, UserInput, PendingConfirmation};
 use terminal::event::{Event, EventHandler};
 use terminal::output_pane::OutputLine;
 use terminal::render;
@@ -55,15 +57,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("{}", rt_env.banner_summary());
 
     // Try to create LLM provider (may fail if no API key).
-    let provider: Option<Arc<dyn LlmProvider>> =
-        match llm::create_provider(&config.models.default, &config.models) {
-            Ok(p) => {
+    let (provider, resolve_info): (Option<Arc<dyn LlmProvider>>, Option<ProviderResolveInfo>) =
+        match llm::create_provider_with_info(&config.models.default, &config.models) {
+            Ok((p, info)) => {
                 tracing::info!("LLM provider: {}", p.model_name());
-                Some(Arc::from(p))
+                (Some(Arc::from(p)), Some(info))
             }
             Err(e) => {
                 tracing::warn!("No LLM provider: {e}. Running in echo mode.");
-                None
+                (None, None)
             }
         };
 
@@ -76,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
     terminal.clear()?;
 
     // Run the app; always restore terminal on exit.
-    let result = run_app(&mut terminal, &config, rt_env, provider).await;
+    let result = run_app(&mut terminal, &config, rt_env, provider, resolve_info).await;
 
     // Restore terminal.
     disable_raw_mode()?;
@@ -91,6 +93,7 @@ async fn run_app(
     config: &OxConfig,
     mut rt_env: runtime::RuntimeEnvironment,
     provider: Option<Arc<dyn LlmProvider>>,
+    resolve_info: Option<ProviderResolveInfo>,
 ) -> anyhow::Result<()> {
     let mut app = App::new();
 
@@ -181,8 +184,8 @@ async fn run_app(
         .map(|p| p.model_name().to_string())
         .unwrap_or_default();
 
-    // Session-scoped trust manager for tool confirmation.
-    let mut trust_manager = TrustManager::new();
+    // Session-scoped trust manager for tool confirmation (shared between UI and agent).
+    let trust_manager = Arc::new(tokio::sync::Mutex::new(TrustManager::new()));
 
     // Interrupt controller for Ctrl+C handling.
     let mut interrupt_ctrl = InterruptController::new();
@@ -193,8 +196,11 @@ async fn run_app(
     // Crossterm event polling thread.
     let mut events = EventHandler::new(Duration::from_millis(33));
 
-    // Agent event channel.
+    // Agent event channels (bidirectional).
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<AgentToUiEvent>();
+
+    // Agent config (shared with spawned task).
+    let agent_config = Arc::new(config.agent.clone());
 
     // Tick counter for spinner animation.
     let mut tick_count: u64 = 0;
@@ -230,11 +236,14 @@ async fn run_app(
                             &system_prompt,
                             context_window,
                             &mut cost_tracker,
-                            &mut trust_manager,
+                            &trust_manager,
                             &model_name,
                             &mut rt_env,
                             &mut interrupt_ctrl,
                             &mut interjection_buf,
+                            &resolve_info,
+                            &config,
+                            &agent_config,
                         );
                     }
                     Some(Event::Resize(_, _)) => {
@@ -293,6 +302,8 @@ async fn run_app(
                             cost_tracker.record(&model_name, &usage);
                             app.agent_running = false;
                             app.status = String::new();
+                            // Clear any stale pending confirmation.
+                            app.pending_confirmation = None;
                             // Update status bar info.
                             app.message_count = history.len();
                             app.cost_summary = cost_tracker.summary_short();
@@ -335,6 +346,51 @@ async fn run_app(
                             app.status = status;
                             app.dirty = true;
                         }
+                        AgentToUiEvent::ToolConfirmationRequest {
+                            tool_call_id,
+                            tool_name,
+                            args_summary,
+                            safety_level,
+                            high_risk_warning,
+                        } => {
+                            // Display confirmation request in output.
+                            let warning_str = high_risk_warning
+                                .as_ref()
+                                .map(|w| format!(" [{}]", w))
+                                .unwrap_or_default();
+                            app.output.push_line(OutputLine::Styled {
+                                prefix: "Confirm".to_string(),
+                                content: format!(
+                                    "{} {:?}{}: {}",
+                                    tool_name, safety_level, warning_str, args_summary
+                                ),
+                            });
+                            app.output.push_line(OutputLine::Plain(
+                                "  [Y] Allow / [N] Deny / [T] Trust always".to_string(),
+                            ));
+                            // Store pending confirmation for key handling.
+                            app.pending_confirmation = Some(PendingConfirmation {
+                                tool_call_id,
+                                tool_name,
+                            });
+                            app.scroll_to_bottom();
+                            app.dirty = true;
+                        }
+                        AgentToUiEvent::ToolOutputChunk { tool_call_id: _, chunk } => {
+                            app.output.push_streaming_chunk(&chunk);
+                            app.dirty = true;
+                        }
+                        AgentToUiEvent::BudgetExceeded { total_tokens, estimated_cost } => {
+                            app.output.push_line(OutputLine::Styled {
+                                prefix: "Budget".to_string(),
+                                content: format!(
+                                    "Token limit reached: {} tokens, est. cost: {}. Continue? [Y/N]",
+                                    total_tokens, estimated_cost
+                                ),
+                            });
+                            app.scroll_to_bottom();
+                            app.dirty = true;
+                        }
                     }
                 }
             }
@@ -362,13 +418,64 @@ fn handle_key_event(
     system_prompt: &str,
     context_window: u32,
     cost_tracker: &mut CostTracker,
-    trust_manager: &mut TrustManager,
+    trust_manager: &Arc<tokio::sync::Mutex<TrustManager>>,
     model_name: &str,
     rt_env: &mut runtime::RuntimeEnvironment,
     interrupt_ctrl: &mut InterruptController,
     interjection_buf: &mut InterjectionBuffer,
+    resolve_info: &Option<ProviderResolveInfo>,
+    config: &OxConfig,
+    agent_config: &Arc<AgentConfig>,
 ) {
     match (key.code, key.modifiers) {
+        // ── Confirmation key handling (Y/N/T when pending) ──
+        (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
+            if let Some(pc) = app.pending_confirmation.take() {
+                if let Some(tx) = &app.ui_to_agent_tx {
+                    let _ = tx.send(UiToAgentEvent::ToolConfirmation {
+                        tool_call_id: pc.tool_call_id,
+                        decision: ConfirmationDecision::Allow,
+                    });
+                    app.output.push_line(OutputLine::Plain("  → Allowed".to_string()));
+                } else {
+                    app.output.push_line(OutputLine::Plain("  → Error: agent channel closed, cannot confirm".to_string()));
+                }
+                app.dirty = true;
+                return;
+            }
+        }
+        (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Char('N'), KeyModifiers::NONE) => {
+            if let Some(pc) = app.pending_confirmation.take() {
+                if let Some(tx) = &app.ui_to_agent_tx {
+                    let _ = tx.send(UiToAgentEvent::ToolConfirmation {
+                        tool_call_id: pc.tool_call_id,
+                        decision: ConfirmationDecision::Deny,
+                    });
+                    app.output.push_line(OutputLine::Plain("  → Denied".to_string()));
+                } else {
+                    app.output.push_line(OutputLine::Plain("  → Error: agent channel closed, cannot deny".to_string()));
+                }
+                app.dirty = true;
+                return;
+            }
+        }
+        (KeyCode::Char('t'), KeyModifiers::NONE) | (KeyCode::Char('T'), KeyModifiers::NONE) => {
+            if let Some(pc) = app.pending_confirmation.take() {
+                if let Some(tx) = &app.ui_to_agent_tx {
+                    let _ = tx.send(UiToAgentEvent::ToolConfirmation {
+                        tool_call_id: pc.tool_call_id,
+                        decision: ConfirmationDecision::TrustAlways,
+                    });
+                    app.output.push_line(OutputLine::Plain(
+                        format!("  → Trusted {} for this session", pc.tool_name),
+                    ));
+                } else {
+                    app.output.push_line(OutputLine::Plain("  → Error: agent channel closed, cannot trust".to_string()));
+                }
+                app.dirty = true;
+                return;
+            }
+        }
         (KeyCode::Char('a'), KeyModifiers::CONTROL) => { app.input.move_home(); app.dirty = true; }
         (KeyCode::Char('e'), KeyModifiers::CONTROL) => { app.input.move_end(); app.dirty = true; }
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => { app.input.clear_to_home(); app.dirty = true; }
@@ -390,7 +497,8 @@ fn handle_key_event(
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
-        (KeyCode::Enter, _) => {
+        (KeyCode::Enter, KeyModifiers::CONTROL) | (KeyCode::Enter, KeyModifiers::ALT) => {
+            // Ctrl+Enter or Alt+Enter: submit (in multiline mode).
             if let Some(input) = app.submit_input() {
                 match input {
                     UserInput::Exit => {
@@ -408,6 +516,8 @@ fn handle_key_event(
                             rt_env,
                             history,
                             session,
+                            &resolve_info,
+                            &config,
                         );
                     }
                     UserInput::Text(text) => {
@@ -449,6 +559,11 @@ fn handle_key_event(
                             let registry = Arc::clone(tool_registry);
                             let ctx = Arc::clone(tool_ctx);
                             let cancel_token = interrupt_ctrl.token();
+                            let tm = Arc::clone(&trust_manager);
+                            let ac = Arc::clone(&agent_config);
+                            // Create a new UI→Agent channel for this turn.
+                            let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
+                            app.ui_to_agent_tx = Some(ui_to_agent_tx);
                             tokio::spawn(async move {
                                 agent::run_agent_turn(
                                     provider,
@@ -456,7 +571,10 @@ fn handle_key_event(
                                     registry,
                                     ctx,
                                     tx,
+                                    ui_to_agent_rx,
                                     cancel_token,
+                                    tm,
+                                    ac,
                                 )
                                 .await;
                             });
@@ -470,6 +588,100 @@ fn handle_key_event(
                     }
                 }
                 app.scroll_to_bottom();
+            }
+        }
+        (KeyCode::Enter, KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::SHIFT) => {
+            // Plain Enter behavior depends on mode and content:
+            // - Single-line mode: always submit
+            // - Multiline mode: submit if input starts with! / (slash command) or is empty,
+            //   otherwise insert newline
+            let should_submit = !app.input.multiline_mode
+                || app.input.buffer.starts_with('/')
+                || app.input.buffer.trim().is_empty();
+            if should_submit {
+                if let Some(input) = app.submit_input() {
+                match input {
+                    UserInput::Exit => {
+                        app.output.push_system("Goodbye.");
+                        app.should_quit = true;
+                    }
+                    UserInput::SlashCommand { cmd, args } => {
+                        handle_slash_command(
+                            app,
+                            &cmd,
+                            &args,
+                            cost_tracker,
+                            trust_manager,
+                            model_name,
+                            rt_env,
+                            history,
+                            session,
+                            &resolve_info,
+                            &config,
+                        );
+                    }
+                    UserInput::Text(text) => {
+                        if app.agent_running {
+                            interjection_buf.push(text.clone(), InterjectionPriority::Normal);
+                            app.output.push_line(OutputLine::Plain(format!(
+                                "(queued while agent running) {}",
+                                text.trim()
+                            )));
+                        } else if let Some(provider) = provider {
+                            app.output.push_line(OutputLine::Styled {
+                                prefix: "You".to_string(),
+                                content: text.clone(),
+                            });
+                            app.output.push_line(OutputLine::Plain(String::new()));
+                            let user_msg = Message::user(&text);
+                            history.push(user_msg.clone());
+                            if let Err(e) = session.append_message(user_msg) {
+                                tracing::error!("Failed to persist user message: {e}");
+                            }
+                            let turn_messages = context_builder.build(
+                                system_prompt,
+                                history,
+                                context_window,
+                            );
+                            app.agent_running = true;
+                            app.status = "Thinking...".to_string();
+                            let provider = Arc::clone(provider);
+                            let tx = agent_tx.clone();
+                            let registry = Arc::clone(tool_registry);
+                            let ctx = Arc::clone(tool_ctx);
+                            let cancel_token = interrupt_ctrl.token();
+                            let tm = Arc::clone(&trust_manager);
+                            let ac = Arc::clone(&agent_config);
+                            let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
+                            app.ui_to_agent_tx = Some(ui_to_agent_tx);
+                            tokio::spawn(async move {
+                                agent::run_agent_turn(
+                                    provider,
+                                    turn_messages,
+                                    registry,
+                                    ctx,
+                                    tx,
+                                    ui_to_agent_rx,
+                                    cancel_token,
+                                    tm,
+                                    ac,
+                                )
+                                .await;
+                            });
+                        } else {
+                            app.output.push_line(OutputLine::Plain(format!(
+                                "[echo] {}",
+                                text.trim()
+                            )));
+                        }
+                    }
+                }
+                app.scroll_to_bottom();
+                }
+            } else {
+                // Multiline mode: insert newline.
+                app.input.insert_newline();
+                app.dirty = true;
             }
         }
         (KeyCode::Backspace, _) => { app.input.backspace(); app.dirty = true; }
@@ -496,11 +708,13 @@ fn handle_slash_command(
     cmd: &str,
     args: &str,
     cost_tracker: &mut CostTracker,
-    trust_manager: &mut TrustManager,
+    trust_manager: &Arc<tokio::sync::Mutex<TrustManager>>,
     model_name: &str,
     rt_env: &mut runtime::RuntimeEnvironment,
     history: &mut Vec<Message>,
     session: &mut Session,
+    resolve_info: &Option<ProviderResolveInfo>,
+    config: &OxConfig,
 ) {
     let parsed = slash::parse_slash_command(cmd, args);
 
@@ -548,13 +762,14 @@ fn handle_slash_command(
                 .push_system("Task plan: (not yet active — agent will create plans automatically)");
         }
         SlashCommand::Trust { tools, all } => {
+            let mut tm = trust_manager.blocking_lock();
             if all {
-                trust_manager.trust_all();
+                tm.trust_all();
                 app.output
                     .push_system("Trusted all non-dangerous tools for this session.");
             } else if tools.is_empty() {
                 // Show currently trusted tools.
-                let list = trust_manager.trusted_list();
+                let list = tm.trusted_list();
                 if list.is_empty() {
                     app.output.push_system("No tools currently trusted. Use /trust <tool_name> or /trust --all.");
                 } else {
@@ -565,7 +780,7 @@ fn handle_slash_command(
                 }
             } else {
                 for tool in &tools {
-                    trust_manager.trust(tool);
+                    tm.trust(tool);
                 }
                 app.output.push_system(&format!(
                     "Trusted for this session: {}",
@@ -574,13 +789,38 @@ fn handle_slash_command(
             }
         }
         SlashCommand::Untrust => {
-            trust_manager.untrust_all();
+            trust_manager.blocking_lock().untrust_all();
             app.output
                 .push_system("All tool trust revoked. Confirmations restored.");
         }
         SlashCommand::Model { name } => {
-            if let Some(_name) = name {
-                app.output.push_system("Model switching will be available in a future update.");
+            if let Some(new_model) = name {
+                // Try to create provider with the new model.
+                match llm::create_provider_with_info(&new_model, &config.models) {
+                    Ok((_new_provider, new_info)) => {
+                        app.output.push_line(OutputLine::Plain(format!(
+                            "Switching to: {} (provider: {}, key: {})",
+                            new_model,
+                            new_info.provider_name,
+                            match &new_info.api_key_source {
+                                llm::ApiKeySource::EnvVar(n) => format!("env:{n}"),
+                                llm::ApiKeySource::ConfigFile => "config".to_string(),
+                                llm::ApiKeySource::NotFound => "NOT FOUND".to_string(),
+                            }
+                        )));
+                        // Note: provider is currently immutable in run_app.
+                        // Full model switching requires storing provider as mutable Arc.
+                        app.output.push_system(
+                            "Model switching applied for next session. Restart to use the new model.",
+                        );
+                    }
+                    Err(e) => {
+                        app.output.push_system(&format!(
+                            "Failed to switch to '{}': {e}",
+                            new_model
+                        ));
+                    }
+                }
             } else {
                 app.output.push_line(OutputLine::Plain(format!(
                     "Current model: {}",
@@ -641,6 +881,69 @@ fn handle_slash_command(
         SlashCommand::Debug => {
             app.output
                 .push_line(OutputLine::Plain(format!("Model: {model_name}")));
+            // Provider resolution info
+            if let Some(info) = resolve_info {
+                app.output.push_line(OutputLine::Plain(format!(
+                    "Provider: {}",
+                    info.provider_name
+                )));
+                let key_src = match &info.api_key_source {
+                    llm::ApiKeySource::EnvVar(name) => format!("env var {}", name),
+                    llm::ApiKeySource::ConfigFile => "config file".to_string(),
+                    llm::ApiKeySource::NotFound => "NOT FOUND".to_string(),
+                };
+                app.output.push_line(OutputLine::Plain(format!(
+                    "API key source: {key_src}"
+                )));
+                let url_src = match &info.base_url_source {
+                    llm::BaseUrlSource::ConfigFile => "config file",
+                    llm::BaseUrlSource::Default => "provider default",
+                };
+                app.output.push_line(OutputLine::Plain(format!(
+                    "Base URL source: {url_src}"
+                )));
+            } else {
+                app.output.push_line(OutputLine::Plain(
+                    "Provider: (none — echo mode)".to_string(),
+                ));
+            }
+            // Config file path
+            let config_path = OxConfig::default_config_path();
+            app.output.push_line(OutputLine::Plain(format!(
+                "Config file: {}",
+                config_path.display()
+            )));
+            // All providers key status (never show values)
+            app.output.push_line(OutputLine::Plain("Providers:".to_string()));
+            for (name, pcfg) in &config.models.providers {
+                let env_key = format!("OX_{}_API_KEY", name.to_uppercase());
+                let has_env = std::env::var(&env_key)
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .is_some();
+                let has_config = !pcfg.api_key.is_empty();
+                let status = if has_env {
+                    "key set (env var)"
+                } else if has_config {
+                    "key set (config)"
+                } else {
+                    "no key"
+                };
+                app.output.push_line(OutputLine::Plain(format!(
+                    "  {name}: {status}"
+                )));
+            }
+            // Model→provider mapping
+            if !config.models.model_providers.is_empty() {
+                app.output.push_line(OutputLine::Plain(
+                    "Model→Provider mappings:".to_string(),
+                ));
+                for (model, provider) in &config.models.model_providers {
+                    app.output.push_line(OutputLine::Plain(format!(
+                        "  {model} → {provider}"
+                    )));
+                }
+            }
             app.output
                 .push_line(OutputLine::Plain(format!("OS: {} ({})", rt_env.os, rt_env.arch)));
             app.output
@@ -665,7 +968,10 @@ fn handle_slash_command(
                 "History: {} messages",
                 history.len()
             )));
-            let trusted = trust_manager.trusted_list();
+            let trusted = {
+                let tm = trust_manager.blocking_lock();
+                tm.trusted_list()
+            };
             app.output.push_line(OutputLine::Plain(format!(
                 "Trusted tools: {}",
                 if trusted.is_empty() {

@@ -31,6 +31,8 @@ pub struct OutputPane {
 impl OutputPane {
     /// Maximum lines to keep in the output buffer to prevent unbounded memory growth.
     const MAX_LINES: usize = 5000;
+    /// Maximum characters per line. Longer lines are truncated.
+    const MAX_LINE_LEN: usize = 10000;
 
     pub fn new() -> Self {
         Self { lines: Vec::new() }
@@ -38,17 +40,60 @@ impl OutputPane {
 
     /// Push a complete line, trimming excess if necessary.
     pub fn push_line(&mut self, line: OutputLine) {
-        self.lines.push(line);
+        let truncated = self.truncate_line(line);
+        self.lines.push(truncated);
         self.trim_excess();
     }
 
     /// Push a system-style message.
     pub fn push_system(&mut self, msg: &str) {
+        let msg = if msg.len() > Self::MAX_LINE_LEN {
+            format!("{}…[truncated]", &msg[..Self::MAX_LINE_LEN])
+        } else {
+            msg.to_string()
+        };
         self.lines.push(OutputLine::Styled {
             prefix: "[system]".to_string(),
-            content: msg.to_string(),
+            content: msg,
         });
         self.trim_excess();
+    }
+
+    /// Truncate a line if it exceeds MAX_LINE_LEN.
+    fn truncate_line(&self, line: OutputLine) -> OutputLine {
+        match line {
+            OutputLine::Plain(s) => {
+                if s.len() > Self::MAX_LINE_LEN {
+                    OutputLine::Plain(format!("{}…[truncated]", &s[..Self::MAX_LINE_LEN]))
+                } else {
+                    OutputLine::Plain(s)
+                }
+            }
+            OutputLine::Styled { prefix, content } => {
+                if content.len() > Self::MAX_LINE_LEN {
+                    OutputLine::Styled {
+                        prefix,
+                        content: format!("{}…[truncated]", &content[..Self::MAX_LINE_LEN]),
+                    }
+                } else {
+                    OutputLine::Styled { prefix, content }
+                }
+            }
+            OutputLine::StreamingPartial(s) => {
+                if s.len() > Self::MAX_LINE_LEN {
+                    OutputLine::StreamingPartial(format!("{}…[truncated]", &s[..Self::MAX_LINE_LEN]))
+                } else {
+                    OutputLine::StreamingPartial(s)
+                }
+            }
+            OutputLine::Markdown(s) => {
+                if s.len() > Self::MAX_LINE_LEN {
+                    OutputLine::Markdown(format!("{}…[truncated]", &s[..Self::MAX_LINE_LEN]))
+                } else {
+                    OutputLine::Markdown(s)
+                }
+            }
+        }
     }
 
     /// Append a streaming text chunk to the current partial line.

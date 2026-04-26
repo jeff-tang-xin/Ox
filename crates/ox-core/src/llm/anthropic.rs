@@ -101,6 +101,7 @@ impl LlmProvider for AnthropicProvider {
         let mut current_event_type = String::new();
         let mut block_index_to_id: std::collections::HashMap<u64, String> =
             std::collections::HashMap::new();
+        let mut done_sent = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -123,19 +124,24 @@ impl LlmProvider for AnthropicProvider {
 
                 if let Some(data) = line.strip_prefix("data: ")
                     && let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        process_anthropic_event(
+                        if process_anthropic_event(
                             &current_event_type,
                             &json,
                             &tx,
                             &mut block_index_to_id,
-                        );
+                        ) {
+                            done_sent = true;
+                        }
                     }
             }
         }
 
-        let _ = tx.send(LlmStreamEvent::Done {
-            usage: TokenUsage::default(),
-        });
+        // Only send Done if process_anthropic_event didn't already send one.
+        if !done_sent {
+            let _ = tx.send(LlmStreamEvent::Done {
+                usage: TokenUsage::default(),
+            });
+        }
 
         Ok(())
     }
@@ -149,12 +155,13 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+/// Returns `true` if a `LlmStreamEvent::Done` was sent (i.e. message_delta with usage).
 fn process_anthropic_event(
     event_type: &str,
     json: &serde_json::Value,
     tx: &mpsc::UnboundedSender<LlmStreamEvent>,
     block_index_to_id: &mut std::collections::HashMap<u64, String>,
-) {
+) -> bool {
     match event_type {
         "message_start" => {
             // Extract usage from message_start if available.
@@ -164,6 +171,7 @@ fn process_anthropic_event(
             {
                 let _ = usage; // We'll capture final usage at message_delta.
             }
+            false
         }
         "content_block_start" => {
             let index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
@@ -182,12 +190,16 @@ fn process_anthropic_event(
                     let name = content_block
                         .get("name")
                         .and_then(|n| n.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    block_index_to_id.insert(index, id.clone());
-                    let _ = tx.send(LlmStreamEvent::ToolCallStart { id, name });
+                        .unwrap_or("");
+                    if !name.is_empty() {
+                        block_index_to_id.insert(index, id.clone());
+                        let _ = tx.send(LlmStreamEvent::ToolCallStart { id, name: name.to_string() });
+                    } else {
+                        tracing::warn!("Anthropic tool_use block with empty name at index {index}, skipping");
+                    }
                 }
             }
+            false
         }
         "content_block_delta" => {
             let index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
@@ -220,12 +232,14 @@ fn process_anthropic_event(
                     _ => {}
                 }
             }
+            false
         }
         "content_block_stop" => {
             let index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
             if let Some(id) = block_index_to_id.get(&index) {
                 let _ = tx.send(LlmStreamEvent::ToolCallEnd { id: id.clone() });
             }
+            false
         }
         "message_delta" => {
             // Final usage info.
@@ -237,10 +251,14 @@ fn process_anthropic_event(
                         total_tokens: 0,
                     },
                 });
+                true
+            } else {
+                false
             }
         }
         "message_stop" => {
             // Streaming complete.
+            false
         }
         "error" => {
             let error_msg = json
@@ -249,8 +267,9 @@ fn process_anthropic_event(
                 .and_then(|m| m.as_str())
                 .unwrap_or("Unknown Anthropic error");
             let _ = tx.send(LlmStreamEvent::Error(error_msg.to_string()));
+            false
         }
-        _ => {}
+        _ => false
     }
 }
 
