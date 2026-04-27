@@ -66,26 +66,37 @@ impl Tool for ShellExecTool {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        // Collect output with timeout.
         let timeout = tokio::time::Duration::from_millis(timeout_ms);
         let result = tokio::time::timeout(timeout, async {
-            let mut output_lines = Vec::new();
-
-            if let Some(stdout) = stdout {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    output_lines.push(line);
+            let stdout_lines = tokio::spawn(async move {
+                let mut lines = Vec::new();
+                if let Some(stdout) = stdout {
+                    let reader = BufReader::new(stdout);
+                    let mut lines_reader = reader.lines();
+                    while let Ok(Some(line)) = lines_reader.next_line().await {
+                        lines.push(line);
+                    }
                 }
-            }
+                lines
+            });
 
-            if let Some(stderr) = stderr {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    output_lines.push(format!("[stderr] {line}"));
+            let stderr_lines = tokio::spawn(async move {
+                let mut lines = Vec::new();
+                if let Some(stderr) = stderr {
+                    let reader = BufReader::new(stderr);
+                    let mut lines_reader = reader.lines();
+                    while let Ok(Some(line)) = lines_reader.next_line().await {
+                        lines.push(format!("[stderr] {line}"));
+                    }
                 }
-            }
+                lines
+            });
+
+            let out = stdout_lines.await.unwrap_or_default();
+            let err = stderr_lines.await.unwrap_or_default();
+
+            let mut output_lines = out;
+            output_lines.extend(err);
 
             let status = child.wait().await;
             (output_lines, status)

@@ -50,5 +50,11 @@ crossterm = "0.28"
 # Syntax highlighting
 syntect = "5"
 
+# Markdown parsing
+pulldown-cmark = "0.12"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # ox-core
 ox-core = { path = "crates/ox-core" }

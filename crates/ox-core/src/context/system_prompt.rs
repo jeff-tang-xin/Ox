@@ -9,6 +9,8 @@ pub fn build_system_prompt(
     rt_env: &RuntimeEnvironment,
     tool_registry: &ToolRegistry,
     persona: Option<&str>,
+    persona_vector: Option<&crate::persona::PersonaVector>,
+    behavior_rules: Option<&crate::config::BehaviorRulesConfig>,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -18,7 +20,24 @@ pub fn build_system_prompt(
     // 2. Core principles (P1-P4).
     parts.push(CORE_PRINCIPLES.to_string());
 
-    // 3. Runtime environment.
+    // 3. PersonaVector (Phase 2).
+    if let Some(pv) = persona_vector {
+        parts.push(pv.generate_prompt_block());
+    }
+
+    // 4. Behavior rules.
+    if let Some(br) = behavior_rules {
+        if br.enforce_all {
+            let mut rules = vec!["## Behavior Rules".to_string()];
+            if br.enforce_safe_code { rules.push("- Never suggest code that bypasses safety checks".into()); }
+            if br.enforce_lint { rules.push("- Always run lint before declaring code complete".into()); }
+            if br.enforce_format { rules.push("- Always format code before writing files".into()); }
+            if br.enforce_tests { rules.push("- Always write tests for new functions".into()); }
+            if rules.len() > 1 { parts.push(rules.join("\n")); }
+        }
+    }
+
+    // 5. Runtime environment.
     parts.push(rt_env.system_prompt_block());
 
     // 4. Available tools.
@@ -46,8 +65,7 @@ Always be concise, accurate, and helpful.";
 
 const CORE_PRINCIPLES: &str = "\
 ## Principles
-- **P1: Think before acting** — Understand the full context before making changes.
-- **P2: Minimal changes** — Only modify what is necessary. Avoid unnecessary refactoring.
-- **P3: Safety first** — Never execute destructive actions without confirmation.
-- **P4: Transparency** — Explain what you're doing and why.
-- **P5: OS-aware commands** — Always check the Environment section above before writing shell commands. Use OS-appropriate syntax (PowerShell on Windows, bash on Linux/macOS). Never use Unix commands on Windows or vice versa.";
+- **P1: Intention Understanding** — Understand the full context before making changes.
+- **P2: Simplicity First** — Minimum code that solves the problem, nothing speculative.
+- **P3: Surgical Changes** — Touch only what you must, match existing style.
+- **P4: Goal-Driven Execution** — Define success criteria, loop until verified.";

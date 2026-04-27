@@ -52,12 +52,18 @@ impl Tool for ProjectDetectTool {
             ("Makefile", "C/C++/Mixed", "Make"),
             ("Gemfile", "Ruby", "Bundler"),
             ("composer.json", "PHP", "Composer"),
-            (".csproj", "C#", ".NET"),
+            ("*.csproj", "C#", ".NET"),
             ("pubspec.yaml", "Dart", "Flutter/Dart"),
         ];
 
         for (file, lang, build) in markers {
-            if base.join(file).exists() {
+            if file.contains('*') {
+                if let Ok(pattern) = glob::glob(&base.join(file).to_string_lossy()) {
+                    if pattern.into_iter().any(|e| e.is_ok()) {
+                        info.push(format!("Language: {lang} (build: {build})"));
+                    }
+                }
+            } else if base.join(file).exists() {
                 info.push(format!("Language: {lang} (build: {build})"));
             }
         }

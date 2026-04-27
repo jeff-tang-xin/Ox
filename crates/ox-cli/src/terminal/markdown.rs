@@ -1,23 +1,18 @@
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-// ── VS Code-inspired markdown colors ───────────────────────────────
+const COLOR_HEADING: Color = Color::Rgb(197, 134, 199);
+const COLOR_LIST_BULLET: Color = Color::Rgb(78, 201, 176);
+const COLOR_INLINE_CODE: Color = Color::Rgb(78, 201, 176);
+const COLOR_CODE_BORDER: Color = Color::Rgb(64, 64, 64);
+const COLOR_CODE_GUTTER: Color = Color::Rgb(64, 64, 64);
+const COLOR_CODE_BG: Color = Color::Rgb(30, 30, 30);
+const COLOR_LANG_LABEL: Color = Color::Rgb(0, 122, 204);
+const COLOR_LINK: Color = Color::Rgb(86, 156, 214);
 
-const COLOR_HEADING: Color = Color::Rgb(197, 134, 199);   // #C586C7 purple
-const COLOR_LIST_BULLET: Color = Color::Rgb(78, 201, 176); // #4EC9B0 teal
-const COLOR_INLINE_CODE: Color = Color::Rgb(78, 201, 176); // #4EC9B0 teal
-const COLOR_CODE_BORDER: Color = Color::Rgb(64, 64, 64);   // #404040
-const COLOR_CODE_GUTTER: Color = Color::Rgb(64, 64, 64);   // #404040
-const COLOR_CODE_BG: Color = Color::Rgb(30, 30, 30);       // #1E1E1E
-const COLOR_LANG_LABEL: Color = Color::Rgb(0, 122, 204);   // #007ACC blue
-
-/// Markdown-to-ratatui renderer.
-///
-/// Converts markdown text lines into styled ratatui `Line`s.
-/// Supports: headings, code blocks (with syntect highlighting),
-/// inline code, bold, and italic.
 pub struct MarkdownRenderer {
     syntax_set: SyntaxSet,
     theme: Theme,
@@ -36,199 +31,169 @@ impl MarkdownRenderer {
         Self { syntax_set, theme }
     }
 
-    /// Render a block of markdown text into ratatui Lines.
-    /// `output_width` is the available width for the code block borders.
     pub fn render_lines(&self, text: &str, output_width: usize) -> Vec<Line<'static>> {
+        let parser = Parser::new(text);
         let mut result: Vec<Line<'static>> = Vec::new();
+        let mut current_spans: Vec<Span<'static>> = Vec::new();
+        let mut style_stack: Vec<Style> = vec![Style::default()];
         let mut in_code_block = false;
         let mut code_lang = String::new();
-        let mut code_buffer: Vec<String> = Vec::new();
+        let mut code_buffer = String::new();
 
-        for line in text.lines() {
-            if line.starts_with("```") {
-                if in_code_block {
-                    let highlighted = self.highlight_code(&code_buffer.join("\n"), &code_lang, output_width);
-                    result.extend(highlighted);
-                    code_buffer.clear();
-                    code_lang.clear();
-                    in_code_block = false;
-                } else {
-                    code_lang = line.trim_start_matches('`').trim().to_string();
-                    in_code_block = true;
+        for event in parser {
+            match event {
+                Event::Start(tag) => match tag {
+                    Tag::Heading { level, .. } => {
+                        let prefix = match level {
+                            HeadingLevel::H1 => "▎▎▎ ",
+                            HeadingLevel::H2 => "▎▎ ",
+                            HeadingLevel::H3 => "▎ ",
+                            _ => "",
+                        };
+                        current_spans.push(Span::styled(
+                            prefix.to_string(),
+                            Style::default().fg(COLOR_HEADING).add_modifier(Modifier::BOLD),
+                        ));
+                        style_stack.push(
+                            Style::default()
+                                .fg(COLOR_HEADING)
+                                .add_modifier(Modifier::BOLD),
+                        );
+                    }
+                    Tag::Paragraph => {
+                        style_stack.push(Style::default());
+                    }
+                    Tag::CodeBlock(kind) => {
+                        in_code_block = true;
+                        code_lang = match kind {
+                            CodeBlockKind::Fenced(lang) => lang.to_string(),
+                            _ => String::new(),
+                        };
+                        code_buffer.clear();
+                    }
+                    Tag::List(_) => {
+                        style_stack.push(Style::default());
+                    }
+                    Tag::Item => {
+                        current_spans.push(Span::styled(
+                            "• ".to_string(),
+                            Style::default().fg(COLOR_LIST_BULLET),
+                        ));
+                        style_stack.push(Style::default());
+                    }
+                    Tag::Strong => {
+                        let current = *style_stack.last().unwrap();
+                        style_stack.push(current.add_modifier(Modifier::BOLD));
+                    }
+                    Tag::Emphasis => {
+                        let current = *style_stack.last().unwrap();
+                        style_stack.push(current.add_modifier(Modifier::ITALIC));
+                    }
+                    Tag::Link { .. } => {
+                        let current = *style_stack.last().unwrap();
+                        style_stack.push(
+                            current
+                                .fg(COLOR_LINK)
+                                .add_modifier(Modifier::UNDERLINED),
+                        );
+                    }
+                    _ => {
+                        style_stack.push(*style_stack.last().unwrap());
+                    }
+                },
+
+                Event::End(tag) => match tag {
+                    TagEnd::Heading(_) => {
+                        style_stack.pop();
+                        if !current_spans.is_empty() {
+                            result.push(Line::from(std::mem::take(&mut current_spans)));
+                        }
+                    }
+                    TagEnd::Paragraph => {
+                        style_stack.pop();
+                        if !current_spans.is_empty() {
+                            result.push(Line::from(std::mem::take(&mut current_spans)));
+                        }
+                    }
+                    TagEnd::CodeBlock => {
+                        in_code_block = false;
+                        let highlighted =
+                            self.highlight_code(&code_buffer, &code_lang, output_width);
+                        result.extend(highlighted);
+                        code_buffer.clear();
+                        code_lang.clear();
+                    }
+                    TagEnd::Item => {
+                        style_stack.pop();
+                        if !current_spans.is_empty() {
+                            result.push(Line::from(std::mem::take(&mut current_spans)));
+                        }
+                    }
+                    TagEnd::List(_) => {
+                        style_stack.pop();
+                    }
+                    TagEnd::Strong
+                    | TagEnd::Emphasis
+                    | TagEnd::Link => {
+                        style_stack.pop();
+                    }
+                    _ => {
+                        style_stack.pop();
+                    }
+                },
+
+                Event::Text(s) => {
+                    if in_code_block {
+                        code_buffer.push_str(&s);
+                    } else {
+                        let style = *style_stack.last().unwrap();
+                        current_spans.push(Span::styled(s.into_string(), style));
+                    }
                 }
-                continue;
-            }
 
-            if in_code_block {
-                code_buffer.push(line.to_string());
-                continue;
-            }
+                Event::Code(s) => {
+                    let style = Style::default().fg(COLOR_INLINE_CODE);
+                    current_spans.push(Span::styled(s.into_string(), style));
+                }
 
-            result.push(self.render_markdown_line(line));
+                Event::SoftBreak => {
+                    if !current_spans.is_empty() {
+                        result.push(Line::from(std::mem::take(&mut current_spans)));
+                    }
+                }
+
+                Event::HardBreak => {
+                    if !current_spans.is_empty() {
+                        result.push(Line::from(std::mem::take(&mut current_spans)));
+                    } else {
+                        result.push(Line::from(""));
+                    }
+                }
+
+                Event::FootnoteReference(s) => {
+                    let style = *style_stack.last().unwrap();
+                    current_spans.push(Span::styled(s.into_string(), style));
+                }
+
+                _ => {}
+            }
+        }
+
+        if !current_spans.is_empty() {
+            result.push(Line::from(current_spans));
         }
 
         if in_code_block && !code_buffer.is_empty() {
-            let highlighted = self.highlight_code(&code_buffer.join("\n"), &code_lang, output_width);
+            let highlighted = self.highlight_code(&code_buffer, &code_lang, output_width);
             result.extend(highlighted);
         }
 
         result
     }
 
-    fn render_markdown_line(&self, line: &str) -> Line<'static> {
-        // Heading detection.
-        if let Some(rest) = line.strip_prefix("### ") {
-            return Line::from(Span::styled(
-                format!("▎ {rest}"),
-                Style::default().fg(COLOR_HEADING).add_modifier(Modifier::BOLD),
-            ));
-        }
-        if let Some(rest) = line.strip_prefix("## ") {
-            return Line::from(Span::styled(
-                format!("▎▎ {rest}"),
-                Style::default().fg(COLOR_HEADING).add_modifier(Modifier::BOLD),
-            ));
-        }
-        if let Some(rest) = line.strip_prefix("# ") {
-            return Line::from(Span::styled(
-                format!("▎▎▎ {rest}"),
-                Style::default().fg(COLOR_HEADING).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            ));
-        }
-
-        // Bullet list items.
-        if line.starts_with("- ") || line.starts_with("* ") {
-            let rest = &line[2..];
-            let mut spans = vec![Span::styled(
-                "• ".to_string(),
-                Style::default().fg(COLOR_LIST_BULLET),
-            )];
-            spans.extend(self.parse_inline_spans(rest));
-            return Line::from(spans);
-        }
-
-        // Numbered list.
-        if let Some(dot_pos) = line.find(". ") {
-            let prefix = &line[..dot_pos];
-            if prefix.chars().all(|c| c.is_ascii_digit()) {
-                let rest = &line[dot_pos + 2..];
-                let mut spans = vec![Span::styled(
-                    format!("{}. ", prefix),
-                    Style::default().fg(COLOR_LIST_BULLET),
-                )];
-                spans.extend(self.parse_inline_spans(rest));
-                return Line::from(spans);
-            }
-        }
-
-        let spans = self.parse_inline_spans(line);
-        Line::from(spans)
-    }
-
-    /// Parse inline markdown: **bold**, *italic*, `code`.
-    fn parse_inline_spans(&self, text: &str) -> Vec<Span<'static>> {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut chars = text.char_indices().peekable();
-        let mut current = String::new();
-
-        while let Some((i, ch)) = chars.next() {
-            match ch {
-                '`' => {
-                    if !current.is_empty() {
-                        spans.push(Span::raw(std::mem::take(&mut current)));
-                    }
-                    let mut code = String::new();
-                    let mut closed = false;
-                    for (_, c) in chars.by_ref() {
-                        if c == '`' {
-                            closed = true;
-                            break;
-                        }
-                        code.push(c);
-                    }
-                    if closed {
-                        spans.push(Span::styled(
-                            code,
-                            Style::default().fg(COLOR_INLINE_CODE),
-                        ));
-                    } else {
-                        current.push('`');
-                        current.push_str(&code);
-                    }
-                }
-                '*' => {
-                    let is_double = chars.peek().is_some_and(|(_, c)| *c == '*');
-                    if is_double {
-                        chars.next();
-                        if !current.is_empty() {
-                            spans.push(Span::raw(std::mem::take(&mut current)));
-                        }
-                        let mut bold_text = String::new();
-                        let mut closed = false;
-                        while let Some((_, c)) = chars.next() {
-                            if c == '*' && chars.peek().is_some_and(|(_, c2)| *c2 == '*') {
-                                chars.next();
-                                closed = true;
-                                break;
-                            }
-                            bold_text.push(c);
-                        }
-                        if closed {
-                            spans.push(Span::styled(
-                                bold_text,
-                                Style::default().add_modifier(Modifier::BOLD),
-                            ));
-                        } else {
-                            current.push_str("**");
-                            current.push_str(&bold_text);
-                        }
-                    } else {
-                        if !current.is_empty() {
-                            spans.push(Span::raw(std::mem::take(&mut current)));
-                        }
-                        let mut italic_text = String::new();
-                        let mut closed = false;
-                        for (_, c) in chars.by_ref() {
-                            if c == '*' {
-                                closed = true;
-                                break;
-                            }
-                            italic_text.push(c);
-                        }
-                        if closed {
-                            spans.push(Span::styled(
-                                italic_text,
-                                Style::default().add_modifier(Modifier::ITALIC),
-                            ));
-                        } else {
-                            current.push('*');
-                            current.push_str(&italic_text);
-                        }
-                    }
-                }
-                _ => {
-                    let _ = i;
-                    current.push(ch);
-                }
-            }
-        }
-
-        if !current.is_empty() {
-            spans.push(Span::raw(current));
-        }
-
-        if spans.is_empty() {
-            spans.push(Span::raw(String::new()));
-        }
-
-        spans
-    }
-
-    /// Syntax-highlight a code block using syntect.
     fn highlight_code(&self, code: &str, lang: &str, available_width: usize) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        // Top border with language label.
         let lang_label = if lang.is_empty() {
             String::new()
         } else {
@@ -280,7 +245,6 @@ impl MarkdownRenderer {
             lines.push(Line::from(spans));
         }
 
-        // Bottom border.
         lines.push(Line::from(Span::styled(
             format!("└{}", "─".repeat(available_width.saturating_sub(1).max(3))),
             Style::default().fg(COLOR_CODE_BORDER),

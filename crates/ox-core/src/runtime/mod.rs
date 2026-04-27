@@ -48,6 +48,10 @@ pub struct RuntimeEnvironment {
     pub working_dir: PathBuf,
     pub project_root: Option<PathBuf>,
     pub project_id: String,
+    /// System-level Ox home: `~/.ox/` (config, sessions, logs, db, skills, memory).
+    pub ox_home_dir: PathBuf,
+    /// Project-level Ox dir: `<project_root>/.ox/` (project_info, skills, memory). None if no project root.
+    pub project_ox_dir: Option<PathBuf>,
 }
 
 impl RuntimeEnvironment {
@@ -124,6 +128,8 @@ pub fn detect_runtime() -> RuntimeEnvironment {
     let project_root = find_project_root(&working_dir);
     let project_id = compute_project_id(&project_root, &working_dir);
     let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let ox_home_dir = home_dir.join(".ox");
+    let project_ox_dir = project_root.as_ref().map(|r| r.join(".ox"));
 
     RuntimeEnvironment {
         os,
@@ -133,6 +139,8 @@ pub fn detect_runtime() -> RuntimeEnvironment {
         working_dir,
         project_root,
         project_id,
+        ox_home_dir,
+        project_ox_dir,
     }
 }
 

@@ -12,6 +12,7 @@ pub struct InputPane {
     /// Saved buffer when navigating history.
     saved_buffer: String,
     /// Whether multiline mode is active.
+    #[allow(dead_code)]
     pub multiline_mode: bool,
 }
 
@@ -28,7 +29,7 @@ impl InputPane {
             history: Vec::new(),
             history_index: None,
             saved_buffer: String::new(),
-            multiline_mode: true, // Enable multiline by default.
+            multiline_mode: false,
         }
     }
 
@@ -98,6 +99,7 @@ impl InputPane {
     }
 
     /// Insert a newline character at the cursor position (for multiline mode).
+    #[allow(dead_code)]
     pub fn insert_newline(&mut self) {
         self.buffer.insert(self.cursor, '\n');
         self.cursor += 1;
@@ -165,6 +167,7 @@ impl InputPane {
     }
 
     /// Character count of buffer (for display purposes).
+    #[allow(dead_code)]
     pub fn char_count(&self) -> usize {
         self.buffer.chars().count()
     }

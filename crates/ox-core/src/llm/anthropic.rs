@@ -102,6 +102,7 @@ impl LlmProvider for AnthropicProvider {
         let mut block_index_to_id: std::collections::HashMap<u64, String> =
             std::collections::HashMap::new();
         let mut done_sent = false;
+        let mut prompt_tokens: u32 = 0;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -109,7 +110,7 @@ impl LlmProvider for AnthropicProvider {
 
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim_end_matches('\r').to_string();
-                buffer = buffer[pos + 1..].to_string();
+                buffer.drain(..=pos);
 
                 if line.is_empty() {
                     // Empty line = end of event, reset event type.
@@ -129,6 +130,7 @@ impl LlmProvider for AnthropicProvider {
                             &json,
                             &tx,
                             &mut block_index_to_id,
+                            &mut prompt_tokens,
                         ) {
                             done_sent = true;
                         }
@@ -161,15 +163,15 @@ fn process_anthropic_event(
     json: &serde_json::Value,
     tx: &mpsc::UnboundedSender<LlmStreamEvent>,
     block_index_to_id: &mut std::collections::HashMap<u64, String>,
+    prompt_tokens: &mut u32,
 ) -> bool {
     match event_type {
         "message_start" => {
-            // Extract usage from message_start if available.
             if let Some(usage) = json
                 .get("message")
                 .and_then(|m| m.get("usage"))
             {
-                let _ = usage; // We'll capture final usage at message_delta.
+                *prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             }
             false
         }
@@ -242,13 +244,13 @@ fn process_anthropic_event(
             false
         }
         "message_delta" => {
-            // Final usage info.
             if let Some(usage) = json.get("usage") {
+                let completion_tokens = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
                 let _ = tx.send(LlmStreamEvent::Done {
                     usage: TokenUsage {
-                        prompt_tokens: 0, // Anthropic reports input in message_start.
-                        completion_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
-                        total_tokens: 0,
+                        prompt_tokens: *prompt_tokens,
+                        completion_tokens,
+                        total_tokens: *prompt_tokens + completion_tokens,
                     },
                 });
                 true

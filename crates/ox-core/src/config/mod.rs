@@ -171,7 +171,6 @@ api_key = ""
 [session]
 # auto_restore = true
 # max_archived_sessions = 50
-# session_dir = ".ox"
 
 [cost]
 # max_monthly_cost = 5.0
@@ -249,7 +248,6 @@ impl Default for TerminalConfig {
 pub struct SessionConfig {
     pub auto_restore: bool,
     pub max_archived_sessions: usize,
-    pub session_dir: String,
 }
 
 impl Default for SessionConfig {
@@ -257,7 +255,6 @@ impl Default for SessionConfig {
         Self {
             auto_restore: true,
             max_archived_sessions: 50,
-            session_dir: ".ox".into(),
         }
     }
 }

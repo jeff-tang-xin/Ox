@@ -47,11 +47,19 @@ pub struct App {
     pub cost_summary: String,
     /// Message count in current session.
     pub message_count: usize,
+    /// Whether user has manually scrolled up (disables auto-scroll-to-bottom).
+    pub user_scrolled: bool,
     // ── Confirmation state ──
     /// Pending tool confirmation request (if any).
     pub pending_confirmation: Option<PendingConfirmation>,
     /// UI→Agent channel sender for sending confirmations.
     pub ui_to_agent_tx: Option<tokio::sync::mpsc::UnboundedSender<ox_core::agent::ui_event::UiToAgentEvent>>,
+    /// Pending council discuss request: (question, rounds, verbose).
+    pub pending_discuss: Option<(String, Option<u8>, bool)>,
+    /// Last completed council session (for /council last).
+    pub last_council_session: Option<ox_core::council::CouncilSession>,
+    /// Pending model switch request (model name).
+    pub pending_model_switch: Option<String>,
 }
 
 impl App {
@@ -70,8 +78,12 @@ impl App {
             working_dir: String::new(),
             cost_summary: String::new(),
             message_count: 0,
+            user_scrolled: false,
             pending_confirmation: None,
             ui_to_agent_tx: None,
+            pending_discuss: None,
+            last_council_session: None,
+            pending_model_switch: None,
         }
     }
 

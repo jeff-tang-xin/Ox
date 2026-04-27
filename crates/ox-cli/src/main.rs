@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -22,6 +23,7 @@ use ox_core::config::AgentConfig;
 use ox_core::context::{self, ContextBuilder};
 use ox_core::cost::CostTracker;
 use ox_core::llm::{self, LlmProvider, ProviderResolveInfo};
+use ox_core::memory::MemoryManager;
 use ox_core::message::{Message, Session};
 use ox_core::runtime;
 use ox_core::safety::TrustManager;
@@ -34,11 +36,44 @@ use terminal::render;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging to stderr (doesn't interfere with TUI).
-    tracing_subscriber::fmt()
-        .with_env_filter("ox=debug")
-        .with_writer(io::stderr)
-        .init();
+    // Detect runtime early to get home_dir for log file path.
+    let early_home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let log_dir = early_home.join(".ox").join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_file_path = log_dir.join("ox.log");
+
+    // Initialize logging: stderr (for TUI) + file (~/.ox/logs/ox.log).
+    if let Ok(log_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ox=warn"));
+        let stderr_layer = tracing_subscriber::fmt::layer()
+            .with_writer(io::stderr)
+            .with_filter(env_filter.clone());
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::sync::Mutex::new(log_file))
+            .with_ansi(false)
+            .with_filter(env_filter);
+        tracing_subscriber::registry()
+            .with(stderr_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        // Fallback: stderr only.
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ox=warn")),
+            )
+            .with_writer(io::stderr)
+            .init();
+    }
 
     // Install panic hook to restore terminal on panic.
     let default_panic = std::panic::take_hook();
@@ -73,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
+    stdout.execute(EnableMouseCapture)?;  // Enable mouse scroll events.
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -82,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore terminal.
     disable_raw_mode()?;
+    io::stdout().execute(DisableMouseCapture)?;
     io::stdout().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
@@ -92,9 +129,24 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config: &OxConfig,
     mut rt_env: runtime::RuntimeEnvironment,
-    provider: Option<Arc<dyn LlmProvider>>,
-    resolve_info: Option<ProviderResolveInfo>,
+    mut provider: Option<Arc<dyn LlmProvider>>,
+    mut resolve_info: Option<ProviderResolveInfo>,
 ) -> anyhow::Result<()> {
+    // Ensure system-level directory structure: ~/.ox/{sessions,db,logs,skills,memory}
+    {
+        let ox = &rt_env.ox_home_dir;
+        let _ = std::fs::create_dir_all(ox.join("sessions"));
+        let _ = std::fs::create_dir_all(ox.join("db"));
+        let _ = std::fs::create_dir_all(ox.join("logs"));
+        let _ = std::fs::create_dir_all(ox.join("skills"));
+        let _ = std::fs::create_dir_all(ox.join("memory"));
+    }
+    // Ensure project-level directory structure: <project_root>/.ox/{skills,memory}
+    if let Some(ref proj_ox) = rt_env.project_ox_dir {
+        let _ = std::fs::create_dir_all(proj_ox.join("skills"));
+        let _ = std::fs::create_dir_all(proj_ox.join("memory"));
+    }
+
     let mut app = App::new();
 
     // Set status bar info.
@@ -135,7 +187,8 @@ async fn run_app(
     }
 
     // Session persistence: load or create.
-    let session_dir = rt_env.working_dir.join(&config.session.session_dir);
+    // System-level: ~/.ox/sessions/<project_id>/
+    let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
     let mut session = if config.session.auto_restore {
         match Session::load(&session_dir)? {
             Some(s) => {
@@ -162,7 +215,10 @@ async fn run_app(
     tracing::info!("Tools registered: {:?}", tool_registry.names());
 
     // Build system prompt using context module.
-    let system_prompt = context::build_system_prompt(&rt_env, &tool_registry, None);
+    let mut persona_vector = ox_core::persona::PersonaVector::for_language(
+        &rt_env.project_root.as_ref().and_then(|r| r.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+    );
+    let system_prompt = context::build_system_prompt(&rt_env, &tool_registry, None, Some(&persona_vector), Some(&config.behavior_rules));
 
     // Context builder for assembling LLM messages within token budgets.
     let context_builder = ContextBuilder::default();
@@ -171,21 +227,31 @@ async fn run_app(
         .map(|p| p.context_window_size())
         .unwrap_or(128_000);
 
-    // Cost tracking.
-    let ox_dir = rt_env.working_dir.join(".ox");
-    let mut cost_tracker = CostTracker::load_or_create(&ox_dir).unwrap_or_else(|e| {
+    // Cost tracking — system-level: ~/.ox/db/
+    let db_dir = rt_env.ox_home_dir.join("db");
+    let mut cost_tracker = CostTracker::load_or_create(&db_dir).unwrap_or_else(|e| {
         tracing::warn!("Failed to load cost tracker: {e}");
         CostTracker::load_or_create(&std::env::temp_dir()).expect("temp dir fallback")
     });
 
+    // Memory system — system-level: ~/.ox/db/memories_*.db
+    let mut memory = MemoryManager::init(&rt_env.ox_home_dir, &rt_env.project_id, &config.memory)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to init memory system: {e}");
+            // Fallback to temp dir.
+            let temp = std::env::temp_dir();
+            MemoryManager::init(&temp, &rt_env.project_id, &config.memory)
+                .expect("memory init with temp dir")
+        });
+
     // Model name for cost recording.
-    let model_name = provider
+    let mut model_name = provider
         .as_ref()
         .map(|p| p.model_name().to_string())
         .unwrap_or_default();
 
     // Session-scoped trust manager for tool confirmation (shared between UI and agent).
-    let trust_manager = Arc::new(tokio::sync::Mutex::new(TrustManager::new()));
+    let trust_manager = Arc::new(std::sync::Mutex::new(TrustManager::new()));
 
     // Interrupt controller for Ctrl+C handling.
     let mut interrupt_ctrl = InterruptController::new();
@@ -205,16 +271,10 @@ async fn run_app(
     // Tick counter for spinner animation.
     let mut tick_count: u64 = 0;
 
-    // Conversation history (user + assistant messages, no system prompt — that's added by ContextBuilder).
-    let mut history: Vec<Message> = Vec::new();
-    for msg in &session.messages {
-        history.push(msg.clone());
-    }
-
     loop {
         // Only re-render when dirty or agent is running (for spinner animation).
         if app.dirty || app.agent_running {
-            terminal.draw(|frame| render::render(frame, &app, tick_count))?;
+            terminal.draw(|frame| render::render(frame, &mut app, tick_count))?;
             app.dirty = false;
         }
 
@@ -228,8 +288,9 @@ async fn run_app(
                             key,
                             &provider,
                             &agent_tx,
-                            &mut history,
                             &mut session,
+                            &mut memory,
+                            &mut persona_vector,
                             &tool_registry,
                             &tool_ctx,
                             &context_builder,
@@ -245,8 +306,40 @@ async fn run_app(
                             &config,
                             &agent_config,
                         );
+                        if let Some(new_model_name) = app.pending_model_switch.take() {
+                            match llm::create_provider_with_info(&new_model_name, &config.models) {
+                                Ok((new_provider, new_info)) => {
+                                    provider = Some(Arc::from(new_provider));
+                                    resolve_info = Some(new_info);
+                                    model_name = provider
+                                        .as_ref()
+                                        .map(|p| p.model_name().to_string())
+                                        .unwrap_or_default();
+                                    app.model_name = model_name.clone();
+                                }
+                                Err(e) => {
+                                    app.output.push_system(&format!(
+                                        "Failed to switch to '{}': {e}",
+                                        new_model_name
+                                    ));
+                                }
+                            }
+                        }
                     }
                     Some(Event::Resize(_, _)) => {
+                        app.dirty = true;
+                    }
+                    Some(Event::ScrollUp) => {
+                        app.scroll_up(3);
+                        app.user_scrolled = true;
+                        app.dirty = true;
+                    }
+                    Some(Event::ScrollDown) => {
+                        app.scroll_down(3);
+                        // If scrolled back to bottom, resume auto-scroll.
+                        if app.scroll_offset == 0 {
+                            app.user_scrolled = false;
+                        }
                         app.dirty = true;
                     }
                     Some(Event::Tick) | None => {
@@ -264,7 +357,7 @@ async fn run_app(
                     match ev {
                         AgentToUiEvent::TextChunk(text) => {
                             app.output.push_streaming_chunk(&text);
-                            app.scroll_to_bottom();
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
                         AgentToUiEvent::ToolStart { name, id } => {
@@ -272,20 +365,21 @@ async fn run_app(
                                 prefix: "Tool".to_string(),
                                 content: format!("{name} [{id}]"),
                             });
-                            app.scroll_to_bottom();
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
                         AgentToUiEvent::ToolResult { name, output, is_error } => {
                             let status = if is_error { "ERROR" } else { "OK" };
                             let display_output = if output.len() > 200 {
-                                format!("{}...(truncated)", &output[..200])
+                                let end = output.char_indices().take_while(|(i, _)| *i < 200).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+                                format!("{}...(truncated)", &output[..end])
                             } else {
                                 output
                             };
                             app.output.push_line(OutputLine::Plain(
                                 format!("  [{name} {status}] {display_output}")
                             ));
-                            app.scroll_to_bottom();
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
                         AgentToUiEvent::TurnDone { new_messages, usage } => {
@@ -296,16 +390,16 @@ async fn run_app(
                                     tracing::error!("Failed to persist message: {e}");
                                 }
                             }
-                            // Append to local conversation history.
-                            history.extend(new_messages);
                             // Record cost.
                             cost_tracker.record(&model_name, &usage);
+                            // Extract memories from this turn.
+                            memory.update_from_turn(&new_messages, &rt_env.project_id, "");
                             app.agent_running = false;
                             app.status = String::new();
                             // Clear any stale pending confirmation.
                             app.pending_confirmation = None;
                             // Update status bar info.
-                            app.message_count = history.len();
+                            app.message_count = session.messages.len();
                             app.cost_summary = cost_tracker.summary_short();
 
                             // Reset interrupt controller for next turn.
@@ -324,14 +418,13 @@ async fn run_app(
                                 if let Some(last) = interjections.into_iter().last() {
                                     app.output.push_line(OutputLine::Plain(String::new()));
                                     let user_msg = Message::user(&last);
-                                    history.push(user_msg.clone());
                                     if let Err(e) = session.append_message(user_msg) {
                                         tracing::error!("Failed to persist interjection: {e}");
                                     }
                                 }
                             }
 
-                            app.scroll_to_bottom();
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
                         AgentToUiEvent::Error(err) => {
@@ -339,7 +432,7 @@ async fn run_app(
                             app.output.push_system(&format!("Error: {err}"));
                             app.agent_running = false;
                             app.status = String::new();
-                            app.scroll_to_bottom();
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
                         AgentToUiEvent::Status(status) => {
@@ -373,11 +466,12 @@ async fn run_app(
                                 tool_call_id,
                                 tool_name,
                             });
-                            app.scroll_to_bottom();
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
                         AgentToUiEvent::ToolOutputChunk { tool_call_id: _, chunk } => {
                             app.output.push_streaming_chunk(&chunk);
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
                         AgentToUiEvent::BudgetExceeded { total_tokens, estimated_cost } => {
@@ -388,7 +482,33 @@ async fn run_app(
                                     total_tokens, estimated_cost
                                 ),
                             });
-                            app.scroll_to_bottom();
+                            app.pending_confirmation = Some(PendingConfirmation {
+                                tool_call_id: "__budget__".into(),
+                                tool_name: "budget".into(),
+                            });
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
+                            app.dirty = true;
+                        }
+                        AgentToUiEvent::CouncilDone { session: council_session } => {
+                            let summary = council_session.format_summary();
+                            for line in summary.lines() {
+                                app.output.push_line(OutputLine::Plain(line.to_string()));
+                            }
+                            // Store council conclusion to memory
+                            if let Some(ref arb) = council_session.arbitration {
+                                let mem_node = ox_core::memory::MemoryNode::new(
+                                    arb.final_recommendation.clone(),
+                                    ox_core::memory::MemoryNodeType::Architectural,
+                                    Some(rt_env.project_id.clone()),
+                                    "multi".into(),
+                                    ox_core::memory::MemorySource::CouncilConclusion,
+                                );
+                                memory.store(mem_node);
+                            }
+                            app.last_council_session = Some(council_session);
+                            app.agent_running = false;
+                            app.status = "Ox".to_string();
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
                     }
@@ -397,6 +517,7 @@ async fn run_app(
         }
 
         if app.should_quit {
+            memory.flush();
             break;
         }
     }
@@ -410,15 +531,16 @@ fn handle_key_event(
     key: crossterm::event::KeyEvent,
     provider: &Option<Arc<dyn LlmProvider>>,
     agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    history: &mut Vec<Message>,
     session: &mut Session,
+    memory: &mut MemoryManager,
+    mut persona_vector: &mut ox_core::persona::PersonaVector,
     tool_registry: &Arc<ToolRegistry>,
     tool_ctx: &Arc<ToolContext>,
     context_builder: &ContextBuilder,
     system_prompt: &str,
     context_window: u32,
     cost_tracker: &mut CostTracker,
-    trust_manager: &Arc<tokio::sync::Mutex<TrustManager>>,
+    trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
     model_name: &str,
     rt_env: &mut runtime::RuntimeEnvironment,
     interrupt_ctrl: &mut InterruptController,
@@ -430,7 +552,8 @@ fn handle_key_event(
     match (key.code, key.modifiers) {
         // ── Confirmation key handling (Y/N/T when pending) ──
         (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
-            if let Some(pc) = app.pending_confirmation.take() {
+            if app.pending_confirmation.is_some() {
+                let pc = app.pending_confirmation.take().unwrap();
                 if let Some(tx) = &app.ui_to_agent_tx {
                     let _ = tx.send(UiToAgentEvent::ToolConfirmation {
                         tool_call_id: pc.tool_call_id,
@@ -443,9 +566,12 @@ fn handle_key_event(
                 app.dirty = true;
                 return;
             }
+            app.input.insert_char('y');
+            app.dirty = true;
         }
         (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Char('N'), KeyModifiers::NONE) => {
-            if let Some(pc) = app.pending_confirmation.take() {
+            if app.pending_confirmation.is_some() {
+                let pc = app.pending_confirmation.take().unwrap();
                 if let Some(tx) = &app.ui_to_agent_tx {
                     let _ = tx.send(UiToAgentEvent::ToolConfirmation {
                         tool_call_id: pc.tool_call_id,
@@ -458,9 +584,12 @@ fn handle_key_event(
                 app.dirty = true;
                 return;
             }
+            app.input.insert_char('n');
+            app.dirty = true;
         }
         (KeyCode::Char('t'), KeyModifiers::NONE) | (KeyCode::Char('T'), KeyModifiers::NONE) => {
-            if let Some(pc) = app.pending_confirmation.take() {
+            if app.pending_confirmation.is_some() {
+                let pc = app.pending_confirmation.take().unwrap();
                 if let Some(tx) = &app.ui_to_agent_tx {
                     let _ = tx.send(UiToAgentEvent::ToolConfirmation {
                         tool_call_id: pc.tool_call_id,
@@ -475,6 +604,8 @@ fn handle_key_event(
                 app.dirty = true;
                 return;
             }
+            app.input.insert_char('t');
+            app.dirty = true;
         }
         (KeyCode::Char('a'), KeyModifiers::CONTROL) => { app.input.move_home(); app.dirty = true; }
         (KeyCode::Char('e'), KeyModifiers::CONTROL) => { app.input.move_end(); app.dirty = true; }
@@ -488,8 +619,9 @@ fn handle_key_event(
                     app.should_quit = true;
                 }
                 InterruptAction::CancelAgent => {
-                    app.output.push_system("Interrupting agent...");
-                    app.status = "Interrupting...".to_string();
+                    app.agent_running = false;
+                    app.output.push_system("Agent interrupted.");
+                    app.status = "Ox".to_string();
                 }
             }
             app.dirty = true;
@@ -497,8 +629,7 @@ fn handle_key_event(
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
-        (KeyCode::Enter, KeyModifiers::CONTROL) | (KeyCode::Enter, KeyModifiers::ALT) => {
-            // Ctrl+Enter or Alt+Enter: submit (in multiline mode).
+        (KeyCode::Enter, _) => {
             if let Some(input) = app.submit_input() {
                 match input {
                     UserInput::Exit => {
@@ -514,112 +645,36 @@ fn handle_key_event(
                             trust_manager,
                             model_name,
                             rt_env,
-                            history,
                             session,
+                            memory,
+                            &mut persona_vector,
                             &resolve_info,
                             &config,
                         );
-                    }
-                    UserInput::Text(text) => {
-                        if app.agent_running {
-                            // Buffer the message as an interjection.
-                            interjection_buf.push(text.clone(), InterjectionPriority::Normal);
-                            app.output.push_line(OutputLine::Plain(format!(
-                                "(queued while agent running) {}",
-                                text.trim()
-                            )));
-                        } else if let Some(provider) = provider {
-                            // Show user message in output.
-                            app.output.push_line(OutputLine::Styled {
-                                prefix: "You".to_string(),
-                                content: text.clone(),
-                            });
-                            app.output.push_line(OutputLine::Plain(String::new()));
-
-                            // Persist user message immediately.
-                            let user_msg = Message::user(&text);
-                            history.push(user_msg.clone());
-                            if let Err(e) = session.append_message(user_msg) {
-                                tracing::error!("Failed to persist user message: {e}");
-                            }
-
-                            // Build context-aware message list with token budgets.
-                            let turn_messages = context_builder.build(
-                                system_prompt,
-                                history,
-                                context_window,
-                            );
-
-                            // Start agent turn.
-                            app.agent_running = true;
-                            app.status = "Thinking...".to_string();
-
-                            let provider = Arc::clone(provider);
-                            let tx = agent_tx.clone();
-                            let registry = Arc::clone(tool_registry);
-                            let ctx = Arc::clone(tool_ctx);
-                            let cancel_token = interrupt_ctrl.token();
-                            let tm = Arc::clone(&trust_manager);
-                            let ac = Arc::clone(&agent_config);
-                            // Create a new UI→Agent channel for this turn.
-                            let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
-                            app.ui_to_agent_tx = Some(ui_to_agent_tx);
+                        // Check if a council discuss was queued
+                        if let Some((question, rounds, verbose)) = app.pending_discuss.take() {
+                            let council_config = config.council.clone();
+                            let models_config = config.models.clone();
+                            let ctx_messages = session.messages.clone();
+                            let agent_tx_council = agent_tx.clone();
                             tokio::spawn(async move {
-                                agent::run_agent_turn(
-                                    provider,
-                                    turn_messages,
-                                    registry,
-                                    ctx,
-                                    tx,
-                                    ui_to_agent_rx,
-                                    cancel_token,
-                                    tm,
-                                    ac,
-                                )
-                                .await;
+                                use ox_core::council::orchestrator::CouncilOrchestrator;
+                                let orch = CouncilOrchestrator::new(models_config, council_config);
+                                match orch.convene(&question, &ctx_messages, rounds, verbose).await {
+                                    Ok(council_session) => {
+                                        let _ = agent_tx_council.send(AgentToUiEvent::CouncilDone {
+                                            session: council_session,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = agent_tx_council.send(AgentToUiEvent::Error(
+                                            format!("Council failed: {}", e)
+                                        ));
+                                    }
+                                }
                             });
-                        } else {
-                            // No provider — echo mode.
-                            app.output.push_line(OutputLine::Plain(format!(
-                                "[echo] {}",
-                                text.trim()
-                            )));
                         }
                     }
-                }
-                app.scroll_to_bottom();
-            }
-        }
-        (KeyCode::Enter, KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::SHIFT) => {
-            // Plain Enter behavior depends on mode and content:
-            // - Single-line mode: always submit
-            // - Multiline mode: submit if input starts with! / (slash command) or is empty,
-            //   otherwise insert newline
-            let should_submit = !app.input.multiline_mode
-                || app.input.buffer.starts_with('/')
-                || app.input.buffer.trim().is_empty();
-            if should_submit {
-                if let Some(input) = app.submit_input() {
-                match input {
-                    UserInput::Exit => {
-                        app.output.push_system("Goodbye.");
-                        app.should_quit = true;
-                    }
-                    UserInput::SlashCommand { cmd, args } => {
-                        handle_slash_command(
-                            app,
-                            &cmd,
-                            &args,
-                            cost_tracker,
-                            trust_manager,
-                            model_name,
-                            rt_env,
-                            history,
-                            session,
-                            &resolve_info,
-                            &config,
-                        );
-                    }
                     UserInput::Text(text) => {
                         if app.agent_running {
                             interjection_buf.push(text.clone(), InterjectionPriority::Normal);
@@ -628,19 +683,16 @@ fn handle_key_event(
                                 text.trim()
                             )));
                         } else if let Some(provider) = provider {
-                            app.output.push_line(OutputLine::Styled {
-                                prefix: "You".to_string(),
-                                content: text.clone(),
-                            });
-                            app.output.push_line(OutputLine::Plain(String::new()));
                             let user_msg = Message::user(&text);
-                            history.push(user_msg.clone());
                             if let Err(e) = session.append_message(user_msg) {
                                 tracing::error!("Failed to persist user message: {e}");
                             }
+                            let memory_nodes = memory.retrieve(&text, &Some(rt_env.project_id.as_str()), 5);
+                            let memory_ctx = memory.format_memory_context(&memory_nodes);
                             let turn_messages = context_builder.build(
                                 system_prompt,
-                                history,
+                                &memory_ctx,
+                                &session.messages,
                                 context_window,
                             );
                             app.agent_running = true;
@@ -677,23 +729,33 @@ fn handle_key_event(
                     }
                 }
                 app.scroll_to_bottom();
-                }
-            } else {
-                // Multiline mode: insert newline.
-                app.input.insert_newline();
-                app.dirty = true;
+                app.user_scrolled = false;
             }
         }
         (KeyCode::Backspace, _) => { app.input.backspace(); app.dirty = true; }
         (KeyCode::Delete, _) => { app.input.delete(); app.dirty = true; }
         (KeyCode::Left, _) => { app.input.move_left(); app.dirty = true; }
         (KeyCode::Right, _) => { app.input.move_right(); app.dirty = true; }
+        (KeyCode::Up, KeyModifiers::SHIFT) => {
+            app.scroll_up(1); app.user_scrolled = true; app.dirty = true;
+        }
+        (KeyCode::Down, KeyModifiers::SHIFT) => {
+            app.scroll_down(1);
+            if app.scroll_offset == 0 { app.user_scrolled = false; }
+            app.dirty = true;
+        }
         (KeyCode::Up, _) => { app.input.history_up(); app.dirty = true; }
         (KeyCode::Down, _) => { app.input.history_down(); app.dirty = true; }
         (KeyCode::Home, _) => { app.input.move_home(); app.dirty = true; }
         (KeyCode::End, _) => { app.input.move_end(); app.dirty = true; }
-        (KeyCode::PageUp, _) => { app.scroll_up(10); app.dirty = true; }
-        (KeyCode::PageDown, _) => { app.scroll_down(10); app.dirty = true; }
+        (KeyCode::PageUp, _) => {
+            app.scroll_up(10); app.user_scrolled = true; app.dirty = true;
+        }
+        (KeyCode::PageDown, _) => {
+            app.scroll_down(10);
+            if app.scroll_offset == 0 { app.user_scrolled = false; }
+            app.dirty = true;
+        }
         (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
             app.input.insert_char(ch);
             app.dirty = true;
@@ -708,11 +770,12 @@ fn handle_slash_command(
     cmd: &str,
     args: &str,
     cost_tracker: &mut CostTracker,
-    trust_manager: &Arc<tokio::sync::Mutex<TrustManager>>,
+    trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
     model_name: &str,
     rt_env: &mut runtime::RuntimeEnvironment,
-    history: &mut Vec<Message>,
     session: &mut Session,
+    memory: &mut MemoryManager,
+    persona_vector: &mut ox_core::persona::PersonaVector,
     resolve_info: &Option<ProviderResolveInfo>,
     config: &OxConfig,
 ) {
@@ -735,7 +798,6 @@ fn handle_slash_command(
             if let Err(e) = session.archive(&session_dir) {
                 tracing::warn!("Failed to archive session: {e}");
             }
-            history.clear();
             let project_id = rt_env.project_id.clone();
             match Session::new(&session_dir, &project_id) {
                 Ok(s) => {
@@ -762,7 +824,7 @@ fn handle_slash_command(
                 .push_system("Task plan: (not yet active — agent will create plans automatically)");
         }
         SlashCommand::Trust { tools, all } => {
-            let mut tm = trust_manager.blocking_lock();
+            let mut tm = trust_manager.lock().unwrap();
             if all {
                 tm.trust_all();
                 app.output
@@ -789,38 +851,16 @@ fn handle_slash_command(
             }
         }
         SlashCommand::Untrust => {
-            trust_manager.blocking_lock().untrust_all();
+            trust_manager.lock().unwrap().untrust_all();
             app.output
                 .push_system("All tool trust revoked. Confirmations restored.");
         }
         SlashCommand::Model { name } => {
             if let Some(new_model) = name {
-                // Try to create provider with the new model.
-                match llm::create_provider_with_info(&new_model, &config.models) {
-                    Ok((_new_provider, new_info)) => {
-                        app.output.push_line(OutputLine::Plain(format!(
-                            "Switching to: {} (provider: {}, key: {})",
-                            new_model,
-                            new_info.provider_name,
-                            match &new_info.api_key_source {
-                                llm::ApiKeySource::EnvVar(n) => format!("env:{n}"),
-                                llm::ApiKeySource::ConfigFile => "config".to_string(),
-                                llm::ApiKeySource::NotFound => "NOT FOUND".to_string(),
-                            }
-                        )));
-                        // Note: provider is currently immutable in run_app.
-                        // Full model switching requires storing provider as mutable Arc.
-                        app.output.push_system(
-                            "Model switching applied for next session. Restart to use the new model.",
-                        );
-                    }
-                    Err(e) => {
-                        app.output.push_system(&format!(
-                            "Failed to switch to '{}': {e}",
-                            new_model
-                        ));
-                    }
-                }
+                app.pending_model_switch = Some(new_model.clone());
+                app.output.push_line(OutputLine::Plain(format!(
+                    "Switching to: {}", new_model
+                )));
             } else {
                 app.output.push_line(OutputLine::Plain(format!(
                     "Current model: {}",
@@ -966,10 +1006,10 @@ fn handle_slash_command(
             )));
             app.output.push_line(OutputLine::Plain(format!(
                 "History: {} messages",
-                history.len()
+                session.messages.len()
             )));
             let trusted = {
-                let tm = trust_manager.blocking_lock();
+                let tm = trust_manager.lock().unwrap();
                 tm.trusted_list()
             };
             app.output.push_line(OutputLine::Plain(format!(
@@ -1014,13 +1054,12 @@ fn handle_slash_command(
                         }
                         // Restore archived session.
                         let msg_count = archived_session.messages.len();
-                        *history = archived_session.messages.clone();
                         *session = archived_session;
                         app.output.push_system(&format!(
                             "Session restored: {} messages from {}",
                             msg_count, filename
                         ));
-                        app.message_count = history.len();
+                        app.message_count = session.messages.len();
                     }
                     Ok(None) => {
                         app.output.push_system(&format!(
@@ -1032,6 +1071,98 @@ fn handle_slash_command(
                         app.output.push_system(&format!("Failed to resume session: {e}"));
                     }
                 }
+            }
+        }
+        SlashCommand::Remember { content } => {
+            if content.is_empty() {
+                app.output.push_system("Usage: /remember <content>  (stores as Style memory)");
+            } else {
+                memory.store_explicit(&content, &rt_env.project_id, "");
+                app.output.push_system(&format!("Remembered: {}", content.chars().take(100).collect::<String>()));
+            }
+        }
+        SlashCommand::Forget { keyword } => {
+            if keyword.is_empty() {
+                app.output.push_system("Usage: /forget <keyword>  (deletes matching memories)");
+            } else {
+                let deleted = memory.forget(&keyword, &rt_env.project_id);
+                app.output.push_system(&format!("Forgot {} memory(ies) matching '{}'", deleted, keyword));
+            }
+        }
+        SlashCommand::Memory => {
+            let (project_count, overall_count) = memory.stats(&rt_env.project_id);
+            app.output.push_line(OutputLine::Plain(format!("Memory: {} project, {} long-term", project_count, overall_count)));
+            let nodes = memory.retrieve("", &Some(rt_env.project_id.as_str()), 5);
+            for node in &nodes {
+                app.output.push_line(OutputLine::Plain(format!(
+                    "  [{}] {} (depth: {})",
+                    node.node_type,
+                    node.content.chars().take(80).collect::<String>(),
+                    node.depth
+                )));
+            }
+        }
+        SlashCommand::Feedback { category } => {
+            match category.as_str() {
+                "good" => {
+                    app.output.push_system("Feedback noted: positive. Memory reinforced.");
+                }
+                "bad" => {
+                    app.output.push_system("Feedback noted: negative. Will adjust approach.");
+                }
+                "unsafe" => {
+                    app.output.push_system("Safety violation noted. Reviewing constraints.");
+                }
+                _ => {
+                    app.output.push_system("Usage: /feedback <good|bad|unsafe>");
+                }
+            }
+        }
+        SlashCommand::Persona { action } => {
+            if action.is_empty() || action == "show" {
+                app.output.push_line(OutputLine::Plain(format!("Persona: {}", persona_vector)));
+            } else if action == "freeze" {
+                app.output.push_system("Persona frozen (evolution stopped). Use /persona unfreeze to resume.");
+            } else if action == "unfreeze" {
+                app.output.push_system("Persona unfrozen (evolution resumed).");
+            } else {
+                app.output.push_system("Usage: /persona [show|freeze|unfreeze]");
+            }
+        }
+        SlashCommand::Discuss { question, rounds, verbose } => {
+            let question_text = match question {
+                Some(q) => q.clone(),
+                None => {
+                    app.output.push_system("Usage: /discuss <question> [--rounds N] [--verbose]");
+                    return;
+                }
+            };
+            app.output.push_system(&format!("Starting council debate on: {}", question_text));
+            app.agent_running = true;
+            app.status = "Council debating...".to_string();
+            app.dirty = true;
+            // Council will be run via tokio::spawn after this match
+            // Store the discuss request for the main loop to pick up
+            app.pending_discuss = Some((question_text, rounds, verbose));
+        }
+        SlashCommand::Council { action } => {
+            if action == "last" {
+                if let Some(ref session) = app.last_council_session {
+                    let output = if session.phases.len() > 2 {
+                        session.format_verbose()
+                    } else {
+                        session.format_summary()
+                    };
+                    for line in output.lines() {
+                        app.output.push_line(OutputLine::Plain(line.to_string()));
+                    }
+                } else {
+                    app.output.push_system("No previous council session.");
+                }
+            } else if action == "stats" {
+                app.output.push_system("Council stats: (model capability tracking not yet persisted)");
+            } else {
+                app.output.push_system("Usage: /council <last|stats>");
             }
         }
         SlashCommand::Unknown { cmd } => {

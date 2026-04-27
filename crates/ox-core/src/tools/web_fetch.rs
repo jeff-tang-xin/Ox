@@ -52,9 +52,10 @@ impl Tool for WebFetchTool {
                 match resp.text().await {
                     Ok(body) => {
                         let truncated = if body.len() > 10000 {
+                            let end = body.char_indices().take_while(|(i, _)| *i < 10000).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
                             format!(
                                 "{}\n\n... (truncated, {} total chars)",
-                                &body[..10000],
+                                &body[..end],
                                 body.len()
                             )
                         } else {

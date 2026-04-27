@@ -50,12 +50,12 @@ impl ContextBuilder {
 
     /// Assemble the final message list for an LLM call.
     ///
-    /// Strategy: system prompt first, then fill history from newest to oldest
-    /// until the history budget is exhausted. Memory placeholder is reserved
-    /// but empty for Phase 1.
+    /// Strategy: system prompt first, then memory context, then fill history
+    /// from newest to oldest until the history budget is exhausted.
     pub fn build(
         &self,
         system_prompt: &str,
+        memory_context: &str,
         history: &[Message],
         context_window: u32,
     ) -> Vec<Message> {
@@ -66,7 +66,12 @@ impl ContextBuilder {
         // 1. System prompt (always included).
         result.push(Message::system(system_prompt));
 
-        // 2. Fill history from newest to oldest within budget.
+        // 2. Memory context (if non-empty).
+        if !memory_context.is_empty() {
+            result.push(Message::system(memory_context));
+        }
+
+        // 3. Fill history from newest to oldest within budget.
         let history_budget = budgets.history as usize;
         let mut used_tokens: usize = 0;
         let mut selected_indices: Vec<usize> = Vec::new();
@@ -135,7 +140,7 @@ mod tests {
             Message::user("how are you"),
             Message::assistant("I'm good"),
         ];
-        let result = cb.build("You are helpful.", &history, 128_000);
+        let result = cb.build("You are helpful.", "", &history, 128_000);
         // Should have system + all 4 history messages (they're tiny).
         assert_eq!(result.len(), 5);
     }
@@ -154,7 +159,7 @@ mod tests {
             history.push(Message::user(format!("Message number {i} with some extra text to consume tokens")));
             history.push(Message::assistant(format!("Response {i} with additional content")));
         }
-        let result = cb.build("System", &history, 128_000);
+        let result = cb.build("System", "", &history, 128_000);
         // Should have fewer than all 200 history messages.
         assert!(result.len() < 201);
         // But should have at least system + a few recent messages.

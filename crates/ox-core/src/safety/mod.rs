@@ -1,3 +1,5 @@
+pub mod sanitizer;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 

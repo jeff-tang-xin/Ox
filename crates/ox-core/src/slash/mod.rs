@@ -15,6 +15,13 @@ pub enum SlashCommand {
     Init,
     Sessions,
     Resume { filename: String },
+    Remember { content: String },
+    Forget { keyword: String },
+    Memory,
+    Feedback { category: String },
+    Persona { action: String },
+    Discuss { question: Option<String>, rounds: Option<u8>, verbose: bool },
+    Council { action: String },
     Unknown { cmd: String },
 }
 
@@ -68,6 +75,52 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
         "resume" => SlashCommand::Resume {
             filename: args.to_string(),
         },
+        "remember" => SlashCommand::Remember {
+            content: args.to_string(),
+        },
+        "forget" => SlashCommand::Forget {
+            keyword: args.to_string(),
+        },
+        "memory" => SlashCommand::Memory,
+        "feedback" => SlashCommand::Feedback {
+            category: args.to_string(),
+        },
+        "persona" => SlashCommand::Persona {
+            action: args.to_string(),
+        },
+        "discuss" => {
+            let mut rounds = None;
+            let mut verbose = false;
+            let mut question_parts = Vec::new();
+            for part in args.split_whitespace() {
+                if part == "--verbose" || part == "-v" {
+                    verbose = true;
+                } else if part == "--rounds" || part == "-r" {
+                    // next part is rounds count, handled below
+                    rounds = None; // placeholder
+                } else if let Some(prev) = question_parts.last() {
+                    if prev == "--rounds" || prev == "-r" {
+                        question_parts.pop();
+                        if let Ok(r) = part.parse::<u8>() {
+                            rounds = Some(r);
+                        }
+                        continue;
+                    }
+                    question_parts.push(part.to_string());
+                } else {
+                    question_parts.push(part.to_string());
+                }
+            }
+            let question = if question_parts.is_empty() {
+                None
+            } else {
+                Some(question_parts.join(" "))
+            };
+            SlashCommand::Discuss { question, rounds, verbose }
+        }
+        "council" => SlashCommand::Council {
+            action: args.to_string(),
+        },
         _ => SlashCommand::Unknown {
             cmd: cmd.to_string(),
         },
@@ -105,7 +158,9 @@ Commands:
   /model [name]     Show or switch model
   /cd [path]        Show or change working directory
   /init             Create default config (~/.ox/config.toml)
-  /debug            Show debug info"
+  /debug            Show debug info
+  /discuss [q]      Start council debate (--rounds N, --verbose)
+  /council <action> Council actions (last, stats)"
             .to_string(),
     }
 }

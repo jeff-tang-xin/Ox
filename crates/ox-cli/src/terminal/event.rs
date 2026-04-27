@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
 /// Events that flow from the crossterm polling thread to the main event loop.
@@ -10,16 +10,17 @@ pub enum Event {
     /// A key press (only Press kind, not Release/Repeat).
     Key(KeyEvent),
     /// Terminal resized.
+    #[allow(dead_code)]
     Resize(u16, u16),
     /// Render tick.
     Tick,
+    /// Mouse scroll up in output pane.
+    ScrollUp,
+    /// Mouse scroll down in output pane.
+    ScrollDown,
 }
 
 /// Spawns a dedicated std::thread that polls crossterm events.
-///
-/// crossterm's `event::read()` is blocking — it cannot run on the tokio runtime
-/// without starving other tasks. A dedicated OS thread solves this cleanly.
-/// Uses `tokio::sync::mpsc` so the receiver can be used in `tokio::select!`.
 pub struct EventHandler {
     rx: mpsc::UnboundedReceiver<Event>,
     _thread: thread::JoinHandle<()>,
@@ -31,23 +32,28 @@ impl EventHandler {
 
         let thread = thread::spawn(move || {
             loop {
-                // Poll with the tick rate as timeout.
                 if event::poll(tick_rate).unwrap_or(false) {
                     match event::read() {
                         Ok(CrosstermEvent::Key(key))
-                            // Only forward actual key presses, not release/repeat.
                             if key.kind == KeyEventKind::Press
                                 && tx.send(Event::Key(key)).is_err() => {
-                                    break; // receiver dropped, main loop exited
+                                    break;
                                 }
                         Ok(CrosstermEvent::Resize(w, h))
                             if tx.send(Event::Resize(w, h)).is_err() => {
                                 break;
                             }
+                        Ok(CrosstermEvent::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, .. }))
+                            if tx.send(Event::ScrollUp).is_err() => {
+                                break;
+                            }
+                        Ok(CrosstermEvent::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, .. }))
+                            if tx.send(Event::ScrollDown).is_err() => {
+                                break;
+                            }
                         _ => {}
                     }
                 } else {
-                    // Timeout elapsed — send a tick for rendering.
                     if tx.send(Event::Tick).is_err() {
                         break;
                     }
@@ -58,7 +64,6 @@ impl EventHandler {
         Self { rx, _thread: thread }
     }
 
-    /// Async receive — use in `tokio::select!`.
     pub async fn recv(&mut self) -> Option<Event> {
         self.rx.recv().await
     }

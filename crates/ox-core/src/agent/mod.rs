@@ -55,6 +55,10 @@ pub enum AgentToUiEvent {
         total_tokens: u32,
         estimated_cost: String,
     },
+    /// Council debate completed.
+    CouncilDone {
+        session: crate::council::CouncilSession,
+    },
 }
 
 /// Run a complete agent turn: LLM -> tool_calls -> execute -> loop -> text.
@@ -69,7 +73,7 @@ pub async fn run_agent_turn(
     ui_tx: mpsc::UnboundedSender<AgentToUiEvent>,
     mut ui_rx: mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
     cancel_token: CancellationToken,
-    trust_manager: Arc<tokio::sync::Mutex<TrustManager>>,
+    trust_manager: Arc<std::sync::Mutex<TrustManager>>,
     agent_config: Arc<AgentConfig>,
 ) {
     let tool_schemas = tool_registry.schemas();
@@ -91,6 +95,16 @@ pub async fn run_agent_turn(
         } else {
             format!("Thinking... (iteration {})", iteration + 1)
         }));
+
+        // Check for queued interjections before LLM call.
+        while let Ok(ev) = ui_rx.try_recv() {
+            if let ui_event::UiToAgentEvent::Interjection(text) = ev {
+                messages.push(Message::user(&text));
+                let _ = ui_tx.send(AgentToUiEvent::Status(
+                    format!("(interjection injected: {})", text.trim())
+                ));
+            }
+        }
 
         // Stream LLM response.
         let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmStreamEvent>();
@@ -259,7 +273,7 @@ pub async fn run_agent_turn(
                 match safety_level {
                     SafetyLevel::Safe => false,
                     SafetyLevel::RequiresConfirmation => {
-                        let tm = trust_manager.lock().await;
+                        let tm = trust_manager.lock().unwrap();
                         !tm.can_skip_confirmation(&tc.name, safety_level)
                     }
                     SafetyLevel::Dangerous => true,
@@ -269,7 +283,8 @@ pub async fn run_agent_turn(
             if should_confirm {
                 // Build args_summary (truncated, sanitized).
                 let args_summary = if tc.arguments.len() > 200 {
-                    format!("{}...(truncated)", &tc.arguments[..200])
+                    let end = tc.arguments.char_indices().take_while(|(i, _)| *i < 200).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+                    format!("{}...(truncated)", &tc.arguments[..end])
                 } else {
                     tc.arguments.clone()
                 };
@@ -351,8 +366,8 @@ pub async fn run_agent_turn(
                         continue;
                     }
                     ui_event::ConfirmationDecision::TrustAlways => {
-                        let mut tm = trust_manager.lock().await;
-                        tm.trust(&tc.name);
+                        let mut tm = trust_manager.lock().unwrap();
+                        tm.trust_all();
                     }
                     ui_event::ConfirmationDecision::Allow => {}
                 }
@@ -368,7 +383,8 @@ pub async fn run_agent_turn(
                         let error_msg = format!(
                             "Invalid tool arguments JSON: {parse_err}. Raw: {}",
                             if tc.arguments.len() > 200 {
-                                format!("{}...(truncated)", &tc.arguments[..200])
+                                let end = tc.arguments.char_indices().take_while(|(i, _)| *i < 200).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+                                format!("{}...(truncated)", &tc.arguments[..end])
                             } else {
                                 tc.arguments.clone()
                             }

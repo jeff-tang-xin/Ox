@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -24,6 +24,7 @@ pub struct Session {
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
     file_path: PathBuf,
+    file_handle: Option<BufWriter<File>>,
 }
 
 impl Session {
@@ -42,16 +43,21 @@ impl Session {
             message_count: 0,
         };
 
-        // Write meta as first line.
-        let mut file = File::create(&file_path)?;
+        // Write meta as first line and keep file handle open.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)?;
+        let mut writer = BufWriter::new(file);
         let meta_line = serde_json::to_string(&serde_json::json!({"_meta": &meta}))?;
-        writeln!(file, "{meta_line}")?;
-        file.flush()?;
+        writeln!(writer, "{meta_line}")?;
+        writer.flush()?;
 
         Ok(Self {
             meta,
             messages: Vec::new(),
             file_path,
+            file_handle: Some(writer),
         })
     }
 
@@ -65,18 +71,14 @@ impl Session {
 
         let file = File::open(&file_path)?;
         let reader = BufReader::new(file);
-        let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
-
-        if lines.is_empty() {
-            return Ok(None);
-        }
 
         // First line is meta.
         let mut meta: Option<SessionMeta> = None;
         let mut messages = Vec::new();
-        let total_lines = lines.len();
+        let mut is_last = false;
 
-        for (i, line) in lines.iter().enumerate() {
+        for (i, line_result) in reader.lines().enumerate() {
+            let line = line_result?;
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -94,13 +96,16 @@ impl Session {
             match serde_json::from_str::<Message>(line) {
                 Ok(msg) => messages.push(msg),
                 Err(e) => {
-                    if i == total_lines - 1 {
-                        tracing::warn!("Skipping malformed last line in session (crash recovery): {e}");
-                    } else {
-                        tracing::warn!("Skipping malformed line {i} in session: {e}");
-                    }
+                    // We can't know if this is the last line without reading ahead,
+                    // so treat all malformed lines as warnings.
+                    tracing::warn!("Skipping malformed line {i} in session: {e}");
+                    is_last = true;
                 }
             }
+        }
+
+        if meta.is_none() && messages.is_empty() && !is_last {
+            return Ok(None);
         }
 
         let meta = meta.unwrap_or_else(|| SessionMeta {
@@ -121,6 +126,7 @@ impl Session {
             meta,
             messages,
             file_path,
+            file_handle: None, // Will be opened on first append.
         }))
     }
 
@@ -128,13 +134,19 @@ impl Session {
     pub fn append_message(&mut self, msg: Message) -> anyhow::Result<()> {
         let json = serde_json::to_string(&msg)?;
 
-        // Append to file.
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file_path)?;
-        writeln!(file, "{json}")?;
-        file.flush()?;
+        // Open file handle lazily on first append, then reuse.
+        if self.file_handle.is_none() {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.file_path)?;
+            self.file_handle = Some(BufWriter::new(file));
+        }
+
+        if let Some(ref mut writer) = self.file_handle {
+            writeln!(writer, "{json}")?;
+            writer.flush()?;
+        }
 
         self.messages.push(msg);
         self.meta.message_count = self.messages.len();
@@ -282,6 +294,7 @@ impl Session {
             meta,
             messages,
             file_path: archive_path,
+            file_handle: None,
         }))
     }
 }

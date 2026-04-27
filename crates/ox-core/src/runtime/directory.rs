@@ -60,8 +60,9 @@ pub fn change_directory(rt_env: &mut RuntimeEnvironment, target: &str) -> Direct
 
     // Update the runtime environment.
     rt_env.working_dir = canonical.clone();
-    rt_env.project_root = new_project_root;
+    rt_env.project_root = new_project_root.clone();
     rt_env.project_id = compute_project_id(&rt_env.project_root, &rt_env.working_dir);
+    rt_env.project_ox_dir = new_project_root.as_ref().map(|r| r.join(".ox"));
 
     // Also update the actual process working directory.
     if let Err(e) = std::env::set_current_dir(&canonical) {

@@ -98,10 +98,10 @@ impl LlmProvider for OpenAiProvider {
             let chunk = chunk?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            // Process complete SSE lines.
+            // Process complete SSE lines using drain to avoid reallocating the buffer.
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim_end_matches('\r').to_string();
-                buffer = buffer[pos + 1..].to_string();
+                buffer.drain(..=pos);
 
                 if line.is_empty() || line.starts_with(':') {
                     continue;
