@@ -116,12 +116,6 @@ impl Session {
             message_count: messages.len(),
         });
 
-        tracing::info!(
-            "Session restored: {} messages (id: {})",
-            messages.len(),
-            &meta.id[..8]
-        );
-
         Ok(Some(Self {
             meta,
             messages,
@@ -165,7 +159,6 @@ impl Session {
         let archive_path = archive_dir.join(archive_name);
 
         fs::rename(&self.file_path, &archive_path)?;
-        tracing::info!("Session archived to {}", archive_path.display());
 
         Ok(())
     }
@@ -181,6 +174,37 @@ impl Session {
     /// Get the session directory path.
     pub fn dir(&self) -> &Path {
         self.file_path.parent().unwrap_or(Path::new("."))
+    }
+
+    /// Clean/reset the session by clearing all messages.
+    /// Writes a new meta line, effectively starting fresh.
+    pub fn clean(&mut self) -> anyhow::Result<()> {
+        // Update meta
+        self.meta.message_count = 0;
+        self.meta.updated_at = Utc::now().to_rfc3339();
+
+        // Clear in-memory messages
+        self.messages.clear();
+
+        // Close existing file handle and rewrite file with fresh meta
+        if let Some(ref mut writer) = self.file_handle {
+            writer.flush()?;
+        }
+        self.file_handle = None;
+
+        // Rewrite file with just meta line
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.file_path)?;
+        let mut writer = BufWriter::new(file);
+        let meta_line = serde_json::to_string(&serde_json::json!({"_meta": &self.meta}))?;
+        writeln!(writer, "{meta_line}")?;
+        writer.flush()?;
+        self.file_handle = Some(writer);
+
+        Ok(())
     }
 
     /// List archived sessions in the sessions/ directory.
@@ -296,6 +320,14 @@ impl Session {
             file_path: archive_path,
             file_handle: None,
         }))
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(ref mut writer) = self.file_handle {
+            let _ = writer.flush();
+        }
     }
 }
 

@@ -90,11 +90,13 @@ pub async fn run_agent_turn(
             break;
         }
 
-        let _ = ui_tx.send(AgentToUiEvent::Status(if iteration == 0 {
-            "Thinking...".to_string()
-        } else {
-            format!("Thinking... (iteration {})", iteration + 1)
-        }));
+        let _ = ui_tx.send(AgentToUiEvent::Status(
+            if iteration == 0 {
+                "Thinking...".to_string()
+            } else {
+                format!("Thinking... (iteration {})", iteration + 1)
+            }
+        ));
 
         // Check for queued interjections before LLM call.
         while let Ok(ev) = ui_rx.try_recv() {
@@ -123,9 +125,7 @@ pub async fn run_agent_turn(
                         let _ = llm_tx_err.send(LlmStreamEvent::Error(format!("Stream failed: {e}")));
                     }
                 }
-                _ = cancel_clone.cancelled() => {
-                    tracing::info!("LLM stream task cancelled");
-                }
+                _ = cancel_clone.cancelled() => {}
             }
         });
 
@@ -175,6 +175,8 @@ pub async fn run_agent_turn(
                     break;
                 }
                 LlmStreamEvent::Error(err) => {
+                    // Log the error to file.
+                    tracing::error!("LLM error: {}", err);
                     let _ = ui_tx.send(AgentToUiEvent::Error(err));
                     // Abort the stream task if still running, don't block on it.
                     stream_handle.abort();
@@ -404,6 +406,16 @@ pub async fn run_agent_turn(
                     }
                 }
             };
+
+            // Check for queued interjections before tool execution.
+            while let Ok(ev) = ui_rx.try_recv() {
+                if let ui_event::UiToAgentEvent::Interjection(text) = ev {
+                    messages.push(Message::user(&text));
+                    let _ = ui_tx.send(AgentToUiEvent::Status(
+                        format!("(interjection injected before tool: {})", text.trim())
+                    ));
+                }
+            }
 
             let result = tool.execute(args, &tool_ctx).await;
 

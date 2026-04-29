@@ -90,9 +90,9 @@ impl LlmProvider for AnthropicProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
-            let _ = tx.send(LlmStreamEvent::Error(format!(
-                "Anthropic API error {status}: {body_text}"
-            )));
+            let err_msg = format!("Anthropic API error {status}: {body_text}");
+            tracing::error!("{}", err_msg);
+            let _ = tx.send(LlmStreamEvent::Error(err_msg));
             return Ok(());
         }
 

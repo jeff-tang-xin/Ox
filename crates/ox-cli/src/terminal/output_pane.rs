@@ -1,50 +1,69 @@
 use ratatui::text::Line;
 
-/// A single line in the output pane.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub enum OutputKind {
+    User,
+    Assistant,
+    Tool,
+    ToolResult,
+    System,
+    Error,
+}
+
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum OutputLine {
-    /// Plain text line (user input echo, system messages).
-    Plain(String),
-    /// Styled line (prefix + content).
-    Styled { prefix: String, content: String },
-    /// Streaming partial — not yet finalized (LLM streaming).
+    User(String),
+    #[allow(dead_code)]
+    Assistant(String),
+    Tool { name: String },
+    ToolResult { name: String, summary: String, is_error: bool },
+    System(String),
+    Error(String),
     StreamingPartial(String),
-    /// Markdown content — will be rendered with syntax highlighting.
     Markdown(String),
 }
 
 impl OutputLine {
     #[allow(dead_code)]
+    pub fn kind(&self) -> OutputKind {
+        match self {
+            Self::User(_) => OutputKind::User,
+            Self::Assistant(_) => OutputKind::Assistant,
+            Self::Tool { .. } => OutputKind::Tool,
+            Self::ToolResult { .. } => OutputKind::ToolResult,
+            Self::System(_) => OutputKind::System,
+            Self::Error(_) => OutputKind::Error,
+            Self::StreamingPartial(_) => OutputKind::Assistant,
+            Self::Markdown(_) => OutputKind::Assistant,
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Plain(s) => s,
-            Self::Styled { content, .. } => content,
+            Self::User(s) => s,
+            Self::Assistant(s) => s,
+            Self::Tool { name } => name,
+            Self::ToolResult { summary, .. } => summary,
+            Self::System(s) => s,
+            Self::Error(s) => s,
             Self::StreamingPartial(s) => s,
             Self::Markdown(s) => s,
         }
     }
 }
 
-/// The output pane: a scrollable buffer of lines displayed in the upper region.
-///
-/// Performance: maintains a `rendered_cache` of pre-rendered ratatui `Line`s.
-/// Only new/changed lines are rendered; cached lines are reused across frames.
-/// Only visible lines are passed to the Paragraph widget.
 pub struct OutputPane {
     pub lines: Vec<OutputLine>,
-    /// Pre-rendered ratatui Lines, indexed 1:1 with `lines`.
-    /// `None` entries mean "not yet rendered" and will be rendered on demand.
     rendered_cache: Vec<Option<Vec<Line<'static>>>>,
-    /// Whether the cache is fully in sync with `lines`.
     cache_valid: bool,
-    /// Width used for last rendering — if changed, invalidate all cache.
     last_output_width: usize,
 }
 
 impl OutputPane {
-    /// Maximum lines to keep in the output buffer to prevent unbounded memory growth.
     const MAX_LINES: usize = 2000;
-    /// Maximum characters per line. Longer lines are truncated.
     const MAX_LINE_LEN: usize = 5000;
 
     pub fn new() -> Self {
@@ -56,16 +75,14 @@ impl OutputPane {
         }
     }
 
-    /// Push a complete line, trimming excess if necessary.
     pub fn push_line(&mut self, line: OutputLine) {
         let truncated = self.truncate_line(line);
         self.lines.push(truncated);
-        self.rendered_cache.push(None); // new line = not yet rendered
+        self.rendered_cache.push(None);
         self.cache_valid = false;
         self.trim_excess();
     }
 
-    /// Push a system-style message.
     pub fn push_system(&mut self, msg: &str) {
         let msg = if msg.len() > Self::MAX_LINE_LEN {
             let end = Self::safe_char_boundary(msg, Self::MAX_LINE_LEN);
@@ -73,16 +90,25 @@ impl OutputPane {
         } else {
             msg.to_string()
         };
-        self.lines.push(OutputLine::Styled {
-            prefix: "[system]".to_string(),
-            content: msg,
-        });
+        self.lines.push(OutputLine::System(msg));
         self.rendered_cache.push(None);
         self.cache_valid = false;
         self.trim_excess();
     }
 
-    /// Append a streaming text chunk.
+    pub fn push_error(&mut self, msg: &str) {
+        let msg = if msg.len() > Self::MAX_LINE_LEN {
+            let end = Self::safe_char_boundary(msg, Self::MAX_LINE_LEN);
+            format!("{}…[truncated]", &msg[..end])
+        } else {
+            msg.to_string()
+        };
+        self.lines.push(OutputLine::Error(msg));
+        self.rendered_cache.push(None);
+        self.cache_valid = false;
+        self.trim_excess();
+    }
+
     pub fn push_streaming_chunk(&mut self, chunk: &str) {
         if !chunk.contains('\n') {
             match self.lines.last_mut() {
@@ -141,13 +167,10 @@ impl OutputPane {
         self.trim_excess();
     }
 
-    /// Convert any trailing StreamingPartial to a Markdown line.
     pub fn finalize_streaming(&mut self) {
         if let Some(OutputLine::StreamingPartial(_)) = self.lines.last() {
-            // Swap the last line to Markdown in-place to avoid clone.
             if let Some(OutputLine::StreamingPartial(s)) = self.lines.pop() {
                 self.lines.push(OutputLine::Markdown(s));
-                // Invalidate the cache entry for this line.
                 if let Some(c) = self.rendered_cache.last_mut() {
                     *c = None;
                 }
@@ -156,12 +179,6 @@ impl OutputPane {
         self.cache_valid = false;
     }
 
-    /// Get the rendered Lines for the visible window only.
-    /// Returns `(visible_lines, total_rendered_lines)`.
-    ///
-    /// Only lines within the visible window are cloned; the rest stay in cache.
-    /// `inner_height` is the display area height in lines.
-    /// `scroll_offset` is 0 = bottom (most recent), increasing = scroll up.
     pub fn get_visible_lines(
         &mut self,
         output_width: usize,
@@ -169,7 +186,6 @@ impl OutputPane {
         scroll_offset: u16,
         mut render_fn: impl FnMut(&OutputLine, usize) -> Vec<Line<'static>>,
     ) -> (Vec<Line<'static>>, usize) {
-        // Populate cache for all entries.
         if output_width != self.last_output_width {
             for entry in &mut self.rendered_cache {
                 *entry = None;
@@ -188,19 +204,24 @@ impl OutputPane {
         }
         self.cache_valid = true;
 
-        // Calculate total rendered lines and visible window.
         let total: usize = self.rendered_cache
             .iter()
             .map(|e| e.as_ref().map_or(0, |v| v.len()))
             .sum();
 
-        let max_scroll = total.saturating_sub(inner_height);
-        let effective_scroll = max_scroll.saturating_sub(scroll_offset as usize);
-        let visible_start = total.saturating_sub(inner_height + effective_scroll).min(total);
-        let visible_count = inner_height.min(total);
-        let visible_end = visible_start + visible_count;
+        // scroll_offset = 0 means at bottom (newest), larger = scrolling up (older)
+        let effective_offset = scroll_offset as usize;
 
-        // Walk through cache, cloning only lines in [visible_start, visible_end).
+        // visible_start: 0 = top (oldest), total-inner_height = bottom (newest)
+        // We want to invert: scroll_offset=0 shows bottom, scroll_offset=max shows top
+        let visible_start = if total <= inner_height {
+            0
+        } else {
+            (total - inner_height).saturating_sub(effective_offset)
+        };
+        let visible_count = inner_height.min(total);
+        let visible_end = (visible_start + visible_count).min(total);
+
         let mut result = Vec::with_capacity(visible_count);
         let mut line_idx = 0usize;
         for entry in &self.rendered_cache {
@@ -222,7 +243,6 @@ impl OutputPane {
         (result, total)
     }
 
-    /// Prevents unbounded memory growth by trimming oldest lines.
     fn trim_excess(&mut self) {
         if self.lines.len() > Self::MAX_LINES {
             let drain_count = self.lines.len() - Self::MAX_LINES;
@@ -231,26 +251,51 @@ impl OutputPane {
         }
     }
 
-    /// Truncate a line if it exceeds MAX_LINE_LEN.
     fn truncate_line(&self, line: OutputLine) -> OutputLine {
         match line {
-            OutputLine::Plain(s) => {
+            OutputLine::User(s) => {
                 if s.len() > Self::MAX_LINE_LEN {
                     let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
-                    OutputLine::Plain(format!("{}…[truncated]", &s[..end]))
+                    OutputLine::User(format!("{}…[truncated]", &s[..end]))
                 } else {
-                    OutputLine::Plain(s)
+                    OutputLine::User(s)
                 }
             }
-            OutputLine::Styled { prefix, content } => {
-                if content.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(&content, Self::MAX_LINE_LEN);
-                    OutputLine::Styled {
-                        prefix,
-                        content: format!("{}…[truncated]", &content[..end]),
+            OutputLine::Assistant(s) => {
+                if s.len() > Self::MAX_LINE_LEN {
+                    let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
+                    OutputLine::Assistant(format!("{}…[truncated]", &s[..end]))
+                } else {
+                    OutputLine::Assistant(s)
+                }
+            }
+            OutputLine::Tool { name } => OutputLine::Tool { name },
+            OutputLine::ToolResult { name, summary, is_error } => {
+                if summary.len() > Self::MAX_LINE_LEN {
+                    let end = Self::safe_char_boundary(&summary, Self::MAX_LINE_LEN);
+                    OutputLine::ToolResult {
+                        name,
+                        summary: format!("{}…[truncated]", &summary[..end]),
+                        is_error,
                     }
                 } else {
-                    OutputLine::Styled { prefix, content }
+                    OutputLine::ToolResult { name, summary, is_error }
+                }
+            }
+            OutputLine::System(s) => {
+                if s.len() > Self::MAX_LINE_LEN {
+                    let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
+                    OutputLine::System(format!("{}…[truncated]", &s[..end]))
+                } else {
+                    OutputLine::System(s)
+                }
+            }
+            OutputLine::Error(s) => {
+                if s.len() > Self::MAX_LINE_LEN {
+                    let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
+                    OutputLine::Error(format!("{}…[truncated]", &s[..end]))
+                } else {
+                    OutputLine::Error(s)
                 }
             }
             OutputLine::StreamingPartial(s) => {
@@ -272,7 +317,6 @@ impl OutputPane {
         }
     }
 
-    /// Find the safe char boundary at or before `max_byte` offset.
     fn safe_char_boundary(s: &str, max_byte: usize) -> usize {
         s.char_indices()
             .take_while(|(i, _)| *i < max_byte)

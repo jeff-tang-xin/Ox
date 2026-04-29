@@ -7,6 +7,7 @@ pub mod file_write;
 pub mod git_commit;
 pub mod git_diff;
 pub mod git_status;
+pub mod memory_search;
 pub mod project_detect;
 pub mod shell_exec;
 pub mod web_fetch;
@@ -59,6 +60,13 @@ pub struct ToolContext {
     pub working_dir: std::path::PathBuf,
 }
 
+impl ToolContext {
+    /// Create a new ToolContext with the given runtime and working directory.
+    pub fn new(runtime: RuntimeEnvironment, working_dir: std::path::PathBuf) -> Self {
+        Self { runtime, working_dir }
+    }
+}
+
 /// Trait for all tools that the agent can invoke.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -108,6 +116,7 @@ impl ToolRegistry {
         registry.register(Box::new(git_diff::GitDiffTool));
         registry.register(Box::new(git_commit::GitCommitTool));
         registry.register(Box::new(web_fetch::WebFetchTool));
+        registry.register(Box::new(memory_search::MemorySearchTool));
 
         registry
     }

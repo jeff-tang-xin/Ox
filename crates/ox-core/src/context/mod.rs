@@ -27,16 +27,44 @@ pub struct ContextBuilder {
 
 impl Default for ContextBuilder {
     fn default() -> Self {
-        Self {
-            system_prompt_ratio: 0.02,
-            memory_ratio: 0.02,
-            history_ratio: 0.36,
-            reply_reserve_ratio: 0.59,
-        }
+        Self::new()
     }
 }
 
 impl ContextBuilder {
+    /// Create a new ContextBuilder with default ratios.
+    pub fn new() -> Self {
+        Self {
+            system_prompt_ratio: 0.02,
+            memory_ratio: 0.02,
+            history_ratio: 0.10,  // 10% for history
+            reply_reserve_ratio: 0.85,
+        }
+    }
+
+    /// Create a ContextBuilder from ContextConfig ratios.
+    pub fn from_config(config: &crate::config::ContextConfig) -> Self {
+        let user_ratio_sum = config.history_ratio + config.memory_ratio + config.system_prompt_ratio;
+        let reply_reserve = if user_ratio_sum >= 1.0 {
+            0.0  // Fallback if ratios are invalid
+        } else {
+            1.0 - user_ratio_sum
+        };
+
+        Self {
+            system_prompt_ratio: config.system_prompt_ratio,
+            memory_ratio: config.memory_ratio,
+            history_ratio: config.history_ratio,
+            reply_reserve_ratio: reply_reserve,
+        }
+    }
+
+    /// Get the history ratio (0.10 = 10% of context window).
+    pub fn history_ratio(&self) -> f32 {
+        self.history_ratio
+    }
+
+    /// Calculate token budgets based on model context window.
     /// Calculate token budgets based on model context window.
     pub fn budgets(&self, context_window: u32) -> TokenBudgets {
         TokenBudgets {
@@ -51,7 +79,7 @@ impl ContextBuilder {
     /// Assemble the final message list for an LLM call.
     ///
     /// Strategy: system prompt first, then memory context, then fill history
-    /// from newest to oldest until the history budget is exhausted.
+    /// from newest to oldest within budget.
     pub fn build(
         &self,
         system_prompt: &str,
@@ -63,15 +91,17 @@ impl ContextBuilder {
 
         let mut result = Vec::new();
 
-        // 1. System prompt (always included).
-        result.push(Message::system(system_prompt));
+        // 1. System prompt + Memory context (merged into ONE system message for MiniMax compatibility).
+        let combined_system = if !memory_context.is_empty() {
+            format!("{}\n\n{}",
+                system_prompt.trim_end_matches('\n'),
+                memory_context.trim_start_matches('\n'))
+        } else {
+            system_prompt.to_string()
+        };
+        result.push(Message::system(&combined_system));
 
-        // 2. Memory context (if non-empty).
-        if !memory_context.is_empty() {
-            result.push(Message::system(memory_context));
-        }
-
-        // 3. Fill history from newest to oldest within budget.
+        // 2. Fill history from newest to oldest within budget.
         let history_budget = budgets.history as usize;
         let mut used_tokens: usize = 0;
         let mut selected_indices: Vec<usize> = Vec::new();

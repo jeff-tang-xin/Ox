@@ -39,7 +39,6 @@ impl OxConfig {
         };
 
         if !path.exists() {
-            tracing::debug!("Config file not found at {}, using defaults", path.display());
             return Ok(Self::default());
         }
 
@@ -48,7 +47,6 @@ impl OxConfig {
         let mut config: OxConfig = toml::from_str(&content)?;
         // Migrate legacy flat API key fields to providers.
         config.models.migrate_legacy(&raw);
-        tracing::info!("Config loaded from {}", path.display());
         Ok(config)
     }
 
@@ -134,6 +132,7 @@ default = "gpt-4o"
 api_key = ""
 # base_url = "https://api.openai.com/v1"
 # max_tokens = 4096
+# stream_usage = true  # Enable for usage tracking (official OpenAI only)
 
 [models.providers.anthropic]
 api_key = ""
@@ -153,6 +152,32 @@ api_key = ""
 # Explicit model→provider mapping (overrides prefix inference and default_provider).
 # [models.model_providers]
 # "deepseek-v4-pro" = "openai"
+
+# ── Embedding Compression (KadaneDial) ──
+# Uses BGE embedding model for semantic context compression.
+# Triggers automatically when history tokens exceed history budget.
+# The history budget is calculated as: context_window * history_ratio (default 10%).
+# This ratio is controlled by [context] history_ratio below.
+
+[models.embedding]
+enabled = false
+# model_path = "~/.ox/models/bge-small-zh-v1.5"  # Path to BGE model (ModelScope format)
+# threshold = 0.0   # Z-score threshold for relevance filtering
+# stop_threshold = 0.5  # Stop when gain drops below this
+# max_segments = 5  # Maximum segments to select
+# min_segment_len = 2  # Minimum messages per segment
+# keep_recent = 4  # Always keep N recent messages
+# chunk_threshold_tokens = 256  # Split messages longer than this
+# max_chunk_tokens = 512  # Max tokens per chunk when splitting
+
+# ── Context Budget Configuration ──
+# Token budget allocation ratios for model context window.
+# Ratios must sum to ≤ 1.0 (remaining is for user input).
+
+[context]
+# history_ratio = 0.10  # 10% of context window for history (triggers compression when exceeded)
+# memory_ratio = 0.02    # 2% for memory context
+# system_prompt_ratio = 0.02  # 2% for system prompt
 
 [agent]
 # max_iterations = 25
@@ -266,6 +291,15 @@ pub struct ContextConfig {
     pub memory_budget_tokens: usize,
     pub history_budget_tokens: usize,
     pub reply_reserve_tokens: usize,
+    /// Token budget ratio for history (triggers compression when exceeded).
+    /// Default: 0.10 (10% of context window).
+    pub history_ratio: f32,
+    /// Token budget ratio for memory context.
+    /// Default: 0.02 (2% of context window).
+    pub memory_ratio: f32,
+    /// Token budget ratio for system prompt.
+    /// Default: 0.02 (2% of context window).
+    pub system_prompt_ratio: f32,
 }
 
 impl Default for ContextConfig {
@@ -275,6 +309,9 @@ impl Default for ContextConfig {
             memory_budget_tokens: 2000,
             history_budget_tokens: 50000,
             reply_reserve_tokens: 73000,
+            history_ratio: 0.10,
+            memory_ratio: 0.02,
+            system_prompt_ratio: 0.02,
         }
     }
 }
@@ -312,6 +349,52 @@ pub struct ProviderConfig {
     pub base_url: String,
     /// Max tokens for response. None = use provider's built-in default.
     pub max_tokens: Option<u32>,
+    /// Whether to send stream_options for usage tracking.
+    /// Default false. Set true only for official OpenAI API if you need usage stats.
+    pub stream_usage: Option<bool>,
+    /// Disable tools/function calling for this provider.
+    /// Set true for providers like MiniMax that don't support tools.
+    pub disable_tools: Option<bool>,
+}
+
+/// Configuration for embedding-based context compression (KadaneDial).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// Enable embedding-based compression.
+    pub enabled: bool,
+    /// Path to BGE model directory (ModelScope format with safetensors).
+    pub model_path: Option<String>,
+    /// Z-score threshold for relevance filtering (higher = stricter).
+    pub threshold: f32,
+    /// Stop when cumulative gain drops below this threshold.
+    pub stop_threshold: f32,
+    /// Maximum number of segments to select.
+    pub max_segments: usize,
+    /// Minimum length of each segment (in message pairs).
+    pub min_segment_len: usize,
+    /// Always keep this many recent messages.
+    pub keep_recent: usize,
+    /// Token threshold for chunking: messages shorter than this are kept as single chunk.
+    pub chunk_threshold_tokens: usize,
+    /// Maximum tokens per chunk when splitting long messages.
+    pub max_chunk_tokens: usize,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: None,
+            threshold: 0.0,
+            stop_threshold: 0.5,
+            max_segments: 5,
+            min_segment_len: 2,
+            keep_recent: 4,
+            chunk_threshold_tokens: 256,
+            max_chunk_tokens: 512,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +414,9 @@ pub struct ModelsConfig {
     /// Takes priority over `resolve_provider_name()` prefix inference and `default_provider`.
     #[serde(default)]
     pub model_providers: HashMap<String, String>,
+    /// Embedding-based compression configuration (KadaneDial).
+    #[serde(default)]
+    pub embedding: Option<EmbeddingConfig>,
 }
 
 impl Default for ModelsConfig {
@@ -343,6 +429,7 @@ impl Default for ModelsConfig {
             providers: HashMap::new(),
             default_provider: String::new(),
             model_providers: HashMap::new(),
+            embedding: None,
         }
     }
 }

@@ -116,7 +116,7 @@ impl CouncilOrchestrator {
                 session.phases.push(DebatePhase::CrossReview(reviews));
             }
         } else if all_high {
-            tracing::info!("Council early convergence: all review scores >= {:.2}, skipping rebuttals",
+            tracing::warn!("Council early convergence: all review scores >= {:.2}, skipping rebuttals",
                 self.council_config.early_convergence_threshold);
         }
 

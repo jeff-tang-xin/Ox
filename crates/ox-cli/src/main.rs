@@ -22,6 +22,7 @@ use ox_core::config::OxConfig;
 use ox_core::config::AgentConfig;
 use ox_core::context::{self, ContextBuilder};
 use ox_core::cost::CostTracker;
+use ox_core::embedding::{CompressionManager, KadaneConfig};
 use ox_core::llm::{self, LlmProvider, ProviderResolveInfo};
 use ox_core::memory::MemoryManager;
 use ox_core::message::{Message, Session};
@@ -34,6 +35,195 @@ use terminal::event::{Event, EventHandler};
 use terminal::output_pane::OutputLine;
 use terminal::render;
 
+const REPLAY_HISTORY_DEPTH: usize = 20;
+
+/// Session action signaled by slash commands, processed in the main event loop.
+#[derive(Debug, Clone, Default)]
+pub enum SessionAction {
+    #[default]
+    None,
+    New,
+    Resume { filename: String },
+}
+
+/// Replay the last N messages from a session into the OutputPane.
+/// Also updates app.header_info and app.message_count.
+fn replay_session_history(
+    app: &mut App,
+    messages: &[Message],
+    rt_env: &runtime::RuntimeEnvironment,
+    has_provider: bool,
+) {
+    app.output.clear();
+
+    let start = messages.len().saturating_sub(REPLAY_HISTORY_DEPTH);
+    let slice = &messages[start..];
+    if slice.is_empty() {
+        app.header_info.clear();
+        app.header_info.push(rt_env.banner_summary());
+        if has_provider {
+            app.header_info.push("Type a message or /help. /exit to quit.".into());
+        } else {
+            app.header_info.push("No API key. Running in echo mode.".into());
+        }
+        app.working_dir = rt_env.working_dir.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| rt_env.working_dir.display().to_string());
+        app.message_count = messages.len();
+        return;
+    }
+
+    app.output.push_line(OutputLine::System(format!(
+        "--- {} messages ---",
+        slice.len()
+    )));
+
+    let mut tc_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for msg in slice {
+        match msg {
+            Message::System { .. } => {} // Skip system prompts in display
+            Message::User { content } => {
+                app.output.push_line(OutputLine::User(content.clone()));
+            }
+            Message::Assistant { content, tool_calls } => {
+                if !content.is_empty() {
+                    app.output.push_line(OutputLine::Markdown(content.clone()));
+                }
+                for tc in tool_calls {
+                    tc_map.insert(tc.id.clone(), tc.name.clone());
+                    app.output.push_line(OutputLine::Tool { name: tc.name.clone() });
+                }
+            }
+            Message::ToolResult { tool_call_id, content } => {
+                let name = tc_map.get(tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| "tool".into());
+                let summary = summarize_tool_result(&name, content);
+                let is_error = content.starts_with("Error:") || content.starts_with("Unknown tool");
+                app.output.push_line(OutputLine::ToolResult { name, summary, is_error });
+            }
+        }
+    }
+
+    app.output.push_line(OutputLine::System("--- end ---".to_string()));
+
+    // Update header and status bar.
+    app.header_info.clear();
+    app.header_info.push(rt_env.banner_summary());
+    if has_provider {
+        app.header_info.push("Type a message or /help. /exit to quit.".into());
+    } else {
+        app.header_info.push("No API key. Running in echo mode.".into());
+    }
+    app.working_dir = rt_env.working_dir.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| rt_env.working_dir.display().to_string());
+    app.message_count = messages.len();
+}
+
+/// Refresh header_info from current runtime state.
+fn refresh_header_info(
+    app: &mut App,
+    rt_env: &runtime::RuntimeEnvironment,
+    has_provider: bool,
+) {
+    app.header_info.clear();
+    app.header_info.push(rt_env.banner_summary());
+    if has_provider {
+        app.header_info.push("Type a message or /help. /exit to quit.".into());
+    } else {
+        app.header_info.push("No API key. Running in echo mode.".into());
+    }
+    app.working_dir = rt_env.working_dir.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| rt_env.working_dir.display().to_string());
+}
+
+/// Extract session display name from first user message (max 6 chars).
+fn session_display_name(session: &Session) -> String {
+    session.messages
+        .iter()
+        .find_map(|m| match m {
+            Message::User { content } => {
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    let first_line = trimmed.lines().next().unwrap_or(trimmed);
+                    let display = if first_line.chars().count() > 6 {
+                        format!("{}..", first_line.chars().take(6).collect::<String>())
+                    } else {
+                        first_line.to_string()
+                    };
+                    Some(display)
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| "new session".to_string())
+}
+
+fn summarize_tool_result(name: &str, output: &str) -> String {
+    match name {
+        "file_write" | "file_patch" => {
+            let first_line = output.lines().next().unwrap_or(output);
+            let truncated: String = first_line.chars().take(120).collect();
+            if first_line.len() > 120 { format!("{truncated}...") } else { truncated }
+        }
+        "file_read" => {
+            let line_count = output.lines().count();
+            let first_path = output.lines().next()
+                .and_then(|l| l.split_whitespace().next())
+                .unwrap_or("");
+            if first_path.is_empty() {
+                format!("{line_count} lines")
+            } else {
+                format!("{first_path} ({line_count} lines)")
+            }
+        }
+        "code_search" => {
+            let match_count = output.lines().take(101).count();
+            if output.contains("truncated") {
+                format!("100+ matches")
+            } else if match_count == 0 {
+                "no matches".into()
+            } else {
+                format!("{match_count} matches")
+            }
+        }
+        "shell_exec" => {
+            if let Some(line) = output.lines().find(|l| l.starts_with("[exit code:")) {
+                format!("{line}")
+            } else {
+                let count = output.lines().count();
+                format!("{count} lines")
+            }
+        }
+        "file_list" | "file_search" => {
+            let count = output.lines().count();
+            format!("{count} entries")
+        }
+        "project_detect" => {
+            let first_line = output.lines().next().unwrap_or(output);
+            let truncated: String = first_line.chars().take(120).collect();
+            truncated
+        }
+        "git_status" | "git_diff" | "git_commit" => {
+            let count = output.lines().count();
+            format!("{count} lines")
+        }
+        "web_fetch" => {
+            let len = output.len();
+            format!("{len} chars")
+        }
+        _ => {
+            let truncated: String = output.chars().take(120).collect();
+            if output.len() > 120 { format!("{truncated}...") } else { truncated }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Detect runtime early to get home_dir for log file path.
@@ -42,7 +232,8 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&log_dir);
     let log_file_path = log_dir.join("ox.log");
 
-    // Initialize logging: stderr (for TUI) + file (~/.ox/logs/ox.log).
+    // Initialize logging: file only (~/.ox/logs/ox.log).
+    // No stderr output in TUI mode to prevent display corruption.
     if let Ok(log_file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -51,27 +242,21 @@ async fn main() -> anyhow::Result<()> {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
         use tracing_subscriber::Layer;
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ox=warn"));
-        let stderr_layer = tracing_subscriber::fmt::layer()
-            .with_writer(io::stderr)
-            .with_filter(env_filter.clone());
+        // Capture info+ to file, silent on terminal
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ox=info"));
         let file_layer = tracing_subscriber::fmt::layer()
             .with_writer(std::sync::Mutex::new(log_file))
             .with_ansi(false)
-            .with_filter(env_filter);
+            .with_filter(filter);
         tracing_subscriber::registry()
-            .with(stderr_layer)
             .with(file_layer)
             .init();
     } else {
-        // Fallback: stderr only.
+        // Fallback: disable logging if file can't be opened
+        use tracing_subscriber::filter::LevelFilter;
         tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ox=warn")),
-            )
-            .with_writer(io::stderr)
+            .with_max_level(LevelFilter::OFF)
             .init();
     }
 
@@ -89,13 +274,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Detect runtime environment.
     let rt_env = runtime::detect_runtime();
-    tracing::info!("{}", rt_env.banner_summary());
 
     // Try to create LLM provider (may fail if no API key).
     let (provider, resolve_info): (Option<Arc<dyn LlmProvider>>, Option<ProviderResolveInfo>) =
         match llm::create_provider_with_info(&config.models.default, &config.models) {
             Ok((p, info)) => {
-                tracing::info!("LLM provider: {}", p.model_name());
                 (Some(Arc::from(p)), Some(info))
             }
             Err(e) => {
@@ -161,28 +344,18 @@ async fn run_app(
         .unwrap_or_else(|| rt_env.working_dir.display().to_string());
     app.message_count = 0;
 
-    // Show startup banner with runtime info.
-    app.output.push_line(OutputLine::Styled {
-        prefix: "Ox".to_string(),
-        content: "v0.1.0 — AI Programming Assistant".to_string(),
-    });
-    app.output
-        .push_line(OutputLine::Plain(rt_env.banner_summary()));
+    // Set header info (fixed, non-scrolling).
+    app.header_info.push(rt_env.banner_summary());
+    if provider.is_some() {
+        app.header_info.push("Type a message or /help for commands. /exit to quit.".to_string());
+    } else {
+        app.header_info.push("No API key. Set env var or config. Running in echo mode.".to_string());
+    }
 
     // Startup check: warn if no config file exists.
     if !OxConfig::config_exists() {
         app.output.push_system(
             "No config file found. Run /init to create ~/.ox/config.toml with default settings.",
-        );
-    }
-
-    if provider.is_some() {
-        app.output.push_line(OutputLine::Plain(
-            "Type a message or /help for commands. /exit to quit.".to_string(),
-        ));
-    } else {
-        app.output.push_system(
-            "No API key configured. Set env var or [models.providers.*] api_key in ~/.ox/config.toml. Running in echo mode.",
         );
     }
 
@@ -192,10 +365,12 @@ async fn run_app(
     let mut session = if config.session.auto_restore {
         match Session::load(&session_dir)? {
             Some(s) => {
-                app.output.push_line(OutputLine::Plain(format!(
+                app.output.push_line(OutputLine::System(format!(
                     "Session restored ({} messages)",
                     s.user_message_count()
                 )));
+                // Replay session history into output pane.
+                replay_session_history(&mut app, &s.messages, &rt_env, provider.is_some());
                 s
             }
             None => Session::new(&session_dir, &rt_env.project_id)?,
@@ -203,16 +378,30 @@ async fn run_app(
     } else {
         Session::new(&session_dir, &rt_env.project_id)?
     };
-    app.output.push_line(OutputLine::Plain(String::new()));
+
+    // Populate sidebar with archived sessions.
+    {
+        let archived = Session::list_archived(&session_dir);
+        for (filename, info) in archived {
+            app.sessions.push(terminal::app::SessionEntry {
+                filename,
+                info,
+                is_active: false,
+            });
+        }
+    }
+    app.sessions.insert(0, terminal::app::SessionEntry {
+        filename: "current".to_string(),
+        info: session_display_name(&session),
+        is_active: true,
+    });
 
     // Create tool registry and context (shared via Arc for tokio::spawn).
     let tool_registry = Arc::new(ToolRegistry::new());
-    let tool_ctx = Arc::new(ToolContext {
-        runtime: rt_env.clone(),
-        working_dir: rt_env.working_dir.clone(),
-    });
-
-    tracing::info!("Tools registered: {:?}", tool_registry.names());
+    let tool_ctx = Arc::new(ToolContext::new(
+        rt_env.clone(),
+        rt_env.working_dir.clone(),
+    ));
 
     // Build system prompt using context module.
     let mut persona_vector = ox_core::persona::PersonaVector::for_language(
@@ -221,28 +410,39 @@ async fn run_app(
     let system_prompt = context::build_system_prompt(&rt_env, &tool_registry, None, Some(&persona_vector), Some(&config.behavior_rules));
 
     // Context builder for assembling LLM messages within token budgets.
-    let context_builder = ContextBuilder::default();
+    // Uses ratios from config if available.
+    let context_builder = ContextBuilder::from_config(&config.context);
     let context_window = provider
         .as_ref()
         .map(|p| p.context_window_size())
         .unwrap_or(128_000);
 
-    // Cost tracking — system-level: ~/.ox/db/
+    // Cost tracking -- system-level: ~/.ox/db/
     let db_dir = rt_env.ox_home_dir.join("db");
     let mut cost_tracker = CostTracker::load_or_create(&db_dir).unwrap_or_else(|e| {
         tracing::warn!("Failed to load cost tracker: {e}");
         CostTracker::load_or_create(&std::env::temp_dir()).expect("temp dir fallback")
     });
 
-    // Memory system — system-level: ~/.ox/db/memories_*.db
+    // Memory system -- system-level: ~/.ox/db/memories_*.db
     let mut memory = MemoryManager::init(&rt_env.ox_home_dir, &rt_env.project_id, &config.memory)
         .unwrap_or_else(|e| {
             tracing::warn!("Failed to init memory system: {e}");
-            // Fallback to temp dir.
             let temp = std::env::temp_dir();
             MemoryManager::init(&temp, &rt_env.project_id, &config.memory)
                 .expect("memory init with temp dir")
         });
+
+    // Probabilistic janitor run on startup (20% chance).
+    if rand::random::<f64>() < config.memory.janitor_run_on_startup_prob {
+        memory.run_janitor(0.3, config.memory.max_nodes);
+    }
+
+    // Create tool context (memory is pre-injected into context by main.rs)
+    let tool_ctx = Arc::new(ToolContext::new(
+        rt_env.clone(),
+        rt_env.working_dir.clone(),
+    ));
 
     // Model name for cost recording.
     let mut model_name = provider
@@ -268,8 +468,59 @@ async fn run_app(
     // Agent config (shared with spawned task).
     let agent_config = Arc::new(config.agent.clone());
 
+    // Compression manager for context compression (KadaneDial).
+    // Uses history_ratio from ContextBuilder for consistent configuration.
+    let compression_manager: Option<CompressionManager> = if let Some(ref emb_config) = config.models.embedding {
+        if emb_config.enabled {
+            let model_path = emb_config.model_path.as_ref()
+                .map(|p| {
+                    let p = p.replace('~', &dirs::home_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .to_string_lossy());
+                    std::path::PathBuf::from(p)
+                })
+                .unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join(".ox/models/bge-small-zh-v1.5")
+                });
+
+            let kadane_config = KadaneConfig {
+                threshold: emb_config.threshold,
+                stop_threshold: emb_config.stop_threshold,
+                max_segments: emb_config.max_segments,
+                min_segment_len: emb_config.min_segment_len,
+                keep_recent: emb_config.keep_recent,
+                chunk_threshold_tokens: emb_config.chunk_threshold_tokens,
+                max_chunk_tokens: emb_config.max_chunk_tokens,
+            };
+
+            match ox_core::embedding::BgeEmbedder::load(&model_path) {
+                Ok(emb) => {
+                    tracing::info!("Embedding model loaded: {:?}", model_path);
+                    // Use history_ratio from ContextBuilder for consistent configuration
+                    Some(CompressionManager::new(emb, kadane_config, context_builder.history_ratio()))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load embedding model: {}. Compression disabled.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Tick counter for spinner animation.
     let mut tick_count: u64 = 0;
+
+    // Session action signaled from slash commands.
+    let mut session_action: SessionAction = SessionAction::None;
+
+    // Holds the old session when switching during agent run.
+    let mut background_session: Option<Session> = None;
 
     loop {
         // Only re-render when dirty or agent is running (for spinner animation).
@@ -294,7 +545,7 @@ async fn run_app(
                             &tool_registry,
                             &tool_ctx,
                             &context_builder,
-                            &system_prompt,
+                            &&system_prompt,
                             context_window,
                             &mut cost_tracker,
                             &trust_manager,
@@ -305,7 +556,71 @@ async fn run_app(
                             &resolve_info,
                             &config,
                             &agent_config,
+                            &mut session_action,
+                            &compression_manager,
                         );
+                        // Process session switch action.
+                        match session_action {
+                            SessionAction::New => {
+                                // Archive current session (it stays in the old context).
+                                let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
+                                if app.agent_running {
+                                    // Move current session to background, create new one
+                                    let project_id = rt_env.project_id.clone();
+                                    let new_s = Session::new(&session_dir, &project_id)
+                                        .expect("failed to create new session");
+                                    background_session = Some(std::mem::replace(&mut session, new_s));
+                                } else {
+                                    let project_id = rt_env.project_id.clone();
+                                    match Session::new(&session_dir, &project_id) {
+                                        Ok(s) => {
+                                            session = s;
+                                            app.output.clear();
+                                            app.output.push_system("New session started.");
+                                            refresh_header_info(&mut app, &rt_env, provider.is_some());
+                                            app.message_count = 0;
+                                        }
+                                        Err(e) => {
+                                            app.output.push_system(&format!("Failed to create session: {e}"));
+                                        }
+                                    }
+                                }
+                            }
+                            SessionAction::Resume { filename } => {
+                                let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
+                                if app.agent_running {
+                                    match Session::load_archived(&session_dir, &filename) {
+                                        Ok(Some(archived)) => {
+                                            background_session = Some(std::mem::replace(&mut session, archived));
+                                        }
+                                        _ => {}
+                                    }
+                                } else {
+                                    match Session::load_archived(&session_dir, &filename) {
+                                        Ok(Some(archived)) => {
+                                            if let Err(e) = session.archive(&session_dir) {
+                                                tracing::warn!("Failed to archive: {e}");
+                                            }
+                                            session = archived;
+                                            replay_session_history(&mut app, &session.messages, &rt_env, provider.is_some());
+                                            app.output.push_system(&format!(
+                                                "Session restored: {} messages from {}",
+                                                session.messages.len(), filename
+                                            ));
+                                        }
+                                        Ok(None) => {
+                                            app.output.push_system(&format!("Session '{}' not found.", filename));
+                                        }
+                                        Err(e) => {
+                                            app.output.push_system(&format!("Failed to resume: {e}"));
+                                        }
+                                    }
+                                }
+                            }
+                            SessionAction::None => {}
+                        }
+                        session_action = SessionAction::None;
+
                         if let Some(new_model_name) = app.pending_model_switch.take() {
                             match llm::create_provider_with_info(&new_model_name, &config.models) {
                                 Ok((new_provider, new_info)) => {
@@ -336,8 +651,7 @@ async fn run_app(
                     }
                     Some(Event::ScrollDown) => {
                         app.scroll_down(3);
-                        // If scrolled back to bottom, resume auto-scroll.
-                        if app.scroll_offset == 0 {
+                        if app.scroll_offset < 3 {
                             app.user_scrolled = false;
                         }
                         app.dirty = true;
@@ -354,31 +668,26 @@ async fn run_app(
             }
             agent_ev = agent_rx.recv() => {
                 if let Some(ev) = agent_ev {
+                    // When switching sessions during agent run, write to background session.
+                    let target_session = background_session.as_mut().unwrap_or(&mut session);
                     match ev {
                         AgentToUiEvent::TextChunk(text) => {
                             app.output.push_streaming_chunk(&text);
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
-                        AgentToUiEvent::ToolStart { name, id } => {
-                            app.output.push_line(OutputLine::Styled {
-                                prefix: "Tool".to_string(),
-                                content: format!("{name} [{id}]"),
-                            });
+                        AgentToUiEvent::ToolStart { name, id: _ } => {
+                            app.output.push_line(OutputLine::Tool { name: name.clone() });
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
                         AgentToUiEvent::ToolResult { name, output, is_error } => {
-                            let status = if is_error { "ERROR" } else { "OK" };
-                            let display_output = if output.len() > 200 {
-                                let end = output.char_indices().take_while(|(i, _)| *i < 200).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
-                                format!("{}...(truncated)", &output[..end])
-                            } else {
-                                output
-                            };
-                            app.output.push_line(OutputLine::Plain(
-                                format!("  [{name} {status}] {display_output}")
-                            ));
+                            let summary = summarize_tool_result(&name, &output);
+                            app.output.push_line(OutputLine::ToolResult {
+                                name: name.clone(),
+                                summary,
+                                is_error,
+                            });
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
@@ -386,40 +695,113 @@ async fn run_app(
                             app.output.finalize_streaming();
                             // Persist all new messages from this turn.
                             for msg in &new_messages {
-                                if let Err(e) = session.append_message(msg.clone()) {
+                                if let Err(e) = target_session.append_message(msg.clone()) {
                                     tracing::error!("Failed to persist message: {e}");
                                 }
                             }
                             // Record cost.
                             cost_tracker.record(&model_name, &usage);
                             // Extract memories from this turn.
-                            memory.update_from_turn(&new_messages, &rt_env.project_id, "");
-                            app.agent_running = false;
-                            app.status = String::new();
-                            // Clear any stale pending confirmation.
-                            app.pending_confirmation = None;
-                            // Update status bar info.
-                            app.message_count = session.messages.len();
-                            app.cost_summary = cost_tracker.summary_short();
+                            memory.update_from_turn(&new_messages, &rt_env.project_id, &rt_env.project_language);
 
-                            // Reset interrupt controller for next turn.
-                            interrupt_ctrl.reset();
+                            if background_session.is_some() {
+                                // Agent finished in background session, clear background.
+                                background_session = None;
+                                app.output.push_system("Background session completed and saved.");
+                            } else {
+                                app.agent_running = false;
+                                app.status = String::new();
+                                // Clear any stale pending confirmation.
+                                app.pending_confirmation = None;
+                                // Update status bar info.
+                                app.message_count = session.messages.len();
+                                app.cost_summary = cost_tracker.summary_short();
+                                // Reset interrupt controller for next turn.
+                                interrupt_ctrl.reset();
+                                // Process any interjection messages queued during the turn.
+                                let interjections_vec: Vec<String> = interjection_buf.drain();
+                                if !interjections_vec.is_empty() {
+                                    // Show all queued messages
+                                    for inj_text in &interjections_vec {
+                                        app.output.push_line(OutputLine::User(format!("(queued) {}", inj_text)));
+                                    }
+                                    // The LAST interjection becomes the next user message and triggers a new agent run.
+                                    if let Some(last) = interjections_vec.last() {
+                                        app.output.push_line(OutputLine::System(String::new()));
+                                        let user_msg = Message::user(last);
+                                        if let Err(e) = session.append_message(user_msg) {
+                                            tracing::error!("Failed to persist interjection: {e}");
+                                        }
+                                        // Trigger new agent run with the interjection message
+                                        let text = last.clone();
+                                        let memory_nodes = memory.retrieve(&text, &Some(rt_env.project_id.as_str()), 5);
+                                        let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
+                                        memory.reinforce_accessed(&accessed_ids);
+                                        let memory_ctx = memory.format_memory_context(&memory_nodes, false);
 
-                            // Process any interjection messages queued during the turn.
-                            let interjections = interjection_buf.drain();
-                            if !interjections.is_empty() {
-                                for inj_text in &interjections {
-                                    app.output.push_line(OutputLine::Styled {
-                                        prefix: "You".to_string(),
-                                        content: format!("(queued) {inj_text}"),
-                                    });
-                                }
-                                // Queue the last interjection as the next user message.
-                                if let Some(last) = interjections.into_iter().last() {
-                                    app.output.push_line(OutputLine::Plain(String::new()));
-                                    let user_msg = Message::user(&last);
-                                    if let Err(e) = session.append_message(user_msg) {
-                                        tracing::error!("Failed to persist interjection: {e}");
+                                        let turn_messages = if let Some(cm) = compression_manager.as_ref() {
+                                            let context_tokens = cm.calculate_context_tokens(&session.messages);
+                                            let history_budget = (context_window as f32 * context_builder.history_ratio() * 0.8) as usize;
+                                            let should_compress = context_tokens >= history_budget;
+                                            let base_messages = context_builder.build(
+                                                &system_prompt,
+                                                &memory_ctx,
+                                                &session.messages,
+                                                context_window,
+                                            );
+                                            if should_compress {
+                                                match cm.compress(&session.messages, &text) {
+                                                    Ok(Some(compressed)) => {
+                                                        app.output.push_line(OutputLine::System(
+                                                            format!("Context compressed: {} msgs ({} tokens) -> {} msgs",
+                                                                session.messages.len(), context_tokens, compressed.len())
+                                                        ));
+                                                        compressed
+                                                    }
+                                                    _ => base_messages,
+                                                }
+                                            } else {
+                                                base_messages
+                                            }
+                                        } else {
+                                            context_builder.build(&system_prompt, &memory_ctx, &session.messages, context_window)
+                                        };
+
+                                        app.agent_running = true;
+                                        app.status = "Thinking...".to_string();
+                                        let provider = Arc::clone(provider.as_ref().unwrap());
+                                        let tx = agent_tx.clone();
+                                        let registry = Arc::clone(&tool_registry);
+                                        let ctx = Arc::clone(&tool_ctx);
+                                        let cancel_token = interrupt_ctrl.token();
+                                        let tm = Arc::clone(&trust_manager);
+                                        let ac = Arc::clone(&agent_config);
+                                        let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
+                                        app.ui_to_agent_tx = Some(ui_to_agent_tx);
+                                        tokio::spawn(async move {
+                                            agent::run_agent_turn(
+                                                provider,
+                                                turn_messages,
+                                                registry,
+                                                ctx,
+                                                tx,
+                                                ui_to_agent_rx,
+                                                cancel_token,
+                                                tm,
+                                                ac,
+                                            )
+                                            .await;
+                                        });
+                                        // Keep agent_running=true, don't reset to false
+                                        app.scroll_to_bottom();
+                                        app.dirty = true;
+                                        // Skip the normal reset logic below since we're starting a new run
+                                        app.message_count = session.messages.len();
+                                        app.cost_summary = cost_tracker.summary_short();
+                                        if !app.user_scrolled { app.scroll_to_bottom(); }
+                                        app.dirty = true;
+                                        // Continue to next iteration of the event loop, don't fall through
+                                        continue;
                                     }
                                 }
                             }
@@ -429,9 +811,13 @@ async fn run_app(
                         }
                         AgentToUiEvent::Error(err) => {
                             app.output.finalize_streaming();
-                            app.output.push_system(&format!("Error: {err}"));
-                            app.agent_running = false;
-                            app.status = String::new();
+                            app.output.push_error(&format!("{err}"));
+                            if background_session.is_some() {
+                                background_session = None;
+                            } else {
+                                app.agent_running = false;
+                                app.status = String::new();
+                            }
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
@@ -451,14 +837,8 @@ async fn run_app(
                                 .as_ref()
                                 .map(|w| format!(" [{}]", w))
                                 .unwrap_or_default();
-                            app.output.push_line(OutputLine::Styled {
-                                prefix: "Confirm".to_string(),
-                                content: format!(
-                                    "{} {:?}{}: {}",
-                                    tool_name, safety_level, warning_str, args_summary
-                                ),
-                            });
-                            app.output.push_line(OutputLine::Plain(
+                            app.output.push_line(OutputLine::Tool { name: format!("Confirm {} {:?}{}: {}", tool_name, safety_level, warning_str, args_summary) });
+                            app.output.push_line(OutputLine::System(
                                 "  [Y] Allow / [N] Deny / [T] Trust always".to_string(),
                             ));
                             // Store pending confirmation for key handling.
@@ -475,13 +855,10 @@ async fn run_app(
                             app.dirty = true;
                         }
                         AgentToUiEvent::BudgetExceeded { total_tokens, estimated_cost } => {
-                            app.output.push_line(OutputLine::Styled {
-                                prefix: "Budget".to_string(),
-                                content: format!(
-                                    "Token limit reached: {} tokens, est. cost: {}. Continue? [Y/N]",
-                                    total_tokens, estimated_cost
-                                ),
-                            });
+                            app.output.push_line(OutputLine::System(format!(
+                                "Token limit reached: {} tokens, est. cost: {}. Continue? [Y/N]",
+                                total_tokens, estimated_cost
+                            )));
                             app.pending_confirmation = Some(PendingConfirmation {
                                 tool_call_id: "__budget__".into(),
                                 tool_name: "budget".into(),
@@ -492,7 +869,7 @@ async fn run_app(
                         AgentToUiEvent::CouncilDone { session: council_session } => {
                             let summary = council_session.format_summary();
                             for line in summary.lines() {
-                                app.output.push_line(OutputLine::Plain(line.to_string()));
+                                app.output.push_line(OutputLine::System(line.to_string()));
                             }
                             // Store council conclusion to memory
                             if let Some(ref arb) = council_session.arbitration {
@@ -506,8 +883,12 @@ async fn run_app(
                                 memory.store(mem_node);
                             }
                             app.last_council_session = Some(council_session);
-                            app.agent_running = false;
-                            app.status = "Ox".to_string();
+                            if background_session.is_some() {
+                                background_session = None;
+                            } else {
+                                app.agent_running = false;
+                                app.status = "Ox".to_string();
+                            }
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
@@ -548,9 +929,11 @@ fn handle_key_event(
     resolve_info: &Option<ProviderResolveInfo>,
     config: &OxConfig,
     agent_config: &Arc<AgentConfig>,
+    session_action: &mut SessionAction,
+    compression_manager: &Option<CompressionManager>,
 ) {
     match (key.code, key.modifiers) {
-        // ── Confirmation key handling (Y/N/T when pending) ──
+        // Confirmation key handling (Y/N/T when pending)
         (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
             if app.pending_confirmation.is_some() {
                 let pc = app.pending_confirmation.take().unwrap();
@@ -559,9 +942,9 @@ fn handle_key_event(
                         tool_call_id: pc.tool_call_id,
                         decision: ConfirmationDecision::Allow,
                     });
-                    app.output.push_line(OutputLine::Plain("  → Allowed".to_string()));
+                    app.output.push_line(OutputLine::System("  -> Allowed".to_string()));
                 } else {
-                    app.output.push_line(OutputLine::Plain("  → Error: agent channel closed, cannot confirm".to_string()));
+                    app.output.push_line(OutputLine::Error("  -> Error: agent channel closed, cannot confirm".to_string()));
                 }
                 app.dirty = true;
                 return;
@@ -577,9 +960,9 @@ fn handle_key_event(
                         tool_call_id: pc.tool_call_id,
                         decision: ConfirmationDecision::Deny,
                     });
-                    app.output.push_line(OutputLine::Plain("  → Denied".to_string()));
+                    app.output.push_line(OutputLine::System("  -> Denied".to_string()));
                 } else {
-                    app.output.push_line(OutputLine::Plain("  → Error: agent channel closed, cannot deny".to_string()));
+                    app.output.push_line(OutputLine::Error("  -> Error: agent channel closed, cannot deny".to_string()));
                 }
                 app.dirty = true;
                 return;
@@ -595,11 +978,11 @@ fn handle_key_event(
                         tool_call_id: pc.tool_call_id,
                         decision: ConfirmationDecision::TrustAlways,
                     });
-                    app.output.push_line(OutputLine::Plain(
-                        format!("  → Trusted {} for this session", pc.tool_name),
+                    app.output.push_line(OutputLine::System(
+                        format!("  -> Trusted {} for this session", pc.tool_name),
                     ));
                 } else {
-                    app.output.push_line(OutputLine::Plain("  → Error: agent channel closed, cannot trust".to_string()));
+                    app.output.push_line(OutputLine::Error("  -> Error: agent channel closed, cannot trust".to_string()));
                 }
                 app.dirty = true;
                 return;
@@ -650,6 +1033,8 @@ fn handle_key_event(
                             &mut persona_vector,
                             &resolve_info,
                             &config,
+                            session_action,
+                            &compression_manager,
                         );
                         // Check if a council discuss was queued
                         if let Some((question, rounds, verbose)) = app.pending_discuss.take() {
@@ -678,23 +1063,82 @@ fn handle_key_event(
                     UserInput::Text(text) => {
                         if app.agent_running {
                             interjection_buf.push(text.clone(), InterjectionPriority::Normal);
-                            app.output.push_line(OutputLine::Plain(format!(
+                            app.output.push_line(OutputLine::System(format!(
                                 "(queued while agent running) {}",
                                 text.trim()
                             )));
+                            app.scroll_to_bottom();
+                            app.dirty = true;
                         } else if let Some(provider) = provider {
                             let user_msg = Message::user(&text);
                             if let Err(e) = session.append_message(user_msg) {
                                 tracing::error!("Failed to persist user message: {e}");
                             }
                             let memory_nodes = memory.retrieve(&text, &Some(rt_env.project_id.as_str()), 5);
-                            let memory_ctx = memory.format_memory_context(&memory_nodes);
-                            let turn_messages = context_builder.build(
-                                system_prompt,
-                                &memory_ctx,
-                                &session.messages,
-                                context_window,
-                            );
+                            let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
+                            memory.reinforce_accessed(&accessed_ids);
+                            let memory_ctx = memory.format_memory_context(&memory_nodes, false);
+
+                            // KadaneDial compression: trigger at 80% of history budget (preventive)
+                            let turn_messages = if let Some(cm) = compression_manager.as_ref() {
+                                let context_tokens = cm.calculate_context_tokens(&session.messages);
+                                // 80% threshold: compress before hitting exact limit
+                                let history_budget = (context_window as f32 * context_builder.history_ratio() * 0.8) as usize;
+                                let should_compress = context_tokens >= history_budget;
+
+                                tracing::info!(
+                                    "[COMPRESSION] tokens={}, budget={}, should_compress={}",
+                                    context_tokens,
+                                    history_budget,
+                                    should_compress
+                                );
+
+                                let base_messages = context_builder.build(
+                                    &system_prompt,
+                                    &memory_ctx,
+                                    &session.messages,
+                                    context_window,
+                                );
+
+                                if should_compress {
+                                    match cm.compress(&session.messages, &text) {
+                                        Ok(Some(compressed)) => {
+                                            app.output.push_line(OutputLine::System(
+                                                format!("Context compressed: {} msgs ({} tokens) → {} msgs",
+                                                    session.messages.len(), context_tokens, compressed.len())
+                                            ));
+                                            app.dirty = true;
+                                            compressed
+                                        }
+                                        Ok(None) => {
+                                            app.output.push_line(OutputLine::System(
+                                                "Compression skipped: no significant chunks to keep".to_string()
+                                            ));
+                                            app.dirty = true;
+                                            base_messages
+                                        }
+                                        Err(e) => {
+                                            app.output.push_line(OutputLine::Error(
+                                                format!("Compression failed: {}. Send anyway with full context?", e)
+                                            ));
+                                            app.dirty = true;
+                                            base_messages
+                                        }
+                                    }
+                                } else {
+                                    base_messages
+                                }
+                            } else {
+                                tracing::info!(
+                                    "[COMPRESSION] compression_manager is None (embedding disabled or not configured)"
+                                );
+                                context_builder.build(
+                                    &system_prompt,
+                                    &memory_ctx,
+                                    &session.messages,
+                                    context_window,
+                                )
+                            };
                             app.agent_running = true;
                             app.status = "Thinking...".to_string();
                             let provider = Arc::clone(provider);
@@ -721,7 +1165,7 @@ fn handle_key_event(
                                 .await;
                             });
                         } else {
-                            app.output.push_line(OutputLine::Plain(format!(
+                            app.output.push_line(OutputLine::System(format!(
                                 "[echo] {}",
                                 text.trim()
                             )));
@@ -741,7 +1185,7 @@ fn handle_key_event(
         }
         (KeyCode::Down, KeyModifiers::SHIFT) => {
             app.scroll_down(1);
-            if app.scroll_offset == 0 { app.user_scrolled = false; }
+            if app.scroll_offset < 3 { app.user_scrolled = false; }
             app.dirty = true;
         }
         (KeyCode::Up, _) => { app.input.history_up(); app.dirty = true; }
@@ -753,7 +1197,7 @@ fn handle_key_event(
         }
         (KeyCode::PageDown, _) => {
             app.scroll_down(10);
-            if app.scroll_offset == 0 { app.user_scrolled = false; }
+            if app.scroll_offset < 3 { app.user_scrolled = false; }
             app.dirty = true;
         }
         (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
@@ -778,6 +1222,8 @@ fn handle_slash_command(
     persona_vector: &mut ox_core::persona::PersonaVector,
     resolve_info: &Option<ProviderResolveInfo>,
     config: &OxConfig,
+    session_action: &mut SessionAction,
+    compression_manager: &Option<ox_core::embedding::CompressionManager>,
 ) {
     let parsed = slash::parse_slash_command(cmd, args);
 
@@ -785,7 +1231,7 @@ fn handle_slash_command(
         SlashCommand::Help { topic } => {
             let text = slash::help_text(topic.as_deref());
             for line in text.lines() {
-                app.output.push_line(OutputLine::Plain(line.to_string()));
+                app.output.push_line(OutputLine::System(line.to_string()));
             }
         }
         SlashCommand::Exit => {
@@ -793,35 +1239,31 @@ fn handle_slash_command(
             app.should_quit = true;
         }
         SlashCommand::New => {
-            // Archive current session before starting new one.
-            let session_dir = session.dir().to_path_buf();
-            if let Err(e) = session.archive(&session_dir) {
-                tracing::warn!("Failed to archive session: {e}");
-            }
-            let project_id = rt_env.project_id.clone();
-            match Session::new(&session_dir, &project_id) {
-                Ok(s) => {
-                    *session = s;
-                    app.output.push_system("New session started. (Previous session archived.)");
-                }
-                Err(e) => {
-                    app.output
-                        .push_system(&format!("Failed to create session: {e}"));
-                }
-            }
+            // Signal session action to main loop for processing.
+            *session_action = SessionAction::New;
         }
         SlashCommand::Clear => {
             app.output.clear();
         }
+        SlashCommand::Clean => {
+            if let Err(e) = session.clean() {
+                app.output.push_error(&format!("Failed to clean session: {}", e));
+            } else {
+                app.output.clear();
+                app.message_count = 0;
+                app.cost_summary = String::new();
+                app.output.push_system("Session cleared. All messages removed.");
+            }
+        }
         SlashCommand::Cost => {
             let summary = cost_tracker.summary();
             for line in summary.lines() {
-                app.output.push_line(OutputLine::Plain(line.to_string()));
+                app.output.push_line(OutputLine::System(line.to_string()));
             }
         }
         SlashCommand::Plan => {
             app.output
-                .push_system("Task plan: (not yet active — agent will create plans automatically)");
+                .push_system("Task plan: (not yet active -- agent will create plans automatically)");
         }
         SlashCommand::Trust { tools, all } => {
             let mut tm = trust_manager.lock().unwrap();
@@ -858,11 +1300,11 @@ fn handle_slash_command(
         SlashCommand::Model { name } => {
             if let Some(new_model) = name {
                 app.pending_model_switch = Some(new_model.clone());
-                app.output.push_line(OutputLine::Plain(format!(
+                app.output.push_line(OutputLine::System(format!(
                     "Switching to: {}", new_model
                 )));
             } else {
-                app.output.push_line(OutputLine::Plain(format!(
+                app.output.push_line(OutputLine::System(format!(
                     "Current model: {}",
                     if model_name.is_empty() {
                         "(none)"
@@ -876,10 +1318,12 @@ fn handle_slash_command(
             if let Some(target) = path {
                 match runtime::change_directory(rt_env, &target) {
                     runtime::DirectoryChangeResult::Success { new_dir, project_changed } => {
-                        app.output.push_line(OutputLine::Plain(format!(
+                        app.output.push_line(OutputLine::System(format!(
                             "Changed to: {}",
                             new_dir.display()
                         )));
+                        // Refresh header info after directory change.
+                        refresh_header_info(app, rt_env, resolve_info.is_some());
                         if project_changed {
                             let project_name = rt_env.project_root
                                 .as_ref()
@@ -887,7 +1331,7 @@ fn handle_slash_command(
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| "(none)".into());
                             app.output.push_system(&format!(
-                                "Project boundary changed → {project_name}"
+                                "Project boundary changed -- {project_name}"
                             ));
                         }
                     }
@@ -899,7 +1343,7 @@ fn handle_slash_command(
                     }
                 }
             } else {
-                app.output.push_line(OutputLine::Plain(format!(
+                app.output.push_line(OutputLine::System(format!(
                     "Working directory: {}",
                     rt_env.working_dir.display()
                 )));
@@ -920,10 +1364,10 @@ fn handle_slash_command(
         }
         SlashCommand::Debug => {
             app.output
-                .push_line(OutputLine::Plain(format!("Model: {model_name}")));
+                .push_line(OutputLine::System(format!("Model: {model_name}")));
             // Provider resolution info
             if let Some(info) = resolve_info {
-                app.output.push_line(OutputLine::Plain(format!(
+                app.output.push_line(OutputLine::System(format!(
                     "Provider: {}",
                     info.provider_name
                 )));
@@ -932,29 +1376,57 @@ fn handle_slash_command(
                     llm::ApiKeySource::ConfigFile => "config file".to_string(),
                     llm::ApiKeySource::NotFound => "NOT FOUND".to_string(),
                 };
-                app.output.push_line(OutputLine::Plain(format!(
+                app.output.push_line(OutputLine::System(format!(
                     "API key source: {key_src}"
                 )));
                 let url_src = match &info.base_url_source {
                     llm::BaseUrlSource::ConfigFile => "config file",
                     llm::BaseUrlSource::Default => "provider default",
                 };
-                app.output.push_line(OutputLine::Plain(format!(
+                app.output.push_line(OutputLine::System(format!(
                     "Base URL source: {url_src}"
                 )));
             } else {
-                app.output.push_line(OutputLine::Plain(
-                    "Provider: (none — echo mode)".to_string(),
+                app.output.push_line(OutputLine::System(
+                    "Provider: (none -- echo mode)".to_string(),
                 ));
             }
             // Config file path
             let config_path = OxConfig::default_config_path();
-            app.output.push_line(OutputLine::Plain(format!(
+            app.output.push_line(OutputLine::System(format!(
                 "Config file: {}",
                 config_path.display()
             )));
+            // Embedding model status
+            if compression_manager.is_some() {
+                let model_path = config.models.embedding.as_ref().and_then(|c| c.model_path.as_ref())
+                    .map(|p| p.clone())
+                    .unwrap_or_else(|| {
+                        dirs::home_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join(".ox/models/bge-small-zh-v1.5")
+                            .to_string_lossy()
+                            .to_string()
+                    });
+                app.output.push_line(OutputLine::System("Embedding: loaded".to_string()));
+                app.output.push_line(OutputLine::System(format!("  Model path: {}", model_path)));
+                if let Some(ref emb_cfg) = config.models.embedding {
+                    app.output.push_line(OutputLine::System(format!(
+                        "  Threshold: {:.2}, stop: {:.2}, segments: {}",
+                        emb_cfg.threshold, emb_cfg.stop_threshold, emb_cfg.max_segments
+                    )));
+                    app.output.push_line(OutputLine::System(format!(
+                        "  Chunk: {} tokens, max: {} tokens",
+                        emb_cfg.chunk_threshold_tokens, emb_cfg.max_chunk_tokens
+                    )));
+                }
+            } else {
+                app.output.push_line(OutputLine::System(
+                    "Embedding: disabled (set [models.embedding] enabled = true)".to_string(),
+                ));
+            }
             // All providers key status (never show values)
-            app.output.push_line(OutputLine::Plain("Providers:".to_string()));
+            app.output.push_line(OutputLine::System("Providers:".to_string()));
             for (name, pcfg) in &config.models.providers {
                 let env_key = format!("OX_{}_API_KEY", name.to_uppercase());
                 let has_env = std::env::var(&env_key)
@@ -969,30 +1441,30 @@ fn handle_slash_command(
                 } else {
                     "no key"
                 };
-                app.output.push_line(OutputLine::Plain(format!(
+                app.output.push_line(OutputLine::System(format!(
                     "  {name}: {status}"
                 )));
             }
-            // Model→provider mapping
+            // Model->provider mapping
             if !config.models.model_providers.is_empty() {
-                app.output.push_line(OutputLine::Plain(
-                    "Model→Provider mappings:".to_string(),
+                app.output.push_line(OutputLine::System(
+                    "Model->Provider mappings:".to_string(),
                 ));
                 for (model, provider) in &config.models.model_providers {
-                    app.output.push_line(OutputLine::Plain(format!(
-                        "  {model} → {provider}"
+                    app.output.push_line(OutputLine::System(format!(
+                        "  {model} -> {provider}"
                     )));
                 }
             }
             app.output
-                .push_line(OutputLine::Plain(format!("OS: {} ({})", rt_env.os, rt_env.arch)));
+                .push_line(OutputLine::System(format!("OS: {} ({})", rt_env.os, rt_env.arch)));
             app.output
-                .push_line(OutputLine::Plain(format!("Shell: {}", rt_env.shell.name)));
-            app.output.push_line(OutputLine::Plain(format!(
+                .push_line(OutputLine::System(format!("Shell: {}", rt_env.shell.name)));
+            app.output.push_line(OutputLine::System(format!(
                 "Working dir: {}",
                 rt_env.working_dir.display()
             )));
-            app.output.push_line(OutputLine::Plain(format!(
+            app.output.push_line(OutputLine::System(format!(
                 "Project root: {}",
                 rt_env
                     .project_root
@@ -1000,11 +1472,11 @@ fn handle_slash_command(
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(none)".into())
             )));
-            app.output.push_line(OutputLine::Plain(format!(
+            app.output.push_line(OutputLine::System(format!(
                 "Project ID: {}",
                 rt_env.project_id
             )));
-            app.output.push_line(OutputLine::Plain(format!(
+            app.output.push_line(OutputLine::System(format!(
                 "History: {} messages",
                 session.messages.len()
             )));
@@ -1012,7 +1484,7 @@ fn handle_slash_command(
                 let tm = trust_manager.lock().unwrap();
                 tm.trusted_list()
             };
-            app.output.push_line(OutputLine::Plain(format!(
+            app.output.push_line(OutputLine::System(format!(
                 "Trusted tools: {}",
                 if trusted.is_empty() {
                     "(none)".to_string()
@@ -1027,16 +1499,16 @@ fn handle_slash_command(
             if archived.is_empty() {
                 app.output.push_system("No archived sessions found. Use /new to start and archive sessions.");
             } else {
-                app.output.push_line(OutputLine::Plain("Archived sessions:".to_string()));
+                app.output.push_line(OutputLine::System("Archived sessions:".to_string()));
                 for (i, (filename, info)) in archived.iter().enumerate() {
-                    app.output.push_line(OutputLine::Plain(format!(
+                    app.output.push_line(OutputLine::System(format!(
                         "  {}. {}  ({})",
                         i + 1,
                         info,
                         filename
                     )));
                 }
-                app.output.push_line(OutputLine::Plain(
+                app.output.push_line(OutputLine::System(
                     "Use /resume <filename> to restore a session.".to_string(),
                 ));
             }
@@ -1045,39 +1517,15 @@ fn handle_slash_command(
             if filename.is_empty() {
                 app.output.push_system("Usage: /resume <filename>  (use /sessions to list)");
             } else {
-                let session_dir = session.dir().to_path_buf();
-                match Session::load_archived(&session_dir, &filename) {
-                    Ok(Some(archived_session)) => {
-                        // Archive current session first.
-                        if let Err(e) = session.archive(&session_dir) {
-                            tracing::warn!("Failed to archive current session: {e}");
-                        }
-                        // Restore archived session.
-                        let msg_count = archived_session.messages.len();
-                        *session = archived_session;
-                        app.output.push_system(&format!(
-                            "Session restored: {} messages from {}",
-                            msg_count, filename
-                        ));
-                        app.message_count = session.messages.len();
-                    }
-                    Ok(None) => {
-                        app.output.push_system(&format!(
-                            "Session '{}' not found. Use /sessions to list.",
-                            filename
-                        ));
-                    }
-                    Err(e) => {
-                        app.output.push_system(&format!("Failed to resume session: {e}"));
-                    }
-                }
+                // Signal session action to main loop for processing.
+                *session_action = SessionAction::Resume { filename: filename.clone() };
             }
         }
         SlashCommand::Remember { content } => {
             if content.is_empty() {
                 app.output.push_system("Usage: /remember <content>  (stores as Style memory)");
             } else {
-                memory.store_explicit(&content, &rt_env.project_id, "");
+                memory.store_explicit(&content, &rt_env.project_id, &rt_env.project_language);
                 app.output.push_system(&format!("Remembered: {}", content.chars().take(100).collect::<String>()));
             }
         }
@@ -1091,10 +1539,10 @@ fn handle_slash_command(
         }
         SlashCommand::Memory => {
             let (project_count, overall_count) = memory.stats(&rt_env.project_id);
-            app.output.push_line(OutputLine::Plain(format!("Memory: {} project, {} long-term", project_count, overall_count)));
+            app.output.push_line(OutputLine::System(format!("Memory: {} project, {} long-term", project_count, overall_count)));
             let nodes = memory.retrieve("", &Some(rt_env.project_id.as_str()), 5);
             for node in &nodes {
-                app.output.push_line(OutputLine::Plain(format!(
+                app.output.push_line(OutputLine::System(format!(
                     "  [{}] {} (depth: {})",
                     node.node_type,
                     node.content.chars().take(80).collect::<String>(),
@@ -1120,7 +1568,7 @@ fn handle_slash_command(
         }
         SlashCommand::Persona { action } => {
             if action.is_empty() || action == "show" {
-                app.output.push_line(OutputLine::Plain(format!("Persona: {}", persona_vector)));
+                app.output.push_line(OutputLine::System(format!("Persona: {}", persona_vector)));
             } else if action == "freeze" {
                 app.output.push_system("Persona frozen (evolution stopped). Use /persona unfreeze to resume.");
             } else if action == "unfreeze" {
@@ -1154,7 +1602,7 @@ fn handle_slash_command(
                         session.format_summary()
                     };
                     for line in output.lines() {
-                        app.output.push_line(OutputLine::Plain(line.to_string()));
+                        app.output.push_line(OutputLine::System(line.to_string()));
                     }
                 } else {
                     app.output.push_system("No previous council session.");

@@ -189,6 +189,11 @@ pub fn create_provider_with_info(
         api_key_source,
         base_url_source,
     };
+    // Use stream_usage from config. Default false (safer for third-party APIs).
+    // User must explicitly set stream_usage = true for official OpenAI API.
+    let stream_usage = provider_cfg.stream_usage.unwrap_or(false);
+    // Check if tools should be disabled for this provider (e.g. MiniMax).
+    let disable_tools = provider_cfg.disable_tools.unwrap_or(false);
 
     let provider = match provider_name.as_str() {
         "anthropic" => Box::new(anthropic::AnthropicProvider::new(
@@ -203,6 +208,8 @@ pub fn create_provider_with_info(
             api_key,
             base_url,
             provider_cfg.max_tokens,
+            stream_usage,
+            disable_tools,
         )),
     };
 

@@ -160,7 +160,7 @@ impl MemoryManager {
                     }
                 }
                 if !expired.is_empty() {
-                    tracing::info!("Janitor deleted {} expired memories", expired.len());
+                    tracing::warn!("Janitor deleted {} expired memories", expired.len());
                 }
             }
         }
@@ -271,6 +271,7 @@ impl MemoryNode {
 const BUFFER_CAPACITY: usize = 10;
 const BUFFER_FLUSH_SECS: i64 = 5;
 
+#[derive(Clone)]
 pub struct WriteBuffer {
     pending: Vec<MemoryNode>,
     last_flush: i64,
@@ -320,7 +321,31 @@ impl MemoryNode {
                     Some(Self::new(content, MemoryNodeType::Fact, Some(project_id.into()), language.into(), MemorySource::ToolObservation))
                 }
             }
+            "shell_exec" => {
+                if tool_args.contains("error") || tool_args.contains("Error") || tool_args.contains("failed") {
+                    let content = if tool_args.len() > 400 {
+                        format!("{}...", &tool_args[..tool_args.char_indices().take(400).last().map(|(i,_)| i).unwrap_or(0)])
+                    } else {
+                        tool_args.to_string()
+                    };
+                    Some(Self::new(content, MemoryNodeType::AntiPattern, Some(project_id.into()), language.into(), MemorySource::ToolObservation))
+                } else {
+                    None
+                }
+            }
             _ => None,
+        }
+    }
+
+    pub fn extract_from_conversation(assistant_content: &str, project_id: &str, language: &str) -> Option<Self> {
+        if contains_architectural_keywords(assistant_content) {
+            let content: String = assistant_content.chars().take(300).collect();
+            Some(Self::new(content, MemoryNodeType::Architectural, Some(project_id.into()), language.into(), MemorySource::LlmExtraction))
+        } else if contains_user_preference(assistant_content) {
+            let content: String = assistant_content.chars().take(200).collect();
+            Some(Self::new(content, MemoryNodeType::Style, Some(project_id.into()), language.into(), MemorySource::LlmExtraction))
+        } else {
+            None
         }
     }
 }
@@ -335,12 +360,18 @@ fn contains_business_keywords(text: &str) -> bool {
     keywords.iter().any(|k| text.to_lowercase().contains(k))
 }
 
+fn contains_user_preference(text: &str) -> bool {
+    let keywords = ["以后都", "不要用", "always use", "never use", "prefer", "avoid", "习惯", "偏好", "应该用", "选型"];
+    keywords.iter().any(|k| text.to_lowercase().contains(k))
+}
+
 // ── MemoryManager (门面) ──
 
 use std::path::PathBuf;
 
 use crate::config::MemoryConfig;
 
+#[derive(Clone)]
 pub struct MemoryManager {
     project_store: Option<store::MemoryStore>,
     overall_store: store::MemoryStore,
@@ -413,11 +444,14 @@ impl MemoryManager {
 
     pub fn update_from_turn(&mut self, messages: &[crate::message::Message], project_id: &str, language: &str) {
         for msg in messages {
-            if let crate::message::Message::Assistant { tool_calls, .. } = msg {
+            if let crate::message::Message::Assistant { content, tool_calls } = msg {
                 for tc in tool_calls {
                     if let Some(node) = MemoryNode::extract_from_tool_call(&tc.name, &tc.arguments, project_id, language) {
                         self.store(node);
                     }
+                }
+                if let Some(node) = MemoryNode::extract_from_conversation(content, project_id, language) {
+                    self.store(node);
                 }
             }
         }
@@ -484,15 +518,27 @@ impl MemoryManager {
         }
     }
 
-    pub fn format_memory_context(&self, nodes: &[MemoryNode]) -> String {
+    pub fn format_memory_context(&self, nodes: &[MemoryNode], use_xml: bool) -> String {
         if nodes.is_empty() { return String::new(); }
-        let mut out = String::from("<relevant_memories>\n");
-        for n in nodes.iter().take(8) {
-            let content: String = n.content.chars().take(120).collect();
-            out.push_str(&format!("  <memory depth=\"{}\" type=\"{}\">{}</memory>\n", n.depth, n.node_type, content));
+
+        if use_xml {
+            // XML format for compatible APIs
+            let mut out = String::from("<relevant_memories>\n");
+            for n in nodes.iter().take(8) {
+                let content: String = n.content.chars().take(120).collect();
+                out.push_str(&format!("  <memory depth=\"{}\" type=\"{}\">{}</memory>\n", n.depth, n.node_type, content));
+            }
+            out.push_str("</relevant_memories>");
+            out
+        } else {
+            // Plain text format for MiniMax and similar APIs
+            let mut out = String::from("Relevant context:\n");
+            for n in nodes.iter().take(5) {
+                let content: String = n.content.chars().take(150).collect();
+                out.push_str(&format!("- {}\n", content));
+            }
+            out
         }
-        out.push_str("</relevant_memories>");
-        out
     }
 
     pub fn forget(&self, keyword: &str, project_id: &str) -> usize {

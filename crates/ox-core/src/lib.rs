@@ -3,6 +3,7 @@ pub mod config;
 pub mod context;
 pub mod cost;
 pub mod council;
+pub mod embedding;
 pub mod llm;
 pub mod memory;
 pub mod message;

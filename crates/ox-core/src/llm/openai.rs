@@ -10,11 +10,13 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     max_tokens: Option<u32>,
+    stream_usage: bool,
+    disable_tools: bool,
     client: reqwest::Client,
 }
 
 impl OpenAiProvider {
-    pub fn new(model: String, api_key: String, base_url: String, max_tokens: Option<u32>) -> Self {
+    pub fn new(model: String, api_key: String, base_url: String, max_tokens: Option<u32>, stream_usage: bool, disable_tools: bool) -> Self {
         Self {
             model,
             api_key,
@@ -24,6 +26,8 @@ impl OpenAiProvider {
                 base_url
             },
             max_tokens,
+            stream_usage,
+            disable_tools,
             client: reqwest::Client::new(),
         }
     }
@@ -46,14 +50,17 @@ impl LlmProvider for OpenAiProvider {
             "model": self.model,
             "messages": api_messages,
             "stream": true,
-            "stream_options": { "include_usage": true },
         });
+
+        if self.stream_usage {
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
 
         if let Some(max_tokens) = self.max_tokens {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
 
-        if !tools.is_empty() {
+        if !tools.is_empty() && !self.disable_tools {
             let tool_defs: Vec<serde_json::Value> = tools
                 .iter()
                 .map(|t| {
@@ -82,47 +89,60 @@ impl LlmProvider for OpenAiProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
-            let _ = tx.send(LlmStreamEvent::Error(format!(
-                "OpenAI API error {status}: {body_text}"
-            )));
+            let err_msg = format!("OpenAI API error {status}: {body_text}");
+            tracing::error!("{}", err_msg);
+            let _ = tx.send(LlmStreamEvent::Error(err_msg));
             return Ok(());
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
         let mut tool_call_index_to_id: std::collections::HashMap<u64, String> =
             std::collections::HashMap::new();
         let mut done_sent = false;
+        let mut pending_data = String::new();
+        let mut line_buf = String::new();
 
+        // SSE parsing: process char by char to handle JSON containing newlines.
+        // Event boundary is empty line, not newlines in JSON content.
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
 
-            // Process complete SSE lines using drain to avoid reallocating the buffer.
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim_end_matches('\r').to_string();
-                buffer.drain(..=pos);
+            for ch in chunk_str.chars() {
+                if ch == '\n' {
+                    let line = line_buf.trim_end_matches('\r').to_string();
+                    line_buf.clear();
 
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data.trim() == "[DONE]" {
-                        continue;
-                    }
-
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        if process_openai_chunk(&json, &tx, &mut tool_call_index_to_id) {
-                            done_sent = true;
+                    if line.is_empty() {
+                        // Empty line - process accumulated data
+                        if !pending_data.is_empty() && pending_data.trim() != "[DONE]" {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&pending_data) {
+                                if process_openai_chunk(&json, &tx, &mut tool_call_index_to_id) {
+                                    done_sent = true;
+                                }
+                            }
                         }
+                        pending_data.clear();
+                    } else if let Some(content) = line.strip_prefix("data: ") {
+                        pending_data.push_str(content);
+                    } else if let Some(content) = line.strip_prefix("data:") {
+                        pending_data.push_str(content.trim_start());
                     }
+                } else {
+                    line_buf.push(ch);
                 }
             }
         }
 
-        // Only send Done if process_openai_chunk didn't already send one
-        // (e.g. API didn't include usage in stream, or non-OpenAI compatible API).
+        // Process any remaining data at stream end
+        if !pending_data.is_empty() && pending_data.trim() != "[DONE]" {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&pending_data) {
+                if process_openai_chunk(&json, &tx, &mut tool_call_index_to_id) {
+                    done_sent = true;
+                }
+            }
+        }
+
         if !done_sent {
             let _ = tx.send(LlmStreamEvent::Done {
                 usage: TokenUsage::default(),
@@ -164,36 +184,29 @@ fn process_openai_chunk(
     };
 
     for choice in choices {
-        // Some compatible APIs use "message" instead of "delta" (e.g. non-streaming mixed in).
         let delta = choice.get("delta").or_else(|| choice.get("message"));
         let Some(delta) = delta else {
             continue;
         };
 
-        // Text content.
         if let Some(content) = delta.get("content").and_then(|c| c.as_str())
             && !content.is_empty() {
                 let _ = tx.send(LlmStreamEvent::TextDelta(content.to_string()));
             }
 
-        // Tool calls.
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tool_calls {
                 let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-                tracing::debug!("Tool call chunk index={index}: {}", serde_json::to_string(tc).unwrap_or_default());
 
-                // First chunk for this tool call includes "id" and "function.name".
                 if let Some(id) = tc.get("id").and_then(|i| i.as_str())
                     && !id.is_empty() {
                         index_to_id.insert(index, id.to_string());
                     }
 
-                // Ensure an id exists for this index (fallback to generated id).
                 let id = if let Some(id) = index_to_id.get(&index) {
                     id.clone()
                 } else {
                     let fallback_id = format!("tc_{index}");
-                    tracing::debug!("No tool call id for index {index}, using fallback: {fallback_id}");
                     index_to_id.insert(index, fallback_id.clone());
                     fallback_id
                 };
@@ -257,12 +270,23 @@ fn message_to_openai(msg: &Message) -> serde_json::Value {
                 let tcs: Vec<serde_json::Value> = tool_calls
                     .iter()
                     .map(|tc| {
+                        let args_str = if tc.arguments.trim().is_empty() {
+                            "{}".to_string()
+                        } else {
+                            match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                                Ok(_) => tc.arguments.clone(),
+                                Err(e) => {
+                                    tracing::warn!("Invalid tool arguments JSON for '{}', sending empty object: {e}", tc.name);
+                                    "{}".to_string()
+                                }
+                            }
+                        };
                         serde_json::json!({
                             "id": tc.id,
                             "type": "function",
                             "function": {
                                 "name": tc.name,
-                                "arguments": tc.arguments,
+                                "arguments": args_str,
                             }
                         })
                     })

@@ -5,6 +5,7 @@ pub enum SlashCommand {
     Exit,
     New,
     Clear,
+    Clean,
     Cost,
     Plan,
     Trust { tools: Vec<String>, all: bool },
@@ -38,6 +39,7 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
         "exit" | "quit" | "q" => SlashCommand::Exit,
         "new" => SlashCommand::New,
         "clear" | "cls" => SlashCommand::Clear,
+        "clean" => SlashCommand::Clean,
         "cost" => SlashCommand::Cost,
         "plan" => SlashCommand::Plan,
         "trust" => {
@@ -147,6 +149,7 @@ Commands:
   /help [topic]     Show help (topics: trust, cost, plan)
   /exit             Exit Ox
   /new              Start a new session (archives current)
+  /clean            Clear all messages in current session
   /clear            Clear the screen
   /cost             Show token usage and cost summary
   /plan             Show current task plan

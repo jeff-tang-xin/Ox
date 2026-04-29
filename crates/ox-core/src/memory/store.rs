@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::{params, Connection, Result as SqlResult};
 
@@ -30,7 +31,15 @@ CREATE INDEX IF NOT EXISTS idx_memories_accessed ON memories(last_accessed);
 "#;
 
 pub struct MemoryStore {
-    conn: Connection,
+    conn: Arc<Connection>,
+}
+
+impl Clone for MemoryStore {
+    fn clone(&self) -> Self {
+        Self {
+            conn: Arc::clone(&self.conn),
+        }
+    }
 }
 
 impl MemoryStore {
@@ -40,7 +49,7 @@ impl MemoryStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-        let mut store = Self { conn };
+        let mut store = Self { conn: Arc::new(conn) };
         store.init_schema()?;
         Ok(store)
     }
