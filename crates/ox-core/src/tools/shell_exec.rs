@@ -64,8 +64,22 @@ impl Tool for ShellExecTool {
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let command = match args.get("command").and_then(|c| c.as_str()) {
-            Some(c) => c,
-            None => return ToolOutput::error("Missing required parameter: command. Usage: {\"command\": \"<shell command>\"}"),
+            Some(c) if !c.is_empty() => c,
+            Some(_) => return ToolOutput::error(
+                "❌ Parameter Error: 'command' cannot be empty\n\n\
+                 💡 Example: {\"command\": \"ls -la\", \"timeout_ms\": 5000}"
+            ),
+            None => return ToolOutput::error(
+                "❌ Missing Required Parameter: 'command'\n\n\
+                 💡 How to fix:\n\
+                 • Add the 'command' parameter with your shell command\n\
+                 • Command will run in the system shell (bash on Linux/Mac, cmd on Windows)\n\
+                 • Use caution with destructive commands (rm, del, etc.)\n\n\
+                 📝 Examples:\n\
+                 {\"command\": \"ls -la\"} - List files\n\
+                 {\"command\": \"cargo build\"} - Build Rust project\n\
+                 {\"command\": \"git status\"} - Check git status"
+            ),
         };
         let timeout_ms = args
             .get("timeout_ms")
@@ -74,10 +88,27 @@ impl Tool for ShellExecTool {
 
         let shell = &ctx.runtime.shell;
         let mut cmd = Command::new(&shell.path);
-        for prefix in &shell.exec_prefix {
-            cmd.arg(prefix);
+        
+        // On Windows, set PowerShell output encoding to UTF-8 to avoid garbled Chinese text
+        if cfg!(windows) && (shell.name == "powershell" || shell.name == "pwsh") {
+            // Set UTF-8 encoding for PowerShell
+            cmd.arg("-NoProfile");
+            cmd.arg("-OutputFormat");
+            cmd.arg("Text");
+            cmd.arg("-Command");
+            // Wrap command with UTF-8 encoding setup
+            let utf8_wrapper = format!(
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'; chcp 65001 | Out-Null; {}",
+                command
+            );
+            cmd.arg(&utf8_wrapper);
+        } else {
+            // Linux/Mac or cmd.exe
+            for prefix in &shell.exec_prefix {
+                cmd.arg(prefix);
+            }
+            cmd.arg(command);
         }
-        cmd.arg(command);
         cmd.current_dir(&ctx.working_dir);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

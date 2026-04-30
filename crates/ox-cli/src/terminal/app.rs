@@ -65,6 +65,17 @@ pub struct App {
     pub last_spinner_frame: u64,
     /// Chat area bounds for mouse scroll detection (x, y, width, height)
     pub chat_area: Option<(u16, u16, u16, u16)>,
+    
+    // Implicit feedback system
+    pub override_detector: ox_core::feedback::CodeOverrideDetector,
+    pub ema_manager: ox_core::feedback::Emamanager,
+    pub rollback_manager: ox_core::feedback::RollbackManager,
+    
+    // Tracking counters for implicit feedback
+    pub total_file_writes: u32,
+    pub accepted_file_writes: u32,
+    pub explicit_feedback_count: u32,
+    pub good_feedback_count: u32,
 }
 
 impl App {
@@ -98,6 +109,15 @@ impl App {
             sidebar_width: 22,
             last_spinner_frame: 0,
             chat_area: None,
+            
+            // Implicit feedback system initialization
+            override_detector: ox_core::feedback::CodeOverrideDetector::new(300), // 5 min window
+            ema_manager: ox_core::feedback::Emamanager::new(0.2), // alpha = 0.2
+            rollback_manager: ox_core::feedback::RollbackManager::new(10), // max 10 snapshots per lang
+            total_file_writes: 0,
+            accepted_file_writes: 0,
+            explicit_feedback_count: 0,
+            good_feedback_count: 0,
         }
     }
 

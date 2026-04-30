@@ -343,7 +343,33 @@ pub async fn run_agent_turn(
                 Some(t) => t,
                 None => {
                     let available = tool_registry.names().join(", ");
-                    let error_msg = format!("Unknown tool: '{}'. Available tools: {}", tc.name, available);
+                    // Find similar tool names (simple string matching)
+                    let mut suggestions: Vec<&str> = Vec::new();
+                    for name in tool_registry.names() {
+                        if name.starts_with(&tc.name[..tc.name.len().min(3)]) ||
+                           tc.name.starts_with(&name[..name.len().min(3)]) {
+                            suggestions.push(name);
+                        }
+                    }
+                    
+                    let suggestion_text = if !suggestions.is_empty() {
+                        format!("\n\n💡 Did you mean: {}?", suggestions.join(", "))
+                    } else {
+                        String::new()
+                    };
+                    
+                    let error_msg = format!(
+                        "❌ Unknown tool: '{}'\n\n\
+                         Available tools: {}{}\n\n\
+                         💡 Tips:\n\
+                         • Check the tool name spelling\n\
+                         • Use /help to see all available tools\n\
+                         • Tool names are case-sensitive",
+                        tc.name, available, suggestion_text
+                    );
+                    
+                    tracing::warn!("Unknown tool requested: '{}'. Available: {}", tc.name, available);
+                    
                     let result_msg = Message::ToolResult {
                         tool_call_id: tc.id.clone(),
                         content: error_msg.clone(),
@@ -486,15 +512,43 @@ pub async fn run_agent_turn(
                 match serde_json::from_str(&tc.arguments) {
                     Ok(v) => v,
                     Err(parse_err) => {
+                        // Provide helpful guidance with examples
+                        let example = match tc.name.as_str() {
+                            "file_read" => "{\"path\": \"src/main.rs\", \"limit\": 100}",
+                            "file_write" => "{\"path\": \"output.txt\", \"content\": \"Hello World\"}",
+                            "file_patch" => "{\"path\": \"src/lib.rs\", \"edits\": [{\"old\": \"...\", \"new\": \"...\"}]}",
+                            "shell_exec" => "{\"command\": \"ls -la\", \"timeout_ms\": 5000}",
+                            "file_search" => "{\"pattern\": \"*.rs\", \"path\": \"src/\"}",
+                            "code_search" => "{\"query\": \"fn main\", \"path\": \"src/\"}",
+                            _ => "{ /* check tool documentation */ }",
+                        };
+                        
                         let error_msg = format!(
-                            "Invalid tool arguments JSON: {parse_err}. Raw: {}",
-                            if tc.arguments.len() > 200 {
-                                let end = tc.arguments.char_indices().take_while(|(i, _)| *i < 200).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
-                                format!("{}...(truncated)", &tc.arguments[..end])
+                            "❌ JSON Parse Error for tool '{}':\n{}\n\n\
+                             💡 How to fix:\n\
+                             • Ensure valid JSON syntax (no trailing commas)\n\
+                             • Quote all keys and string values with double quotes\n\
+                             • Escape special characters in strings\n\
+                             • Check for missing brackets or braces\n\n\
+                             📝 Correct format example:\n\
+                             {}\n\n\
+                             Please retry with corrected arguments.",
+                            tc.name,
+                            parse_err,
+                            example
+                        );
+                        
+                        tracing::warn!(
+                            "Tool argument parse error for '{}': {} | Raw: {}",
+                            tc.name,
+                            parse_err,
+                            if tc.arguments.len() > 100 {
+                                &tc.arguments[..100]
                             } else {
-                                tc.arguments.clone()
+                                &tc.arguments
                             }
                         );
+                        
                         let result_msg = Message::ToolResult {
                             tool_call_id: tc.id.clone(),
                             content: error_msg.clone(),
@@ -525,7 +579,11 @@ pub async fn run_agent_turn(
 
             // If the tool changed working directory, update tool_ctx and notify UI.
             if let Some(new_dir) = result.new_working_dir.clone() {
-                tool_ctx = Arc::new(ToolContext::new(tool_ctx.runtime.clone(), new_dir.clone()));
+                tool_ctx = Arc::new(ToolContext::new(
+                    tool_ctx.runtime.clone(),
+                    new_dir.clone(),
+                    tool_ctx.config.clone(),
+                ));
                 let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
             }
 

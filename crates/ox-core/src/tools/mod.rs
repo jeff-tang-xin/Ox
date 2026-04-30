@@ -13,9 +13,11 @@ pub mod shell_exec;
 pub mod web_fetch;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::config::OxConfig;
 use crate::runtime::RuntimeEnvironment;
 
 /// Safety level of a tool operation.
@@ -62,12 +64,13 @@ impl ToolOutput {
 pub struct ToolContext {
     pub runtime: RuntimeEnvironment,
     pub working_dir: std::path::PathBuf,
+    pub config: Arc<OxConfig>,
 }
 
 impl ToolContext {
     /// Create a new ToolContext with the given runtime and working directory.
-    pub fn new(runtime: RuntimeEnvironment, working_dir: std::path::PathBuf) -> Self {
-        Self { runtime, working_dir }
+    pub fn new(runtime: RuntimeEnvironment, working_dir: std::path::PathBuf, config: Arc<OxConfig>) -> Self {
+        Self { runtime, working_dir, config }
     }
 }
 

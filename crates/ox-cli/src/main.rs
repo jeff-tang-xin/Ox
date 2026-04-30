@@ -225,6 +225,61 @@ fn summarize_tool_result(name: &str, output: &str) -> String {
     }
 }
 
+// === Implicit Feedback Helper Functions ===
+
+/// Extract file path from file_write output
+fn extract_file_path_from_output(output: &str) -> Option<String> {
+    // Output format: "Wrote 1234 bytes to /path/to/file"
+    if let Some(pos) = output.find("to ") {
+        let path_part = &output[pos + 3..];
+        Some(path_part.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract content from last file_write tool call in messages
+fn extract_last_file_write_content(messages: &[Message]) -> Option<String> {
+    // Search backwards for the last Assistant message with file_write tool call
+    for msg in messages.iter().rev() {
+        if let Message::Assistant { tool_calls, .. } = msg {
+            for tc in tool_calls {
+                if tc.name == "file_write" {
+                    // Parse arguments JSON to extract content
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                        return args.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Calculate tool success rate from session messages
+fn calculate_tool_success_rate(messages: &[Message]) -> f64 {
+    let mut total_tools = 0u32;
+    let mut successful_tools = 0u32;
+    
+    for msg in messages {
+        if let Message::ToolResult { content, .. } = msg {
+            total_tools += 1;
+            // Check if content starts with error indicators
+            if !content.starts_with("Error:") && !content.starts_with("Unknown tool") {
+                successful_tools += 1;
+            }
+        }
+    }
+    
+    if total_tools == 0 {
+        1.0 // No tools used, assume perfect
+    } else {
+        successful_tools as f64 / total_tools as f64
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Detect runtime early to get home_dir for log file path.
@@ -421,12 +476,14 @@ async fn run_app(
     let tool_ctx = Arc::new(ToolContext::new(
         rt_env.clone(),
         rt_env.working_dir.clone(),
+        Arc::new(config.clone()),
     ));
 
     // Build system prompt using context module.
     let mut persona_vector = ox_core::persona::PersonaVector::for_language(
         &rt_env.project_root.as_ref().and_then(|r| r.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
     );
+    
     let system_prompt = context::build_system_prompt(&rt_env, &tool_registry, None, Some(&persona_vector), Some(&config.behavior_rules));
 
     // Context builder for assembling LLM messages within token budgets.
@@ -452,6 +509,14 @@ async fn run_app(
             MemoryManager::init(&temp, &rt_env.project_id, &config.memory)
                 .expect("memory init with temp dir")
         });
+    
+    // Load EMA historical state from database for implicit feedback tracking
+    if let Err(e) = app.ema_manager.load_from_store("code_accept_rate", memory.overall_store()) {
+        tracing::warn!("Failed to load EMA history: {}", e);
+    }
+    
+    // Baseline satisfaction for rollback evaluation
+    let baseline_satisfaction = 0.75; // Default baseline, can be made configurable
 
     // Probabilistic janitor run on startup (20% chance).
     if rand::random::<f64>() < config.memory.janitor_run_on_startup_prob {
@@ -462,6 +527,7 @@ async fn run_app(
     let mut tool_ctx = Arc::new(ToolContext::new(
         rt_env.clone(),
         rt_env.working_dir.clone(),
+        Arc::new(config.clone()),
     ));
 
     // Model name for cost recording.
@@ -558,6 +624,75 @@ async fn run_app(
     let mut background_session: Option<Session> = None;
 
     loop {
+        // === IMPLICIT FEEDBACK: Detect overrides before user input ===
+        let override_signals = app.override_detector.detect_overrides();
+        
+        for signal in &override_signals {
+            use ox_core::feedback::{map_override_to_feedback, ImplicitFeedback};
+            
+            if let Some(feedback) = map_override_to_feedback(signal.change_ratio) {
+                match feedback {
+                    ImplicitFeedback::WeakNegative => {
+                        tracing::debug!(
+                            "[IMPLICIT FEEDBACK] Minor change: {:?} ({:.1}%)",
+                            signal.path,
+                            signal.change_ratio * 100.0
+                        );
+                    }
+                    ImplicitFeedback::StrongNegative => {
+                        tracing::info!(
+                            "[IMPLICIT FEEDBACK] Major rewrite: {:?} ({:.1}%)",
+                            signal.path,
+                            signal.change_ratio * 100.0
+                        );
+                    }
+                    ImplicitFeedback::VeryStrongNegative => {
+                        tracing::warn!(
+                            "[IMPLICIT FEEDBACK] File deleted: {:?}",
+                            signal.path
+                        );
+                    }
+                }
+            } else {
+                // No significant change (<5%) - count as acceptance
+                app.accepted_file_writes += 1;
+                tracing::debug!(
+                    "[IMPLICIT FEEDBACK] Accepted: {:?} (change: {:.1}%)",
+                    signal.path,
+                    signal.change_ratio * 100.0
+                );
+            }
+        }
+        
+        // Update EMA tracker with current accept_rate
+        if app.total_file_writes > 0 {
+            let accept_rate = app.ema_manager.calculate_accept_rate(
+                app.total_file_writes,
+                app.accepted_file_writes,
+            );
+            
+            // Persist EMA state periodically (every 10 writes)
+            if app.total_file_writes % 10 == 0 {
+                let store_clone = memory.overall_store().clone();
+                let metric_name = "code_accept_rate".to_string();
+                let ema_clone = app.ema_manager.clone();
+                
+                tokio::spawn(async move {
+                    if let Err(e) = ema_clone.persist_to_store(&metric_name, &store_clone) {
+                        tracing::warn!("Failed to persist EMA state: {}", e);
+                    }
+                });
+            }
+            
+            tracing::debug!(
+                "[FEEDBACK METRICS] accept_rate={:.2}, total={}, accepted={}",
+                accept_rate,
+                app.total_file_writes,
+                app.accepted_file_writes
+            );
+        }
+        // === END IMPLICIT FEEDBACK DETECTION ===
+        
         // Only re-render when needed (dirty or spinner animation changed).
         if app.needs_render() {
             terminal.draw(|frame| render::render(frame, &mut app, tick_count))?;
@@ -866,6 +1001,25 @@ async fn run_app(
                                 summary,
                                 is_error,
                             });
+                            
+                            // Register file writes for implicit feedback tracking
+                            if name == "file_write" && !is_error {
+                                if let Some(path_str) = extract_file_path_from_output(&output) {
+                                    if let Ok(path) = std::path::PathBuf::from(path_str).canonicalize() {
+                                        if let Some(content) = extract_last_file_write_content(&target_session.messages) {
+                                            app.override_detector.register_write(path.clone(), &content);
+                                            app.total_file_writes += 1;
+                                            
+                                            tracing::debug!(
+                                                "[IMPLICIT FEEDBACK] Registered write: {:?}, total: {}",
+                                                path,
+                                                app.total_file_writes
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
@@ -908,6 +1062,122 @@ async fn run_app(
                             }
                             cost_tracker.record(&model_name, &usage);
                             memory.update_from_turn(&new_messages, &rt_env.project_id, &rt_env.project_language);
+
+                            // === IMPLICIT FEEDBACK: Evaluate satisfaction and maybe rollback ===
+                            if config.persona.auto_evolve && !persona_vector.frozen {
+                                // Calculate composite satisfaction score
+                                let explicit_rate = if app.explicit_feedback_count > 0 {
+                                    app.good_feedback_count as f64 / app.explicit_feedback_count as f64
+                                } else {
+                                    0.5 // Neutral if no explicit feedback
+                                };
+                                
+                                // Get tool success rate
+                                let tool_success_rate = calculate_tool_success_rate(&target_session.messages);
+                                
+                                // Get code accept rate from EMA
+                                let code_accept_rate = app.ema_manager.get_value("code_accept_rate")
+                                    .unwrap_or(0.8); // Default if not tracked yet
+                                
+                                let has_explicit = app.explicit_feedback_count >= 5;
+                                
+                                let satisfaction_score = app.rollback_manager.calculate_satisfaction_score(
+                                    explicit_rate,
+                                    tool_success_rate,
+                                    code_accept_rate,
+                                    has_explicit,
+                                );
+                                
+                                tracing::info!(
+                                    "[SATISFACTION EVAL] explicit={:.2}, tool={:.2}, code_accept={:.2}, overall={:.2}",
+                                    explicit_rate,
+                                    tool_success_rate,
+                                    code_accept_rate,
+                                    satisfaction_score
+                                );
+                                
+                                // Evaluate and maybe rollback
+                                match app.rollback_manager.evaluate_and_maybe_rollback(
+                                    &mut persona_vector,
+                                    satisfaction_score,
+                                    baseline_satisfaction,
+                                    memory.overall_store(),
+                                ) {
+                                    Ok(decision) => {
+                                        use ox_core::feedback::RollbackDecision;
+                                        
+                                        match decision {
+                                            RollbackDecision::RolledBack { from_score, to_score, snapshot_id } => {
+                                                app.output.push_system(&format!(
+                                                    "⚠️  Persona rolled back due to satisfaction drop ({:.2} → {:.2})",
+                                                    from_score, to_score
+                                                ));
+                                                tracing::warn!(
+                                                    "[ROLLBACK] Snapshot: {}, Score: {:.2} → {:.2}",
+                                                    snapshot_id, from_score, to_score
+                                                );
+                                            }
+                                            RollbackDecision::NeedsRollback { current_score, baseline_score, degradation } => {
+                                                app.output.push_system(&format!(
+                                                    "⚠️  Warning: Satisfaction dropped ({:.2} < {:.2}), but no rollback point available",
+                                                    current_score, baseline_score
+                                                ));
+                                                tracing::warn!(
+                                                    "[ROLLBACK NEEDED] Current: {:.2}, Baseline: {:.2}, Degradation: {:.2}",
+                                                    current_score, baseline_score, degradation
+                                                );
+                                            }
+                                            RollbackDecision::NoRollback { current_score } => {
+                                                // Normal evolution can proceed
+                                                let evolution_log = memory.run_self_evaluation(
+                                                    &mut persona_vector,
+                                                    config.persona.max_trait_change,
+                                                );
+                                                
+                                                if !evolution_log.is_empty() {
+                                                    for log_entry in &evolution_log {
+                                                        tracing::info!("[PERSONA EVOLUTION] {}", log_entry);
+                                                    }
+                                                    app.output.push_line(OutputLine::System(format!(
+                                                        "✨ Persona evolved: {} adjustments (satisfaction: {:.2})",
+                                                        evolution_log.len(),
+                                                        current_score
+                                                    )));
+                                                    
+                                                    // Create snapshot after successful evolution
+                                                    if let Err(e) = app.rollback_manager.create_snapshot(
+                                                        &persona_vector,
+                                                        current_score,
+                                                        memory.overall_store(),
+                                                    ) {
+                                                        tracing::warn!("Failed to create persona snapshot: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Rollback evaluation failed: {}", e);
+                                        // Fallback to normal evolution
+                                        let evolution_log = memory.run_self_evaluation(
+                                            &mut persona_vector,
+                                            config.persona.max_trait_change,
+                                        );
+                                        if !evolution_log.is_empty() {
+                                            for log_entry in &evolution_log {
+                                                tracing::info!("[PERSONA EVOLUTION] {}", log_entry);
+                                            }
+                                            app.output.push_line(OutputLine::System(format!(
+                                                "Persona evolved: {} adjustments",
+                                                evolution_log.len()
+                                            )));
+                                        }
+                                    }
+                                }
+                            } else if !config.persona.auto_evolve {
+                                app.output.push_system("Auto-evolve is disabled. Enable it in config.toml.");
+                            }
+                            // === END IMPLICIT FEEDBACK ROLLBACK EVALUATION ===
 
                             // Post-turn asynchronous compression trigger
                             if let Some(ref cm) = compression_manager {
@@ -1123,6 +1393,7 @@ async fn run_app(
                                     tool_ctx = Arc::new(ToolContext::new(
                                         rt_env.clone(),
                                         new_dir.clone(),
+                                        Arc::new(config.clone()),
                                     ));
                                     if project_changed {
                                         app.output.push_system(&format!(
@@ -1813,13 +2084,60 @@ fn handle_slash_command(
         SlashCommand::Feedback { category } => {
             match category.as_str() {
                 "good" => {
-                    app.output.push_system("Feedback noted: positive. Memory reinforced.");
+                    // Track explicit feedback for implicit feedback system
+                    app.good_feedback_count += 1;
+                    app.explicit_feedback_count += 1;
+                    
+                    // Reinforce recent memories on positive feedback
+                    let recent_msgs = &session.messages;
+                    if let Some(last_user) = recent_msgs.iter().rev().find_map(|m| {
+                        match m { Message::User { content } => Some(content.clone()), _ => None }
+                    }) {
+                        let nodes = memory.retrieve(&last_user, &Some(rt_env.project_id.as_str()), 3);
+                        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+                        memory.reinforce_accessed(&ids);
+                    }
+                    
+                    app.output.push_system("✅ Feedback noted: positive. Memory reinforced.");
+                    tracing::info!(
+                        "[EXPLICIT FEEDBACK] Good: {}/{}",
+                        app.good_feedback_count,
+                        app.explicit_feedback_count
+                    );
                 }
                 "bad" => {
-                    app.output.push_system("Feedback noted: negative. Will adjust approach.");
+                    // Track explicit feedback for implicit feedback system
+                    app.explicit_feedback_count += 1;
+                    // Don't increment good_feedback_count
+                    
+                    // Process negative feedback through persona evolution
+                    let last_assistant = session.messages.iter().rev()
+                        .find_map(|m| match m { 
+                            Message::Assistant { content, .. } if !content.is_empty() => Some(content.clone()),
+                            _ => None 
+                        })
+                        .unwrap_or_default();
+                    
+                    if config.persona.auto_evolve && !last_assistant.is_empty() {
+                        persona_vector.process_feedback("太啰嗦", config.persona.max_trait_change);
+                        if let Err(e) = persona_vector.persist_to_store(&memory.overall_store()) {
+                            tracing::warn!("Failed to persist persona after feedback: {}", e);
+                        }
+                        app.output.push_system("⚠️  Feedback noted: negative. Persona adjusted.");
+                    } else {
+                        app.output.push_system("⚠️  Feedback noted: negative. Will adjust approach.");
+                    }
+                    
+                    tracing::info!(
+                        "[EXPLICIT FEEDBACK] Bad: {}/{}",
+                        app.good_feedback_count,
+                        app.explicit_feedback_count
+                    );
                 }
                 "unsafe" => {
-                    app.output.push_system("Safety violation noted. Reviewing constraints.");
+                    // Safety violations are logged but refuses_unsafe_code cannot be changed
+                    app.output.push_system("🔒 Safety violation noted. Reviewing constraints.");
+                    tracing::warn!("[SAFETY VIOLATION] Reported by user");
                 }
                 _ => {
                     app.output.push_system("Usage: /feedback <good|bad|unsafe>");
@@ -1829,12 +2147,43 @@ fn handle_slash_command(
         SlashCommand::Persona { action } => {
             if action.is_empty() || action == "show" {
                 app.output.push_line(OutputLine::System(format!("Persona: {}", persona_vector)));
+                app.output.push_line(OutputLine::System(format!(
+                    "Auto-evolve: {} | Max change: {}",
+                    config.persona.auto_evolve,
+                    config.persona.max_trait_change
+                )));
             } else if action == "freeze" {
+                persona_vector.frozen = true;
+                if let Err(e) = persona_vector.persist_to_store(&memory.overall_store()) {
+                    tracing::warn!("Failed to persist frozen persona: {}", e);
+                }
                 app.output.push_system("Persona frozen (evolution stopped). Use /persona unfreeze to resume.");
             } else if action == "unfreeze" {
+                persona_vector.frozen = false;
+                if let Err(e) = persona_vector.persist_to_store(&memory.overall_store()) {
+                    tracing::warn!("Failed to persist unfrozen persona: {}", e);
+                }
                 app.output.push_system("Persona unfrozen (evolution resumed).");
+            } else if action == "evolve" {
+                // Manual trigger for self-evaluation
+                if config.persona.auto_evolve {
+                    let evolution_log = memory.run_self_evaluation(
+                        persona_vector,
+                        config.persona.max_trait_change,
+                    );
+                    if evolution_log.is_empty() {
+                        app.output.push_system("No evolution triggered (insufficient patterns or already optimized).");
+                    } else {
+                        for log_entry in &evolution_log {
+                            app.output.push_line(OutputLine::System(format!("  → {}", log_entry)));
+                        }
+                        app.output.push_system("Persona evolved based on memory patterns.");
+                    }
+                } else {
+                    app.output.push_system("Auto-evolve is disabled. Enable it in config.toml.");
+                }
             } else {
-                app.output.push_system("Usage: /persona [show|freeze|unfreeze]");
+                app.output.push_system("Usage: /persona [show|freeze|unfreeze|evolve]");
             }
         }
         SlashCommand::Discuss { question, rounds, verbose } => {

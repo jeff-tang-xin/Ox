@@ -118,57 +118,23 @@ impl OutputPane {
     }
 
     pub fn push_streaming_chunk(&mut self, chunk: &str) {
-        if !chunk.contains('\n') {
-            match self.lines.last_mut() {
-                Some(OutputLine::StreamingPartial(s)) => {
-                    s.push_str(chunk);
-                    if s.len() > Self::MAX_LINE_LEN {
-                        let end = Self::safe_char_boundary(s, Self::MAX_LINE_LEN);
-                        s.truncate(end);
-                        s.push_str("…[truncated]");
-                    }
-                    if let Some(c) = self.rendered_cache.last_mut() {
-                        *c = None;
-                    }
+        // Don't split on newlines during streaming - accumulate all chunks
+        // into a single StreamingPartial to keep Markdown blocks continuous
+        match self.lines.last_mut() {
+            Some(OutputLine::StreamingPartial(s)) => {
+                s.push_str(chunk);
+                if s.len() > Self::MAX_LINE_LEN {
+                    let end = Self::safe_char_boundary(s, Self::MAX_LINE_LEN);
+                    s.truncate(end);
+                    s.push_str("…[truncated]");
                 }
-                _ => {
-                    self.lines.push(OutputLine::StreamingPartial(chunk.to_string()));
-                    self.rendered_cache.push(None);
+                if let Some(c) = self.rendered_cache.last_mut() {
+                    *c = None;
                 }
             }
-            self.cache_valid = false;
-            return;
-        }
-
-        let mut remaining = chunk;
-        while let Some(pos) = remaining.find('\n') {
-            let before = &remaining[..pos];
-            match self.lines.last_mut() {
-                Some(OutputLine::StreamingPartial(s)) => {
-                    s.push_str(before);
-                }
-                _ => {
-                    if !before.is_empty() {
-                        self.lines.push(OutputLine::StreamingPartial(before.to_string()));
-                        self.rendered_cache.push(None);
-                    }
-                }
-            }
-            self.finalize_streaming();
-            remaining = &remaining[pos + 1..];
-        }
-        if !remaining.is_empty() {
-            match self.lines.last_mut() {
-                Some(OutputLine::StreamingPartial(s)) => {
-                    s.push_str(remaining);
-                    if let Some(c) = self.rendered_cache.last_mut() {
-                        *c = None;
-                    }
-                }
-                _ => {
-                    self.lines.push(OutputLine::StreamingPartial(remaining.to_string()));
-                    self.rendered_cache.push(None);
-                }
+            _ => {
+                self.lines.push(OutputLine::StreamingPartial(chunk.to_string()));
+                self.rendered_cache.push(None);
             }
         }
         self.cache_valid = false;

@@ -131,6 +131,7 @@ impl MarkdownRenderer {
                     }
                     TagEnd::Paragraph => {
                         style_stack.pop();
+                        // Flush current spans as a single line (paragraph continues on same line)
                         if !current_spans.is_empty() {
                             result.push(Line::from(std::mem::take(&mut current_spans)));
                         }
@@ -186,9 +187,10 @@ impl MarkdownRenderer {
                 }
 
                 Event::SoftBreak => {
-                    if !current_spans.is_empty() {
-                        result.push(Line::from(std::mem::take(&mut current_spans)));
-                    }
+                    // Don't break on soft breaks - keep paragraph continuous
+                    // Only add a space to separate words
+                    let style = *style_stack.last().unwrap();
+                    current_spans.push(Span::styled(" ".to_string(), style));
                 }
 
                 Event::HardBreak => {
@@ -319,5 +321,44 @@ mod tests {
         let lines = md.render_lines("This is **bold** and *italic* text", 80);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].spans.len() >= 4);
+    }
+
+    #[test]
+    fn paragraph_continuity() {
+        // Test that soft breaks don't split paragraphs into multiple lines
+        let md = MarkdownRenderer::new();
+        let input = "This is a long paragraph\nwith multiple lines\nthat should stay together";
+        let lines = md.render_lines(input, 80);
+        
+        // Should be rendered as a single line (paragraph), not split by soft breaks
+        assert_eq!(lines.len(), 1, "Paragraph should remain as single line");
+        
+        // Verify the content contains all parts
+        let full_text: String = lines[0].spans.iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(full_text.contains("long paragraph"));
+        assert!(full_text.contains("multiple lines"));
+        assert!(full_text.contains("stay together"));
+    }
+
+    #[test]
+    fn code_block_integrity() {
+        // Ensure code blocks are still properly formatted
+        let md = MarkdownRenderer::new();
+        let input = "Here's code:\n```rust\nfn main() {\n    println!(\"Hello\");\n}\n```\nDone.";
+        let lines = md.render_lines(input, 80);
+        
+        // Should have: text line + code block header + code lines + footer + text line
+        assert!(lines.len() >= 6);
+        
+        // First line should be the intro text
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("Here's code:")));
+        
+        // Last line should be the ending text
+        let last_line_text: String = lines.last().unwrap().spans.iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(last_line_text.contains("Done."));
     }
 }

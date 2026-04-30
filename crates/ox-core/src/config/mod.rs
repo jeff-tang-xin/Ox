@@ -200,8 +200,9 @@ enabled = false
 # auto_confirm_safe = true
 # confirm_writes = true
 # confirm_shell = true
-# shell_timeout_ms = 30000
-# max_output_chars = 10000
+# shell_timeout_ms = 30000          # Shell命令超时时间（毫秒）
+# max_output_chars = 10000         # Shell输出最大字符数（默认10000，约200-300行）
+                                    # 推荐范围: 5000(快速) ~ 20000(详细) ~ 50000(最大)
 
 [agent]
 # max_iterations = 25

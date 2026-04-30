@@ -41,8 +41,23 @@ impl Tool for FileReadTool {
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let raw_path = match args.get("path").and_then(|p| p.as_str()) {
-            Some(p) => p,
-            None => return ToolOutput::error("Missing required parameter: path. Usage: {\"path\": \"<file path>\"}"),
+            Some(p) if !p.is_empty() => p,
+            Some(_) => return ToolOutput::error(
+                "❌ Parameter Error: 'path' cannot be empty\n\n\
+                 💡 Example usage:\n\
+                 {\"path\": \"src/main.rs\", \"limit\": 100}\n\n\
+                 Please provide a valid file path."
+            ),
+            None => return ToolOutput::error(
+                "❌ Missing Required Parameter: 'path'\n\n\
+                 💡 How to fix:\n\
+                 • Add the 'path' parameter with the file location\n\
+                 • Path can be relative to working directory\n\
+                 • Use forward slashes (/) for paths\n\n\
+                 📝 Example usage:\n\
+                 {\"path\": \"src/main.rs\"} - Read entire file\n\
+                 {\"path\": \"src/main.rs\", \"offset\": 10, \"limit\": 50} - Read lines 10-60"
+            ),
         };
         let resolved_path = ctx.working_dir.join(raw_path);
 

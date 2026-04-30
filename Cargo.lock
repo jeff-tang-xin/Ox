@@ -2031,6 +2031,7 @@ dependencies = [
  "pulldown-cmark",
  "rand 0.8.6",
  "ratatui",
+ "serde_json",
  "syntect",
  "tokio",
  "tracing",

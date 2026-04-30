@@ -572,6 +572,11 @@ impl MemoryManager {
         }
     }
 
+    /// Get a reference to the overall memory store (for persona persistence)
+    pub fn overall_store(&self) -> &store::MemoryStore {
+        &self.overall_store
+    }
+
     // ── Self-Evolution: Persona-Memory Co-evolution ──
 
     /// Analyze memory patterns and suggest persona evolution
