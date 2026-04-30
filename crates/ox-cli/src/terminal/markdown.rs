@@ -16,6 +16,34 @@ const COLOR_LINK: Color = Color::Rgb(86, 156, 214);
 const COLOR_BLOCKQUOTE: Color = Color::Rgb(106, 153, 85);
 const COLOR_BLOCKQUOTE_BORDER: Color = Color::Rgb(70, 100, 60);
 
+/// Preprocess Markdown text to ensure proper line break handling.
+/// Converts single newlines after certain elements to hard breaks (two spaces + newline)
+/// so they render as separate lines in the terminal.
+fn preprocess_markdown(text: &str) -> String {
+    let mut result = String::with_capacity(text.len() + 100);
+    let mut lines = text.lines().peekable();
+    
+    while let Some(line) = lines.next() {
+        result.push_str(line);
+        
+        // Check if next line exists
+        if let Some(&next_line) = lines.peek() {
+            if !next_line.trim().is_empty() {
+                // Non-empty next line: add hard break for proper line separation
+                result.push_str("  \n");
+            } else {
+                // Empty line = paragraph break, keep as-is (don't consume it)
+                result.push('\n');
+            }
+        } else {
+            // Last line, no trailing newline needed
+            break;
+        }
+    }
+    
+    result
+}
+
 pub struct MarkdownRenderer {
     syntax_set: SyntaxSet,
     theme: Theme,
@@ -35,7 +63,9 @@ impl MarkdownRenderer {
     }
 
     pub fn render_lines(&self, text: &str, output_width: usize) -> Vec<Line<'static>> {
-        let parser = Parser::new(text);
+        // Preprocess text to handle line breaks properly
+        let processed_text = preprocess_markdown(text);
+        let parser = Parser::new(&processed_text);
         let mut result: Vec<Line<'static>> = Vec::new();
         let mut current_spans: Vec<Span<'static>> = Vec::new();
         let mut style_stack: Vec<Style> = vec![Style::default()];
@@ -187,13 +217,14 @@ impl MarkdownRenderer {
                 }
 
                 Event::SoftBreak => {
-                    // Don't break on soft breaks - keep paragraph continuous
-                    // Only add a space to separate words
+                    // Soft break: single newline in source becomes a space
+                    // This is CommonMark behavior - only double newline creates paragraph break
                     let style = *style_stack.last().unwrap();
                     current_spans.push(Span::styled(" ".to_string(), style));
                 }
 
                 Event::HardBreak => {
+                    // Hard break: two spaces + newline, or explicit <br>
                     if !current_spans.is_empty() {
                         result.push(Line::from(std::mem::take(&mut current_spans)));
                     } else {
@@ -325,21 +356,28 @@ mod tests {
 
     #[test]
     fn paragraph_continuity() {
-        // Test that soft breaks don't split paragraphs into multiple lines
+        // Test that consecutive non-empty lines are properly separated
         let md = MarkdownRenderer::new();
-        let input = "This is a long paragraph\nwith multiple lines\nthat should stay together";
+        let input = "This is a long paragraph\nwith multiple lines\nthat should be on separate lines";
         let lines = md.render_lines(input, 80);
         
-        // Should be rendered as a single line (paragraph), not split by soft breaks
-        assert_eq!(lines.len(), 1, "Paragraph should remain as single line");
+        // With preprocess_markdown, each non-empty line becomes a separate rendered line
+        assert_eq!(lines.len(), 3, "Each non-empty line should be rendered separately");
         
-        // Verify the content contains all parts
-        let full_text: String = lines[0].spans.iter()
+        // Verify the content of each line
+        let line0_text: String = lines[0].spans.iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(full_text.contains("long paragraph"));
-        assert!(full_text.contains("multiple lines"));
-        assert!(full_text.contains("stay together"));
+        let line1_text: String = lines[1].spans.iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let line2_text: String = lines[2].spans.iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        
+        assert!(line0_text.contains("long paragraph"));
+        assert!(line1_text.contains("multiple lines"));
+        assert!(line2_text.contains("separate lines"));
     }
 
     #[test]

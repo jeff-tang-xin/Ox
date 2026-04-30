@@ -186,14 +186,17 @@ impl OutputPane {
         // scroll_offset = 0 means at bottom (newest), larger = scrolling up (older)
         let effective_offset = scroll_offset as usize;
 
+        // Reserve 1 line for paragraph bottom padding to prevent last message from being cut off
+        let usable_height = inner_height.saturating_sub(1);
+
         // visible_start: 0 = top (oldest), total-inner_height = bottom (newest)
         // We want to invert: scroll_offset=0 shows bottom, scroll_offset=max shows top
-        let visible_start = if total <= inner_height {
+        let visible_start = if total <= usable_height {
             0
         } else {
-            (total - inner_height).saturating_sub(effective_offset)
+            (total - usable_height).saturating_sub(effective_offset)
         };
-        let visible_count = inner_height.min(total);
+        let visible_count = usable_height.min(total);
         let visible_end = (visible_start + visible_count).min(total);
 
         let mut result = Vec::with_capacity(visible_count);
