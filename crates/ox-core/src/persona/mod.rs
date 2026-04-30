@@ -60,6 +60,39 @@ impl PersonaVector {
         }
     }
 
+    /// Load persona from store, or create default if not found
+    pub fn load_or_default(lang: &str, store: &crate::memory::store::MemoryStore) -> anyhow::Result<Self> {
+        if let Some((safety, conciseness, style, refuses_unsafe, frozen, forbidden, priorities)) = 
+            store.load_persona_vector(lang)? {
+            Ok(Self {
+                favors_safety_over_speed: safety,
+                prefers_conciseness: conciseness,
+                code_style_strictness: style,
+                forbidden_phrases: forbidden,
+                moral_priorities: priorities,
+                language: lang.into(),
+                frozen,
+                refuses_unsafe_code: refuses_unsafe,
+            })
+        } else {
+            Ok(Self::for_language(lang))
+        }
+    }
+
+    /// Persist persona vector to store
+    pub fn persist_to_store(&self, store: &crate::memory::store::MemoryStore) -> anyhow::Result<()> {
+        store.save_persona_vector(
+            &self.language,
+            self.favors_safety_over_speed,
+            self.prefers_conciseness,
+            self.code_style_strictness,
+            self.refuses_unsafe_code,
+            self.frozen,
+            &self.forbidden_phrases,
+            &self.moral_priorities,
+        )
+    }
+
     pub fn generate_prompt_block(&self) -> String {
         format!(
             "## Persona\n\
@@ -95,6 +128,28 @@ impl PersonaVector {
             PersonaSignal::Safer => {
                 self.favors_safety_over_speed = adjust(self.favors_safety_over_speed, 0.05, max_change);
             }
+        }
+    }
+
+    /// Process user feedback and evolve persona accordingly
+    pub fn process_feedback(&mut self, feedback: &str, max_change: f64) {
+        let feedback_lower = feedback.to_lowercase();
+        
+        // Detect feedback signals
+        if feedback_lower.contains("太啰嗦") || feedback_lower.contains("too verbose") || feedback_lower.contains("更简洁") {
+            self.evolve(PersonaSignal::MoreConcise, max_change);
+        }
+        if feedback_lower.contains("太简单") || feedback_lower.contains("too brief") || feedback_lower.contains("详细点") {
+            self.evolve(PersonaSignal::MoreVerbose, max_change);
+        }
+        if feedback_lower.contains("格式不规范") || feedback_lower.contains("style issue") || feedback_lower.contains("规范点") {
+            self.evolve(PersonaSignal::StricterStyle, max_change);
+        }
+        if feedback_lower.contains("太严格") || feedback_lower.contains("too strict") || feedback_lower.contains("灵活点") {
+            self.evolve(PersonaSignal::LooserStyle, max_change);
+        }
+        if feedback_lower.contains("不安全") || feedback_lower.contains("unsafe") || feedback_lower.contains("更安全") {
+            self.evolve(PersonaSignal::Safer, max_change);
         }
     }
 }

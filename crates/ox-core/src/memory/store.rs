@@ -28,6 +28,33 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(node_type);
 CREATE INDEX IF NOT EXISTS idx_memories_accessed ON memories(last_accessed);
+
+-- Council model capability scores
+CREATE TABLE IF NOT EXISTS model_capabilities (
+    provider          TEXT NOT NULL,
+    model             TEXT NOT NULL,
+    topic_category    TEXT NOT NULL,
+    proposal_adopted_rate REAL NOT NULL DEFAULT 0.5,
+    review_quality    REAL NOT NULL DEFAULT 0.5,
+    session_count     INTEGER NOT NULL DEFAULT 0,
+    last_updated      INTEGER NOT NULL,
+    PRIMARY KEY (provider, model, topic_category)
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_caps_topic ON model_capabilities(topic_category);
+
+-- Persona vectors persistence
+CREATE TABLE IF NOT EXISTS persona_vectors (
+    language              TEXT PRIMARY KEY,
+    safety_over_speed     REAL NOT NULL DEFAULT 0.7,
+    prefers_conciseness   REAL NOT NULL DEFAULT 0.7,
+    code_style_strictness REAL NOT NULL DEFAULT 0.7,
+    refuses_unsafe_code   INTEGER NOT NULL DEFAULT 1,
+    frozen                INTEGER NOT NULL DEFAULT 0,
+    forbidden_phrases     TEXT NOT NULL DEFAULT '',
+    moral_priorities      TEXT NOT NULL DEFAULT '',
+    last_updated          INTEGER NOT NULL
+);
 "#;
 
 pub struct MemoryStore {
@@ -253,6 +280,127 @@ impl MemoryStore {
     pub fn checkpoint(&self) -> anyhow::Result<()> {
         self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
+    }
+
+    // ── Model Capability Score persistence ──
+
+    pub fn save_model_capability(
+        &self,
+        provider: &str,
+        model: &str,
+        topic: &str,
+        adopted_rate: f32,
+        quality: f32,
+        count: u32,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO model_capabilities 
+             (provider, model, topic_category, proposal_adopted_rate, review_quality, session_count, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![provider, model, topic, adopted_rate, quality, count, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_model_capability(
+        &self,
+        provider: &str,
+        model: &str,
+        topic: &str,
+    ) -> anyhow::Result<Option<(f32, f32, u32)>> {
+        let row = self.conn.query_row(
+            "SELECT proposal_adopted_rate, review_quality, session_count FROM model_capabilities
+             WHERE provider = ?1 AND model = ?2 AND topic_category = ?3",
+            params![provider, model, topic],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        );
+        match row {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn get_all_model_capabilities(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, String, f32, f32, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider, model, topic_category, proposal_adopted_rate, review_quality, session_count
+             FROM model_capabilities ORDER BY provider, model, topic_category"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?;
+        rows.collect::<SqlResult<Vec<_>>>().map_err(Into::into)
+    }
+
+    // ── Persona Vector persistence ──
+
+    pub fn save_persona_vector(
+        &self,
+        language: &str,
+        safety: f64,
+        conciseness: f64,
+        style_strictness: f64,
+        refuses_unsafe: bool,
+        frozen: bool,
+        forbidden: &[String],
+        priorities: &[String],
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let forbidden_str = forbidden.join("|");
+        let priorities_str = priorities.join("|");
+        
+        self.conn.execute(
+            "INSERT OR REPLACE INTO persona_vectors 
+             (language, safety_over_speed, prefers_conciseness, code_style_strictness,
+              refuses_unsafe_code, frozen, forbidden_phrases, moral_priorities, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                language, safety, conciseness, style_strictness,
+                refuses_unsafe as i32, frozen as i32,
+                forbidden_str, priorities_str, now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_persona_vector(
+        &self,
+        language: &str,
+    ) -> anyhow::Result<Option<(f64, f64, f64, bool, bool, Vec<String>, Vec<String>)>> {
+        let row = self.conn.query_row(
+            "SELECT safety_over_speed, prefers_conciseness, code_style_strictness,
+                    refuses_unsafe_code, frozen, forbidden_phrases, moral_priorities
+             FROM persona_vectors WHERE language = ?1",
+            params![language],
+            |row| {
+                let forbidden: String = row.get(5)?;
+                let priorities: String = row.get(6)?;
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i32>(3)? != 0,
+                    row.get::<_, i32>(4)? != 0,
+                    if forbidden.is_empty() { vec![] } else { forbidden.split('|').map(|s| s.to_string()).collect() },
+                    if priorities.is_empty() { vec![] } else { priorities.split('|').map(|s| s.to_string()).collect() },
+                ))
+            },
+        );
+        match row {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn row_to_node(&self, row: &rusqlite::Row) -> SqlResult<MemoryNode> {

@@ -261,10 +261,97 @@ impl ModelCapabilityScore {
         ts.review_quality = ema(ts.review_quality, review_cited_ratio, alpha);
         ts.session_count += 1;
     }
+
+    pub fn from_store(
+        provider: String,
+        model: String,
+        store: &crate::memory::store::MemoryStore,
+    ) -> anyhow::Result<Self> {
+        let mut scores = Self::new(provider.clone(), model.clone());
+        for cat in &[TopicCategory::Architecture, TopicCategory::Algorithm, TopicCategory::Debugging,
+                     TopicCategory::CodeReview, TopicCategory::DevOps, TopicCategory::Frontend,
+                     TopicCategory::Database, TopicCategory::Security, TopicCategory::General] {
+            if let Some((adopted, quality, count)) = store.load_model_capability(&provider, &model, cat.as_str())? {
+                let mut ts = TopicScore::default();
+                ts.proposal_adopted_rate = adopted;
+                ts.review_quality = quality;
+                ts.session_count = count;
+                scores.topic_scores.insert(*cat, ts);
+            }
+        }
+        Ok(scores)
+    }
+
+    pub fn persist_to_store(&self, store: &crate::memory::store::MemoryStore) -> anyhow::Result<()> {
+        for (topic, score) in &self.topic_scores {
+            store.save_model_capability(
+                &self.provider,
+                &self.model,
+                topic.as_str(),
+                score.proposal_adopted_rate,
+                score.review_quality,
+                score.session_count,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 fn ema(prev: f32, new: f32, alpha: f32) -> f32 {
     prev + alpha * (new - prev)
+}
+
+// ── Participant selection helper ──
+
+impl TopicCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Architecture => "architecture",
+            Self::Algorithm => "algorithm",
+            Self::Debugging => "debugging",
+            Self::CodeReview => "code_review",
+            Self::DevOps => "devops",
+            Self::Frontend => "frontend",
+            Self::Database => "database",
+            Self::Security => "security",
+            Self::General => "general",
+        }
+    }
+}
+
+pub fn select_best_participants(
+    available_models: &[String],
+    topic: TopicCategory,
+    store: &crate::memory::store::MemoryStore,
+    max_participants: usize,
+) -> Vec<String> {
+    use std::collections::HashMap;
+
+    // Load capability scores for all models on this topic
+    let mut model_scores: HashMap<String, f32> = HashMap::new();
+    
+    for model_name in available_models {
+        let provider = crate::llm::resolve_provider_name(model_name);
+        if let Ok(Some((adopted, _quality, count))) = store.load_model_capability(provider, model_name, topic.as_str()) {
+            // Score based on adoption rate and experience (session count)
+            let experience_bonus = (count as f32).min(10.0) / 10.0 * 0.2; // Up to 0.2 bonus for experience
+            let score = adopted * 0.8 + experience_bonus;
+            model_scores.insert(model_name.clone(), score);
+        } else {
+            // Unknown models get default score
+            model_scores.insert(model_name.clone(), 0.5);
+        }
+    }
+
+    // Sort by score descending
+    let mut sorted: Vec<_> = model_scores.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    
+    // Take top N participants
+    sorted.into_iter()
+        .take(max_participants)
+        .map(|(model, _)| model)
+        .collect()
 }
 
 #[cfg(test)]

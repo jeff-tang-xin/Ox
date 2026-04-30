@@ -571,4 +571,99 @@ impl MemoryManager {
             let _ = self.overall_store.increment_depth(id);
         }
     }
+
+    // ── Self-Evolution: Persona-Memory Co-evolution ──
+
+    /// Analyze memory patterns and suggest persona evolution
+    pub fn analyze_and_evolve_persona(
+        &self,
+        persona: &mut crate::persona::PersonaVector,
+        max_trait_change: f64,
+    ) -> Vec<String> {
+        let mut evolution_log = Vec::new();
+
+        // Get all memories for this language
+        let lang = persona.language.clone();
+        
+        // Check for style-related memories
+        if let Ok(style_memories) = self.overall_store.query_overall(
+            &[MemoryNodeType::Style],
+            50,
+        ) {
+            let relevant_memories: Vec<_> = style_memories.iter()
+                .filter(|m| m.language == lang)
+                .collect();
+
+            // If many style memories emphasize conciseness, evolve persona
+            let concise_count = relevant_memories.iter()
+                .filter(|m| {
+                    let content_lower = m.content.to_lowercase();
+                    content_lower.contains("简洁") || content_lower.contains("concise") || content_lower.contains("brief")
+                })
+                .count();
+
+            if concise_count > 5 && persona.prefers_conciseness < 0.8 {
+                persona.evolve(crate::persona::PersonaSignal::MoreConcise, max_trait_change);
+                evolution_log.push(format!("Evolved towards more conciseness ({} style memories)", concise_count));
+            }
+
+            // If many style memories emphasize strict formatting
+            let strict_count = relevant_memories.iter()
+                .filter(|m| {
+                    let content_lower = m.content.to_lowercase();
+                    content_lower.contains("规范") || content_lower.contains("format") || content_lower.contains("style")
+                })
+                .count();
+
+            if strict_count > 5 && persona.code_style_strictness < 0.8 {
+                persona.evolve(crate::persona::PersonaSignal::StricterStyle, max_trait_change);
+                evolution_log.push(format!("Evolved towards stricter style ({} style memories)", strict_count));
+            }
+        }
+
+        // Check for safety-related anti-patterns
+        if let Ok(anti_patterns) = self.overall_store.query_overall(
+            &[MemoryNodeType::AntiPattern],
+            30,
+        ) {
+            let safety_issues = anti_patterns.iter()
+                .filter(|m| {
+                    let content_lower = m.content.to_lowercase();
+                    content_lower.contains("unsafe") || content_lower.contains("安全") || content_lower.contains("vulnerability")
+                })
+                .count();
+
+            if safety_issues > 3 && persona.favors_safety_over_speed < 0.9 {
+                persona.evolve(crate::persona::PersonaSignal::Safer, max_trait_change);
+                evolution_log.push(format!("Evolved towards safer code ({} safety issues found)", safety_issues));
+            }
+        }
+
+        evolution_log
+    }
+
+    /// Run periodic self-evaluation and evolution
+    pub fn run_self_evaluation(
+        &self,
+        persona: &mut crate::persona::PersonaVector,
+        max_trait_change: f64,
+    ) -> Vec<String> {
+        tracing::warn!("Running self-evaluation for persona evolution...");
+        
+        let evolution_log = self.analyze_and_evolve_persona(
+            persona,
+            max_trait_change,
+        );
+
+        // Persist evolved persona
+        if !evolution_log.is_empty() {
+            if let Err(e) = persona.persist_to_store(&self.overall_store) {
+                tracing::warn!("Failed to persist evolved persona: {}", e);
+            } else {
+                tracing::warn!("Persona evolved and persisted: {:?}", evolution_log);
+            }
+        }
+
+        evolution_log
+    }
 }

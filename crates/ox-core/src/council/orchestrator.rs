@@ -3,8 +3,9 @@ use std::sync::Arc;
 use crate::config::{CouncilConfig, ModelsConfig};
 use crate::llm::{self, LlmProvider, LlmStreamEvent};
 use crate::message::Message;
+use crate::memory::store::MemoryStore;
 
-use super::{Arbitration, CouncilSession, CouncilTokenUsage, DebatePhase, Participant, ParticipantRole, Proposal, Rebuttal, Review};
+use super::{Arbitration, CouncilSession, CouncilTokenUsage, DebatePhase, Participant, ParticipantRole, Proposal, Rebuttal, Review, TopicCategory};
 
 async fn call_model_simple(models_config: &ModelsConfig, model: &str, system: &str, user: &str) -> anyhow::Result<(String, u32, u32)> {
     let (provider, _) = llm::create_provider_with_info(model, models_config)?;
@@ -48,6 +49,7 @@ async fn call_model_simple(models_config: &ModelsConfig, model: &str, system: &s
 pub struct CouncilOrchestrator {
     models_config: ModelsConfig,
     council_config: CouncilConfig,
+    capability_store: Option<MemoryStore>,
 }
 
 impl CouncilOrchestrator {
@@ -55,7 +57,13 @@ impl CouncilOrchestrator {
         Self {
             models_config,
             council_config,
+            capability_store: None,
         }
+    }
+
+    pub fn with_capability_store(mut self, store: MemoryStore) -> Self {
+        self.capability_store = Some(store);
+        self
     }
 
     pub async fn convene(
@@ -125,8 +133,65 @@ impl CouncilOrchestrator {
         session.token_usage.add(tokens.0, tokens.1, 0.0);
         session.arbitration = Some(arbitration);
 
+        // Update model capability scores if store is available
+        if let Some(ref store) = self.capability_store {
+            self.update_capability_scores(&session, store)?;
+        }
+
         let _ = verbose;
         Ok(session)
+    }
+
+    fn update_capability_scores(&self, session: &CouncilSession, store: &MemoryStore) -> anyhow::Result<()> {
+        let topic = TopicCategory::classify(&session.question);
+        
+        // Determine which proposal was adopted (from arbitration)
+        let primary_source = session.arbitration.as_ref()
+            .map(|a| a.primary_source_idx)
+            .unwrap_or(0);
+
+        // Update each participant's capability score
+        for (idx, participant) in session.participants.iter().enumerate() {
+            let proposal_adopted = idx == primary_source;
+            
+            // Calculate review quality based on reviews received
+            let reviews_received: Vec<&Review> = session.phases.iter()
+                .filter_map(|p| match p {
+                    DebatePhase::CrossReview(reviews) => Some(reviews),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|r| r.target_idx == idx)
+                .collect();
+
+            let review_cited_ratio = if reviews_received.is_empty() {
+                0.5 // Default if no reviews
+            } else {
+                // Higher average score means better quality
+                reviews_received.iter().map(|r| r.score).sum::<f32>() / reviews_received.len() as f32
+            };
+
+            // Load existing scores or create new
+            let mut scores = crate::council::ModelCapabilityScore::from_store(
+                participant.provider.clone(),
+                participant.model.clone(),
+                store,
+            ).unwrap_or_else(|_| crate::council::ModelCapabilityScore::new(
+                participant.provider.clone(),
+                participant.model.clone(),
+            ));
+
+            // Update with this session's results
+            scores.update(topic, proposal_adopted, review_cited_ratio);
+
+            // Persist back to store
+            if let Err(e) = scores.persist_to_store(store) {
+                tracing::warn!("Failed to persist capability scores for {}:{} - {}", 
+                    participant.provider, participant.model, e);
+            }
+        }
+
+        Ok(())
     }
 
     fn resolve_participants(&self) -> anyhow::Result<Vec<Participant>> {
