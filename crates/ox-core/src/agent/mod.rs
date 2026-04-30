@@ -19,7 +19,7 @@ pub enum AgentToUiEvent {
     /// Streaming text from LLM.
     TextChunk(String),
     /// Agent is calling a tool.
-    ToolStart { name: String, id: String },
+    ToolStart { name: String, id: String, detail: Option<String> },
     /// Tool execution result.
     ToolResult {
         name: String,
@@ -59,6 +59,16 @@ pub enum AgentToUiEvent {
     CouncilDone {
         session: crate::council::CouncilSession,
     },
+    /// Agent detected a working directory change (e.g. shell cd).
+    WorkingDirChanged(std::path::PathBuf),
+    /// Agent reached the iteration limit and is asking user to continue.
+    IterationLimitReached { iteration: u32 },
+    /// Compression completed — carries compressed messages to persist into SQLite.
+    CompressionComplete {
+        compressed_messages: Vec<Message>,
+        /// Number of original session messages that were compressed.
+        source_msg_count: usize,
+    },
 }
 
 /// Run a complete agent turn: LLM -> tool_calls -> execute -> loop -> text.
@@ -75,19 +85,58 @@ pub async fn run_agent_turn(
     cancel_token: CancellationToken,
     trust_manager: Arc<std::sync::Mutex<TrustManager>>,
     agent_config: Arc<AgentConfig>,
+    planning_mode: bool,
 ) {
     let tool_schemas = tool_registry.schemas();
     let max_iterations = agent_config.max_iterations;
+    let mut tool_ctx = tool_ctx; // Allow reassignment on cd
 
     // Track new messages produced during this turn for returning to the caller.
     let mut new_messages: Vec<Message> = Vec::new();
     let mut total_usage = TokenUsage::default();
 
-    for iteration in 0..max_iterations {
+    let mut iteration = 0u32;
+    loop {
         // Check cancellation before each LLM call.
         if cancel_token.is_cancelled() {
             let _ = ui_tx.send(AgentToUiEvent::Status("Interrupted.".to_string()));
             break;
+        }
+
+        // When iteration limit is reached, ask user whether to continue.
+        if iteration > 0 && iteration >= max_iterations {
+            let _ = ui_tx.send(AgentToUiEvent::IterationLimitReached { iteration });
+
+            let should_continue = loop {
+                tokio::select! {
+                    ev = ui_rx.recv() => {
+                        match ev {
+                            Some(ui_event::UiToAgentEvent::ToolConfirmation { tool_call_id, decision })
+                                if tool_call_id == "__iteration_limit__" =>
+                            {
+                                break matches!(
+                                    decision,
+                                    ui_event::ConfirmationDecision::Allow
+                                        | ui_event::ConfirmationDecision::TrustAlways
+                                );
+                            }
+                            Some(ui_event::UiToAgentEvent::Interjection(text)) => {
+                                messages.push(Message::user(&text));
+                            }
+                            _ => continue,
+                        }
+                    }
+                    _ = cancel_token.cancelled() => {
+                        break false;
+                    }
+                }
+            };
+
+            if !should_continue {
+                break;
+            }
+            // User chose to continue — reset counter so we get another full batch.
+            iteration = 0;
         }
 
         let _ = ui_tx.send(AgentToUiEvent::Status(
@@ -103,7 +152,7 @@ pub async fn run_agent_turn(
             if let ui_event::UiToAgentEvent::Interjection(text) = ev {
                 messages.push(Message::user(&text));
                 let _ = ui_tx.send(AgentToUiEvent::Status(
-                    format!("(interjection injected: {})", text.trim())
+                    format!("💬 User: {}", text.trim())
                 ));
             }
         }
@@ -113,7 +162,13 @@ pub async fn run_agent_turn(
 
         let provider_clone = Arc::clone(&provider);
         let msgs = messages.clone();
-        let schemas = tool_schemas.clone();
+        // In planning mode, first iteration omits tool schemas so the LLM
+        // can only respond with text (the plan). Subsequent iterations use real schemas.
+        let schemas = if planning_mode && iteration == 0 {
+            vec![]
+        } else {
+            tool_schemas.clone()
+        };
         let cancel_clone = cancel_token.clone();
         let llm_tx_err = llm_tx.clone();
         let mut stream_handle = tokio::spawn(async move {
@@ -151,6 +206,7 @@ pub async fn run_agent_turn(
                     let _ = ui_tx.send(AgentToUiEvent::ToolStart {
                         name: name.clone(),
                         id: id.clone(),
+                        detail: None,
                     });
                     current_tool_args.insert(id.clone(), String::new());
                     tool_calls.push(ToolCall {
@@ -213,6 +269,25 @@ pub async fn run_agent_turn(
             return;
         }
 
+        // Sanitize tool_call arguments: if the LLM response was truncated
+        // (e.g. finish_reason="length"), arguments may be incomplete JSON.
+        // Mark truncated tool calls so we skip execution and return an error
+        // to the LLM, letting it retry.
+        let mut truncated_ids = std::collections::HashSet::new();
+        for tc in &mut tool_calls {
+            if !tc.arguments.trim().is_empty() {
+                if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err() {
+                    tracing::warn!(
+                        "Truncated tool arguments for '{}' (len {}), will return error to LLM",
+                        tc.name,
+                        tc.arguments.len()
+                    );
+                    truncated_ids.insert(tc.id.clone());
+                    tc.arguments = "{}".to_string();
+                }
+            }
+        }
+
         // Push assistant message with tool calls.
         let assistant_msg = Message::Assistant {
             content: full_text,
@@ -229,10 +304,40 @@ pub async fn run_agent_turn(
                 break;
             }
 
+            // Skip truncated tool calls — return error so LLM can retry.
+            if truncated_ids.contains(&tc.id) {
+                let error_msg = "Tool call failed: arguments were truncated (incomplete JSON). Please retry with complete arguments.".to_string();
+                let result_msg = Message::ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: error_msg.clone(),
+                };
+                new_messages.push(result_msg.clone());
+                messages.push(result_msg);
+                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                    name: tc.name.clone(),
+                    output: error_msg,
+                    is_error: true,
+                });
+                continue;
+            }
+
             let _ = ui_tx.send(AgentToUiEvent::Status(format!(
                 "Running tool: {}",
                 tc.name
             )));
+
+            // For shell_exec, send an updated ToolStart with the command detail.
+            if tc.name == "shell_exec" {
+                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    if let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
+                        let _ = ui_tx.send(AgentToUiEvent::ToolStart {
+                            name: tc.name.clone(),
+                            id: tc.id.clone(),
+                            detail: Some(cmd.to_string()),
+                        });
+                    }
+                }
+            }
 
             let tool = match tool_registry.get(&tc.name) {
                 Some(t) => t,
@@ -274,11 +379,10 @@ pub async fn run_agent_turn(
             } else {
                 match safety_level {
                     SafetyLevel::Safe => false,
-                    SafetyLevel::RequiresConfirmation => {
+                    SafetyLevel::RequiresConfirmation | SafetyLevel::Dangerous => {
                         let tm = trust_manager.lock().unwrap();
                         !tm.can_skip_confirmation(&tc.name, safety_level)
                     }
-                    SafetyLevel::Dangerous => true,
                 }
             };
 
@@ -412,12 +516,18 @@ pub async fn run_agent_turn(
                 if let ui_event::UiToAgentEvent::Interjection(text) = ev {
                     messages.push(Message::user(&text));
                     let _ = ui_tx.send(AgentToUiEvent::Status(
-                        format!("(interjection injected before tool: {})", text.trim())
+                        format!("💬 User (before tool): {}", text.trim())
                     ));
                 }
             }
 
             let result = tool.execute(args, &tool_ctx).await;
+
+            // If the tool changed working directory, update tool_ctx and notify UI.
+            if let Some(new_dir) = result.new_working_dir.clone() {
+                tool_ctx = Arc::new(ToolContext::new(tool_ctx.runtime.clone(), new_dir.clone()));
+                let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
+            }
 
             let _ = ui_tx.send(AgentToUiEvent::ToolResult {
                 name: tc.name.clone(),
@@ -434,18 +544,13 @@ pub async fn run_agent_turn(
         }
 
         // Loop back to call LLM again with tool results.
+        iteration += 1;
     }
 
-    // If we exit the loop (max iterations or cancellation), still send TurnDone
-    // so the UI can persist whatever messages were collected.
-    if cancel_token.is_cancelled() {
-        let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-            new_messages,
-            usage: total_usage,
-        });
-    } else {
-        let _ = ui_tx.send(AgentToUiEvent::Error(
-            "Agent exceeded maximum iterations (25).".to_string(),
-        ));
-    }
+    // Loop exited via break (cancellation or user declined to continue).
+    // Send TurnDone so the UI can persist collected messages.
+    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+        new_messages,
+        usage: total_usage,
+    });
 }

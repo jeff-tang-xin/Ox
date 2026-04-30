@@ -12,6 +12,7 @@ pub enum UserInput {
 #[derive(Debug, Clone)]
 pub struct PendingConfirmation {
     pub tool_call_id: String,
+    #[allow(dead_code)]
     pub tool_name: String,
 }
 
@@ -21,6 +22,12 @@ pub struct SessionEntry {
     pub filename: String,
     pub info: String,
     pub is_active: bool,
+}
+
+/// Deferred compression: set by handle_key_event, processed by main loop after render.
+pub struct PendingCompression {
+    pub text: String,
+    pub memory_ctx: String,
 }
 
 pub struct App {
@@ -43,9 +50,21 @@ pub struct App {
     pub pending_discuss: Option<(String, Option<u8>, bool)>,
     pub last_council_session: Option<ox_core::council::CouncilSession>,
     pub pending_model_switch: Option<String>,
+    pub pending_compression: Option<PendingCompression>,
+    /// Message count at last compression. Used to avoid re-compressing
+    /// when no new messages have been added since last compression.
+    pub last_compression_msg_count: usize,
+    /// Whether compression is currently in progress. Used to prevent
+    /// re-entrant compression while an async compression is running.
+    pub compression_in_progress: bool,
+    pub trusted_all: bool,
     pub header_info: Vec<String>,
     pub sessions: Vec<SessionEntry>,
     pub sidebar_width: u16,
+    /// Track last spinner frame to avoid unnecessary renders
+    pub last_spinner_frame: u64,
+    /// Chat area bounds for mouse scroll detection (x, y, width, height)
+    pub chat_area: Option<(u16, u16, u16, u16)>,
 }
 
 impl App {
@@ -70,9 +89,15 @@ impl App {
             pending_discuss: None,
             last_council_session: None,
             pending_model_switch: None,
+            pending_compression: None,
+            last_compression_msg_count: 0,
+            compression_in_progress: false,
+            trusted_all: false,
             header_info: Vec::new(),
             sessions: Vec::new(),
             sidebar_width: 22,
+            last_spinner_frame: 0,
+            chat_area: None,
         }
     }
 
@@ -118,5 +143,22 @@ impl App {
         // Approximate max scroll based on total line count
         let total_lines = self.output.lines.len() as u16 * 3; // rough estimate of wrapped lines
         total_lines.saturating_sub(10).min(500)
+    }
+
+    /// Check if render is needed, considering spinner animation
+    pub fn needs_render(&self) -> bool {
+        if self.dirty {
+            return true;
+        }
+        // Only re-render for spinner if frame actually changed
+        if self.agent_running && self.spinner_frame != self.last_spinner_frame {
+            return true;
+        }
+        false
+    }
+
+    /// Mark that spinner frame has been processed for rendering
+    pub fn mark_spinner_rendered(&mut self) {
+        self.last_spinner_frame = self.spinner_frame;
     }
 }

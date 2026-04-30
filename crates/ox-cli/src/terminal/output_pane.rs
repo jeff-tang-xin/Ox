@@ -17,7 +17,7 @@ pub enum OutputLine {
     User(String),
     #[allow(dead_code)]
     Assistant(String),
-    Tool { name: String },
+    Tool { name: String, detail: Option<String> },
     ToolResult { name: String, summary: String, is_error: bool },
     System(String),
     Error(String),
@@ -45,7 +45,7 @@ impl OutputLine {
         match self {
             Self::User(s) => s,
             Self::Assistant(s) => s,
-            Self::Tool { name } => name,
+            Self::Tool { name, .. } => name,
             Self::ToolResult { summary, .. } => summary,
             Self::System(s) => s,
             Self::Error(s) => s,
@@ -72,6 +72,14 @@ impl OutputPane {
             rendered_cache: Vec::new(),
             cache_valid: false,
             last_output_width: 0,
+        }
+    }
+
+    /// Invalidate the rendered cache so lines are re-rendered on the next draw.
+    pub fn invalidate_cache(&mut self) {
+        self.cache_valid = false;
+        for c in &mut self.rendered_cache {
+            *c = None;
         }
     }
 
@@ -269,7 +277,7 @@ impl OutputPane {
                     OutputLine::Assistant(s)
                 }
             }
-            OutputLine::Tool { name } => OutputLine::Tool { name },
+            OutputLine::Tool { name, detail } => OutputLine::Tool { name, detail },
             OutputLine::ToolResult { name, summary, is_error } => {
                 if summary.len() > Self::MAX_LINE_LEN {
                     let end = Self::safe_char_boundary(&summary, Self::MAX_LINE_LEN);

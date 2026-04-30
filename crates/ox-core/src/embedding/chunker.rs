@@ -206,20 +206,14 @@ pub fn chunks_to_messages(
     let selected_ids: std::collections::HashSet<usize> =
         selected_message_indices.iter().cloned().collect();
 
-    // Reconstruct messages, stripping tool_calls to avoid orphaned references
+    // Reconstruct messages in original form.
+    // Tool pair sanitization (orphaned ToolResult/tool_calls) is handled
+    // downstream by context_builder after budget truncation.
     let mut result: Vec<Message> = Vec::new();
 
     for &msg_idx in &selected_message_indices {
         if let Some(msg) = original_messages.get(msg_idx).cloned() {
-            // Strip tool_calls from Assistant messages since tool results may be missing
-            let cleaned_msg = match msg {
-                Message::Assistant { content, .. } => Message::Assistant {
-                    content,
-                    tool_calls: Vec::new(),
-                },
-                _ => msg,
-            };
-            result.push(cleaned_msg);
+            result.push(msg);
         }
     }
 

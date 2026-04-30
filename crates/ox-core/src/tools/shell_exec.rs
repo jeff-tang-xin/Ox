@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -6,6 +7,29 @@ use tokio::process::Command;
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
 pub struct ShellExecTool;
+
+/// Parse a `cd <path>` target from a command string.
+/// Returns the resolved absolute path if the command starts with `cd`.
+fn detect_cd_target(command: &str, current_dir: &Path) -> Option<PathBuf> {
+    let trimmed = command.trim();
+    if !trimmed.starts_with("cd ") && !trimmed.starts_with("cd\t") && trimmed != "cd" {
+        return None;
+    }
+    let rest = if trimmed == "cd" { "" } else { trimmed[3..].trim() };
+    // Stop at && or ; (compound commands like `cd /tmp && ls`).
+    let path_str = rest.split(&['&', ';'][..]).next().unwrap_or("").trim();
+    // Strip surrounding quotes.
+    let path_str = path_str.trim_matches(|c| c == '"' || c == '\'');
+    if path_str.is_empty() {
+        return None;
+    }
+    let target = if Path::new(path_str).is_absolute() {
+        PathBuf::from(path_str)
+    } else {
+        current_dir.join(path_str)
+    };
+    target.canonicalize().ok().filter(|p| p.is_dir())
+}
 
 #[async_trait::async_trait]
 impl Tool for ShellExecTool {
@@ -121,11 +145,16 @@ impl Tool for ShellExecTool {
 
                 let output = truncated.join("\n");
                 let suffix = format!("\n[exit code: {exit_code}]");
-                if exit_code == 0 {
+                let mut tool_output = if exit_code == 0 {
                     ToolOutput::success(format!("{output}{suffix}"))
                 } else {
                     ToolOutput::error(format!("{output}{suffix}"))
+                };
+                // Detect cd: if command succeeded and contains a cd target, carry the new dir.
+                if exit_code == 0 {
+                    tool_output.new_working_dir = detect_cd_target(command, &ctx.working_dir);
                 }
+                tool_output
             }
             Err(_) => {
                 // Timeout — kill the process.

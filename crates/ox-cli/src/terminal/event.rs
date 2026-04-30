@@ -15,9 +15,9 @@ pub enum Event {
     /// Render tick.
     Tick,
     /// Mouse scroll up in output pane.
-    ScrollUp,
+    ScrollUp { column: u16, row: u16 },
     /// Mouse scroll down in output pane.
-    ScrollDown,
+    ScrollDown { column: u16, row: u16 },
 }
 
 /// Spawns a dedicated std::thread that polls crossterm events.
@@ -43,12 +43,12 @@ impl EventHandler {
                             if tx.send(Event::Resize(w, h)).is_err() => {
                                 break;
                             }
-                        Ok(CrosstermEvent::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, .. }))
-                            if tx.send(Event::ScrollUp).is_err() => {
+                        Ok(CrosstermEvent::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, column, row, .. }))
+                            if tx.send(Event::ScrollUp { column, row }).is_err() => {
                                 break;
                             }
-                        Ok(CrosstermEvent::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, .. }))
-                            if tx.send(Event::ScrollDown).is_err() => {
+                        Ok(CrosstermEvent::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, column, row, .. }))
+                            if tx.send(Event::ScrollDown { column, row }).is_err() => {
                                 break;
                             }
                         _ => {}

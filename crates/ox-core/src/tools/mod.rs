@@ -34,6 +34,8 @@ pub enum SafetyLevel {
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// If the tool changed the working directory (e.g. shell cd), carry the new path.
+    pub new_working_dir: Option<std::path::PathBuf>,
 }
 
 impl ToolOutput {
@@ -41,6 +43,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            new_working_dir: None,
         }
     }
 
@@ -48,6 +51,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            new_working_dir: None,
         }
     }
 }

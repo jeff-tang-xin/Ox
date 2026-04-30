@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+#[cfg(not(target_os = "windows"))]
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -35,7 +36,7 @@ use terminal::event::{Event, EventHandler};
 use terminal::output_pane::OutputLine;
 use terminal::render;
 
-const REPLAY_HISTORY_DEPTH: usize = 20;
+const REPLAY_HISTORY_DEPTH: usize = 100;
 
 /// Session action signaled by slash commands, processed in the main event loop.
 #[derive(Debug, Clone, Default)]
@@ -92,7 +93,7 @@ fn replay_session_history(
                 }
                 for tc in tool_calls {
                     tc_map.insert(tc.id.clone(), tc.name.clone());
-                    app.output.push_line(OutputLine::Tool { name: tc.name.clone() });
+                    app.output.push_line(OutputLine::Tool { name: tc.name.clone(), detail: None });
                 }
             }
             Message::ToolResult { tool_call_id, content } => {
@@ -291,7 +292,10 @@ async fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(EnableMouseCapture)?;  // Enable mouse scroll events.
+    // Enable mouse capture for scroll events (skip on Windows where it
+    // can cause garbled input in cmd/powershell).
+    #[cfg(not(target_os = "windows"))]
+    stdout.execute(EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -301,6 +305,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore terminal.
     disable_raw_mode()?;
+    #[cfg(not(target_os = "windows"))]
     io::stdout().execute(DisableMouseCapture)?;
     io::stdout().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -378,6 +383,20 @@ async fn run_app(
     } else {
         Session::new(&session_dir, &rt_env.project_id)?
     };
+    // Truncate old ToolResult content loaded from disk (JSONL retains full content).
+    // All loaded messages are from previous turns — use aggressive threshold.
+    for msg in session.messages.iter_mut() {
+        if let Message::ToolResult { content, .. } = msg {
+            let char_len = content.chars().count();
+            if char_len > 500 {
+                let preview: String = content.chars().take(200).collect();
+                *content = format!("{}...[truncated, {} chars total]", preview, char_len);
+            }
+        }
+    }
+    // Initialize compression debounce baseline so loaded sessions
+    // don't immediately trigger compression on the first new message.
+    app.last_compression_msg_count = session.messages.len();
 
     // Populate sidebar with archived sessions.
     {
@@ -398,6 +417,7 @@ async fn run_app(
 
     // Create tool registry and context (shared via Arc for tokio::spawn).
     let tool_registry = Arc::new(ToolRegistry::new());
+    #[allow(unused_variables)]
     let tool_ctx = Arc::new(ToolContext::new(
         rt_env.clone(),
         rt_env.working_dir.clone(),
@@ -439,7 +459,7 @@ async fn run_app(
     }
 
     // Create tool context (memory is pre-injected into context by main.rs)
-    let tool_ctx = Arc::new(ToolContext::new(
+    let mut tool_ctx = Arc::new(ToolContext::new(
         rt_env.clone(),
         rt_env.working_dir.clone(),
     ));
@@ -467,6 +487,16 @@ async fn run_app(
 
     // Agent config (shared with spawned task).
     let agent_config = Arc::new(config.agent.clone());
+
+    // Compressed context store -- SQLite: ~/.ox/db/compressed_context.db
+    let compressed_ctx_store = Arc::new(ox_core::context::compressed_store::CompressedContextStore::open(
+        &db_dir.join("compressed_context.db"),
+    ).unwrap_or_else(|e| {
+        tracing::warn!("Failed to open compressed context store: {e}");
+        ox_core::context::compressed_store::CompressedContextStore::open(
+            &std::env::temp_dir().join("compressed_context.db"),
+        ).expect("compressed context store with temp dir")
+    }));
 
     // Compression manager for context compression (KadaneDial).
     // Uses history_ratio from ContextBuilder for consistent configuration.
@@ -516,6 +546,11 @@ async fn run_app(
     // Tick counter for spinner animation.
     let mut tick_count: u64 = 0;
 
+    // Cached compressed context: (compressed_messages, source_msg_count).
+    // source_msg_count = number of JSONL messages absorbed into the compressed context.
+    let mut compressed_cache: Option<(Vec<Message>, usize)> =
+        compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+
     // Session action signaled from slash commands.
     let mut session_action: SessionAction = SessionAction::None;
 
@@ -523,14 +558,123 @@ async fn run_app(
     let mut background_session: Option<Session> = None;
 
     loop {
-        // Only re-render when dirty or agent is running (for spinner animation).
-        if app.dirty || app.agent_running {
+        // Only re-render when needed (dirty or spinner animation changed).
+        if app.needs_render() {
             terminal.draw(|frame| render::render(frame, &mut app, tick_count))?;
             app.dirty = false;
+            app.mark_spinner_rendered();
+        }
+
+        // Handle deferred compression (set by handle_key_event after status render).
+        // Compression runs on a blocking thread so the TUI stays responsive.
+        if let Some(pc) = app.pending_compression.take() {
+            // Skip if compression is already in progress (prevents re-entrant compression).
+            if app.compression_in_progress {
+                app.output.push_line(OutputLine::System(
+                    "Compression in progress, skipping...".to_string()
+                ));
+                app.agent_running = false;
+                app.dirty = true;
+                continue;
+            }
+            app.compression_in_progress = true;
+            let source_msg_count = session.messages.len();
+            app.last_compression_msg_count = source_msg_count;
+            app.agent_running = true;
+            app.status = "Compressing...".to_string();
+            app.dirty = true;
+            if let Some(ref p) = provider {
+                let cm = compression_manager.clone();
+                // Build input: existing compressed context + new messages, or all messages.
+                let messages = if let Some((ref cached, prev_count)) = compressed_cache {
+                    let new_msgs = &session.messages[prev_count.min(session.messages.len())..];
+                    let mut combined = cached.clone();
+                    combined.extend_from_slice(new_msgs);
+                    combined
+                } else {
+                    session.messages.clone()
+                };
+                let sp = system_prompt.clone();
+                let memory_ctx = pc.memory_ctx;
+                let query = pc.text;
+                let cb = context_builder.clone();
+                let cw = context_window;
+                let provider = Arc::clone(p);
+                let tx = agent_tx.clone();
+                let registry = Arc::clone(&tool_registry);
+                let ctx = Arc::clone(&tool_ctx);
+                let cancel_token = interrupt_ctrl.token();
+                let tm = Arc::clone(&trust_manager);
+                let ac = Arc::clone(&agent_config);
+                let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
+                app.ui_to_agent_tx = Some(ui_to_agent_tx);
+                tokio::spawn(async move {
+                    let tx_status = tx.clone();
+                    let turn_messages = match cm {
+                        Some(cm) => {
+                            let q = query;
+                            let mem_ctx = memory_ctx.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                // Use enhanced compression with memory context
+                                let result = if !mem_ctx.is_empty() {
+                                    cm.compress_with_memory(&messages, &q, Some(&mem_ctx))
+                                } else {
+                                    cm.compress(&messages, &q)
+                                };
+                                (result, messages, cm)
+                            })
+                            .await
+                            {
+                                Ok((Ok(Some(compressed)), original, _cm)) => {
+                                    let _ = tx_status.send(AgentToUiEvent::Status(
+                                        format!(
+                                            "Compressed: {} → {} msgs",
+                                            original.len(),
+                                            compressed.len()
+                                        ),
+                                    ));
+                                    let _ = tx_status.send(AgentToUiEvent::CompressionComplete {
+                                        compressed_messages: compressed.clone(),
+                                        source_msg_count,
+                                    });
+                                    cb.build(&sp, &memory_ctx, &compressed, cw)
+                                }
+                                Ok((Ok(None), original, _cm)) => {
+                                    cb.build(&sp, &memory_ctx, &original, cw)
+                                }
+                                Ok((Err(e), original, _cm)) => {
+                                    tracing::error!("Compression failed: {}", e);
+                                    cb.build(&sp, &memory_ctx, &original, cw)
+                                }
+                                Err(_) => {
+                                    tracing::error!("Compression task panicked");
+                                    return;
+                                }
+                            }
+                        }
+                        None => cb.build(&sp, &memory_ctx, &messages, cw),
+                    };
+                    agent::run_agent_turn(
+                        provider,
+                        turn_messages,
+                        registry,
+                        ctx,
+                        tx,
+                        ui_to_agent_rx,
+                        cancel_token,
+                        tm,
+                        ac,
+                        false, // compression path: skip planning
+                    )
+                    .await;
+                });
+            }
         }
 
         // Async event loop: wait for crossterm event OR agent event.
+        // Use biased to prioritize user input over agent events.
         tokio::select! {
+            biased;
             ev = events.recv() => {
                 match ev {
                     Some(Event::Key(key)) => {
@@ -558,6 +702,7 @@ async fn run_app(
                             &agent_config,
                             &mut session_action,
                             &compression_manager,
+                            &compressed_cache,
                         );
                         // Process session switch action.
                         match session_action {
@@ -570,6 +715,8 @@ async fn run_app(
                                     let new_s = Session::new(&session_dir, &project_id)
                                         .expect("failed to create new session");
                                     background_session = Some(std::mem::replace(&mut session, new_s));
+                                    // Clear UI→Agent channel for background session
+                                    app.ui_to_agent_tx = None;
                                 } else {
                                     let project_id = rt_env.project_id.clone();
                                     match Session::new(&session_dir, &project_id) {
@@ -592,6 +739,8 @@ async fn run_app(
                                     match Session::load_archived(&session_dir, &filename) {
                                         Ok(Some(archived)) => {
                                             background_session = Some(std::mem::replace(&mut session, archived));
+                                            // Clear UI→Agent channel when switching to background
+                                            app.ui_to_agent_tx = None;
                                         }
                                         _ => {}
                                     }
@@ -644,23 +793,34 @@ async fn run_app(
                     Some(Event::Resize(_, _)) => {
                         app.dirty = true;
                     }
-                    Some(Event::ScrollUp) => {
-                        app.scroll_up(3);
-                        app.user_scrolled = true;
-                        app.dirty = true;
-                    }
-                    Some(Event::ScrollDown) => {
-                        app.scroll_down(3);
-                        if app.scroll_offset < 3 {
-                            app.user_scrolled = false;
+                    Some(Event::ScrollUp { column, row }) => {
+                        // Only handle scroll if mouse is in chat area
+                        if let Some((cx, cy, cw, ch)) = app.chat_area {
+                            if column >= cx && column < cx + cw && row >= cy && row < cy + ch {
+                                app.scroll_up(3);
+                                app.user_scrolled = true;
+                                app.dirty = true;
+                            }
                         }
-                        app.dirty = true;
+                    }
+                    Some(Event::ScrollDown { column, row }) => {
+                        // Only handle scroll if mouse is in chat area
+                        if let Some((cx, cy, cw, ch)) = app.chat_area {
+                            if column >= cx && column < cx + cw && row >= cy && row < cy + ch {
+                                app.scroll_down(3);
+                                if app.scroll_offset < 3 {
+                                    app.user_scrolled = false;
+                                }
+                                app.dirty = true;
+                            }
+                        }
                     }
                     Some(Event::Tick) | None => {
                         tick_count = tick_count.wrapping_add(1);
                         app.spinner_frame = tick_count;
                         // Agent running needs spinner animation updates.
-                        if app.agent_running {
+                        // Only mark dirty if spinner frame actually changed and agent is running
+                        if app.agent_running && app.spinner_frame != app.last_spinner_frame {
                             app.dirty = true;
                         }
                     }
@@ -676,8 +836,26 @@ async fn run_app(
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
-                        AgentToUiEvent::ToolStart { name, id: _ } => {
-                            app.output.push_line(OutputLine::Tool { name: name.clone() });
+                        AgentToUiEvent::ToolStart { name, id: _, detail } => {
+                            if detail.is_some() {
+                                // Update the last matching Tool line with the detail.
+                                let mut updated = false;
+                                for line in app.output.lines.iter_mut().rev() {
+                                    if let OutputLine::Tool { name: n, detail: d } = line {
+                                        if *n == name {
+                                            *d = detail.clone();
+                                            updated = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !updated {
+                                    app.output.push_line(OutputLine::Tool { name: name.clone(), detail });
+                                }
+                                app.output.invalidate_cache();
+                            } else {
+                                app.output.push_line(OutputLine::Tool { name: name.clone(), detail: None });
+                            }
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
@@ -693,80 +871,132 @@ async fn run_app(
                         }
                         AgentToUiEvent::TurnDone { new_messages, usage } => {
                             app.output.finalize_streaming();
-                            // Persist all new messages from this turn.
+                            // Two-tier ToolResult truncation (in-memory only; JSONL keeps full content).
+                            let prev_count = target_session.messages.len();
+                            let recent_boundary = {
+                                let mut user_count = 0usize;
+                                let mut boundary = prev_count;
+                                for (i, m) in target_session.messages[..prev_count].iter().enumerate().rev() {
+                                    if matches!(m, Message::User { .. }) {
+                                        user_count += 1;
+                                        if user_count >= 2 {
+                                            boundary = i;
+                                            break;
+                                        }
+                                    }
+                                }
+                                boundary
+                            };
+                            for (i, msg) in target_session.messages[..prev_count].iter_mut().enumerate() {
+                                if let Message::ToolResult { content, .. } = msg {
+                                    let char_len = content.chars().count();
+                                    let (max_len, preview_len) = if i < recent_boundary {
+                                        (500, 200)
+                                    } else {
+                                        (2000, 800)
+                                    };
+                                    if char_len > max_len {
+                                        let preview: String = content.chars().take(preview_len).collect();
+                                        *content = format!("{}...[truncated, {} chars total]", preview, char_len);
+                                    }
+                                }
+                            }
                             for msg in &new_messages {
                                 if let Err(e) = target_session.append_message(msg.clone()) {
                                     tracing::error!("Failed to persist message: {e}");
                                 }
                             }
-                            // Record cost.
                             cost_tracker.record(&model_name, &usage);
-                            // Extract memories from this turn.
                             memory.update_from_turn(&new_messages, &rt_env.project_id, &rt_env.project_language);
 
+                            // Post-turn asynchronous compression trigger
+                            if let Some(ref cm) = compression_manager {
+                                let session_id = target_session.meta.id.clone();
+                                let msgs = target_session.messages.clone();
+                                let store = Arc::clone(&compressed_ctx_store);
+                                let tx_comp = agent_tx.clone();
+                                let last_count = app.last_compression_msg_count;
+                                let cw = context_window;
+                                let cm_clone = cm.clone();
+                                
+                                // Get memory context for better compression
+                                let last_user_query = msgs.last()
+                                    .and_then(|m| match m { Message::User { content } => Some(content.clone()), _ => None })
+                                    .unwrap_or_default();
+                                let memory_nodes = memory.retrieve(&last_user_query, &Some(rt_env.project_id.as_str()), 5);
+                                let memory_ctx = memory.format_memory_context(&memory_nodes, false);
+                                
+                                tokio::spawn(async move {
+                                    let current_tokens = cm_clone.calculate_context_tokens(&msgs);
+                                    
+                                    // Use smart compression trigger
+                                    let should_compress = cm_clone.should_compress_smart(&msgs, cw);
+                                    
+                                    if should_compress && msgs.len() > last_count {
+                                        let query = msgs.last()
+                                            .and_then(|m| match m { Message::User { content } => Some(content.clone()), _ => None })
+                                            .unwrap_or_default();
+                                        // Use enhanced compression with memory context
+                                        let compressed_result = if !memory_ctx.is_empty() {
+                                            cm_clone.compress_with_memory(&msgs, &query, Some(&memory_ctx))
+                                        } else {
+                                            cm_clone.compress(&msgs, &query)
+                                        };
+                                        
+                                        if let Ok(Some(compressed)) = compressed_result {
+                                            let source_count = msgs.len();
+                                            let compressed_len = compressed.len();
+                                            let _ = store.save(&session_id, &compressed, source_count);
+                                            let _ = tx_comp.send(AgentToUiEvent::CompressionComplete {
+                                                compressed_messages: compressed,
+                                                source_msg_count: source_count,
+                                            });
+                                            tracing::info!("[ASYNC COMPRESS] Done: {} -> {} msgs (tokens: {})", source_count, compressed_len, current_tokens);
+                                        }
+                                    }
+                                });
+                            }
+
                             if background_session.is_some() {
-                                // Agent finished in background session, clear background.
                                 background_session = None;
                                 app.output.push_system("Background session completed and saved.");
                             } else {
                                 app.agent_running = false;
                                 app.status = String::new();
-                                // Clear any stale pending confirmation.
                                 app.pending_confirmation = None;
-                                // Update status bar info.
                                 app.message_count = session.messages.len();
                                 app.cost_summary = cost_tracker.summary_short();
-                                // Reset interrupt controller for next turn.
                                 interrupt_ctrl.reset();
-                                // Process any interjection messages queued during the turn.
+                                // Clear the UI→Agent channel after turn completes
+                                app.ui_to_agent_tx = None;
+                                
+                                // Process interjections after turn completion
                                 let interjections_vec: Vec<String> = interjection_buf.drain();
                                 if !interjections_vec.is_empty() {
-                                    // Show all queued messages
                                     for inj_text in &interjections_vec {
                                         app.output.push_line(OutputLine::User(format!("(queued) {}", inj_text)));
                                     }
-                                    // The LAST interjection becomes the next user message and triggers a new agent run.
                                     if let Some(last) = interjections_vec.last() {
                                         app.output.push_line(OutputLine::System(String::new()));
                                         let user_msg = Message::user(last);
                                         if let Err(e) = session.append_message(user_msg) {
                                             tracing::error!("Failed to persist interjection: {e}");
                                         }
-                                        // Trigger new agent run with the interjection message
+                                        // Trigger new run for interjection
                                         let text = last.clone();
                                         let memory_nodes = memory.retrieve(&text, &Some(rt_env.project_id.as_str()), 5);
                                         let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
                                         memory.reinforce_accessed(&accessed_ids);
                                         let memory_ctx = memory.format_memory_context(&memory_nodes, false);
-
-                                        let turn_messages = if let Some(cm) = compression_manager.as_ref() {
-                                            let context_tokens = cm.calculate_context_tokens(&session.messages);
-                                            let history_budget = (context_window as f32 * context_builder.history_ratio() * 0.8) as usize;
-                                            let should_compress = context_tokens >= history_budget;
-                                            let base_messages = context_builder.build(
-                                                &system_prompt,
-                                                &memory_ctx,
-                                                &session.messages,
-                                                context_window,
-                                            );
-                                            if should_compress {
-                                                match cm.compress(&session.messages, &text) {
-                                                    Ok(Some(compressed)) => {
-                                                        app.output.push_line(OutputLine::System(
-                                                            format!("Context compressed: {} msgs ({} tokens) -> {} msgs",
-                                                                session.messages.len(), context_tokens, compressed.len())
-                                                        ));
-                                                        compressed
-                                                    }
-                                                    _ => base_messages,
-                                                }
-                                            } else {
-                                                base_messages
-                                            }
+                                        let effective_messages = if let Some((ref cached, prev_count)) = compressed_cache {
+                                            let new_msgs = &session.messages[prev_count.min(session.messages.len())..];
+                                            let mut combined = cached.clone();
+                                            combined.extend_from_slice(new_msgs);
+                                            combined
                                         } else {
-                                            context_builder.build(&system_prompt, &memory_ctx, &session.messages, context_window)
+                                            session.messages.clone()
                                         };
-
+                                        let turn_messages = context_builder.build(&system_prompt, &memory_ctx, &effective_messages, context_window);
                                         app.agent_running = true;
                                         app.status = "Thinking...".to_string();
                                         let provider = Arc::clone(provider.as_ref().unwrap());
@@ -779,28 +1009,12 @@ async fn run_app(
                                         let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
                                         app.ui_to_agent_tx = Some(ui_to_agent_tx);
                                         tokio::spawn(async move {
-                                            agent::run_agent_turn(
-                                                provider,
-                                                turn_messages,
-                                                registry,
-                                                ctx,
-                                                tx,
-                                                ui_to_agent_rx,
-                                                cancel_token,
-                                                tm,
-                                                ac,
-                                            )
-                                            .await;
+                                            agent::run_agent_turn(provider, turn_messages, registry, ctx, tx, ui_to_agent_rx, cancel_token, tm, ac, false).await;
                                         });
-                                        // Keep agent_running=true, don't reset to false
                                         app.scroll_to_bottom();
                                         app.dirty = true;
-                                        // Skip the normal reset logic below since we're starting a new run
                                         app.message_count = session.messages.len();
                                         app.cost_summary = cost_tracker.summary_short();
-                                        if !app.user_scrolled { app.scroll_to_bottom(); }
-                                        app.dirty = true;
-                                        // Continue to next iteration of the event loop, don't fall through
                                         continue;
                                     }
                                 }
@@ -817,6 +1031,8 @@ async fn run_app(
                             } else {
                                 app.agent_running = false;
                                 app.status = String::new();
+                                // Clear the UI→Agent channel on error
+                                app.ui_to_agent_tx = None;
                             }
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
@@ -837,7 +1053,7 @@ async fn run_app(
                                 .as_ref()
                                 .map(|w| format!(" [{}]", w))
                                 .unwrap_or_default();
-                            app.output.push_line(OutputLine::Tool { name: format!("Confirm {} {:?}{}: {}", tool_name, safety_level, warning_str, args_summary) });
+                            app.output.push_line(OutputLine::Tool { name: format!("Confirm {} {:?}{}: {}", tool_name, safety_level, warning_str, args_summary), detail: None });
                             app.output.push_line(OutputLine::System(
                                 "  [Y] Allow / [N] Deny / [T] Trust always".to_string(),
                             ));
@@ -888,9 +1104,64 @@ async fn run_app(
                             } else {
                                 app.agent_running = false;
                                 app.status = "Ox".to_string();
+                                // Clear the UI→Agent channel after council completes
+                                app.ui_to_agent_tx = None;
                             }
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
+                        }
+                        AgentToUiEvent::WorkingDirChanged(new_dir) => {
+                            let target = new_dir.display().to_string();
+                            match runtime::change_directory(&mut rt_env, &target) {
+                                runtime::DirectoryChangeResult::Success { new_dir, project_changed } => {
+                                    app.output.push_line(OutputLine::System(format!(
+                                        "Working directory: {}",
+                                        new_dir.display()
+                                    )));
+                                    refresh_header_info(&mut app, &rt_env, provider.is_some());
+                                    // Update tool_ctx for next agent turn.
+                                    tool_ctx = Arc::new(ToolContext::new(
+                                        rt_env.clone(),
+                                        new_dir.clone(),
+                                    ));
+                                    if project_changed {
+                                        app.output.push_system(&format!(
+                                            "Project boundary changed: {}",
+                                            new_dir.display()
+                                        ));
+                                    }
+                                }
+                                _ => {} // Agent already resolved; unlikely to fail here.
+                            }
+                            app.dirty = true;
+                        }
+                        AgentToUiEvent::IterationLimitReached { iteration } => {
+                            app.output.push_line(OutputLine::System(format!(
+                                "Agent reached {} iterations. Continue? [Y] Yes / [N] Stop",
+                                iteration
+                            )));
+                            app.pending_confirmation = Some(PendingConfirmation {
+                                tool_call_id: "__iteration_limit__".into(),
+                                tool_name: "iteration_limit".into(),
+                            });
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
+                            app.dirty = true;
+                        }
+                        AgentToUiEvent::CompressionComplete { compressed_messages, source_msg_count } => {
+                            let target_session = background_session.as_ref().unwrap_or(&session);
+                            let sid = target_session.meta.id.clone();
+                            if let Err(e) = compressed_ctx_store.save(&sid, &compressed_messages, source_msg_count) {
+                                tracing::error!("Failed to save compressed context to SQLite: {e}");
+                            } else {
+                                tracing::info!(
+                                    "[COMPRESSION] Saved to SQLite: source_msgs={}, compressed={}",
+                                    source_msg_count,
+                                    compressed_messages.len()
+                                );
+                            }
+                            compressed_cache = Some((compressed_messages, source_msg_count));
+                            app.last_compression_msg_count = source_msg_count;
+                            app.compression_in_progress = false;
                         }
                     }
                 }
@@ -931,12 +1202,12 @@ fn handle_key_event(
     agent_config: &Arc<AgentConfig>,
     session_action: &mut SessionAction,
     compression_manager: &Option<CompressionManager>,
+    compressed_cache: &Option<(Vec<Message>, usize)>,
 ) {
     match (key.code, key.modifiers) {
         // Confirmation key handling (Y/N/T when pending)
         (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
-            if app.pending_confirmation.is_some() {
-                let pc = app.pending_confirmation.take().unwrap();
+            if let Some(pc) = app.pending_confirmation.take() {
                 if let Some(tx) = &app.ui_to_agent_tx {
                     let _ = tx.send(UiToAgentEvent::ToolConfirmation {
                         tool_call_id: pc.tool_call_id,
@@ -953,8 +1224,7 @@ fn handle_key_event(
             app.dirty = true;
         }
         (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Char('N'), KeyModifiers::NONE) => {
-            if app.pending_confirmation.is_some() {
-                let pc = app.pending_confirmation.take().unwrap();
+            if let Some(pc) = app.pending_confirmation.take() {
                 if let Some(tx) = &app.ui_to_agent_tx {
                     let _ = tx.send(UiToAgentEvent::ToolConfirmation {
                         tool_call_id: pc.tool_call_id,
@@ -971,16 +1241,16 @@ fn handle_key_event(
             app.dirty = true;
         }
         (KeyCode::Char('t'), KeyModifiers::NONE) | (KeyCode::Char('T'), KeyModifiers::NONE) => {
-            if app.pending_confirmation.is_some() {
-                let pc = app.pending_confirmation.take().unwrap();
+            if let Some(pc) = app.pending_confirmation.take() {
                 if let Some(tx) = &app.ui_to_agent_tx {
                     let _ = tx.send(UiToAgentEvent::ToolConfirmation {
                         tool_call_id: pc.tool_call_id,
                         decision: ConfirmationDecision::TrustAlways,
                     });
                     app.output.push_line(OutputLine::System(
-                        format!("  -> Trusted {} for this session", pc.tool_name),
+                        "  -> Trusted all tools for this session. Use /untrust to revoke.".to_string(),
                     ));
+                    app.trusted_all = true;
                 } else {
                     app.output.push_line(OutputLine::Error("  -> Error: agent channel closed, cannot trust".to_string()));
                 }
@@ -1036,6 +1306,8 @@ fn handle_key_event(
                             session_action,
                             &compression_manager,
                         );
+                        // Mark dirty to trigger UI refresh after slash command processing
+                        app.dirty = true;
                         // Check if a council discuss was queued
                         if let Some((question, rounds, verbose)) = app.pending_discuss.take() {
                             let council_config = config.council.clone();
@@ -1062,10 +1334,28 @@ fn handle_key_event(
                     }
                     UserInput::Text(text) => {
                         if app.agent_running {
-                            interjection_buf.push(text.clone(), InterjectionPriority::Normal);
+                            // Send interjection to agent immediately via channel
+                            let priority = if text.starts_with('!') {
+                                InterjectionPriority::Urgent
+                            } else {
+                                InterjectionPriority::Normal
+                            };
+                            let content = text.trim_start_matches('!').to_string();
+                            
+                            if let Some(tx) = &app.ui_to_agent_tx {
+                                let _ = tx.send(UiToAgentEvent::Interjection(content.clone()));
+                            }
+                            
+                            // Also buffer locally for fallback display
+                            interjection_buf.push(content.clone(), priority);
+                            
+                            let prefix = if priority == InterjectionPriority::Urgent {
+                                "(urgent!)"
+                            } else {
+                                "(queued)"
+                            };
                             app.output.push_line(OutputLine::System(format!(
-                                "(queued while agent running) {}",
-                                text.trim()
+                                "{} {}", prefix, content.trim()
                             )));
                             app.scroll_to_bottom();
                             app.dirty = true;
@@ -1079,68 +1369,27 @@ fn handle_key_event(
                             memory.reinforce_accessed(&accessed_ids);
                             let memory_ctx = memory.format_memory_context(&memory_nodes, false);
 
-                            // KadaneDial compression: trigger at 80% of history budget (preventive)
-                            let turn_messages = if let Some(cm) = compression_manager.as_ref() {
-                                let context_tokens = cm.calculate_context_tokens(&session.messages);
-                                // 80% threshold: compress before hitting exact limit
-                                let history_budget = (context_window as f32 * context_builder.history_ratio() * 0.8) as usize;
-                                let should_compress = context_tokens >= history_budget;
-
-                                tracing::info!(
-                                    "[COMPRESSION] tokens={}, budget={}, should_compress={}",
-                                    context_tokens,
-                                    history_budget,
-                                    should_compress
-                                );
-
-                                let base_messages = context_builder.build(
-                                    &system_prompt,
-                                    &memory_ctx,
-                                    &session.messages,
-                                    context_window,
-                                );
-
-                                if should_compress {
-                                    match cm.compress(&session.messages, &text) {
-                                        Ok(Some(compressed)) => {
-                                            app.output.push_line(OutputLine::System(
-                                                format!("Context compressed: {} msgs ({} tokens) → {} msgs",
-                                                    session.messages.len(), context_tokens, compressed.len())
-                                            ));
-                                            app.dirty = true;
-                                            compressed
-                                        }
-                                        Ok(None) => {
-                                            app.output.push_line(OutputLine::System(
-                                                "Compression skipped: no significant chunks to keep".to_string()
-                                            ));
-                                            app.dirty = true;
-                                            base_messages
-                                        }
-                                        Err(e) => {
-                                            app.output.push_line(OutputLine::Error(
-                                                format!("Compression failed: {}. Send anyway with full context?", e)
-                                            ));
-                                            app.dirty = true;
-                                            base_messages
-                                        }
-                                    }
-                                } else {
-                                    base_messages
-                                }
+                            // Build effective messages using the latest compressed cache from SQLite
+                            let effective_messages = if let Some((cached, prev_count)) = compressed_cache {
+                                let pc = *prev_count;
+                                let new_msgs = &session.messages[pc.min(session.messages.len())..];
+                                let mut combined = cached.clone();
+                                combined.extend_from_slice(new_msgs);
+                                combined
                             } else {
-                                tracing::info!(
-                                    "[COMPRESSION] compression_manager is None (embedding disabled or not configured)"
-                                );
-                                context_builder.build(
-                                    &system_prompt,
-                                    &memory_ctx,
-                                    &session.messages,
-                                    context_window,
-                                )
+                                session.messages.clone()
                             };
+
+                            let turn_messages = context_builder.build(
+                                &system_prompt,
+                                &memory_ctx,
+                                &effective_messages,
+                                context_window,
+                            );
                             app.agent_running = true;
                             app.status = "Thinking...".to_string();
+                            let effort = ox_core::context::estimate_effort(&text, session.messages.len());
+                            let planning = effort == ox_core::context::EffortLevel::High;
                             let provider = Arc::clone(provider);
                             let tx = agent_tx.clone();
                             let registry = Arc::clone(tool_registry);
@@ -1161,6 +1410,7 @@ fn handle_key_event(
                                     cancel_token,
                                     tm,
                                     ac,
+                                    planning,
                                 )
                                 .await;
                             });
@@ -1266,11 +1516,18 @@ fn handle_slash_command(
                 .push_system("Task plan: (not yet active -- agent will create plans automatically)");
         }
         SlashCommand::Trust { tools, all } => {
-            let mut tm = trust_manager.lock().unwrap();
+            let mut tm = match trust_manager.lock() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    app.output.push_line(OutputLine::Error(format!("Failed to lock trust manager: {}", e)));
+                    return;
+                }
+            };
             if all {
                 tm.trust_all();
+                app.trusted_all = true;
                 app.output
-                    .push_system("Trusted all non-dangerous tools for this session.");
+                    .push_system("Trusted all tools for this session. Use /untrust to revoke.");
             } else if tools.is_empty() {
                 // Show currently trusted tools.
                 let list = tm.trusted_list();
@@ -1293,7 +1550,10 @@ fn handle_slash_command(
             }
         }
         SlashCommand::Untrust => {
-            trust_manager.lock().unwrap().untrust_all();
+            if let Ok(mut tm) = trust_manager.lock() {
+                tm.untrust_all();
+            }
+            app.trusted_all = false;
             app.output
                 .push_system("All tool trust revoked. Confirmations restored.");
         }
@@ -1611,6 +1871,35 @@ fn handle_slash_command(
                 app.output.push_system("Council stats: (model capability tracking not yet persisted)");
             } else {
                 app.output.push_system("Usage: /council <last|stats>");
+            }
+        }
+        SlashCommand::Reload => {
+            // Reload session from JSONL file to sync with disk state.
+            let session_dir = session.dir().to_path_buf();
+            match Session::load(&session_dir) {
+                Ok(Some(loaded)) => {
+                    let old_count = session.messages.len();
+                    let new_count = loaded.messages.len();
+                    
+                    // Replace session messages with loaded data (clone to avoid move out of Drop type)
+                    session.messages = loaded.messages.clone();
+                    session.meta = loaded.meta.clone();
+                    
+                    // Replay history into UI
+                    replay_session_history(app, &session.messages, rt_env, resolve_info.is_some());
+                    
+                    app.output.push_system(&format!(
+                        "Session reloaded from disk: {} messages (was {})",
+                        new_count, old_count
+                    ));
+                    app.message_count = session.messages.len();
+                }
+                Ok(None) => {
+                    app.output.push_error("Failed to reload: session file is empty or corrupted");
+                }
+                Err(e) => {
+                    app.output.push_error(&format!("Failed to reload session: {}", e));
+                }
             }
         }
         SlashCommand::Unknown { cmd } => {

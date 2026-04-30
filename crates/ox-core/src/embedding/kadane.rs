@@ -34,7 +34,7 @@ impl Default for KadaneConfig {
     fn default() -> Self {
         Self {
             threshold: 0.0,
-            stop_threshold: 0.5,
+            stop_threshold: 0.1, // Z-scores are typically small,
             max_segments: 5,
             min_segment_len: 2,
             keep_recent: 4,
@@ -270,7 +270,7 @@ mod tests {
         let scores = vec![0.1, 0.9, 0.95, 0.8, 0.2, 0.15];
         let config = KadaneConfig {
             threshold: 0.0,
-            stop_threshold: 0.5,
+            stop_threshold: 0.1, // Z-scores are typically small
             max_segments: 3,
             min_segment_len: 2,
             keep_recent: 4,
@@ -303,7 +303,7 @@ mod tests {
         assert!((m - 3.0).abs() < 1e-6);
 
         let sd = std_dev(&values, m);
-        // Std dev of [1,2,3,4,5] is sqrt(2) ≈ 1.414
+        // Std dev of [1,2,3,4,5] is sqrt(2) �?1.414
         assert!((sd - 1.41421).abs() < 0.01);
     }
 }

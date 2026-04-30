@@ -1,5 +1,6 @@
 mod effort;
 mod system_prompt;
+pub mod compressed_store;
 
 pub use effort::{estimate_effort, EffortLevel};
 pub use system_prompt::build_system_prompt;
@@ -18,6 +19,7 @@ pub struct TokenBudgets {
 }
 
 /// Builds the final message list for an LLM call, fitting within token budgets.
+#[derive(Clone)]
 pub struct ContextBuilder {
     system_prompt_ratio: f32,
     memory_ratio: f32,
@@ -121,7 +123,55 @@ impl ContextBuilder {
             result.push(history[i].clone());
         }
 
+        // Sanitize: remove orphaned ToolResults and strip orphaned tool_calls
+        // caused by budget truncation breaking tool interaction sequences.
+        sanitize_tool_pairs(&mut result);
+
         result
+    }
+}
+
+/// Sanitize tool interaction pairs in a message list.
+///
+/// After budget truncation, the message list may contain:
+/// - ToolResult without a preceding Assistant that has the matching tool_call
+/// - Assistant tool_calls without a following ToolResult
+///
+/// This function removes orphaned ToolResults and strips orphaned tool_calls
+/// to produce a valid message sequence for the LLM API.
+pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
+    // Collect all tool_call_ids from Assistant messages in a single pass
+    let mut assistant_call_ids = std::collections::HashSet::with_capacity(messages.len());
+    let mut result_call_ids = std::collections::HashSet::with_capacity(messages.len());
+
+    for msg in messages.iter() {
+        match msg {
+            Message::Assistant { tool_calls, .. } => {
+                for tc in tool_calls {
+                    assistant_call_ids.insert(tc.id.clone());
+                }
+            }
+            Message::ToolResult { tool_call_id, .. } => {
+                result_call_ids.insert(tool_call_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Remove orphaned ToolResults (no matching tool_call in any Assistant)
+    messages.retain(|m| {
+        if let Message::ToolResult { tool_call_id, .. } = m {
+            assistant_call_ids.contains(tool_call_id)
+        } else {
+            true
+        }
+    });
+
+    // Strip orphaned tool_calls (no matching ToolResult)
+    for msg in messages.iter_mut() {
+        if let Message::Assistant { tool_calls, .. } = msg {
+            tool_calls.retain(|tc| result_call_ids.contains(&tc.id));
+        }
     }
 }
 

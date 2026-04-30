@@ -23,6 +23,7 @@ pub enum SlashCommand {
     Persona { action: String },
     Discuss { question: Option<String>, rounds: Option<u8>, verbose: bool },
     Council { action: String },
+    Reload,
     Unknown { cmd: String },
 }
 
@@ -123,6 +124,7 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
         "council" => SlashCommand::Council {
             action: args.to_string(),
         },
+        "reload" => SlashCommand::Reload,
         _ => SlashCommand::Unknown {
             cmd: cmd.to_string(),
         },
@@ -163,7 +165,8 @@ Commands:
   /init             Create default config (~/.ox/config.toml)
   /debug            Show debug info
   /discuss [q]      Start council debate (--rounds N, --verbose)
-  /council <action> Council actions (last, stats)"
+  /council <action> Council actions (last, stats)
+  /reload           Reload session from disk (JSONL)"
             .to_string(),
     }
 }

@@ -1,7 +1,7 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{params, Connection, Result as SqlResult, Statement};
 
 use super::{MemoryNode, MemoryNodeType, MemorySource};
 
@@ -32,12 +32,20 @@ CREATE INDEX IF NOT EXISTS idx_memories_accessed ON memories(last_accessed);
 
 pub struct MemoryStore {
     conn: Arc<Connection>,
+    // Precompiled statements for better performance
+    insert_stmt: Mutex<Option<Statement<'static>>>,
 }
+
+// Safety: Statements are tied to connection lifetime, but we use 'static for simplicity
+// since the connection is Arc'd and lives as long as the store.
+unsafe impl Send for MemoryStore {}
+unsafe impl Sync for MemoryStore {}
 
 impl Clone for MemoryStore {
     fn clone(&self) -> Self {
         Self {
             conn: Arc::clone(&self.conn),
+            insert_stmt: Mutex::new(None), // Don't clone precompiled statements
         }
     }
 }
@@ -49,7 +57,10 @@ impl MemoryStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-        let mut store = Self { conn: Arc::new(conn) };
+        let mut store = Self { 
+            conn: Arc::new(conn),
+            insert_stmt: Mutex::new(None),
+        };
         store.init_schema()?;
         Ok(store)
     }
@@ -59,45 +70,66 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Get or create precompiled insert statement
+    fn get_insert_stmt(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Option<Statement<'static>>>> {
+        let mut stmt_guard = self.insert_stmt.lock().unwrap();
+        if stmt_guard.is_none() {
+            // Prepare statement - note: we leak the statement to get 'static lifetime
+            // This is safe because the connection lives as long as the store
+            let raw_conn = Arc::as_ptr(&self.conn) as *mut Connection;
+            let stmt = unsafe { (&*raw_conn).prepare(
+                "INSERT OR REPLACE INTO memories
+                 (id, content, node_type, depth, project_id, language, source,
+                  created_at, last_accessed, is_project_critical,
+                  trace_0, trace_1, trace_2, trace_3, trace_4, language_weight)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
+            )? };
+            // Safety: We're transmuting the statement to 'static lifetime.
+            // This is safe because: 1) The connection is Arc'd and won't be dropped
+            // while the store exists. 2) We only drop statements when the store drops.
+            let static_stmt: Statement<'static> = unsafe { std::mem::transmute(stmt) };
+            *stmt_guard = Some(static_stmt);
+        }
+        Ok(stmt_guard)
+    }
+
     pub fn insert(&self, node: &MemoryNode) -> anyhow::Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO memories
-             (id, content, node_type, depth, project_id, language, source,
-              created_at, last_accessed, is_project_critical,
-              trace_0, trace_1, trace_2, trace_3, trace_4, language_weight)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-            params![
-                node.id,
-                node.content,
-                node.node_type.as_str(),
-                node.depth,
-                node.project_id,
-                node.language,
-                node.source.as_str(),
-                node.created_at,
-                node.last_accessed,
-                node.is_project_critical as i32,
-                node.traces[0],
-                node.traces[1],
-                node.traces[2],
-                node.traces[3],
-                node.traces[4],
-                node.language_weight,
-            ],
-        )?;
+        let mut stmt_guard = self.get_insert_stmt()?;
+        let stmt = stmt_guard.as_mut().unwrap();
+        stmt.execute(params![
+            node.id,
+            node.content,
+            node.node_type.as_str(),
+            node.depth,
+            node.project_id,
+            node.language,
+            node.source.as_str(),
+            node.created_at,
+            node.last_accessed,
+            node.is_project_critical as i32,
+            node.traces[0],
+            node.traces[1],
+            node.traces[2],
+            node.traces[3],
+            node.traces[4],
+            node.language_weight,
+        ])?;
         Ok(())
     }
 
     pub fn insert_batch(&self, nodes: &[MemoryNode]) -> anyhow::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        for node in nodes {
-            tx.execute(
+        {
+            // Use a local prepared statement for the transaction
+            let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO memories
                  (id, content, node_type, depth, project_id, language, source,
                   created_at, last_accessed, is_project_critical,
                   trace_0, trace_1, trace_2, trace_3, trace_4, language_weight)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-                params![
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
+            )?;
+            for node in nodes {
+                stmt.execute(params![
                     node.id,
                     node.content,
                     node.node_type.as_str(),
@@ -114,8 +146,8 @@ impl MemoryStore {
                     node.traces[3],
                     node.traces[4],
                     node.language_weight,
-                ],
-            )?;
+                ])?;
+            }
         }
         tx.commit()?;
         Ok(())

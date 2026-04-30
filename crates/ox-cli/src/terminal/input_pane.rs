@@ -172,9 +172,63 @@ impl InputPane {
         self.buffer.chars().count()
     }
 
-    /// Cursor position in character count (not byte offset).
-    pub fn cursor_char_pos(&self) -> usize {
-        self.buffer[..self.cursor].chars().count()
+    /// Calculate the visual width of a string for terminal display.
+    /// This accounts for wide characters like CJK, emoji, etc.
+    pub fn visual_width(s: &str) -> usize {
+        use unicode_width::UnicodeWidthStr;
+        s.width()
+    }
+
+    /// Get the visible portion of the buffer given a maximum width.
+    /// Returns (visible_text, scroll_offset) where scroll_offset is the
+    /// number of characters scrolled from the start.
+    pub fn get_visible_content(&self, max_width: usize) -> (String, usize) {
+        if max_width == 0 {
+            return (String::new(), 0);
+        }
+
+        let total_width = Self::visual_width(&self.buffer);
+        
+        // If content fits, show everything
+        if total_width <= max_width {
+            return (self.buffer.clone(), 0);
+        }
+
+        // Content doesn't fit - need to scroll
+        // Strategy: keep cursor visible with some padding
+        let cursor_visual_pos = Self::visual_width(&self.buffer[..self.cursor]);
+        
+        // Calculate optimal scroll position to keep cursor visible
+        // Try to center cursor with ~20% padding on each side
+        let padding = max_width / 5; // 20% padding
+        let mut scroll_chars = 0;
+        let mut current_width = 0;
+        
+        // Find how many characters to skip from the start
+        for (char_idx, ch) in self.buffer.char_indices() {
+            let char_width = Self::visual_width(&ch.to_string());
+            if current_width + char_width > cursor_visual_pos.saturating_sub(padding) {
+                scroll_chars = char_idx;
+                break;
+            }
+            current_width += char_width;
+        }
+
+        // Extract visible portion
+        let remaining = &self.buffer[scroll_chars..];
+        let mut visible = String::new();
+        let mut visible_width = 0;
+        
+        for ch in remaining.chars() {
+            let char_width = Self::visual_width(&ch.to_string());
+            if visible_width + char_width > max_width {
+                break;
+            }
+            visible.push(ch);
+            visible_width += char_width;
+        }
+
+        (visible, scroll_chars)
     }
 
     /// Clear from cursor to beginning of line (Ctrl+U style).

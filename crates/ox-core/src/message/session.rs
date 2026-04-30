@@ -207,6 +207,41 @@ impl Session {
         Ok(())
     }
 
+    /// Replace session messages with a compressed set and rewrite the JSONL file.
+    /// This persists the compression result so future loads start from the compressed state.
+    pub fn rewrite_messages(&mut self, messages: Vec<Message>) -> anyhow::Result<()> {
+        // Close existing file handle
+        if let Some(ref mut writer) = self.file_handle {
+            writer.flush()?;
+        }
+        self.file_handle = None;
+
+        // Update meta
+        self.meta.message_count = messages.len();
+        self.meta.updated_at = Utc::now().to_rfc3339();
+
+        // Rewrite file: meta line + all messages
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.file_path)?;
+        let mut writer = BufWriter::new(file);
+        let meta_line = serde_json::to_string(&serde_json::json!({"_meta": &self.meta}))?;
+        writeln!(writer, "{meta_line}")?;
+        for msg in &messages {
+            let json = serde_json::to_string(msg)?;
+            writeln!(writer, "{json}")?;
+        }
+        writer.flush()?;
+        self.file_handle = Some(writer);
+
+        // Replace in-memory messages
+        self.messages = messages;
+
+        Ok(())
+    }
+
     /// List archived sessions in the sessions/ directory.
     /// Returns (filename, display_info) pairs sorted by most recent first.
     pub fn list_archived(session_dir: &Path) -> Vec<(String, String)> {

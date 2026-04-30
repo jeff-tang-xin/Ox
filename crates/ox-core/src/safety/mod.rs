@@ -27,8 +27,9 @@ impl TrustManager {
                 self.trusted_tools.contains(tool_name)
                     || self.trusted_tools.contains("__all__")
             }
-            // Dangerous tools always require confirmation.
-            SafetyLevel::Dangerous => false,
+            SafetyLevel::Dangerous => {
+                self.trusted_tools.contains("__all__")
+            }
         }
     }
 
@@ -130,11 +131,14 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_never_skips() {
+    fn dangerous_skips_when_trust_all() {
         let mut tm = TrustManager::new();
+        // Individual trust does NOT skip Dangerous.
         tm.trust("shell_exec");
-        tm.trust_all();
         assert!(!tm.can_skip_confirmation("shell_exec", SafetyLevel::Dangerous));
+        // trust_all DOES skip Dangerous.
+        tm.trust_all();
+        assert!(tm.can_skip_confirmation("shell_exec", SafetyLevel::Dangerous));
     }
 
     #[test]
