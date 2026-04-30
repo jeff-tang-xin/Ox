@@ -170,32 +170,106 @@ enabled = false
 # chunk_threshold_tokens = 256  # Split messages longer than this
 # max_chunk_tokens = 512  # Max tokens per chunk when splitting
 
-# ── Context Budget Configuration ──
-# Token budget allocation ratios for model context window.
-# Ratios must sum to ≤ 1.0 (remaining is for user input).
-
-[context]
-# history_ratio = 0.10  # 10% of context window for history (triggers compression when exceeded)
-# memory_ratio = 0.02    # 2% for memory context
-# system_prompt_ratio = 0.02  # 2% for system prompt
-
-[agent]
-# max_iterations = 25
-# max_per_turn_tokens = 500000
+[repl]
+# history_file = "~/.ox/history"
+# max_history_entries = 10000
+# multiline_enabled = true
+# stream_output = true
+# syntax_highlight = true
 
 [terminal]
 # split_view = true
 # output_ratio = 85
+# urgent_prefix = "!"
+# input_during_agent = true
+
+[session]
+# auto_restore = true
+# max_archived_sessions = 50
+
+[context]
+# max_history_turns = 20
+# memory_budget_tokens = 2000
+# history_budget_tokens = 50000
+# reply_reserve_tokens = 73000
+# history_ratio = 0.10  # 10% of context window for history (triggers compression when exceeded)
+# memory_ratio = 0.02    # 2% for memory context
+# system_prompt_ratio = 0.02  # 2% for system prompt
 
 [tools]
 # auto_confirm_safe = true
 # confirm_writes = true
 # confirm_shell = true
 # shell_timeout_ms = 30000
+# max_output_chars = 10000
 
-[session]
-# auto_restore = true
-# max_archived_sessions = 50
+[agent]
+# max_iterations = 25
+# max_per_turn_tokens = 500000
+
+[council]
+# default_rounds = 2
+# max_rounds = 3
+# max_participants = 4
+# participants = ["gpt-4o", "claude-sonnet-4-20250514", "deepseek-coder"]
+# arbiter_model = "default"
+# early_convergence_threshold = 0.8
+# verbose_by_default = false
+# budget_warning = true
+# council_memory_decay_factor = 0.7
+
+[memory]
+# max_nodes = 1000
+# alpha = 0.8
+# time_decay = 0.01
+# isolation_application = true
+# share_session_group = true
+# share_request = true
+# export_format = "json"
+# janitor_run_on_startup_prob = 0.2
+
+[memory.project_decay]
+# base_half_life = 30
+# critical_threshold = 0.3
+
+[memory.overall_decay]
+# beta = 0.015
+
+# Language-specific decay configurations
+# [memory.language_config.rust]
+# lambda = 0.02
+# max_retention_days = 30
+# traces = [0.1, 0.2, 0.3, 0.4, 0.5]
+
+# [memory.language_config.python]
+# lambda = 0.01
+# max_retention_days = 90
+# traces = [0.05, 0.15, 0.25, 0.35, 0.5]
+
+[memory.transform]
+# interval_days = 7
+# batch_size = 20
+# daily_token_cap = 10000
+# trigger = "manual"  # "manual" (需 /memory transform) | "auto" (定期自动)
+
+[persona]
+# auto_evolve = true
+# max_trait_change = 0.1
+# frozen = false
+# export_format = "json"
+
+[behavior_rules]
+# enforce_safe_code = true
+# enforce_lint = true
+# enforce_format = true
+# enforce_tests = true
+# enforce_all = true
+
+[safety]
+# enable_sandbox = false
+# confirm_dangerous_ops = true
+# high_risk_apis = ["Command::new", "remove_dir_all", "fs::remove_dir_all", "os.remove", "os.rmdir"]
+# custom_rules = []
 
 [cost]
 # max_monthly_cost = 5.0
