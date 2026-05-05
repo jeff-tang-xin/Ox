@@ -17,6 +17,15 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(model: String, api_key: String, base_url: String, max_tokens: Option<u32>, stream_usage: bool, disable_tools: bool) -> Self {
+        // Build client with timeout settings for better stability
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300)) // 5 minutes total timeout
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to build custom reqwest client: {}, using default", e);
+                reqwest::Client::new()
+            });
+        
         Self {
             model,
             api_key,
@@ -28,7 +37,7 @@ impl OpenAiProvider {
             max_tokens,
             stream_usage,
             disable_tools,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }
@@ -84,7 +93,29 @@ impl LlmProvider for OpenAiProvider {
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .await?;
+            .await;
+        
+        // Handle network errors with detailed logging
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Failed to send request to {}: {}", self.base_url, e);
+                
+                // Provide helpful error messages based on error type
+                let error_msg = if e.is_timeout() {
+                    format!("请求超时：无法连接到 {}\n\n可能原因：\n• 网络连接不稳定\n• API 服务器响应过慢\n• 防火墙阻止连接", self.base_url)
+                } else if e.is_connect() {
+                    format!("连接失败：无法连接到 {}\n\n可能原因：\n• 网络连接中断\n• DNS 解析失败\n• 防火墙/代理阻止\n• API 服务不可用", self.base_url)
+                } else if e.is_request() {
+                    format!("请求错误：{}\n\n请检查：\n• API 密钥是否正确\n• base_url 是否配置正确\n• 模型名称是否有效", e)
+                } else {
+                    format!("网络错误：{}\n\nURL: {}\n\n请检查网络连接或稍后重试。", e, self.base_url)
+                };
+                
+                let _ = tx.send(LlmStreamEvent::Error(error_msg));
+                return Ok(());
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -101,38 +132,84 @@ impl LlmProvider for OpenAiProvider {
         let mut done_sent = false;
         let mut pending_data = String::new();
         let mut line_buf = String::new();
+        let mut consecutive_errors = 0u32;
+        let mut total_chunks_received = 0u32;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
         // SSE parsing: process char by char to handle JSON containing newlines.
         // Event boundary is empty line, not newlines in JSON content.
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let chunk_str = String::from_utf8_lossy(&chunk);
-
-            for ch in chunk_str.chars() {
-                if ch == '\n' {
-                    let line = line_buf.trim_end_matches('\r').to_string();
-                    line_buf.clear();
-
-                    if line.is_empty() {
-                        // Empty line - process accumulated data
-                        if !pending_data.is_empty() && pending_data.trim() != "[DONE]" {
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&pending_data) {
-                                if process_openai_chunk(&json, &tx, &mut tool_call_index_to_id) {
-                                    done_sent = true;
-                                }
-                            }
-                        }
-                        pending_data.clear();
-                    } else if let Some(content) = line.strip_prefix("data: ") {
-                        pending_data.push_str(content);
-                    } else if let Some(content) = line.strip_prefix("data:") {
-                        pending_data.push_str(content.trim_start());
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    consecutive_errors = 0; // Reset error counter on success
+                    total_chunks_received += 1;
+                    
+                    // Log raw chunk size for debugging
+                    tracing::debug!("Received chunk: {} bytes", chunk.len());
+                    
+                    let chunk_str = String::from_utf8_lossy(&chunk);
+                    
+                    // Log first 100 chars of chunk for debugging
+                    if chunk_str.len() > 0 {
+                        let preview: String = chunk_str.chars().take(100).collect();
+                        tracing::debug!("Chunk preview: {}", preview);
                     }
-                } else {
-                    line_buf.push(ch);
+
+                    for ch in chunk_str.chars() {
+                        if ch == '\n' {
+                            let line = line_buf.trim_end_matches('\r').to_string();
+                            line_buf.clear();
+
+                            if line.is_empty() {
+                                // Empty line - process accumulated data
+                                if !pending_data.is_empty() && pending_data.trim() != "[DONE]" {
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&pending_data) {
+                                        if process_openai_chunk(&json, &tx, &mut tool_call_index_to_id) {
+                                            done_sent = true;
+                                        }
+                                    } else {
+                                        tracing::debug!("Failed to parse SSE data: {}", pending_data);
+                                    }
+                                }
+                                pending_data.clear();
+                            } else if let Some(content) = line.strip_prefix("data: ") {
+                                pending_data.push_str(content);
+                            } else if let Some(content) = line.strip_prefix("data:") {
+                                pending_data.push_str(content.trim_start());
+                            }
+                        } else {
+                            line_buf.push(ch);
+                        }
+                    }
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    tracing::warn!(
+                        "Stream chunk error (consecutive: {}/{}): {} - Error type: {:?}",
+                        consecutive_errors,
+                        MAX_CONSECUTIVE_ERRORS,
+                        e,
+                        e
+                    );
+                    
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        tracing::error!("Too many consecutive stream errors, aborting. Total chunks received before failure: {}", total_chunks_received);
+                        let _ = tx.send(LlmStreamEvent::Error(
+                            format!("网络不稳定，流式响应中断（已接收 {} 个数据块）。请检查网络连接或稍后重试。", total_chunks_received)
+                        ));
+                        return Ok(());
+                    }
+                    
+                    // Log that we're skipping this chunk
+                    tracing::debug!("Skipping failed chunk, continuing to receive data...");
+                    
+                    // Skip this chunk and continue
+                    continue;
                 }
             }
         }
+
+        tracing::info!("Stream ended: total_chunks={}, consecutive_errors={}", total_chunks_received, consecutive_errors);
 
         // Process any remaining data at stream end
         if !pending_data.is_empty() && pending_data.trim() != "[DONE]" {
@@ -140,6 +217,8 @@ impl LlmProvider for OpenAiProvider {
                 if process_openai_chunk(&json, &tx, &mut tool_call_index_to_id) {
                     done_sent = true;
                 }
+            } else {
+                tracing::debug!("Failed to parse remaining data: {}", pending_data);
             }
         }
 
@@ -169,6 +248,7 @@ fn process_openai_chunk(
 ) -> bool {
     // Check for usage in the final chunk.
     if let Some(usage) = json.get("usage").filter(|u| !u.is_null()) {
+        tracing::info!("Received usage chunk: {:?}", usage);
         let _ = tx.send(LlmStreamEvent::Done {
             usage: TokenUsage {
                 prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
@@ -180,19 +260,27 @@ fn process_openai_chunk(
     }
 
     let Some(choices) = json.get("choices").and_then(|c| c.as_array()) else {
+        tracing::debug!("No choices in chunk: {}", json);
         return false;
     };
 
     for choice in choices {
         let delta = choice.get("delta").or_else(|| choice.get("message"));
         let Some(delta) = delta else {
+            tracing::debug!("No delta in choice");
             continue;
         };
 
-        if let Some(content) = delta.get("content").and_then(|c| c.as_str())
-            && !content.is_empty() {
+        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+            if !content.is_empty() {
+                tracing::debug!("Sending TextDelta: {} chars", content.len());
                 let _ = tx.send(LlmStreamEvent::TextDelta(content.to_string()));
+            } else {
+                tracing::debug!("Empty content in delta");
             }
+        } else {
+            tracing::debug!("No content field in delta");
+        }
 
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tool_calls {

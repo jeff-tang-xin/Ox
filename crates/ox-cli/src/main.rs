@@ -2251,6 +2251,36 @@ fn handle_slash_command(
                 }
             }
         }
+        SlashCommand::DownloadModel { model_name } => {
+            let model = model_name.unwrap_or_else(|| "bge-small-zh-v1.5".to_string());
+            let target_dir = dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(format!(".ox/models/{}", model));
+
+            app.output.push_system(&format!("Downloading embedding model '{}'...", model));
+            app.output.push_line(OutputLine::System(format!(
+                "Target: {}",
+                target_dir.display()
+            )));
+            app.output.push_system("This may take a few minutes depending on your network speed...");
+
+            match ox_core::embedding::download_model(&model, &target_dir) {
+                Ok(()) => {
+                    app.output.push_system(&format!(
+                        "✅ Model '{}' downloaded successfully to {}",
+                        model,
+                        target_dir.display()
+                    ));
+                    app.output.push_system("To enable it, set [models.embedding] enabled = true in your config.");
+                }
+                Err(e) => {
+                    app.output.push_error(&format!("❌ Failed to download model: {}", e));
+                    if e.to_string().contains("git") {
+                        app.output.push_system("Make sure git is installed and available in your PATH.");
+                    }
+                }
+            }
+        }
         SlashCommand::Unknown { cmd } => {
             app.output
                 .push_system(&format!("Unknown command: /{cmd}. Type /help for available commands."));

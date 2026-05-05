@@ -33,6 +33,104 @@ use crate::llm::tokenizer::estimate_tokens;
 use crate::message::Message;
 use anyhow::Result;
 
+/// ModelScope repository URLs for BGE models.
+pub const MODELSCOPE_BGE_SMALL_ZH: &str = "https://www.modelscope.cn/AI-ModelScope/bge-small-zh-v1.5.git";
+pub const MODELSCOPE_BGE_BASE_ZH: &str = "https://www.modelscope.cn/AI-ModelScope/bge-base-zh-v1.5.git";
+pub const MODELSCOPE_BGE_LARGE_ZH: &str = "https://www.modelscope.cn/AI-ModelScope/bge-large-zh-v1.5.git";
+
+/// Download a BGE model from ModelScope using git clone.
+///
+/// # Arguments
+/// * `model_name` - Model name (e.g., "bge-small-zh-v1.5", "bge-base-zh-v1.5", "bge-large-zh-v1.5")
+/// * `target_dir` - Target directory for the model (e.g., ~/.ox/models/bge-small-zh-v1.5)
+///
+/// # Returns
+/// * `Ok(())` if download succeeds
+/// * `Err` if git is not available or download fails
+pub fn download_model(model_name: &str, target_dir: &std::path::Path) -> Result<()> {
+    // Determine the ModelScope URL based on model name
+    let repo_url = match model_name {
+        "bge-base-zh-v1.5" => MODELSCOPE_BGE_BASE_ZH,
+        "bge-large-zh-v1.5" => MODELSCOPE_BGE_LARGE_ZH,
+        _ => MODELSCOPE_BGE_SMALL_ZH, // Default to small model
+    };
+
+    tracing::info!("Downloading model {} from ModelScope...", model_name);
+    tracing::info!("Target directory: {:?}", target_dir);
+
+    // Check if target directory already exists
+    if target_dir.exists() {
+        return Err(anyhow::anyhow!(
+            "Model directory already exists: {:?}. Remove it first if you want to re-download.",
+            target_dir
+        ));
+    }
+
+    // Create parent directory if needed
+    if let Some(parent) = target_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Execute git clone with progress output
+    tracing::info!("Starting git clone...");
+    let mut child = std::process::Command::new("git")
+        .args(&["clone", repo_url])
+        .arg(target_dir.to_str().unwrap())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to execute git clone: {}. Is git installed?", e))?;
+
+    // Read and log progress in real-time
+    use std::io::{BufRead, BufReader};
+    
+    if let Some(stderr) = child.stderr.take() {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                // Log progress lines
+                if !line.is_empty() {
+                    tracing::info!("[git] {}", line);
+                }
+            }
+        }
+    }
+
+    // Wait for git clone to complete
+    let status = child.wait()
+        .map_err(|e| anyhow::anyhow!("Failed to wait for git clone: {}", e))?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "Git clone failed with exit code: {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+
+    tracing::info!("Verifying downloaded files...");
+    
+    // Verify that essential files exist
+    let required_files = ["model.safetensors", "tokenizer.json", "config.json"];
+    let mut missing_count = 0;
+    for file in &required_files {
+        let file_path = target_dir.join(file);
+        if !file_path.exists() {
+            tracing::warn!("Warning: Expected file not found: {:?}", file_path);
+            missing_count += 1;
+        } else {
+            let file_size = std::fs::metadata(&file_path)?.len();
+            tracing::info!("✓ {} ({:.2} MB)", file, file_size as f64 / 1024.0 / 1024.0);
+        }
+    }
+
+    if missing_count > 0 {
+        tracing::warn!("Warning: {} expected files are missing", missing_count);
+    }
+
+    tracing::info!("Model downloaded successfully to {:?}", target_dir);
+    Ok(())
+}
+
 /// Compression level for different scenarios.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionLevel {
@@ -208,8 +306,9 @@ impl CompressionManager {
             match msg {
                 Message::ToolResult { tool_call_id, content } => {
                     // Truncate very long tool results
-                    let truncated = if content.len() > 500 {
-                        format!("{}...[truncated]", &content[..200])
+                    let truncated = if content.chars().count() > 500 {
+                        let preview: String = content.chars().take(200).collect();
+                        format!("{}...[truncated]", preview)
                     } else {
                         content.clone()
                     };
@@ -561,16 +660,18 @@ fn extract_recent_context(messages: &[Message], max_exchanges: usize) -> String 
         
         match msg {
             Message::User { content } => {
-                if content.len() > 100 {
-                    context_parts.push(format!("User: {}...", &content[..100]));
+                let truncated: String = content.chars().take(100).collect();
+                if content.chars().count() > 100 {
+                    context_parts.push(format!("User: {}...", truncated));
                 } else {
                     context_parts.push(format!("User: {}", content));
                 }
                 exchange_count += 1;
             }
             Message::Assistant { content, .. } => {
-                if content.len() > 100 {
-                    context_parts.push(format!("Assistant: {}...", &content[..100]));
+                let truncated: String = content.chars().take(100).collect();
+                if content.chars().count() > 100 {
+                    context_parts.push(format!("Assistant: {}...", truncated));
                 } else {
                     context_parts.push(format!("Assistant: {}", content));
                 }

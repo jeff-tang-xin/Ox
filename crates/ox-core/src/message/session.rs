@@ -289,11 +289,7 @@ impl Session {
                 let count = meta.get("message_count")?.as_u64().unwrap_or(0);
                 let created = meta.get("created_at")?.as_str().unwrap_or("?");
                 // Shorten the timestamp for display.
-                let short_time = if created.len() >= 16 {
-                    &created[..16]
-                } else {
-                    created
-                };
+                let short_time: String = created.chars().take(16).collect();
                 Some((name, format!("{short_time}  [{count} msgs]  id:{:.8}", id)))
             })
             .collect()

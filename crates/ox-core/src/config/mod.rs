@@ -158,17 +158,27 @@ api_key = ""
 # Triggers automatically when history tokens exceed history budget.
 # The history budget is calculated as: context_window * history_ratio (default 10%).
 # This ratio is controlled by [context] history_ratio below.
+#
+# To download a BGE model, use the /download-model command in Ox REPL:
+#   /download-model                    # Downloads bge-small-zh-v1.5 (default)
+#   /download-model bge-base-zh-v1.5   # Downloads base model
+#   /download-model bge-large-zh-v1.5  # Downloads large model
+#
+# Available models from ModelScope:
+#   - bge-small-zh-v1.5  (~130MB, fast, good for most cases)
+#   - bge-base-zh-v1.5   (~420MB, balanced performance)
+#   - bge-large-zh-v1.5  (~1.2GB, best quality, slower)
 
 [models.embedding]
 enabled = false
-# model_path = "~/.ox/models/bge-small-zh-v1.5"  # Path to BGE model (ModelScope format)
-# threshold = 0.0   # Z-score threshold for relevance filtering
-# stop_threshold = 0.5  # Stop when gain drops below this
-# max_segments = 5  # Maximum segments to select
+# model_path = "~/.ox/models/bge-small-zh-v1.5"  # Path to downloaded BGE model
+# threshold = 0.0   # Z-score threshold for relevance filtering (higher = stricter)
+# stop_threshold = 0.5  # Stop selecting segments when gain drops below this
+# max_segments = 5  # Maximum number of conversation segments to keep
 # min_segment_len = 2  # Minimum messages per segment
-# keep_recent = 4  # Always keep N recent messages
-# chunk_threshold_tokens = 256  # Split messages longer than this
-# max_chunk_tokens = 512  # Max tokens per chunk when splitting
+# keep_recent = 4  # Always keep the N most recent messages uncompressed
+# chunk_threshold_tokens = 256  # Split messages longer than this into chunks
+# max_chunk_tokens = 512  # Maximum tokens per chunk when splitting long messages
 
 [repl]
 # history_file = "~/.ox/history"
@@ -715,6 +725,11 @@ pub struct BehaviorRulesConfig {
     pub enforce_format: bool,
     pub enforce_tests: bool,
     pub enforce_all: bool,
+    
+    /// User-defined mandatory coding rules (replaces language-specific rules).
+    /// These rules are injected into system prompt and MUST be followed.
+    /// Custom rules override built-in behavior rules but NOT basic safety rules.
+    pub custom_rules: Vec<String>,
 }
 
 impl Default for BehaviorRulesConfig {
@@ -725,6 +740,7 @@ impl Default for BehaviorRulesConfig {
             enforce_format: true,
             enforce_tests: true,
             enforce_all: true,
+            custom_rules: Vec::new(),
         }
     }
 }

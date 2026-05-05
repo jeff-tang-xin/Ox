@@ -1,4 +1,4 @@
-/// Parsed slash command.
+// Parsed slash command.
 #[derive(Debug, Clone)]
 pub enum SlashCommand {
     Help { topic: Option<String> },
@@ -24,6 +24,7 @@ pub enum SlashCommand {
     Discuss { question: Option<String>, rounds: Option<u8>, verbose: bool },
     Council { action: String },
     Reload,
+    DownloadModel { model_name: Option<String> },
     Unknown { cmd: String },
 }
 
@@ -125,6 +126,13 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
             action: args.to_string(),
         },
         "reload" => SlashCommand::Reload,
+        "download-model" => SlashCommand::DownloadModel {
+            model_name: if args.is_empty() {
+                None
+            } else {
+                Some(args.to_string())
+            },
+        },
         _ => SlashCommand::Unknown {
             cmd: cmd.to_string(),
         },
@@ -166,7 +174,8 @@ Commands:
   /debug            Show debug info
   /discuss [q]      Start council debate (--rounds N, --verbose)
   /council <action> Council actions (last, stats)
-  /reload           Reload session from disk (JSONL)"
+  /reload           Reload session from disk (JSONL)
+  /download-model [name] Download embedding model (default: bge-small-zh-v1.5)"
             .to_string(),
     }
 }

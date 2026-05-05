@@ -12,7 +12,9 @@ impl Tool for FilePatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply a search-and-replace patch to a file. The search string must match exactly once in the file."
+        "Apply a targeted edit to an existing file by replacing specific text. \
+         Use this for small changes (<50% of file). The search string must match EXACTLY ONCE in the file. \
+         For creating new files or rewriting entire files, use file_write instead."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -21,18 +23,25 @@ impl Tool for FilePatchTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to patch (relative to working directory)"
+                    "description": "Path to the file (relative to working directory). Example: 'src/main.rs'"
                 },
                 "search": {
                     "type": "string",
-                    "description": "The exact text to search for (must match exactly once)"
+                    "description": "The EXACT text to find and replace. Must match exactly once in the file. Include enough context to be unique."
                 },
                 "replace": {
                     "type": "string",
-                    "description": "The replacement text"
+                    "description": "The replacement text. Use \\n for newlines. Escape special characters properly in JSON."
                 }
             },
-            "required": ["path", "search", "replace"]
+            "required": ["path", "search", "replace"],
+            "examples": [
+                {
+                    "path": "src/main.rs",
+                    "search": "fn old_function() {\n    println!(\"old\");\n}",
+                    "replace": "fn new_function() {\n    println!(\"new\");\n}"
+                }
+            ]
         })
     }
 

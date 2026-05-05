@@ -12,7 +12,10 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Creates parent directories as needed."
+        "Create a new file or completely overwrite an existing file with new content. \
+         Use this ONLY for: (1) creating brand new files, (2) rewriting entire files (>50% changed). \
+         For small edits to existing files, use file_patch instead. \
+         Automatically creates parent directories if they don't exist."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -88,12 +91,37 @@ impl Tool for FileWriteTool {
                 ));
             }
 
-        match fs::write(&path, content) {
-            Ok(()) => ToolOutput::success(format!(
-                "Written {} bytes to {}",
-                content.len(),
-                path.display()
-            )),
+        // Write file with UTF-8 encoding
+        // For text files (.txt, .md, .log, etc.), add BOM for Windows compatibility
+        // For code files (.rs, .py, .js, etc.), write without BOM (compilers may reject BOM)
+        let should_add_bom = path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| matches!(ext.to_lowercase().as_str(), 
+                "txt" | "md" | "markdown" | "log" | "csv" | "json" | "xml" | "html" | "css"
+            ))
+            .unwrap_or(false);
+        
+        let bytes_to_write = if should_add_bom {
+            // Add UTF-8 BOM (0xEF 0xBB 0xBF) for text files on Windows
+            let mut bytes = Vec::with_capacity(3 + content.len());
+            bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            bytes.extend_from_slice(content.as_bytes());
+            bytes
+        } else {
+            // Write code files without BOM
+            content.as_bytes().to_vec()
+        };
+        
+        match fs::write(&path, &bytes_to_write) {
+            Ok(()) => {
+                let encoding_info = if should_add_bom { "UTF-8 with BOM" } else { "UTF-8" };
+                ToolOutput::success(format!(
+                    "Written {} bytes to {} ({})",
+                    bytes_to_write.len(),
+                    path.display(),
+                    encoding_info
+                ))
+            },
             Err(e) => ToolOutput::error(format!("Failed to write {}: {e}", path.display())),
         }
     }
@@ -119,9 +147,16 @@ fn validate_content(content: &str) -> Result<(), String> {
     }
 
     // Count non-printable characters (excluding whitespace and common control chars)
+    // IMPORTANT: Unicode characters (CJK, emoji, etc.) are NOT considered non-printable
     let non_printable_count = content
         .chars()
         .filter(|c| {
+            // Skip all Unicode characters (including CJK, emoji, accented letters, etc.)
+            if !c.is_ascii() {
+                return false; // Unicode chars are valid printable characters
+            }
+            
+            // For ASCII chars, check if they're printable
             !c.is_whitespace()
                 && !c.is_ascii_graphic()
                 && !c.is_ascii_punctuation()
@@ -181,9 +216,17 @@ fn validate_content(content: &str) -> Result<(), String> {
 
 /// Detect common garbled text patterns
 fn contains_garbled_patterns(content: &str) -> bool {
-    // Pattern 1: Consecutive non-printable characters (≥5)
+    // Pattern 1: Consecutive non-printable ASCII characters (≥5)
+    // IMPORTANT: Skip Unicode characters (CJK, emoji, etc.) - they are valid
     let mut consecutive_non_printable = 0;
     for c in content.chars() {
+        // Skip all Unicode characters
+        if !c.is_ascii() {
+            consecutive_non_printable = 0; // Reset counter for Unicode chars
+            continue;
+        }
+        
+        // Check ASCII control characters (excluding common whitespace)
         if !c.is_whitespace() && !c.is_ascii_graphic() && !c.is_ascii_punctuation() {
             consecutive_non_printable += 1;
             if consecutive_non_printable >= 5 {
@@ -195,9 +238,16 @@ fn contains_garbled_patterns(content: &str) -> bool {
     }
 
     // Pattern 2: Mixed CJK and garbage characters (common in encoding errors)
-    // Detect sequences like: 文字 or 文件   
+    // Detect sequences like: 文字 or 文件\x00\x00\x00
     let mut mixed_sequence = 0;
     for c in content.chars() {
+        // Skip Unicode characters (they're valid)
+        if !c.is_ascii() {
+            mixed_sequence = 0; // Reset for Unicode
+            continue;
+        }
+        
+        // Check for suspicious ASCII sequences
         if (c.is_ascii() && !c.is_alphanumeric() && !c.is_whitespace())
             || (c.is_ascii_control() && !matches!(c, '\n' | '\r' | '\t'))
         {
