@@ -118,6 +118,8 @@ pub struct App {
     pub last_council_session: Option<ox_core::council::CouncilSession>,
     pub pending_model_switch: Option<String>,
     pub pending_compression: Option<PendingCompression>,
+    /// Pending spec content for auto-planning (set by /spec command)
+    pub pending_spec_planning: Option<String>,
     /// Message count at last compression. Used to avoid re-compressing
     /// when no new messages have been added since last compression.
     pub last_compression_msg_count: usize,
@@ -185,6 +187,7 @@ impl App {
             last_council_session: None,
             pending_model_switch: None,
             pending_compression: None,
+            pending_spec_planning: None,
             last_compression_msg_count: 0,
             compression_in_progress: false,
             trusted_all: false,

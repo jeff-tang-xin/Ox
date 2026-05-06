@@ -1508,6 +1508,97 @@ fn handle_key_event(
                         );
                         // Mark dirty to trigger UI refresh after slash command processing
                         app.dirty = true;
+                        
+                        // Check if spec planning was triggered by /spec command
+                        if let Some(spec_content) = app.pending_spec_planning.take() {
+                            if let Some(provider) = provider {
+                                // Build system prompt with spec content
+                                let mut current_system_prompt = context::build_system_prompt(
+                                    &rt_env,
+                                    &tool_registry,
+                                    None,
+                                    Some(&config.behavior_rules),
+                                    Some(&spec_content)
+                                );
+                                
+                                // Add workflow step instructions
+                                if let Some(ref wf_info) = app.workflow_display {
+                                    if let Some(ref step_prompt) = wf_info.step_prompt {
+                                        current_system_prompt.push_str("\n\n## Current Workflow Step\n\n");
+                                        current_system_prompt.push_str(step_prompt);
+                                        
+                                        if !wf_info.allows_code_modification {
+                                            current_system_prompt.push_str("\n\n⚠️ IMPORTANT: You CAN use tools (file_read, file_search, etc.) but you CANNOT modify source code files (.rs, .py, .js, etc.) in this step. You can only create/modify documentation files (.md, .txt, etc.).");
+                                        }
+                                    }
+                                }
+                                
+                                // Create a user message to trigger planning
+                                let planning_msg = Message::user(&format!(
+                                    "Based on the following requirement, please analyze and create a detailed spec document (.ox/spec.md):\n\n{}",
+                                    spec_content
+                                ));
+                                
+                                if let Err(e) = session.append_message(planning_msg) {
+                                    tracing::error!("Failed to persist message: {e}");
+                                }
+                                
+                                let memory_nodes = memory.retrieve(&spec_content, &Some(rt_env.project_id.as_str()), 5);
+                                let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
+                                memory.reinforce_accessed(&accessed_ids);
+                                let memory_ctx = memory.format_memory_context(&memory_nodes, false);
+                                
+                                let effective_messages = if let Some((cached, prev_count)) = compressed_cache {
+                                    let pc = *prev_count;
+                                    let new_msgs = &session.messages[pc.min(session.messages.len())..];
+                                    let mut combined = cached.clone();
+                                    combined.extend_from_slice(new_msgs);
+                                    combined
+                                } else {
+                                    session.messages.clone()
+                                };
+                                
+                                let turn_messages = context_builder.build(
+                                    &current_system_prompt,
+                                    &memory_ctx,
+                                    &effective_messages,
+                                    context_window,
+                                );
+                                
+                                app.agent_running = true;
+                                app.status = "Planning...".to_string();
+                                let effort = ox_core::context::estimate_effort(&spec_content, session.messages.len());
+                                let planning = effort == ox_core::context::EffortLevel::High;
+                                let provider = Arc::clone(provider);
+                                let tx = agent_tx.clone();
+                                let registry = Arc::clone(tool_registry);
+                                let ctx = Arc::clone(tool_ctx);
+                                let cancel_token = interrupt_ctrl.token();
+                                let tm = Arc::clone(&trust_manager);
+                                let ac = Arc::clone(&agent_config);
+                                let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
+                                app.ui_to_agent_tx = Some(ui_to_agent_tx);
+                                
+                                let workflow_engine_clone = app.workflow_engine.clone();
+                                
+                                tokio::spawn(async move {
+                                    agent::run_agent_turn(
+                                        provider,
+                                        turn_messages,
+                                        registry,
+                                        ctx,
+                                        tx,
+                                        ui_to_agent_rx,
+                                        cancel_token,
+                                        tm,
+                                        ac,
+                                        planning,
+                                        workflow_engine_clone,
+                                    ).await;
+                                });
+                            }
+                        }
+                        
                         // Check if a council discuss was queued
                         if let Some((question, rounds, verbose)) = app.pending_discuss.take() {
                             let council_config = config.council.clone();
@@ -2482,28 +2573,15 @@ fn handle_slash_command(
                             }
                         }
                         
-                        // Save to file
-                        if let Some(ref project_root) = rt_env.project_root {
-                            match context::save_spec(project_root, &config.spec.file_path, &content) {
-                                Ok(path) => {
-                                    app.output.push_system(&format!(
-                                        "✅ Spec saved to {} ({} chars)", 
-                                        path,
-                                        content.len()
-                                    ));
-                                }
-                                Err(e) => {
-                                    app.output.push_error(&format!("Failed to save spec: {}", e));
-                                }
-                            }
-                        } else {
-                            app.output.push_system(&format!(
-                                "✅ Spec set ({} chars, not persisted - no project root)", 
-                                content.len()
-                            ));
-                        }
+                        // Don't save to file - let AI generate spec.md in Workflow Step 3
+                        app.output.push_system(&format!(
+                            "✅ Spec requirement set ({} chars). Starting task planning...",
+                            content.len()
+                        ));
+                        app.dirty = true;
                         
-                        app.output.push_system("Spec mode activated. Send a message to start planning.");
+                        // Set flag to trigger auto-planning after slash command
+                        app.pending_spec_planning = Some(content.clone());
                     }
                 }
             }
