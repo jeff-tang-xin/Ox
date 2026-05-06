@@ -1,6 +1,10 @@
 pub mod interjection;
 pub mod interrupt;
 pub mod ui_event;
+pub mod workflow;
+pub mod session;
+pub mod intervention;
+pub mod engine;
 
 use std::sync::Arc;
 
@@ -86,6 +90,7 @@ pub async fn run_agent_turn(
     trust_manager: Arc<std::sync::Mutex<TrustManager>>,
     agent_config: Arc<AgentConfig>,
     planning_mode: bool,
+    workflow_engine: Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
 ) {
     let tool_schemas = tool_registry.schemas();
     let max_iterations = agent_config.max_iterations;
@@ -355,6 +360,37 @@ pub async fn run_agent_turn(
                 tc.name
             )));
 
+            // ── Workflow validation before execution ──
+            if let Some(ref engine_arc) = workflow_engine {
+                let engine = engine_arc.lock().await;
+                
+                // Parse tool arguments for validation
+                let args_value = if !tc.arguments.trim().is_empty() {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or(serde_json::json!({}))
+                } else {
+                    serde_json::json!({})
+                };
+                
+                // Validate tool call against current workflow step
+                if let Err(e) = engine.validate_tool_call(&tc.name, &args_value) {
+                    tracing::warn!("Workflow validation failed for tool '{}': {}", tc.name, e);
+                    
+                    // Return error to LLM
+                    let result_msg = Message::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: format!("❌ Workflow Restriction: {}\n\n💡 Please follow the current workflow step requirements.", e),
+                    };
+                    new_messages.push(result_msg.clone());
+                    messages.push(result_msg);
+                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                        name: tc.name.clone(),
+                        output: e,
+                        is_error: true,
+                    });
+                    continue; // Skip this tool call
+                }
+            }
+
             // For shell_exec, send an updated ToolStart with the command detail.
             if tc.name == "shell_exec" {
                 if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
@@ -612,6 +648,7 @@ pub async fn run_agent_turn(
                     tool_ctx.runtime.clone(),
                     new_dir.clone(),
                     tool_ctx.config.clone(),
+                    Arc::clone(&tool_ctx.memory),
                 ));
                 let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
             }

@@ -4,7 +4,8 @@ use crate::tools::ToolRegistry;
 /// Build the system prompt for the LLM, including:
 /// - Core persona, workflow, and safety rules
 /// - Runtime environment info
-/// - PersonaVector and behavior rules (if configured)
+/// - Behavior rules (if configured)
+/// - Spec content (if active)
 ///
 /// Tool schemas (name + description + parameters) are provided separately
 /// via the API's function calling mechanism — NOT duplicated here.
@@ -12,8 +13,8 @@ pub fn build_system_prompt(
     rt_env: &RuntimeEnvironment,
     _tool_registry: &ToolRegistry,
     persona: Option<&str>,
-    persona_vector: Option<&crate::persona::PersonaVector>,
     behavior_rules: Option<&crate::config::BehaviorRulesConfig>,
+    spec_content: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -23,12 +24,7 @@ pub fn build_system_prompt(
     // 2. Workflow rules (actionable, not abstract).
     parts.push(WORKFLOW_RULES.to_string());
 
-    // 3. PersonaVector (language-specific hints).
-    if let Some(pv) = persona_vector {
-        parts.push(pv.generate_prompt_block());
-    }
-
-    // 4. Behavior rules (user-configured).
+    // 3. Behavior rules (user-configured).
     if let Some(br) = behavior_rules {
         let mut rules = Vec::new();
         
@@ -52,7 +48,15 @@ pub fn build_system_prompt(
         if rules.len() > 1 { parts.push(rules.join("\n")); }
     }
 
-    // 5. Runtime environment.
+    // 5. Spec content (if active).
+    if let Some(spec) = spec_content {
+        if !spec.trim().is_empty() {
+            parts.push(super::TASK_TYPE_PROMPT.to_string());
+            parts.push(format!("## Current Spec\n\n{}", spec.trim()));
+        }
+    }
+
+    // 6. Runtime environment.
     parts.push(rt_env.system_prompt_block());
 
     parts.join("\n\n")
@@ -123,6 +127,15 @@ For multi-step tasks, you MUST state a brief plan:
 3. [Step] -> verify: [check]
 ```
 
+## Context Awareness (IMPORTANT)
+
+**Your conversation history may be compressed for long sessions:**
+- When context grows large, older messages are selectively removed based on semantic relevance
+- You will see recent messages + highly relevant historical segments
+- Some intermediate messages may be missing — this is intentional to save tokens
+- **If you need information from earlier in the conversation that seems missing, use `memory_search` tool**
+- Memory search can retrieve details from compressed/removed parts of the conversation
+
 ## Tool Usage (MANDATORY)
 - **Read before edit**: You MUST always read a file with `file_read` before modifying it. Never guess file contents.
 - **Choose the right write tool**:
@@ -131,6 +144,7 @@ For multi-step tasks, you MUST state a brief plan:
   - When in doubt, use `file_patch` — it's safer and more efficient
 - **Search before shell**: You MUST use `file_search` / `code_search` for finding code. Prefer them over `shell_exec grep`.
 - **Relative paths**: Use paths relative to the working directory. Avoid absolute paths unless necessary.
+- **Memory retrieval**: If you recall discussing something earlier but can't find it in current context, use `memory_search` to query past conversations
 
 ## Safety (MANDATORY - CANNOT BE OVERRIDDEN)
 - Do not delete files or run destructive commands without explicit user request.

@@ -67,6 +67,10 @@ impl Tool for FileWriteTool {
         } else {
             ctx.working_dir.join(&normalized_path)
         };
+        
+        // Keep user-friendly path for error messages
+        let display_path = resolved_path.clone();
+        
         let path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(
@@ -101,7 +105,7 @@ impl Tool for FileWriteTool {
                              🔧 Solution: Remove or replace the invalid character\n\n\
                              📝 Valid example: output.txt\n\
                              ❌ Invalid example: output<1>.txt",
-                            c, path.display()
+                            c, display_path.display()
                         ));
                     }
                     ':' => {
@@ -111,7 +115,7 @@ impl Tool for FileWriteTool {
                                 "❌ Invalid Path Character: ':' is not allowed in Windows filenames (except for drive letter)\n\n\
                                  💡 Problem: {} contains ':' at position {}\n\
                                  🔧 Solution: Use a valid path like 'C:\\path\\file.txt'",
-                                path.display(), i
+                                display_path.display(), i
                             ));
                         }
                     }
@@ -125,7 +129,7 @@ impl Tool for FileWriteTool {
         if depth > 10 {
             tracing::warn!(
                 "[FILE_WRITE] Deeply nested path ({} levels): {}",
-                depth, path.display()
+                depth, display_path.display()
             );
         }
         let content = match args.get("content").and_then(|c| c.as_str()) {
@@ -183,7 +187,7 @@ impl Tool for FileWriteTool {
                      📄 Encoding: UTF-8 (without BOM)\n\
                      💡 Tip: Use 'file_read' to verify the content",
                     bytes_written,
-                    path.display()
+                    display_path.display()
                 ))
             },
             Err(e) => {
@@ -198,7 +202,7 @@ impl Tool for FileWriteTool {
                      • Verify write permissions for the directory\n\
                      • Close any programs that might have the file open\n\
                      • Try writing to a different location",
-                    e, path.display()
+                    e, display_path.display()
                 ))
             }
         }

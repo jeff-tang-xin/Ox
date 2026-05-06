@@ -72,6 +72,9 @@ impl Tool for FileReadTool {
         } else {
             ctx.working_dir.join(&normalized_path)
         };
+        
+        // Keep user-friendly path for error messages
+        let display_path = resolved_path.clone();
 
         // Path traversal protection.
         let path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
@@ -101,7 +104,7 @@ impl Tool for FileReadTool {
 
                 ToolOutput::success(selected.join("\n"))
             }
-            Err(e) => ToolOutput::error(format!("Failed to read {}: {e}", path.display())),
+            Err(e) => ToolOutput::error(format!("Failed to read {}: {e}", display_path.display())),
         }
     }
 }

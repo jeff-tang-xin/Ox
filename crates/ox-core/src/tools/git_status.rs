@@ -71,9 +71,18 @@ impl Tool for GitDiffTool {
 
         let path_str;
         if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
-            git_args.push("--");
-            path_str = path.to_string();
-            git_args.push(&path_str);
+            // Normalize path: trim whitespace and standardize separators
+            let normalized_path = path.trim().replace('\\', "/");
+            let resolved = ctx.working_dir.join(&normalized_path);
+            
+            match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
+                Ok(validated) => {
+                    git_args.push("--");
+                    path_str = validated.to_string_lossy().to_string();
+                    git_args.push(&path_str);
+                },
+                Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
+            }
         }
 
         run_git(&git_args, ctx).await
@@ -132,8 +141,28 @@ impl Tool for GitCommitTool {
             });
 
         let stage_result = if let Some(files) = &files {
+            // Validate each file path before staging
+            let mut validated_files = Vec::new();
+            for file in files {
+                // Normalize path: trim whitespace and standardize separators
+                let normalized_path = file.trim().replace('\\', "/");
+                let resolved = ctx.working_dir.join(&normalized_path);
+                
+                match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
+                    Ok(validated) => {
+                        // Convert back to relative path for git add
+                        if let Ok(relative) = validated.strip_prefix(&ctx.working_dir) {
+                            validated_files.push(relative.to_string_lossy().to_string());
+                        } else {
+                            return ToolOutput::error(format!("Path validation failed for '{}': outside working directory", file));
+                        }
+                    },
+                    Err(e) => return ToolOutput::error(format!("Path validation failed for '{}': {}", file, e)),
+                }
+            }
+            
             let mut git_args = vec!["add"];
-            let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+            let file_refs: Vec<&str> = validated_files.iter().map(|s| s.as_str()).collect();
             git_args.extend(file_refs);
             run_git(&git_args, ctx).await
         } else {

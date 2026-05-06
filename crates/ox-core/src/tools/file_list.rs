@@ -38,8 +38,15 @@ impl Tool for FileListTool {
             None => return ToolOutput::error("Missing required parameter: path. Usage: {\"path\": \"<directory or glob pattern>\"}"),
         };
 
+        // Normalize path: trim whitespace and standardize separators
+        let normalized_path = path_str.trim().replace('\\', "/");
+        
         // Path traversal protection.
-        let resolved_path = ctx.working_dir.join(path_str);
+        let resolved_path = ctx.working_dir.join(&normalized_path);
+        
+        // Keep user-friendly path for error messages
+        let display_path = resolved_path.clone();
+        
         let validated_path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
@@ -95,7 +102,7 @@ impl Tool for FileListTool {
                 }
                 Err(e) => ToolOutput::error(format!(
                     "Failed to list {}: {e}",
-                    full_path.display()
+                    display_path.display()
                 )),
             }
         }

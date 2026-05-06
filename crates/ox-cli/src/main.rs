@@ -4,7 +4,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyModifiers, EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -29,7 +29,7 @@ use ox_core::runtime;
 use ox_core::safety::TrustManager;
 use ox_core::slash::{self, SlashCommand};
 use ox_core::tools::{ToolContext, ToolRegistry};
-use terminal::app::{App, UserInput, PendingConfirmation};
+use terminal::app::{App, UserInput, PendingConfirmation, WorkflowState, CouncilWorkflowStep};
 use terminal::event::{Event, EventHandler};
 use terminal::output_pane::OutputLine;
 use terminal::render;
@@ -467,21 +467,36 @@ async fn run_app(
         is_active: true,
     });
 
-    // Create tool registry and context (shared via Arc for tokio::spawn).
+    // Create tool registry (tool context will be created after memory initialization)
     let tool_registry = Arc::new(ToolRegistry::new());
-    #[allow(unused_variables)]
-    let tool_ctx = Arc::new(ToolContext::new(
-        rt_env.clone(),
-        rt_env.working_dir.clone(),
-        Arc::new(config.clone()),
-    ));
 
-    // Build system prompt using context module.
-    let mut persona_vector = ox_core::persona::PersonaVector::for_language(
-        &rt_env.project_root.as_ref().and_then(|r| r.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
-    );
+    // Load spec if auto_load enabled
+    if config.spec.auto_load {
+        if let Some(ref project_root) = rt_env.project_root {
+            match context::load_spec(project_root, &config.spec.file_path) {
+                Ok(content) if !content.is_empty() => {
+                    app.activate_spec_mode(content);
+                    tracing::info!("Spec mode activated from: {}", config.spec.file_path);
+                }
+                Ok(_) => {},
+                Err(e) => {
+                    tracing::warn!("Failed to load spec: {}", e);
+                }
+            }
+        }
+    }
     
-    let system_prompt = context::build_system_prompt(&rt_env, &tool_registry, None, Some(&persona_vector), Some(&config.behavior_rules));
+    // Initial system prompt (not used for agent turns, built dynamically)
+    let system_prompt = context::build_system_prompt(
+        &rt_env, 
+        &tool_registry, 
+        None, 
+        Some(&config.behavior_rules),
+        match &app.workflow_state {
+            WorkflowState::Spec { spec_content, .. } if !spec_content.is_empty() => Some(spec_content.as_str()),
+            _ => None,
+        }
+    );
 
     // Context builder for assembling LLM messages within token budgets.
     // Uses ratios from config if available.
@@ -499,7 +514,7 @@ async fn run_app(
     });
 
     // Memory system -- system-level: ~/.ox/db/memories_*.db
-    let mut memory = MemoryManager::init(&rt_env.ox_home_dir, &rt_env.project_id, &config.memory)
+    let memory = MemoryManager::init(&rt_env.ox_home_dir, &rt_env.project_id, &config.memory)
         .unwrap_or_else(|e| {
             tracing::warn!("Failed to init memory system: {e}");
             let temp = std::env::temp_dir();
@@ -507,24 +522,26 @@ async fn run_app(
                 .expect("memory init with temp dir")
         });
     
+    // Wrap in Arc for shared access
+    let memory_arc = Arc::new(memory);
+    
     // Load EMA historical state from database for implicit feedback tracking
-    if let Err(e) = app.ema_manager.load_from_store("code_accept_rate", memory.overall_store()) {
+    if let Err(e) = app.ema_manager.load_from_store("code_accept_rate", memory_arc.overall_store()) {
         tracing::warn!("Failed to load EMA history: {}", e);
     }
     
     // Baseline satisfaction for rollback evaluation
-    let baseline_satisfaction = 0.75; // Default baseline, can be made configurable
+    let _baseline_satisfaction = 0.75; // Default baseline, can be made configurable
 
     // Probabilistic janitor run on startup (20% chance).
     if rand::random::<f64>() < config.memory.janitor_run_on_startup_prob {
-        memory.run_janitor(0.3, config.memory.max_nodes);
+        memory_arc.run_janitor(0.3, config.memory.max_nodes);
     }
-
-    // Create tool context (memory is pre-injected into context by main.rs)
     let mut tool_ctx = Arc::new(ToolContext::new(
         rt_env.clone(),
         rt_env.working_dir.clone(),
         Arc::new(config.clone()),
+        Arc::clone(&memory_arc),
     ));
 
     // Model name for cost recording.
@@ -620,6 +637,9 @@ async fn run_app(
     // Holds the old session when switching during agent run.
     let mut background_session: Option<Session> = None;
 
+    // Initialize Workflow Engine in App
+    app.init_workflow_engine(&session.meta.id);
+
     loop {
         // === IMPLICIT FEEDBACK: Detect overrides before user input ===
         let override_signals = app.override_detector.detect_overrides();
@@ -670,7 +690,7 @@ async fn run_app(
             
             // Persist EMA state periodically (every 10 writes)
             if app.total_file_writes % 10 == 0 {
-                let store_clone = memory.overall_store().clone();
+                let store_clone = memory_arc.overall_store().clone();
                 let metric_name = "code_accept_rate".to_string();
                 let ema_clone = app.ema_manager.clone();
                 
@@ -740,6 +760,10 @@ async fn run_app(
                 let ac = Arc::clone(&agent_config);
                 let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
                 app.ui_to_agent_tx = Some(ui_to_agent_tx);
+                
+                // Clone workflow engine for async task
+                let workflow_engine_clone = app.workflow_engine.clone();
+                
                 tokio::spawn(async move {
                     let tx_status = tx.clone();
                     let turn_messages = match cm {
@@ -786,6 +810,7 @@ async fn run_app(
                         }
                         None => cb.build(&sp, &memory_ctx, &messages, cw),
                     };
+                    
                     agent::run_agent_turn(
                         provider,
                         turn_messages,
@@ -797,6 +822,7 @@ async fn run_app(
                         tm,
                         ac,
                         false, // compression path: skip planning
+                        workflow_engine_clone,
                     )
                     .await;
                 });
@@ -816,12 +842,10 @@ async fn run_app(
                             &provider,
                             &agent_tx,
                             &mut session,
-                            &mut memory,
-                            &mut persona_vector,
+                            &memory_arc,
                             &tool_registry,
                             &tool_ctx,
                             &context_builder,
-                            &&system_prompt,
                             context_window,
                             &mut cost_tracker,
                             &trust_manager,
@@ -928,6 +952,10 @@ async fn run_app(
                     Some(Event::Tick) | None => {
                         tick_count = tick_count.wrapping_add(1);
                         app.spinner_frame = tick_count;
+                        
+                        // Update workflow display cache (avoids locking in render)
+                        app.update_workflow_display();
+                        
                         // Agent running needs spinner animation updates.
                         // Only mark dirty if spinner frame actually changed and agent is running
                         if app.agent_running && app.spinner_frame != app.last_spinner_frame {
@@ -1036,123 +1064,41 @@ async fn run_app(
                                 }
                             }
                             cost_tracker.record(&model_name, &usage);
-                            memory.update_from_turn(&new_messages, &rt_env.project_id, &rt_env.project_language);
+                            memory_arc.update_from_turn(&new_messages, &rt_env.project_id, &rt_env.project_language);
 
-                            // === IMPLICIT FEEDBACK: Evaluate satisfaction and maybe rollback ===
-                            if config.persona.auto_evolve && !persona_vector.frozen {
-                                // Calculate composite satisfaction score
-                                let explicit_rate = if app.explicit_feedback_count > 0 {
-                                    app.good_feedback_count as f64 / app.explicit_feedback_count as f64
-                                } else {
-                                    0.5 // Neutral if no explicit feedback
-                                };
-                                
-                                // Get tool success rate
-                                let tool_success_rate = calculate_tool_success_rate(&target_session.messages);
-                                
-                                // Get code accept rate from EMA
-                                let code_accept_rate = app.ema_manager.get_value("code_accept_rate")
-                                    .unwrap_or(0.8); // Default if not tracked yet
-                                
-                                let has_explicit = app.explicit_feedback_count >= 5;
-                                
-                                let satisfaction_score = app.rollback_manager.calculate_satisfaction_score(
-                                    explicit_rate,
-                                    tool_success_rate,
-                                    code_accept_rate,
-                                    has_explicit,
-                                );
-                                
-                                tracing::info!(
-                                    "[SATISFACTION EVAL] explicit={:.2}, tool={:.2}, code_accept={:.2}, overall={:.2}",
-                                    explicit_rate,
-                                    tool_success_rate,
-                                    code_accept_rate,
-                                    satisfaction_score
-                                );
-                                
-                                // Evaluate and maybe rollback
-                                match app.rollback_manager.evaluate_and_maybe_rollback(
-                                    &mut persona_vector,
-                                    satisfaction_score,
-                                    baseline_satisfaction,
-                                    memory.overall_store(),
-                                ) {
-                                    Ok(decision) => {
-                                        use ox_core::feedback::RollbackDecision;
-                                        
-                                        match decision {
-                                            RollbackDecision::RolledBack { from_score, to_score, snapshot_id } => {
-                                                app.output.push_system(&format!(
-                                                    "⚠️  Persona rolled back due to satisfaction drop ({:.2} → {:.2})",
-                                                    from_score, to_score
-                                                ));
-                                                tracing::warn!(
-                                                    "[ROLLBACK] Snapshot: {}, Score: {:.2} → {:.2}",
-                                                    snapshot_id, from_score, to_score
-                                                );
-                                            }
-                                            RollbackDecision::NeedsRollback { current_score, baseline_score, degradation } => {
-                                                app.output.push_system(&format!(
-                                                    "⚠️  Warning: Satisfaction dropped ({:.2} < {:.2}), but no rollback point available",
-                                                    current_score, baseline_score
-                                                ));
-                                                tracing::warn!(
-                                                    "[ROLLBACK NEEDED] Current: {:.2}, Baseline: {:.2}, Degradation: {:.2}",
-                                                    current_score, baseline_score, degradation
-                                                );
-                                            }
-                                            RollbackDecision::NoRollback { current_score } => {
-                                                // Normal evolution can proceed
-                                                let evolution_log = memory.run_self_evaluation(
-                                                    &mut persona_vector,
-                                                    config.persona.max_trait_change,
-                                                );
-                                                
-                                                if !evolution_log.is_empty() {
-                                                    for log_entry in &evolution_log {
-                                                        tracing::info!("[PERSONA EVOLUTION] {}", log_entry);
-                                                    }
-                                                    app.output.push_line(OutputLine::System(format!(
-                                                        "✨ Persona evolved: {} adjustments (satisfaction: {:.2})",
-                                                        evolution_log.len(),
-                                                        current_score
-                                                    )));
-                                                    
-                                                    // Create snapshot after successful evolution
-                                                    if let Err(e) = app.rollback_manager.create_snapshot(
-                                                        &persona_vector,
-                                                        current_score,
-                                                        memory.overall_store(),
-                                                    ) {
-                                                        tracing::warn!("Failed to create persona snapshot: {}", e);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Rollback evaluation failed: {}", e);
-                                        // Fallback to normal evolution
-                                        let evolution_log = memory.run_self_evaluation(
-                                            &mut persona_vector,
-                                            config.persona.max_trait_change,
-                                        );
-                                        if !evolution_log.is_empty() {
-                                            for log_entry in &evolution_log {
-                                                tracing::info!("[PERSONA EVOLUTION] {}", log_entry);
-                                            }
-                                            app.output.push_line(OutputLine::System(format!(
-                                                "Persona evolved: {} adjustments",
-                                                evolution_log.len()
-                                            )));
-                                        }
-                                    }
-                                }
-                            } else if !config.persona.auto_evolve {
-                                app.output.push_system("Auto-evolve is disabled. Enable it in config.toml.");
-                            }
-                            // === END IMPLICIT FEEDBACK ROLLBACK EVALUATION ===
+                            // === IMPLICIT FEEDBACK: Evaluate satisfaction ===
+                            // Calculate composite satisfaction score
+                            let explicit_rate = if app.explicit_feedback_count > 0 {
+                                app.good_feedback_count as f64 / app.explicit_feedback_count as f64
+                            } else {
+                                0.5 // Neutral if no explicit feedback
+                            };
+                            
+                            // Get tool success rate
+                            let tool_success_rate = calculate_tool_success_rate(&target_session.messages);
+                            
+                            // Get code accept rate from EMA
+                            let code_accept_rate = app.ema_manager.get_value("code_accept_rate")
+                                .unwrap_or(0.8); // Default if not tracked yet
+                            
+                            let has_explicit = app.explicit_feedback_count >= 5;
+                            
+                            let satisfaction_score = app.rollback_manager.calculate_satisfaction_score(
+                                explicit_rate,
+                                tool_success_rate,
+                                code_accept_rate,
+                                has_explicit,
+                            );
+                            
+                            tracing::info!(
+                                "[SATISFACTION] explicit={:.2}, tool={:.2}, code_accept={:.2}, overall={:.2}",
+                                explicit_rate,
+                                tool_success_rate,
+                                code_accept_rate,
+                                satisfaction_score
+                            );
+                            
+                            // === END IMPLICIT FEEDBACK ===
 
                             // Post-turn asynchronous compression trigger
                             if let Some(ref cm) = compression_manager {
@@ -1168,8 +1114,8 @@ async fn run_app(
                                 let last_user_query = msgs.last()
                                     .and_then(|m| match m { Message::User { content } => Some(content.clone()), _ => None })
                                     .unwrap_or_default();
-                                let memory_nodes = memory.retrieve(&last_user_query, &Some(rt_env.project_id.as_str()), 5);
-                                let memory_ctx = memory.format_memory_context(&memory_nodes, false);
+                                let memory_nodes = memory_arc.retrieve(&last_user_query, &Some(rt_env.project_id.as_str()), 5);
+                                let memory_ctx = memory_arc.format_memory_context(&memory_nodes, false);
                                 
                                 tokio::spawn(async move {
                                     let current_tokens = cm_clone.calculate_context_tokens(&msgs);
@@ -1229,10 +1175,10 @@ async fn run_app(
                                         }
                                         // Trigger new run for interjection
                                         let text = last.clone();
-                                        let memory_nodes = memory.retrieve(&text, &Some(rt_env.project_id.as_str()), 5);
+                                        let memory_nodes = memory_arc.retrieve(&text, &Some(rt_env.project_id.as_str()), 5);
                                         let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
-                                        memory.reinforce_accessed(&accessed_ids);
-                                        let memory_ctx = memory.format_memory_context(&memory_nodes, false);
+                                        memory_arc.reinforce_accessed(&accessed_ids);
+                                        let memory_ctx = memory_arc.format_memory_context(&memory_nodes, false);
                                         let effective_messages = if let Some((ref cached, prev_count)) = compressed_cache {
                                             let new_msgs = &session.messages[prev_count.min(session.messages.len())..];
                                             let mut combined = cached.clone();
@@ -1253,8 +1199,12 @@ async fn run_app(
                                         let ac = Arc::clone(&agent_config);
                                         let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
                                         app.ui_to_agent_tx = Some(ui_to_agent_tx);
+                                        
+                                        // Clone workflow engine for async task
+                                        let workflow_engine_clone = app.workflow_engine.clone();
+                                        
                                         tokio::spawn(async move {
-                                            agent::run_agent_turn(provider, turn_messages, registry, ctx, tx, ui_to_agent_rx, cancel_token, tm, ac, false).await;
+                                            agent::run_agent_turn(provider, turn_messages, registry, ctx, tx, ui_to_agent_rx, cancel_token, tm, ac, false, workflow_engine_clone).await;
                                         });
                                         app.scroll_to_bottom();
                                         app.dirty = true;
@@ -1341,7 +1291,7 @@ async fn run_app(
                                     "multi".into(),
                                     ox_core::memory::MemorySource::CouncilConclusion,
                                 );
-                                memory.store(mem_node);
+                                memory_arc.store(mem_node);
                             }
                             app.last_council_session = Some(council_session);
                             if background_session.is_some() {
@@ -1369,6 +1319,7 @@ async fn run_app(
                                         rt_env.clone(),
                                         new_dir.clone(),
                                         Arc::new(config.clone()),
+                                        Arc::clone(&memory_arc),
                                     ));
                                     if project_changed {
                                         app.output.push_system(&format!(
@@ -1415,7 +1366,7 @@ async fn run_app(
         }
 
         if app.should_quit {
-            memory.flush();
+            memory_arc.flush();
             break;
         }
     }
@@ -1430,12 +1381,10 @@ fn handle_key_event(
     provider: &Option<Arc<dyn LlmProvider>>,
     agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
     session: &mut Session,
-    memory: &mut MemoryManager,
-    mut persona_vector: &mut ox_core::persona::PersonaVector,
+    memory: &Arc<MemoryManager>,
     tool_registry: &Arc<ToolRegistry>,
     tool_ctx: &Arc<ToolContext>,
     context_builder: &ContextBuilder,
-    system_prompt: &str,
     context_window: u32,
     cost_tracker: &mut CostTracker,
     trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
@@ -1546,7 +1495,6 @@ fn handle_key_event(
                             rt_env,
                             session,
                             memory,
-                            &mut persona_vector,
                             &resolve_info,
                             &config,
                             session_action,
@@ -1579,7 +1527,36 @@ fn handle_key_event(
                         }
                     }
                     UserInput::Text(text) => {
-                        if app.agent_running {
+                        // Handle spec edit mode
+                        if app.spec_edit_mode {
+                            app.spec_edit_mode = false;
+                            app.spec_content = text.clone();
+                            app.spec_active = true;
+                            
+                            // Save to file
+                            if let Some(ref project_root) = rt_env.project_root {
+                                match context::save_spec(project_root, &config.spec.file_path, &text) {
+                                    Ok(path) => {
+                                        app.output.push_system(&format!(
+                                            "✅ Spec saved to {} ({} chars)", 
+                                            path,
+                                            text.len()
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        app.output.push_error(&format!("Failed to save spec: {}", e));
+                                    }
+                                }
+                            } else {
+                                app.output.push_system(&format!(
+                                    "✅ Spec set ({} chars, not persisted - no project root)", 
+                                    text.len()
+                                ));
+                            }
+                            
+                            app.output.push_system("Spec mode activated. AI will use this spec for task planning.");
+                            app.dirty = true;
+                        } else if app.agent_running {
                             // Send interjection to agent immediately via channel
                             let priority = if text.starts_with('!') {
                                 InterjectionPriority::Urgent
@@ -1606,6 +1583,32 @@ fn handle_key_event(
                             app.scroll_to_bottom();
                             app.dirty = true;
                         } else if let Some(provider) = provider {
+                            // Build system prompt dynamically to include latest spec content AND workflow step instructions
+                            let mut current_system_prompt = context::build_system_prompt(
+                                &rt_env,
+                                &tool_registry,
+                                None,
+                                Some(&config.behavior_rules),
+                                if app.spec_active && !app.spec_content.is_empty() {
+                                    Some(&app.spec_content)
+                                } else {
+                                    None
+                                }
+                            );
+                            
+                            // Add workflow step instructions if in Spec or Council mode (use cached data)
+                            if let Some(ref wf_info) = app.workflow_display {
+                                if let Some(ref step_prompt) = wf_info.step_prompt {
+                                    current_system_prompt.push_str("\n\n## Current Workflow Step\n\n");
+                                    current_system_prompt.push_str(step_prompt);
+                                    
+                                    // Add tool restriction warnings
+                                    if !wf_info.allows_code_modification {
+                                        current_system_prompt.push_str("\n\n⚠️ IMPORTANT: You CAN use tools (file_read, file_search, etc.) but you CANNOT modify source code files (.rs, .py, .js, etc.) in this step. You can only create/modify documentation files (.md, .txt, etc.).");
+                                    }
+                                }
+                            }
+                            
                             let user_msg = Message::user(&text);
                             if let Err(e) = session.append_message(user_msg) {
                                 tracing::error!("Failed to persist user message: {e}");
@@ -1627,7 +1630,7 @@ fn handle_key_event(
                             };
 
                             let turn_messages = context_builder.build(
-                                &system_prompt,
+                                &current_system_prompt,  // Use dynamically built prompt
                                 &memory_ctx,
                                 &effective_messages,
                                 context_window,
@@ -1645,6 +1648,10 @@ fn handle_key_event(
                             let ac = Arc::clone(&agent_config);
                             let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
                             app.ui_to_agent_tx = Some(ui_to_agent_tx);
+                            
+                            // Clone workflow engine Arc for the async task
+                            let workflow_engine_clone = app.workflow_engine.clone();
+                            
                             tokio::spawn(async move {
                                 agent::run_agent_turn(
                                     provider,
@@ -1657,6 +1664,7 @@ fn handle_key_event(
                                     tm,
                                     ac,
                                     planning,
+                                    workflow_engine_clone,
                                 )
                                 .await;
                             });
@@ -1714,8 +1722,7 @@ fn handle_slash_command(
     model_name: &str,
     rt_env: &mut runtime::RuntimeEnvironment,
     session: &mut Session,
-    memory: &mut MemoryManager,
-    persona_vector: &mut ox_core::persona::PersonaVector,
+    memory: &Arc<MemoryManager>,
     resolve_info: &Option<ProviderResolveInfo>,
     config: &OxConfig,
     session_action: &mut SessionAction,
@@ -1733,6 +1740,14 @@ fn handle_slash_command(
         SlashCommand::Exit => {
             app.output.push_system("Goodbye.");
             app.should_quit = true;
+        }
+        SlashCommand::Cancel => {
+            if app.spec_edit_mode {
+                app.spec_edit_mode = false;
+                app.output.push_system("Spec edit cancelled.");
+            } else {
+                app.output.push_system("Nothing to cancel.");
+            }
         }
         SlashCommand::New => {
             // Signal session action to main loop for processing.
@@ -2045,15 +2060,30 @@ fn handle_slash_command(
         }
         SlashCommand::Memory => {
             let (project_count, overall_count) = memory.stats(&rt_env.project_id);
-            app.output.push_line(OutputLine::System(format!("Memory: {} project, {} long-term", project_count, overall_count)));
-            let nodes = memory.retrieve("", &Some(rt_env.project_id.as_str()), 5);
-            for node in &nodes {
-                app.output.push_line(OutputLine::System(format!(
-                    "  [{}] {} (depth: {})",
-                    node.node_type,
-                    node.content.chars().take(80).collect::<String>(),
-                    node.depth
-                )));
+            app.output.push_line(OutputLine::System(format!(
+                "📊 Memory Statistics: {} project memories, {} global memories\n",
+                project_count, overall_count
+            )));
+            
+            // Show recent memories with enhanced formatting
+            let nodes = memory.retrieve("", &Some(rt_env.project_id.as_str()), 8);
+            if nodes.is_empty() {
+                app.output.push_system("No memories found yet. Memories are created automatically during conversations.");
+            } else {
+                app.output.push_system("Recent memories:");
+                for node in &nodes {
+                    let scope = if node.project_id.is_some() { "📁" } else { "🌍" };
+                    let confidence = calculate_memory_confidence(node);
+                    app.output.push_line(OutputLine::System(format!(
+                        "  {} [{}] {} (depth: {}, confidence: {:.0}%)",
+                        scope,
+                        node.node_type,
+                        truncate_content(&node.content, 100),
+                        node.depth,
+                        confidence * 100.0
+                    )));
+                }
+                app.output.push_system("\n💡 Tip: Use the memory_search tool in conversations to query specific knowledge.");
             }
         }
         SlashCommand::Feedback { category } => {
@@ -2093,14 +2123,10 @@ fn handle_slash_command(
                         })
                         .unwrap_or_default();
                     
-                    if config.persona.auto_evolve && !last_assistant.is_empty() {
-                        persona_vector.process_feedback("太啰嗦", config.persona.max_trait_change);
-                        if let Err(e) = persona_vector.persist_to_store(&memory.overall_store()) {
-                            tracing::warn!("Failed to persist persona after feedback: {}", e);
-                        }
-                        app.output.push_system("⚠️  Feedback noted: negative. Persona adjusted.");
-                    } else {
+                    if !last_assistant.is_empty() {
                         app.output.push_system("⚠️  Feedback noted: negative. Will adjust approach.");
+                    } else {
+                        app.output.push_system("⚠️  Feedback noted: negative.");
                     }
                     
                     tracing::info!(
@@ -2117,48 +2143,6 @@ fn handle_slash_command(
                 _ => {
                     app.output.push_system("Usage: /feedback <good|bad|unsafe>");
                 }
-            }
-        }
-        SlashCommand::Persona { action } => {
-            if action.is_empty() || action == "show" {
-                app.output.push_line(OutputLine::System(format!("Persona: {}", persona_vector)));
-                app.output.push_line(OutputLine::System(format!(
-                    "Auto-evolve: {} | Max change: {}",
-                    config.persona.auto_evolve,
-                    config.persona.max_trait_change
-                )));
-            } else if action == "freeze" {
-                persona_vector.frozen = true;
-                if let Err(e) = persona_vector.persist_to_store(&memory.overall_store()) {
-                    tracing::warn!("Failed to persist frozen persona: {}", e);
-                }
-                app.output.push_system("Persona frozen (evolution stopped). Use /persona unfreeze to resume.");
-            } else if action == "unfreeze" {
-                persona_vector.frozen = false;
-                if let Err(e) = persona_vector.persist_to_store(&memory.overall_store()) {
-                    tracing::warn!("Failed to persist unfrozen persona: {}", e);
-                }
-                app.output.push_system("Persona unfrozen (evolution resumed).");
-            } else if action == "evolve" {
-                // Manual trigger for self-evaluation
-                if config.persona.auto_evolve {
-                    let evolution_log = memory.run_self_evaluation(
-                        persona_vector,
-                        config.persona.max_trait_change,
-                    );
-                    if evolution_log.is_empty() {
-                        app.output.push_system("No evolution triggered (insufficient patterns or already optimized).");
-                    } else {
-                        for log_entry in &evolution_log {
-                            app.output.push_line(OutputLine::System(format!("  → {}", log_entry)));
-                        }
-                        app.output.push_system("Persona evolved based on memory patterns.");
-                    }
-                } else {
-                    app.output.push_system("Auto-evolve is disabled. Enable it in config.toml.");
-                }
-            } else {
-                app.output.push_system("Usage: /persona [show|freeze|unfreeze|evolve]");
             }
         }
         SlashCommand::Discuss { question, rounds, verbose } => {
@@ -2178,23 +2162,101 @@ fn handle_slash_command(
             app.pending_discuss = Some((question_text, rounds, verbose));
         }
         SlashCommand::Council { action } => {
-            if action == "last" {
-                if let Some(ref session) = app.last_council_session {
-                    let output = if session.phases.len() > 2 {
-                        session.format_verbose()
+            let action = action.trim();
+            
+            match action {
+                "" | "status" => {
+                    // Show council status
+                    if matches!(app.workflow_state, WorkflowState::Council { .. }) {
+                        app.output.push_system("✅ Council mode: ACTIVE");
                     } else {
-                        session.format_summary()
-                    };
-                    for line in output.lines() {
-                        app.output.push_line(OutputLine::System(line.to_string()));
+                        app.output.push_system("❌ Council mode: INACTIVE");
                     }
-                } else {
-                    app.output.push_system("No previous council session.");
+                    app.output.push_system("Usage: /council [start <topic>|last|stats]");
                 }
-            } else if action == "stats" {
-                app.output.push_system("Council stats: (model capability tracking not yet persisted)");
-            } else {
-                app.output.push_system("Usage: /council <last|stats>");
+                "start" => {
+                    // Activate council mode with a topic
+                    let topic = if args.len() > 6 { &args[6..] } else { "General Discussion" };
+                    
+                    // Update workflow state
+                    app.workflow_state = WorkflowState::Council {
+                        step: CouncilWorkflowStep::TopicDefinition,
+                        topic: Some(topic.to_string()),
+                    };
+                    
+                    // Activate workflow engine (use try_lock to avoid blocking in async context)
+                    if let Some(ref engine_arc) = app.workflow_engine {
+                        if let Ok(mut engine) = engine_arc.try_lock() {
+                            if let Err(e) = engine.activate_workflow("council_workflow") {
+                                tracing::warn!("Failed to activate council workflow: {}", e);
+                            }
+                        }
+                    }
+                    
+                    app.output.push_system(&format!("🎯 Council mode activated: {}", topic));
+                    app.output.push_system("Starting multi-agent debate...");
+                }
+                "last" => {
+                    if let Some(ref session) = app.last_council_session {
+                        let output = if session.phases.len() > 2 {
+                            session.format_verbose()
+                        } else {
+                            session.format_summary()
+                        };
+                        for line in output.lines() {
+                            app.output.push_line(OutputLine::System(line.to_string()));
+                        }
+                    } else {
+                        app.output.push_system("No previous council session.");
+                    }
+                }
+                "stats" => {
+                    app.output.push_system("Council stats: (model capability tracking not yet persisted)");
+                }
+                "stop" | "off" => {
+                    // Deactivate council mode and switch to free mode
+                    let was_active = matches!(app.workflow_state, WorkflowState::Council { .. });
+                    
+                    // Update workflow state to Free
+                    app.workflow_state = WorkflowState::Free;
+                    
+                    // Activate free workflow (use try_lock to avoid blocking in async context)
+                    if let Some(ref engine_arc) = app.workflow_engine {
+                        if let Ok(mut engine) = engine_arc.try_lock() {
+                            if let Err(e) = engine.activate_workflow("free_workflow") {
+                                tracing::warn!("Failed to activate free workflow: {}", e);
+                            }
+                        }
+                    }
+                    
+                    if was_active {
+                        app.output.push_system("✅ Council mode deactivated. Switched to Free mode.");
+                    } else {
+                        app.output.push_system("Council mode was already inactive. In Free mode.");
+                    }
+                }
+                _ => {
+                    // Treat as inline topic - start council mode directly
+                    let topic = action;
+                    
+                    // Update workflow state
+                    app.workflow_state = WorkflowState::Council {
+                        step: CouncilWorkflowStep::TopicDefinition,
+                        topic: Some(topic.to_string()),
+                    };
+                    
+                    // Activate workflow engine (use try_lock to avoid blocking in async context)
+                    if let Some(ref engine_arc) = app.workflow_engine {
+                        if let Ok(mut engine) = engine_arc.try_lock() {
+                            if let Err(e) = engine.activate_workflow("council_workflow") {
+                                tracing::warn!("Failed to activate council workflow: {}", e);
+                            }
+                        }
+                    }
+                    
+                    app.output.push_system(&format!("🎯 Council mode activated: {}", topic));
+                    app.output.push_system("Starting multi-agent debate...");
+                }
             }
         }
         SlashCommand::Reload => {
@@ -2256,9 +2318,247 @@ fn handle_slash_command(
                 }
             }
         }
+        SlashCommand::Spec { action } => {
+            let action = action.trim();
+            
+            match action {
+                "status" | "" => {
+                    // Show current spec status
+                    if app.spec_active {
+                        let lines = app.spec_content.lines().count();
+                        app.output.push_system(&format!(
+                            "✅ Spec mode: ACTIVE ({} lines, {})", 
+                            lines, 
+                            config.spec.file_path
+                        ));
+                    } else {
+                        app.output.push_system("❌ Spec mode: INACTIVE");
+                    }
+                    app.output.push_system("Usage: /spec [on|off|show|edit|clear|<content>]");
+                }
+                "show" => {
+                    // Display current spec content
+                    if app.spec_content.is_empty() {
+                        app.output.push_system("No spec content. Use /spec edit to create one.");
+                    } else {
+                        app.output.push_line(OutputLine::System("─── Current Spec ───".to_string()));
+                        for line in app.spec_content.lines() {
+                            app.output.push_line(OutputLine::System(line.to_string()));
+                        }
+                        app.output.push_line(OutputLine::System("─── End ───".to_string()));
+                    }
+                }
+                "on" => {
+                    // Activate spec mode: load from file or prompt to create
+                    if app.spec_active {
+                        app.output.push_system("Spec mode is already active.");
+                    } else if let Some(ref project_root) = rt_env.project_root {
+                        match context::load_spec(project_root, &config.spec.file_path) {
+                            Ok(content) if !content.is_empty() => {
+                                app.spec_content = content.clone();
+                                app.spec_active = true;
+                                
+                                // Activate workflow engine (use try_lock to avoid blocking in async context)
+                                if let Some(ref engine_arc) = app.workflow_engine {
+                                    if let Ok(mut engine) = engine_arc.try_lock() {
+                                        if let Err(e) = engine.activate_workflow("spec_workflow") {
+                                            tracing::warn!("Failed to activate spec workflow: {}", e);
+                                        }
+                                    }
+                                }
+                                
+                                app.output.push_system(&format!(
+                                    "✅ Spec mode activated from {} ({} lines)", 
+                                    config.spec.file_path,
+                                    content.lines().count()
+                                ));
+                                // Show first few lines as preview
+                                for line in content.lines().take(5) {
+                                    app.output.push_line(OutputLine::System(format!("  {}", line)));
+                                }
+                                if content.lines().count() > 5 {
+                                    app.output.push_system("  ...");
+                                }
+                            }
+                            Ok(_) => {
+                                // File doesn't exist or is empty
+                                app.output.push_system(&format!(
+                                    "📝 No spec file found at {}. Use /spec edit to create one.",
+                                    config.spec.file_path
+                                ));
+                            }
+                            Err(e) => {
+                                app.output.push_error(&format!("Failed to load spec: {}", e));
+                            }
+                        }
+                    } else {
+                        app.output.push_system("No project root detected. Use /spec edit to create a spec anyway.");
+                    }
+                }
+                "off" => {
+                    // Deactivate spec mode and switch to free mode
+                    if app.spec_active {
+                        app.spec_active = false;
+                    }
+                    
+                    // Update workflow state to Free
+                    let previous_mode = match app.workflow_state {
+                        WorkflowState::Spec { .. } => Some("Spec"),
+                        WorkflowState::Council { .. } => Some("Council"),
+                        WorkflowState::Free => None,
+                    };
+                    
+                    app.workflow_state = WorkflowState::Free;
+                    
+                    // Activate free workflow (use try_lock to avoid blocking in async context)
+                    if let Some(ref engine_arc) = app.workflow_engine {
+                        if let Ok(mut engine) = engine_arc.try_lock() {
+                            if let Err(e) = engine.activate_workflow("free_workflow") {
+                                tracing::warn!("Failed to activate free workflow: {}", e);
+                            }
+                        }
+                    }
+                    
+                    if let Some(mode) = previous_mode {
+                        app.output.push_system(&format!("✅ {} mode deactivated. Switched to Free mode.", mode));
+                    } else {
+                        app.output.push_system("Spec mode was already inactive. In Free mode.");
+                    }
+                }
+                "edit" => {
+                    // Enter edit mode: next user input becomes spec content
+                    app.spec_edit_mode = true;
+                    app.output.push_system("📝 Entering spec edit mode...");
+                    app.output.push_system("Type your spec content. Submit (Enter) to save, or /cancel to abort.");
+                }
+                "clear" => {
+                    // Clear spec content and optionally delete file
+                    let had_content = !app.spec_content.is_empty();
+                    app.spec_content.clear();
+                    app.spec_active = false;
+                    
+                    // Optionally delete the spec file
+                    if let Some(ref project_root) = rt_env.project_root {
+                        let spec_path = project_root.join(&config.spec.file_path);
+                        if spec_path.exists() {
+                            match std::fs::remove_file(&spec_path) {
+                                Ok(_) => {
+                                    app.output.push_system(&format!("Spec cleared and file deleted: {}", spec_path.display()));
+                                }
+                                Err(e) => {
+                                    app.output.push_error(&format!("Failed to delete spec file: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    
+                    if had_content {
+                        app.output.push_system("Spec content cleared.");
+                    } else {
+                        app.output.push_system("Spec was already empty.");
+                    }
+                }
+                _ => {
+                    // Treat as inline spec content
+                    let content = action.to_string();
+                    if content.len() < 10 {
+                        app.output.push_system("Spec content too short. Use /spec edit for longer content.");
+                    } else {
+                        app.spec_content = content.clone();
+                        app.spec_active = true;
+                        
+                        // Activate workflow engine (use try_lock to avoid blocking in async context)
+                        if let Some(ref engine_arc) = app.workflow_engine {
+                            if let Ok(mut engine) = engine_arc.try_lock() {
+                                if let Err(e) = engine.activate_workflow("spec_workflow") {
+                                    tracing::warn!("Failed to activate spec workflow: {}", e);
+                                }
+                            }
+                        }
+                        
+                        // Save to file
+                        if let Some(ref project_root) = rt_env.project_root {
+                            match context::save_spec(project_root, &config.spec.file_path, &content) {
+                                Ok(path) => {
+                                    app.output.push_system(&format!(
+                                        "✅ Spec saved to {} ({} chars)", 
+                                        path,
+                                        content.len()
+                                    ));
+                                }
+                                Err(e) => {
+                                    app.output.push_error(&format!("Failed to save spec: {}", e));
+                                }
+                            }
+                        } else {
+                            app.output.push_system(&format!(
+                                "✅ Spec set ({} chars, not persisted - no project root)", 
+                                content.len()
+                            ));
+                        }
+                        
+                        app.output.push_system("Spec mode activated. AI will use this spec for task planning.");
+                    }
+                }
+            }
+        }
+        SlashCommand::Free => {
+            // Switch to free mode - activate free workflow
+            let previous_mode = match app.workflow_state {
+                WorkflowState::Spec { .. } => "Spec",
+                WorkflowState::Council { .. } => "Council",
+                WorkflowState::Free => {
+                    app.output.push_system("Already in Free mode.");
+                    return;
+                }
+            };
+            
+            // Update workflow state
+            app.workflow_state = WorkflowState::Free;
+            
+            // Activate free workflow (use try_lock to avoid blocking in async context)
+            if let Some(ref engine_arc) = app.workflow_engine {
+                if let Ok(mut engine) = engine_arc.try_lock() {
+                    if let Err(e) = engine.activate_workflow("free_workflow") {
+                        tracing::warn!("Failed to activate free workflow: {}", e);
+                    }
+                }
+            }
+            
+            app.output.push_system(&format!("✅ Switched from {} mode to Free mode", previous_mode));
+            app.output.push_system("No workflow constraints. All tools available.");
+        }
         SlashCommand::Unknown { cmd } => {
             app.output
                 .push_system(&format!("Unknown command: /{cmd}. Type /help for available commands."));
         }
+    }
+}
+
+/// Helper function to calculate memory confidence (same logic as in memory_search tool)
+fn calculate_memory_confidence(node: &ox_core::memory::MemoryNode) -> f32 {
+    let depth_score = (node.depth as f32 / 5.0).min(1.0);
+    
+    let type_weight = match node.node_type {
+        ox_core::memory::MemoryNodeType::Architectural => 0.9,
+        ox_core::memory::MemoryNodeType::BestPractice => 0.85,
+        ox_core::memory::MemoryNodeType::Style => 0.8,
+        ox_core::memory::MemoryNodeType::Council => 0.9,
+        ox_core::memory::MemoryNodeType::MetaSkill => 0.85,
+        ox_core::memory::MemoryNodeType::AntiPattern => 0.8,
+        ox_core::memory::MemoryNodeType::Business => 0.75,
+        ox_core::memory::MemoryNodeType::Pattern => 0.75,
+        ox_core::memory::MemoryNodeType::Fact => 0.7,
+    };
+    
+    (depth_score * 0.6 + type_weight * 0.4).clamp(0.0, 1.0)
+}
+
+/// Helper function to truncate content with ellipsis
+fn truncate_content(content: &str, max_len: usize) -> String {
+    if content.len() <= max_len {
+        content.to_string()
+    } else {
+        format!("{}...", &content[..max_len])
     }
 }

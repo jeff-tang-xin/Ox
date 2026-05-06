@@ -59,6 +59,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
+    // Line 1: Main title
     lines.push(Line::from(vec![
         Span::styled(" ◆ ".to_string(), Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
         Span::styled("Ox".to_string(), Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
@@ -66,8 +67,36 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" — AI Programming Assistant".to_string(), Style::default().fg(TEXT)),
     ]));
 
+    // Line 2: Workflow status (if active) - use cached data to avoid locking
+    if let Some(ref wf_info) = app.workflow_display {
+        let progress_pct = (wf_info.step_num as f32 / wf_info.total_steps as f32 * 100.0) as u32;
+        let filled = (wf_info.step_num * 10 / wf_info.total_steps) as usize;
+        let empty = 10 - filled;
+        let progress_bar = "█".repeat(filled) + &"░".repeat(empty);
+        
+        lines.push(Line::from(vec![
+            Span::styled(" 📋 ".to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{}", wf_info.workflow_name), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" | Step {}/{}", wf_info.step_num, wf_info.total_steps), Style::default().fg(TEXT)),
+            Span::styled(format!(" [{}] {}%", progress_bar, progress_pct), Style::default().fg(Color::Green)),
+        ]));
+        
+        // Current step name
+        lines.push(Line::from(vec![
+            Span::styled("   → ".to_string(), Style::default().fg(TEXT_DIM)),
+            Span::styled(wf_info.step_name.clone(), Style::default().fg(STREAMING).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
+    // Additional header info (max remaining lines)
+    let max_info_lines = if app.workflow_engine.is_some() {
+        area.height.saturating_sub(3) as usize  // Reserve 3 lines for workflow
+    } else {
+        area.height.saturating_sub(1) as usize  // Only reserve 1 line for title
+    };
+    
     for info in &app.header_info {
-        if lines.len() < area.height as usize - 1 {
+        if lines.len() < area.height as usize - 1 && lines.len() <= max_info_lines {
             lines.push(Line::from(vec![
                 Span::styled(" ● ".to_string(), Style::default().fg(SYS_COLOR)),
                 Span::styled(info.clone(), Style::default().fg(TEXT_DIM)),

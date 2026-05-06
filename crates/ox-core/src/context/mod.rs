@@ -1,9 +1,11 @@
 mod effort;
 mod system_prompt;
+mod spec;
 pub mod compressed_store;
 
 pub use effort::{estimate_effort, EffortLevel};
 pub use system_prompt::build_system_prompt;
+pub use spec::{load_spec, save_spec, spec_exists, TASK_TYPE_PROMPT};
 
 use crate::llm::tokenizer::estimate_tokens;
 use crate::message::Message;

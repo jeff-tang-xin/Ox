@@ -3,6 +3,7 @@
 pub enum SlashCommand {
     Help { topic: Option<String> },
     Exit,
+    Cancel,
     New,
     Clear,
     Clean,
@@ -20,11 +21,15 @@ pub enum SlashCommand {
     Forget { keyword: String },
     Memory,
     Feedback { category: String },
-    Persona { action: String },
     Discuss { question: Option<String>, rounds: Option<u8>, verbose: bool },
     Council { action: String },
     Reload,
     DownloadModel { model_name: Option<String> },
+    Spec {
+        /// Subcommand: status, show, on, off, edit, clear, or inline content
+        action: String,
+    },
+    Free,
     Unknown { cmd: String },
 }
 
@@ -39,6 +44,7 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
             },
         },
         "exit" | "quit" | "q" => SlashCommand::Exit,
+        "cancel" => SlashCommand::Cancel,
         "new" => SlashCommand::New,
         "clear" | "cls" => SlashCommand::Clear,
         "clean" => SlashCommand::Clean,
@@ -89,9 +95,6 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
         "feedback" => SlashCommand::Feedback {
             category: args.to_string(),
         },
-        "persona" => SlashCommand::Persona {
-            action: args.to_string(),
-        },
         "discuss" => {
             let mut rounds = None;
             let mut verbose = false;
@@ -133,6 +136,10 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
                 Some(args.to_string())
             },
         },
+        "spec" => SlashCommand::Spec {
+            action: args.to_string(),
+        },
+        "free" => SlashCommand::Free,
         _ => SlashCommand::Unknown {
             cmd: cmd.to_string(),
         },
@@ -153,11 +160,22 @@ pub fn help_text(topic: Option<&str>) -> String {
         Some("plan") => "\
 /plan               Show current task plan"
             .to_string(),
+        Some("spec") => "\
+/spec               Show spec status
+/spec status       Show spec status
+/spec show         Display current spec content
+/spec on           Activate spec mode (load from file or create new)
+/spec off          Deactivate spec mode
+/spec edit         Enter edit mode (next input becomes spec)
+/spec clear        Clear spec and delete file
+/spec <content>    Set spec content directly"
+            .to_string(),
         Some(other) => format!("Unknown help topic: {other}. Type /help for all commands."),
         None => "\
 Commands:
-  /help [topic]     Show help (topics: trust, cost, plan)
+  /help [topic]     Show help (topics: trust, cost, plan, spec)
   /exit             Exit Ox
+  /cancel           Cancel current operation (e.g., spec edit mode)
   /new              Start a new session (archives current)
   /clean            Clear all messages in current session
   /clear            Clear the screen
@@ -173,7 +191,9 @@ Commands:
   /init             Create default config (~/.ox/config.toml)
   /debug            Show debug info
   /discuss [q]      Start council debate (--rounds N, --verbose)
-  /council <action> Council actions (last, stats)
+  /council [topic]  Start/view council debate (start/status/stop/last/stats)
+  /spec <action>    Spec mode (on/off/edit/status) - structured workflow
+  /free             Switch to free mode (deactivate any workflow)
   /reload           Reload session from disk (JSONL)
   /download-model [name] Download embedding model (default: bge-small-zh-v1.5)"
             .to_string(),
@@ -217,5 +237,41 @@ mod tests {
     fn parse_init() {
         let cmd = parse_slash_command("init", "");
         assert!(matches!(cmd, SlashCommand::Init));
+    }
+
+    #[test]
+    fn parse_spec_status() {
+        let cmd = parse_slash_command("spec", "status");
+        if let SlashCommand::Spec { action } = cmd {
+            assert_eq!(action, "status");
+        } else {
+            panic!("Expected Spec");
+        }
+    }
+
+    #[test]
+    fn parse_spec_show() {
+        let cmd = parse_slash_command("spec", "show");
+        if let SlashCommand::Spec { action } = cmd {
+            assert_eq!(action, "show");
+        } else {
+            panic!("Expected Spec");
+        }
+    }
+
+    #[test]
+    fn parse_spec_inline_content() {
+        let cmd = parse_slash_command("spec", "Build a REST API with auth");
+        if let SlashCommand::Spec { action } = cmd {
+            assert_eq!(action, "Build a REST API with auth");
+        } else {
+            panic!("Expected Spec");
+        }
+    }
+
+    #[test]
+    fn parse_cancel() {
+        let cmd = parse_slash_command("cancel", "");
+        assert!(matches!(cmd, SlashCommand::Cancel));
     }
 }

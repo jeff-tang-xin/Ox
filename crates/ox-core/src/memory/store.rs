@@ -43,19 +43,6 @@ CREATE TABLE IF NOT EXISTS model_capabilities (
 
 CREATE INDEX IF NOT EXISTS idx_model_caps_topic ON model_capabilities(topic_category);
 
--- Persona vectors persistence
-CREATE TABLE IF NOT EXISTS persona_vectors (
-    language              TEXT PRIMARY KEY,
-    safety_over_speed     REAL NOT NULL DEFAULT 0.7,
-    prefers_conciseness   REAL NOT NULL DEFAULT 0.7,
-    code_style_strictness REAL NOT NULL DEFAULT 0.7,
-    refuses_unsafe_code   INTEGER NOT NULL DEFAULT 1,
-    frozen                INTEGER NOT NULL DEFAULT 0,
-    forbidden_phrases     TEXT NOT NULL DEFAULT '',
-    moral_priorities      TEXT NOT NULL DEFAULT '',
-    last_updated          INTEGER NOT NULL
-);
-
 -- EMA trend tracking for implicit feedback metrics
 CREATE TABLE IF NOT EXISTS ema_trends (
     metric_name         TEXT NOT NULL,
@@ -64,27 +51,7 @@ CREATE TABLE IF NOT EXISTS ema_trends (
     sample_count        INTEGER NOT NULL DEFAULT 0,
     last_updated        INTEGER NOT NULL,
     PRIMARY KEY (metric_name)
-);
-
--- Persona snapshots for rollback mechanism
-CREATE TABLE IF NOT EXISTS persona_snapshots (
-    snapshot_id         TEXT PRIMARY KEY,
-    language            TEXT NOT NULL,
-    safety_over_speed   REAL NOT NULL,
-    prefers_conciseness REAL NOT NULL,
-    code_style_strictness REAL NOT NULL,
-    refuses_unsafe_code INTEGER NOT NULL,
-    frozen              INTEGER NOT NULL DEFAULT 0,
-    forbidden_phrases   TEXT NOT NULL,
-    moral_priorities    TEXT NOT NULL,
-    satisfaction_score  REAL NOT NULL,
-    created_at          INTEGER NOT NULL,
-    is_active           INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_persona_snapshots_lang ON persona_snapshots(language);
-CREATE INDEX IF NOT EXISTS idx_persona_snapshots_active ON persona_snapshots(is_active);
-"#;
+);"#;
 
 pub struct MemoryStore {
     conn: Arc<Connection>,
@@ -371,67 +338,6 @@ impl MemoryStore {
         rows.collect::<SqlResult<Vec<_>>>().map_err(Into::into)
     }
 
-    // ── Persona Vector persistence ──
-
-    pub fn save_persona_vector(
-        &self,
-        language: &str,
-        safety: f64,
-        conciseness: f64,
-        style_strictness: f64,
-        refuses_unsafe: bool,
-        frozen: bool,
-        forbidden: &[String],
-        priorities: &[String],
-    ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().timestamp();
-        let forbidden_str = forbidden.join("|");
-        let priorities_str = priorities.join("|");
-        
-        self.conn.execute(
-            "INSERT OR REPLACE INTO persona_vectors 
-             (language, safety_over_speed, prefers_conciseness, code_style_strictness,
-              refuses_unsafe_code, frozen, forbidden_phrases, moral_priorities, last_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                language, safety, conciseness, style_strictness,
-                refuses_unsafe as i32, frozen as i32,
-                forbidden_str, priorities_str, now
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn load_persona_vector(
-        &self,
-        language: &str,
-    ) -> anyhow::Result<Option<(f64, f64, f64, bool, bool, Vec<String>, Vec<String>)>> {
-        let row = self.conn.query_row(
-            "SELECT safety_over_speed, prefers_conciseness, code_style_strictness,
-                    refuses_unsafe_code, frozen, forbidden_phrases, moral_priorities
-             FROM persona_vectors WHERE language = ?1",
-            params![language],
-            |row| {
-                let forbidden: String = row.get(5)?;
-                let priorities: String = row.get(6)?;
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get::<_, i32>(3)? != 0,
-                    row.get::<_, i32>(4)? != 0,
-                    if forbidden.is_empty() { vec![] } else { forbidden.split('|').map(|s| s.to_string()).collect() },
-                    if priorities.is_empty() { vec![] } else { priorities.split('|').map(|s| s.to_string()).collect() },
-                ))
-            },
-        );
-        match row {
-            Ok(data) => Ok(Some(data)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     // ── EMA Trend Tracking persistence ──
 
     pub fn save_ema_trend(
@@ -463,101 +369,6 @@ impl MemoryStore {
         );
         match row {
             Ok(data) => Ok(Some(data)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    // ── Persona Snapshot persistence for rollback ──
-
-    pub fn save_persona_snapshot(
-        &self,
-        snapshot_id: &str,
-        language: &str,
-        safety: f64,
-        conciseness: f64,
-        style_strictness: f64,
-        refuses_unsafe: bool,
-        frozen: bool,
-        forbidden: &[String],
-        priorities: &[String],
-        satisfaction_score: f64,
-    ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now().timestamp();
-        let forbidden_str = forbidden.join("|");
-        let priorities_str = priorities.join("|");
-        
-        self.conn.execute(
-            "INSERT OR REPLACE INTO persona_snapshots 
-             (snapshot_id, language, safety_over_speed, prefers_conciseness, 
-              code_style_strictness, refuses_unsafe_code, frozen, forbidden_phrases, 
-              moral_priorities, satisfaction_score, created_at, is_active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                snapshot_id, language, safety, conciseness, style_strictness,
-                refuses_unsafe as i32, frozen as i32,
-                forbidden_str, priorities_str, satisfaction_score, now, 0
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn load_persona_snapshot(
-        &self,
-        snapshot_id: &str,
-    ) -> anyhow::Result<Option<(String, f64, f64, f64, bool, bool, Vec<String>, Vec<String>, f64)>> {
-        let row = self.conn.query_row(
-            "SELECT language, safety_over_speed, prefers_conciseness, code_style_strictness,
-                    refuses_unsafe_code, frozen, forbidden_phrases, moral_priorities, satisfaction_score
-             FROM persona_snapshots WHERE snapshot_id = ?1",
-            params![snapshot_id],
-            |row| {
-                let forbidden: String = row.get(6)?;
-                let priorities: String = row.get(7)?;
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get::<_, i32>(4)? != 0,
-                    row.get::<_, i32>(5)? != 0,
-                    if forbidden.is_empty() { vec![] } else { forbidden.split('|').map(|s| s.to_string()).collect() },
-                    if priorities.is_empty() { vec![] } else { priorities.split('|').map(|s| s.to_string()).collect() },
-                    row.get(8)?,
-                ))
-            },
-        );
-        match row {
-            Ok(data) => Ok(Some(data)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub fn activate_snapshot(&self, snapshot_id: &str) -> anyhow::Result<()> {
-        // Deactivate all snapshots first
-        self.conn.execute(
-            "UPDATE persona_snapshots SET is_active = 0 WHERE is_active = 1",
-            [],
-        )?;
-        // Activate the target snapshot
-        self.conn.execute(
-            "UPDATE persona_snapshots SET is_active = 1 WHERE snapshot_id = ?1",
-            params![snapshot_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_active_snapshot_id(&self, language: &str) -> anyhow::Result<Option<String>> {
-        let row = self.conn.query_row(
-            "SELECT snapshot_id FROM persona_snapshots 
-             WHERE language = ?1 AND is_active = 1 
-             ORDER BY created_at DESC LIMIT 1",
-            params![language],
-            |row| row.get(0),
-        );
-        match row {
-            Ok(id) => Ok(Some(id)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }

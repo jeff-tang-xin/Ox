@@ -64,6 +64,10 @@ impl Tool for FilePatchTool {
         } else {
             ctx.working_dir.join(&normalized_path)
         };
+        
+        // Keep the user-friendly path for error messages
+        let display_path = resolved_path.clone();
+        
         let path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
@@ -91,23 +95,23 @@ impl Tool for FilePatchTool {
         match count {
             0 => ToolOutput::error(format!(
                 "Search string not found in {}",
-                path.display()
+                display_path.display()
             )),
             1 => {
                 let new_content = content.replacen(search, replace, 1);
                 match fs::write(&path, &new_content) {
                     Ok(()) => ToolOutput::success(format!(
                         "Patched {} (replaced 1 occurrence)",
-                        path.display()
+                        display_path.display()
                     )),
                     Err(e) => {
-                        ToolOutput::error(format!("Failed to write {}: {e}", path.display()))
+                        ToolOutput::error(format!("Failed to write {}: {e}", display_path.display()))
                     }
                 }
             }
             n => ToolOutput::error(format!(
                 "Search string found {n} times in {} (must match exactly once). Provide more context to make it unique.",
-                path.display()
+                display_path.display()
             )),
         }
     }

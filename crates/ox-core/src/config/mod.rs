@@ -21,10 +21,10 @@ pub struct OxConfig {
     pub agent: AgentConfig,
     pub council: CouncilConfig,
     pub memory: MemoryConfig,
-    pub persona: PersonaConfig,
     pub behavior_rules: BehaviorRulesConfig,
     pub safety: SafetyConfig,
     pub cost: CostConfig,
+    pub spec: SpecConfig,
 }
 
 
@@ -262,12 +262,6 @@ enabled = false
 # batch_size = 20
 # daily_token_cap = 10000
 # trigger = "manual"  # "manual" (需 /memory transform) | "auto" (定期自动)
-
-[persona]
-# auto_evolve = true
-# max_trait_change = 0.1
-# frozen = false
-# export_format = "json"
 
 [behavior_rules]
 # enforce_safe_code = true
@@ -695,27 +689,7 @@ impl Default for MemoryTransformConfig {
     }
 }
 
-// ──────────────────── Persona / Behavior / Safety / Cost ────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PersonaConfig {
-    pub auto_evolve: bool,
-    pub max_trait_change: f64,
-    pub frozen: bool,
-    pub export_format: String,
-}
-
-impl Default for PersonaConfig {
-    fn default() -> Self {
-        Self {
-            auto_evolve: true,
-            max_trait_change: 0.1,
-            frozen: false,
-            export_format: "json".into(),
-        }
-    }
-}
+// ──────────────────── Behavior / Safety / Cost ────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -807,6 +781,33 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 25,
             max_per_turn_tokens: 500_000,
+        }
+    }
+}
+
+// ──────────────────── Spec ────────────────────
+
+/// Specification mode configuration for structured task workflows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpecConfig {
+    /// Whether to auto-load spec.md on startup.
+    pub auto_load: bool,
+    /// Path to the spec file (relative to project root).
+    pub file_path: String,
+    /// Whether spec mode is currently active.
+    pub active: bool,
+    /// Content of the loaded spec (in-memory cache).
+    pub content: String,
+}
+
+impl Default for SpecConfig {
+    fn default() -> Self {
+        Self {
+            auto_load: false,
+            file_path: ".ox/spec.md".to_string(),
+            active: false,
+            content: String::new(),
         }
     }
 }

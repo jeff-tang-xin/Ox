@@ -31,11 +31,18 @@ impl Tool for ProjectDetectTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
-        let base = args
-            .get("path")
-            .and_then(|p| p.as_str())
-            .map(|p| ctx.working_dir.join(p))
-            .unwrap_or_else(|| ctx.working_dir.to_path_buf());
+        let base = if let Some(p) = args.get("path").and_then(|p| p.as_str()) {
+            // Normalize path: trim whitespace and standardize separators
+            let normalized_path = p.trim().replace('\\', "/");
+            let resolved = ctx.working_dir.join(&normalized_path);
+            
+            match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
+                Ok(validated) => validated,
+                Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
+            }
+        } else {
+            ctx.working_dir.to_path_buf()
+        };
 
         let mut info = Vec::new();
 

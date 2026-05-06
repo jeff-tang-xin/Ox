@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
+use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
 /// Events that flow from the crossterm polling thread to the main event loop.

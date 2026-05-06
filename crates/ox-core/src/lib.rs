@@ -8,7 +8,6 @@ pub mod feedback;
 pub mod llm;
 pub mod memory;
 pub mod message;
-pub mod persona;
 pub mod runtime;
 pub mod safety;
 pub mod slash;
