@@ -59,7 +59,19 @@ impl Tool for FileReadTool {
                  {\"path\": \"src/main.rs\", \"offset\": 10, \"limit\": 50} - Read lines 10-60"
             ),
         };
-        let resolved_path = ctx.working_dir.join(raw_path);
+        
+        // Normalize path: 
+        // 1. Replace backslashes with forward slashes for consistency
+        // 2. Trim whitespace that LLM might accidentally include
+        let normalized_path = raw_path.trim().replace('\\', "/");
+        
+        // Handle edge case: if LLM provides an absolute path, use it directly
+        // Otherwise, join with working directory
+        let resolved_path = if std::path::Path::new(&normalized_path).is_absolute() {
+            std::path::PathBuf::from(&normalized_path)
+        } else {
+            ctx.working_dir.join(&normalized_path)
+        };
 
         // Path traversal protection.
         let path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {

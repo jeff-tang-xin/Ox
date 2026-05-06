@@ -139,6 +139,10 @@ impl ContextBuilder {
 ///
 /// This function removes orphaned ToolResults and strips orphaned tool_calls
 /// to produce a valid message sequence for the LLM API.
+///
+/// IMPORTANT: OpenAI API requires strict matching between tool_calls and tool_results.
+/// If we send a ToolResult with an ID that doesn't exist in any Assistant's tool_calls,
+/// the API will return error 400 "tool result's tool id not found".
 pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     // Collect all tool_call_ids from Assistant messages in a single pass
     let mut assistant_call_ids = std::collections::HashSet::with_capacity(messages.len());
@@ -158,7 +162,8 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
         }
     }
 
-    // Remove orphaned ToolResults (no matching tool_call in any Assistant)
+    // Step 1: Remove orphaned ToolResults (no matching tool_call in any Assistant)
+    // This is safe - if there's no tool_call, the result is meaningless
     messages.retain(|m| {
         if let Message::ToolResult { tool_call_id, .. } = m {
             assistant_call_ids.contains(tool_call_id)
@@ -167,12 +172,40 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
         }
     });
 
-    // Strip orphaned tool_calls (no matching ToolResult)
+    // Step 2: For orphaned tool_calls (no matching ToolResult), we have two options:
+    // Option A: Strip the tool_call from the Assistant (current behavior)
+    // Option B: Remove the entire Assistant message
+    // 
+    // We choose Option A because:
+    // - The Assistant might have other content besides tool_calls
+    // - Removing the entire message could lose important context
+    // - OpenAI allows Assistant messages with empty tool_calls array
+    //
+    // HOWEVER: We must NOT strip tool_calls if the Assistant ONLY has tool_calls
+    // and no text content, because that would create an empty Assistant message.
     for msg in messages.iter_mut() {
-        if let Message::Assistant { tool_calls, .. } = msg {
+        if let Message::Assistant { content, tool_calls } = msg {
+            let original_count = tool_calls.len();
             tool_calls.retain(|tc| result_call_ids.contains(&tc.id));
+            
+            // If we removed all tool_calls and there's no content, mark for removal
+            if tool_calls.is_empty() && content.trim().is_empty() && original_count > 0 {
+                tracing::debug!(
+                    "Removing empty Assistant message (had {} orphaned tool_calls)",
+                    original_count
+                );
+            }
         }
     }
+    
+    // Step 3: Remove Assistant messages that are now completely empty
+    messages.retain(|m| {
+        if let Message::Assistant { content, tool_calls } = m {
+            !(content.trim().is_empty() && tool_calls.is_empty())
+        } else {
+            true
+        }
+    });
 }
 
 /// Estimate tokens for a single message.
@@ -244,5 +277,81 @@ mod tests {
         assert!(result.len() < 201);
         // But should have at least system + a few recent messages.
         assert!(result.len() >= 3);
+    }
+
+    #[test]
+    fn sanitize_removes_orphaned_tool_results() {
+        use crate::message::ToolCall;
+        
+        let mut messages = vec![
+            Message::Assistant {
+                content: "Let me check that".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "call_abc".to_string(),
+                    name: "file_read".to_string(),
+                    arguments: "{\"path\": \"test.txt\"}".to_string(),
+                }],
+            },
+            Message::ToolResult {
+                tool_call_id: "call_xyz".to_string(), // Orphaned - no matching tool_call
+                content: "Some result".to_string(),
+            },
+        ];
+        
+        sanitize_tool_pairs(&mut messages);
+        
+        // Orphaned ToolResult should be removed
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(&messages[0], Message::Assistant { .. }));
+    }
+
+    #[test]
+    fn sanitize_removes_empty_assistant_messages() {
+        use crate::message::ToolCall;
+        
+        let mut messages = vec![
+            Message::Assistant {
+                content: "".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "call_abc".to_string(),
+                    name: "file_read".to_string(),
+                    arguments: "{\"path\": \"test.txt\"}".to_string(),
+                }],
+            },
+            // No ToolResult for call_abc - orphaned tool_call
+        ];
+        
+        sanitize_tool_pairs(&mut messages);
+        
+        // Empty Assistant message should be removed
+        assert_eq!(messages.len(), 0);
+    }
+
+    #[test]
+    fn sanitize_keeps_assistant_with_content_even_if_tool_calls_removed() {
+        use crate::message::ToolCall;
+        
+        let mut messages = vec![
+            Message::Assistant {
+                content: "I'll read the file for you.".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "call_abc".to_string(),
+                    name: "file_read".to_string(),
+                    arguments: "{\"path\": \"test.txt\"}".to_string(),
+                }],
+            },
+            // No ToolResult for call_abc - orphaned tool_call
+        ];
+        
+        sanitize_tool_pairs(&mut messages);
+        
+        // Assistant message should be kept (has content), but tool_calls removed
+        assert_eq!(messages.len(), 1);
+        if let Message::Assistant { content, tool_calls } = &messages[0] {
+            assert_eq!(content, "I'll read the file for you.");
+            assert!(tool_calls.is_empty());
+        } else {
+            panic!("Expected Assistant message");
+        }
     }
 }

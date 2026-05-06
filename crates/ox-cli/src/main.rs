@@ -4,12 +4,10 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, EnableMouseCapture, DisableMouseCapture};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-#[cfg(not(target_os = "windows"))]
-use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -347,8 +345,7 @@ async fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
-    // Enable mouse capture for scroll events (skip on Windows where it
-    // can cause garbled input in cmd/powershell).
+    // Enable mouse capture for scroll events (disabled on Windows to avoid stdin pollution)
     #[cfg(not(target_os = "windows"))]
     stdout.execute(EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
@@ -927,28 +924,6 @@ async fn run_app(
                     }
                     Some(Event::Resize(_, _)) => {
                         app.dirty = true;
-                    }
-                    Some(Event::ScrollUp { column, row }) => {
-                        // Only handle scroll if mouse is in chat area
-                        if let Some((cx, cy, cw, ch)) = app.chat_area {
-                            if column >= cx && column < cx + cw && row >= cy && row < cy + ch {
-                                app.scroll_up(3);
-                                app.user_scrolled = true;
-                                app.dirty = true;
-                            }
-                        }
-                    }
-                    Some(Event::ScrollDown { column, row }) => {
-                        // Only handle scroll if mouse is in chat area
-                        if let Some((cx, cy, cw, ch)) = app.chat_area {
-                            if column >= cx && column < cx + cw && row >= cy && row < cy + ch {
-                                app.scroll_down(3);
-                                if app.scroll_offset < 3 {
-                                    app.user_scrolled = false;
-                                }
-                                app.dirty = true;
-                            }
-                        }
                     }
                     Some(Event::Tick) | None => {
                         tick_count = tick_count.wrapping_add(1);

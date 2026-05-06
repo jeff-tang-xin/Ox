@@ -1,7 +1,10 @@
 use serde_json::{json, Value};
 use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
+use super::{content_validation, SafetyLevel, Tool, ToolContext, ToolOutput};
 
 pub struct FileWriteTool;
 
@@ -54,7 +57,16 @@ impl Tool for FileWriteTool {
                  📝 Example: {\"path\": \"output.txt\", \"content\": \"Your content here\"}"
             ),
         };
-        let resolved_path = ctx.working_dir.join(raw_path);
+        
+        // Normalize path: trim whitespace and standardize separators
+        let normalized_path = raw_path.trim().replace('\\', "/");
+        
+        // Handle absolute vs relative paths
+        let resolved_path = if std::path::Path::new(&normalized_path).is_absolute() {
+            std::path::PathBuf::from(&normalized_path)
+        } else {
+            ctx.working_dir.join(&normalized_path)
+        };
         let path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
             Ok(p) => p,
             Err(e) => return ToolOutput::error(
@@ -66,6 +78,56 @@ impl Tool for FileWriteTool {
                 )
             ),
         };
+
+        // Validate path for platform-specific invalid characters
+        let path_str = path.to_string_lossy();
+        if cfg!(windows) {
+            // Strip Windows UNC prefix if present (\\?\ or \\?\UNC\)
+            let clean_path = if path_str.starts_with("\\\\?\\") {
+                &path_str[4..]  // Remove "\\?\" prefix
+            } else {
+                path_str.as_ref()
+            };
+            
+            // Check for invalid characters, but allow ':' in drive letter position (e.g., C:)
+            // Invalid chars: < > " | ? *
+            // Exception: ':' is allowed at position 1 for drive letters (C:, D:, etc.)
+            for (i, c) in clean_path.char_indices() {
+                match c {
+                    '<' | '>' | '"' | '|' | '?' | '*' => {
+                        return ToolOutput::error(format!(
+                            "❌ Invalid Path Character: '{}' is not allowed in Windows filenames\n\n\
+                             💡 Problem: {}\n\
+                             🔧 Solution: Remove or replace the invalid character\n\n\
+                             📝 Valid example: output.txt\n\
+                             ❌ Invalid example: output<1>.txt",
+                            c, path.display()
+                        ));
+                    }
+                    ':' => {
+                        // ':' is only valid at position 1 (drive letter separator)
+                        if i != 1 {
+                            return ToolOutput::error(format!(
+                                "❌ Invalid Path Character: ':' is not allowed in Windows filenames (except for drive letter)\n\n\
+                                 💡 Problem: {} contains ':' at position {}\n\
+                                 🔧 Solution: Use a valid path like 'C:\\path\\file.txt'",
+                                path.display(), i
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Warn about deeply nested paths (>10 levels)
+        let depth = path.components().count();
+        if depth > 10 {
+            tracing::warn!(
+                "[FILE_WRITE] Deeply nested path ({} levels): {}",
+                depth, path.display()
+            );
+        }
         let content = match args.get("content").and_then(|c| c.as_str()) {
             Some(c) => c,
             None => return ToolOutput::error(
@@ -77,8 +139,23 @@ impl Tool for FileWriteTool {
             ),
         };
 
-        // Validate content quality - prevent garbled/corrupted text
-        if let Err(e) = validate_content(content) {
+        // Check file size limit (5 MB)
+        const MAX_FILE_SIZE: usize = 5 * 1024 * 1024;
+        let content_bytes = content.as_bytes();
+        if content_bytes.len() > MAX_FILE_SIZE {
+            return ToolOutput::error(format!(
+                "❌ File Too Large: Content is {:.2} MB (limit: {} MB)\n\n\
+                 💡 Recommendations:\n\
+                 • Split into multiple smaller files\n\
+                 • Use file_patch for incremental changes\n\
+                 • Compress or summarize the content",
+                content_bytes.len() as f64 / 1024.0 / 1024.0,
+                MAX_FILE_SIZE as f64 / 1024.0 / 1024.0
+            ));
+        }
+
+        // Validate content quality using shared validation logic
+        if let Err(e) = content_validation::validate_content(content) {
             return ToolOutput::error(e);
         }
 
@@ -86,79 +163,134 @@ impl Tool for FileWriteTool {
         if let Some(parent) = path.parent()
             && let Err(e) = fs::create_dir_all(parent) {
                 return ToolOutput::error(format!(
-                    "Failed to create directory {}: {e}",
-                    parent.display()
+                    "❌ Directory Creation Failed: Cannot create {}\n\n\
+                     💡 Error: {}\n\
+                     🔍 Possible causes:\n\
+                     • Insufficient permissions\n\
+                     • Disk is full\n\
+                     • Path contains invalid characters",
+                    parent.display(), e
                 ));
             }
 
-        // Write file with UTF-8 encoding
-        // For text files (.txt, .md, .log, etc.), add BOM for Windows compatibility
-        // For code files (.rs, .py, .js, etc.), write without BOM (compilers may reject BOM)
-        let should_add_bom = path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| matches!(ext.to_lowercase().as_str(), 
-                "txt" | "md" | "markdown" | "log" | "csv" | "json" | "xml" | "html" | "css"
-            ))
-            .unwrap_or(false);
+        // Atomic write with retry mechanism for transient failures
+        let temp_path = create_temp_path(&path);
         
-        let bytes_to_write = if should_add_bom {
-            // Add UTF-8 BOM (0xEF 0xBB 0xBF) for text files on Windows
-            let mut bytes = Vec::with_capacity(3 + content.len());
-            bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
-            bytes.extend_from_slice(content.as_bytes());
-            bytes
-        } else {
-            // Write code files without BOM
-            content.as_bytes().to_vec()
-        };
-        
-        match fs::write(&path, &bytes_to_write) {
-            Ok(()) => {
-                let encoding_info = if should_add_bom { "UTF-8 with BOM" } else { "UTF-8" };
+        match atomic_write_with_retry(&temp_path, &path, content.as_bytes(), 3).await {
+            Ok(bytes_written) => {
                 ToolOutput::success(format!(
-                    "Written {} bytes to {} ({})",
-                    bytes_to_write.len(),
-                    path.display(),
-                    encoding_info
+                    "✅ Successfully written {} bytes to {}\n\
+                     📄 Encoding: UTF-8 (without BOM)\n\
+                     💡 Tip: Use 'file_read' to verify the content",
+                    bytes_written,
+                    path.display()
                 ))
             },
-            Err(e) => ToolOutput::error(format!("Failed to write {}: {e}", path.display())),
+            Err(e) => {
+                // Clean up temp file if it exists
+                let _ = fs::remove_file(&temp_path);
+                
+                ToolOutput::error(format!(
+                    "❌ File Write Failed: {}\n\n\
+                     💡 Path: {}\n\
+                     🔍 Common solutions:\n\
+                     • Check disk space: 'df -h' (Linux/Mac) or check Properties (Windows)\n\
+                     • Verify write permissions for the directory\n\
+                     • Close any programs that might have the file open\n\
+                     • Try writing to a different location",
+                    e, path.display()
+                ))
+            }
         }
     }
 }
 
-/// Validate file content to prevent garbled/corrupted text from being written
-fn validate_content(content: &str) -> Result<(), String> {
-    // Check 1: Validate UTF-8 encoding (most important for Chinese)
-    if !content.is_ascii() && !String::from_utf8(content.as_bytes().to_vec()).is_ok() {
-        return Err("❌ Invalid Content: File content contains invalid UTF-8 encoding\n\n\
-                    💡 Possible causes:\n\
-                    • Content was copied from a corrupted source\n\
-                    • Binary data was included by mistake\n\
-                    • Encoding mismatch (e.g., GBK vs UTF-8)\n\n\
-                    📝 Please verify the content encoding and retry.".to_string());
-    }
+/// Create a temporary file path in the same directory as the target
+fn create_temp_path(target: &std::path::Path) -> PathBuf {
+    let mut temp = target.to_path_buf();
+    let file_name = target.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    
+    // Add .tmp extension and random suffix to avoid conflicts
+    let temp_name = format!("{}.tmp.{}", file_name, std::process::id());
+    temp.set_file_name(temp_name);
+    temp
+}
 
-    // Check 2: Detect null bytes (common corruption indicator)
-    if content.contains('\x00') {
-        return Err("❌ Corrupted Content: File contains null bytes (\\x00)\n\n\
-                    💡 This indicates:\n\
-                    • File corruption\n\
-                    • Binary data mixed with text\n\
-                    • Encoding errors\n\n\
-                     Please verify and regenerate the content.".to_string());
-    }
+/// Atomically write content to a file using temp file + rename strategy
+/// This ensures the target file is never left in a corrupted state
+fn atomic_write(temp_path: &PathBuf, target: &std::path::Path, content: &[u8]) -> Result<usize, String> {
+    // Step 1: Write to temp file
+    let mut file = fs::File::create(temp_path).map_err(|e| {
+        format!("Cannot create temporary file: {}", e)
+    })?;
+    
+    file.write_all(content).map_err(|e| {
+        format!("Failed to write data: {}", e)
+    })?;
+    
+    // Flush to ensure data is written to disk
+    file.flush().map_err(|e| {
+        format!("Failed to flush data: {}", e)
+    })?;
+    
+    // Sync to ensure data is physically on disk (not just in OS cache)
+    file.sync_all().map_err(|e| {
+        format!("Failed to sync to disk: {}", e)
+    })?;
+    
+    drop(file); // Close the file before renaming
+    
+    let bytes_written = content.len();
+    
+    // Step 2: Atomic rename (on most filesystems, rename is atomic)
+    fs::rename(temp_path, target).map_err(|e| {
+        format!("Failed to finalize file: {}", e)
+    })?;
+    
+    Ok(bytes_written)
+}
 
-    // Check 3: Detect replacement characters (U+FFFD - encoding failure indicator)
-    if content.contains('\u{FFFD}') {
-        return Err("❌ Encoding Errors Detected: Content contains replacement characters (U+FFFD)\n\n\
-                    💡 This means:\n\
-                    • Original text had invalid encoding\n\
-                    • Conversion between encodings failed\n\
-                    • Data was corrupted during transfer\n\n\
-                    📝 Please use the original source with correct encoding.".to_string());
+/// Atomically write with retry mechanism for transient failures
+async fn atomic_write_with_retry(
+    temp_path: &PathBuf,
+    target: &std::path::Path,
+    content: &[u8],
+    max_retries: u32,
+) -> Result<usize, String> {
+    let mut last_error = String::new();
+    
+    for attempt in 1..=max_retries {
+        match atomic_write(temp_path, target, content) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                last_error = e.clone();
+                
+                // Check if error is retryable
+                if is_retryable_error(&e) && attempt < max_retries {
+                    let delay = Duration::from_millis(100 * attempt as u64); // Exponential backoff
+                    tracing::warn!(
+                        "[FILE_WRITE] Attempt {} failed, retrying in {:?}: {}",
+                        attempt, delay, e
+                    );
+                    tokio::time::sleep(delay).await;
+                } else {
+                    break;
+                }
+            }
+        }
     }
+    
+    Err(format!("Failed after {} attempts: {}", max_retries, last_error))
+}
 
-    // All checks passed - content is valid
-    Ok(())
+/// Determine if an error is transient and worth retrying
+fn is_retryable_error(error: &str) -> bool {
+    error.contains("being used by another process") ||  // Windows file lock
+    error.contains("resource busy") ||                   // Unix file lock
+    error.contains("disk I/O error") ||                  // Temporary disk issue
+    error.contains("device or resource busy") ||
+    error.contains("too many open files")                // File descriptor exhaustion
 }

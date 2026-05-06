@@ -276,14 +276,30 @@ pub async fn run_agent_turn(
         let mut truncated_ids = std::collections::HashSet::new();
         for tc in &mut tool_calls {
             if !tc.arguments.trim().is_empty() {
-                if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err() {
-                    tracing::warn!(
-                        "Truncated tool arguments for '{}' (len {}), will return error to LLM",
-                        tc.name,
-                        tc.arguments.len()
-                    );
-                    truncated_ids.insert(tc.id.clone());
-                    tc.arguments = "{}".to_string();
+                match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    Ok(_) => {} // Valid JSON, no issue
+                    Err(e) => {
+                        // Check if this looks like truncation vs other JSON errors
+                        let is_likely_truncated = is_likely_json_truncation(&tc.arguments, &e);
+                        
+                        if is_likely_truncated {
+                            tracing::warn!(
+                                "Truncated tool arguments for '{}' (len {}, error: {}), will return error to LLM",
+                                tc.name,
+                                tc.arguments.len(),
+                                e
+                            );
+                            truncated_ids.insert(tc.id.clone());
+                            tc.arguments = "{}".to_string();
+                        } else {
+                            // Not truncation, let it pass through to normal error handling
+                            tracing::debug!(
+                                "Invalid JSON for '{}' but not truncation (error: {}), will handle later",
+                                tc.name,
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -306,7 +322,20 @@ pub async fn run_agent_turn(
 
             // Skip truncated tool calls — return error so LLM can retry.
             if truncated_ids.contains(&tc.id) {
-                let error_msg = "Tool call failed: arguments were truncated (incomplete JSON). Please retry with complete arguments.".to_string();
+                let error_msg = format!(
+                    "❌ JSON Truncation Error for tool '{}':\n\
+                     Arguments were truncated (incomplete JSON). This usually happens when:\n\
+                     • The response exceeded the token limit\n\
+                     • The content was cut off during transmission\n\n\
+                     💡 How to fix:\n\
+                     • Retry with a shorter or more concise request\n\
+                     • Break large operations into smaller steps\n\
+                     • Ensure complete JSON syntax with all brackets/braces closed\n\n\
+                     📝 Example of complete JSON:\n\
+                     {{\"path\": \"output.txt\", \"content\": \"Hello World\"}}\n\n\
+                     Please retry with complete arguments.",
+                    tc.name
+                );
                 let result_msg = Message::ToolResult {
                     tool_call_id: tc.id.clone(),
                     content: error_msg.clone(),
@@ -611,4 +640,42 @@ pub async fn run_agent_turn(
         new_messages,
         usage: total_usage,
     });
+}
+
+/// Heuristically determine if a JSON parse error is likely due to truncation.
+/// 
+/// Truncation typically manifests as:
+/// - EOF errors (unexpected end of input)
+/// - Missing closing brackets/braces
+/// - Incomplete string literals
+fn is_likely_json_truncation(json_str: &str, error: &serde_json::Error) -> bool {
+    let error_msg = error.to_string();
+    
+    // Common truncation indicators
+    let truncation_patterns = [
+        "EOF",                    // End of file unexpectedly
+        "expected `,` or `}`",   // Missing closing brace
+        "expected `,` or `]`",   // Missing closing bracket
+        "expected `\"`",         // Unclosed string
+        "control character",     // Cut off in middle of content
+        "invalid escape",        // Truncated escape sequence
+    ];
+    
+    // Check if error message matches truncation patterns
+    let is_eof_error = truncation_patterns.iter().any(|pattern| error_msg.contains(pattern));
+    
+    // Additional heuristic: check if the JSON looks incomplete
+    let trimmed = json_str.trim();
+    let has_unclosed_structure = (
+        // Count opening/closing braces
+        (trimmed.matches('{').count() > trimmed.matches('}').count()) ||
+        (trimmed.matches('[').count() > trimmed.matches(']').count()) ||
+        // Ends with incomplete syntax
+        trimmed.ends_with(',') ||
+        trimmed.ends_with(':') ||
+        // Has unclosed quote
+        (trimmed.matches('"').count() % 2 != 0)
+    );
+    
+    is_eof_error || has_unclosed_structure
 }

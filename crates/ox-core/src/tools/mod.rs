@@ -1,4 +1,5 @@
 pub mod code_search;
+pub mod content_validation;
 pub mod file_list;
 pub mod file_patch;
 pub mod file_read;

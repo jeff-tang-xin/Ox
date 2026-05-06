@@ -3,6 +3,7 @@ pub mod openai;
 pub mod openai_sse;
 pub mod tokenizer;
 mod sse;
+pub mod universal_adapter;
 
 use crate::message::{Message, TokenUsage};
 

@@ -98,26 +98,20 @@ pub fn is_path_within_workdir(path: &Path, working_dir: &Path) -> bool {
     false
 }
 
-/// Validate and resolve a path. No longer hard-rejects paths outside working directory;
-/// the agent layer handles confirmation for out-of-workdir paths.
-/// Only errors on truly unresolvable paths.
+/// Resolve a path to an absolute path if it exists.
+/// For non-existent paths (e.g., new files), returns the path as-is.
+/// This is a convenience wrapper around PathBuf::join + canonicalize.
 pub fn validate_path_within_workdir(
     path: &Path,
     _working_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
-    // Path already exists: canonicalize and return.
-    if let Ok(canonical_path) = path.canonicalize() {
-        return Ok(canonical_path);
+    // Try to canonicalize if the path exists
+    if path.exists() {
+        return Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     }
-
-    // Path doesn't exist (new file): validate parent directory exists.
-    if let Some(parent) = path.parent() {
-        if parent.canonicalize().is_ok() {
-            return Ok(path.to_path_buf());
-        }
-    }
-
-    anyhow::bail!("Cannot validate path '{}'", path.display())
+    
+    // Path doesn't exist yet, return as-is
+    Ok(path.to_path_buf())
 }
 
 #[cfg(test)]
