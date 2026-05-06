@@ -45,6 +45,10 @@ impl SseEventBuffer {
         // Parse data: `data: ...` (note: both `data:` and `data: ` are valid)
         if let Some(data) = line.strip_prefix("data:") {
             let data_content = data.strip_prefix(' ').unwrap_or(data);
+            // Add newline between multiple data lines per SSE spec
+            if !self.data.is_empty() {
+                self.data.push('\n');
+            }
             self.data.push_str(data_content);
             self.has_content = true;
         }
@@ -171,9 +175,14 @@ pub fn parse_json_values(input: &str) -> impl Iterator<Item = serde_json::Result
         }
     }
     
-    // Handle any remaining content
-    if !current.trim().is_empty() {
+    // Handle any remaining content - ONLY if we're back to Outside state (complete JSON)
+    // If still InObject/InArray, the JSON is incomplete (truncated stream) - skip it
+    if !current.trim().is_empty() && matches!(state, State::Outside) {
         results.push(serde_json::from_str(current.trim()));
+    } else if !current.trim().is_empty() {
+        // Log truncated JSON for debugging but don't attempt to parse
+        tracing::debug!("Skipping incomplete JSON ({} chars): {}", current.len(), 
+            if current.len() > 100 { &current[..100] } else { &current });
     }
     
     results.into_iter()
@@ -220,5 +229,26 @@ mod tests {
         let values: Vec<_> = parse_json_values(input).collect();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].as_ref().unwrap()["foo"], "bar");
+    }
+
+    #[test]
+    fn test_truncated_json_is_skipped() {
+        // Simulate a truncated JSON stream (common network issue)
+        let input = r#"{"choices":[{"delta":{"content":"Hello world, this is a long string that gets cut off..."}}]"#;
+        let values: Vec<_> = parse_json_values(input).collect();
+        // Should not panic, should return empty or error (not crash with EOF)
+        assert!(values.is_empty() || values.iter().all(|r| r.is_err()));
+    }
+
+    #[test]
+    fn test_complete_and_truncated_mixed() {
+        // First JSON complete, second truncated
+        let input = r#"{"a": 1}
+{"b": "incomplete""#;
+        let values: Vec<_> = parse_json_values(input).collect();
+        // Should successfully parse the first one, skip the incomplete second one
+        assert_eq!(values.len(), 1); // Only the complete one is returned
+        assert!(values[0].is_ok());
+        assert_eq!(values[0].as_ref().unwrap()["a"], 1);
     }
 }

@@ -13,6 +13,8 @@ pub struct OpenAiSseParser {
     active_tool_calls: HashSet<u64>,
     seen_indices: HashSet<u64>,
     argument_buffers: HashMap<u64, String>,
+    /// Reverse map: tool_call_id → index (for O(1) lookup)
+    id_to_index: HashMap<String, u64>,
 }
 
 impl Default for OpenAiSseParser {
@@ -28,6 +30,7 @@ impl OpenAiSseParser {
             active_tool_calls: HashSet::new(),
             seen_indices: HashSet::new(),
             argument_buffers: HashMap::new(),
+            id_to_index: HashMap::new(),
         }
     }
 
@@ -118,11 +121,13 @@ impl OpenAiSseParser {
                     .or_else(|| tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string()));
                 
                 if let (Some(id), Some(name)) = (&id, &name) {
-                    let is_new = !self.tool_call_ids.values().any(|v| v == id);
+                    // O(1) lookup using reverse map
+                    let is_new = !self.id_to_index.contains_key(id.as_str());
                     if is_new {
                         self.tool_call_ids.insert(tc_index, id.clone());
                         self.tool_call_names.insert(tc_index, name.clone());
                         self.active_tool_calls.insert(tc_index);
+                        self.id_to_index.insert(id.clone(), tc_index);
                         events.push(LlmStreamEvent::ToolCallStart { id: id.clone(), name: name.clone() });
                     }
                 }
@@ -158,6 +163,7 @@ impl OpenAiSseParser {
         self.active_tool_calls.clear();
         self.seen_indices.clear();
         self.argument_buffers.clear();
+        self.id_to_index.clear();
     }
 }
 
@@ -171,6 +177,8 @@ mod tests {
         for line in sse_data.lines() {
             events.extend(parser.parse_line(line));
         }
+        // Add empty line to trigger event boundary (SSE protocol requirement)
+        events.extend(parser.parse_line(""));
         events.extend(parser.finalize());
         events
     }
@@ -184,9 +192,12 @@ mod tests {
 
     #[test]
     fn test_tool_call_with_finish_reason() {
+        // Two separate SSE events (note the empty line between them)
         let data = r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_abc","function":{"name":"test","arguments":"{}"}}]}}]}
+
 data: {"choices":[{"index":0,"finish_reason":"tool_calls"}]}"#;
         let events = parse_events(data);
+        eprintln!("Events received: {:?}", events);
         assert!(events.iter().any(|e| matches!(e, LlmStreamEvent::ToolCallEnd { id } if id == "call_abc")));
     }
 

@@ -87,7 +87,17 @@ impl LlmProvider for AnthropicProvider {
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
-            .await?;
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Failed to send request to {}: {}", self.base_url, e);
+                let error_msg = format!("Request failed: {}", e);
+                let _ = tx.send(LlmStreamEvent::Error(error_msg));
+                return Ok(());
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
