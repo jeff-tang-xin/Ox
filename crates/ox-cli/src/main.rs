@@ -873,6 +873,9 @@ async fn run_app(
                                     background_session = Some(std::mem::replace(&mut session, new_s));
                                     // Clear UI→Agent channel for background session
                                     app.ui_to_agent_tx = None;
+                                    
+                                    // Reinitialize workflow engine for new session
+                                    app.init_workflow_engine(&session.meta.id);
                                 } else {
                                     let project_id = rt_env.project_id.clone();
                                     match Session::new(&session_dir, &project_id) {
@@ -882,6 +885,9 @@ async fn run_app(
                                             app.output.push_system("New session started.");
                                             refresh_header_info(&mut app, &rt_env, provider.is_some());
                                             app.message_count = 0;
+                                            
+                                            // Reinitialize workflow engine for new session
+                                            app.init_workflow_engine(&session.meta.id);
                                         }
                                         Err(e) => {
                                             app.output.push_system(&format!("Failed to create session: {e}"));
@@ -2461,8 +2467,8 @@ fn handle_slash_command(
                 _ => {
                     // Treat as inline spec content
                     let content = action.to_string();
-                    if content.len() < 10 {
-                        app.output.push_system("Spec content too short. Use /spec edit for longer content.");
+                    if content.is_empty() {
+                        app.output.push_system("Please provide spec content. Usage: /spec <content>");
                     } else {
                         app.spec_content = content.clone();
                         app.spec_active = true;
@@ -2497,7 +2503,7 @@ fn handle_slash_command(
                             ));
                         }
                         
-                        app.output.push_system("Spec mode activated. AI will use this spec for task planning.");
+                        app.output.push_system("Spec mode activated. Send a message to start planning.");
                     }
                 }
             }
