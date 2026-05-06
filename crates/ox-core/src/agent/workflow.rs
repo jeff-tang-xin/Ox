@@ -106,7 +106,7 @@ pub fn create_spec_workflow() -> Workflow {
             "Analyze user request and classify task type (Complex/Simple/Exploratory)"
         )
         .allow_tools_disallow_code()
-        .with_prompt("STEP 1: Analyze the task type. You can use file_read, file_search, code_search to understand the codebase. Do NOT modify any code files yet.")
+        .with_prompt("STEP 1: Analyze the task type. You can use file_read, file_search, code_search to understand the codebase. Do NOT modify any code files yet. When you complete the analysis, respond with [STEP_COMPLETE] to proceed.")
         .with_validator("check_task_classified")
     );
     
@@ -118,7 +118,7 @@ pub fn create_spec_workflow() -> Workflow {
             "Create spec.md with goal, constraints, output files, verification criteria"
         )
         .allow_tools_disallow_code()
-        .with_prompt("STEP 2: For Complex tasks:\n1. Generate a short, descriptive name for this requirement (e.g., 'user-auth', 'payment-integration')\n2. Create directory `.ox/{requirement_name}/`\n3. Use file_write tool to create `.ox/{requirement_name}/spec.md` with:\n   - Goal (one sentence)\n   - Constraints (technical, style, testing)\n   - Output Files (list of files to modify/create)\n   - Verification Criteria (how to verify success)\n\nYou CAN create documentation files but CANNOT modify source code files (.rs, .py, .js, etc).")
+        .with_prompt("STEP 2: For Complex tasks:\n1. Generate a short, descriptive name for this requirement (e.g., 'user-auth', 'payment-integration')\n2. Create directory `.ox/{requirement_name}/`\n3. Use file_write tool to create `.ox/{requirement_name}/spec.md` with:\n   - Goal (one sentence)\n   - Constraints (technical, style, testing)\n   - Output Files (list of files to modify/create)\n   - Verification Criteria (how to verify success)\n\nYou CAN create documentation files but CANNOT modify source code files (.rs, .py, .js, etc). After creating spec.md, respond with [STEP_COMPLETE].")
         .with_validator("check_spec_file_exists")
     );
     
@@ -142,7 +142,7 @@ pub fn create_spec_workflow() -> Workflow {
             "Create task.md with step-by-step execution plan"
         )
         .allow_tools_disallow_code()
-        .with_prompt("STEP 4: Use the SAME requirement_name from Step 2. Use file_write tool to create `.ox/{requirement_name}/task.md` with:\n- Steps (numbered list)\n- Verification for each step\n- Status tracking (- [ ] / - [x])\n\nYou CAN create documentation files but CANNOT modify source code files.")
+        .with_prompt("STEP 4: Use the SAME requirement_name from Step 2. Use file_write tool to create `.ox/{requirement_name}/task.md` with:\n- Steps (numbered list)\n- Verification for each step\n- Status tracking (- [ ] / - [x])\n\nYou CAN create documentation files but CANNOT modify source code files. After creating task.md, respond with [STEP_COMPLETE].")
         .with_validator("check_task_file_exists")
     );
     

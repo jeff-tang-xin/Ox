@@ -311,7 +311,7 @@ pub async fn run_agent_turn(
 
         // Push assistant message with tool calls.
         let assistant_msg = Message::Assistant {
-            content: full_text,
+            content: full_text.clone(), // Clone to keep full_text for workflow advancement check
             tool_calls: tool_calls.clone(),
         };
         new_messages.push(assistant_msg.clone());
@@ -667,6 +667,57 @@ pub async fn run_agent_turn(
             messages.push(result_msg);
         }
 
+        // ── Workflow Step Advancement Logic (after each iteration) ──
+        // Check if we should advance to the next workflow step
+        if let Some(ref engine_arc) = workflow_engine {
+            let mut engine = engine_arc.lock().await;
+            
+            // Check if AI signaled step completion via [STEP_COMPLETE] marker
+            let ai_signaled_complete = full_text.contains("[STEP_COMPLETE]");
+            
+            // Check if key operations were completed (e.g., file creation)
+            let key_operation_completed = new_messages.iter().any(|msg| {
+                matches!(msg, Message::ToolResult { content, .. } if {
+                    // Detect successful file_write or file_patch
+                    content.contains("✅ File written") || 
+                    content.contains("✅ File patched") ||
+                    content.contains("Successfully created")
+                })
+            });
+            
+            // Advance step if:
+            // 1. AI explicitly signaled completion, OR
+            // 2. Key operation completed AND current step doesn't require user confirmation
+            let should_advance = ai_signaled_complete || 
+                (key_operation_completed && !engine.requires_user_confirmation());
+            
+            if should_advance && !engine.is_workflow_complete() {
+                tracing::info!("Advancing workflow step (AI signaled: {}, Key op completed: {})", 
+                    ai_signaled_complete, key_operation_completed);
+                
+                match engine.advance_step() {
+                    Ok(has_next_step) => {
+                        if has_next_step {
+                            // Notify UI about step transition
+                            if let Some(step_info) = get_current_step_info(&engine) {
+                                let _ = ui_tx.send(AgentToUiEvent::Status(
+                                    format!("✅ Step completed. Moving to: {}", step_info.step_name)
+                                ));
+                            }
+                        } else {
+                            // Workflow complete
+                            let _ = ui_tx.send(AgentToUiEvent::Status(
+                                "🎉 Workflow completed!".to_string()
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to advance workflow step: {}", e);
+                    }
+                }
+            }
+        }
+
         // Loop back to call LLM again with tool results.
         iteration += 1;
     }
@@ -715,4 +766,29 @@ fn is_likely_json_truncation(json_str: &str, error: &serde_json::Error) -> bool 
     );
     
     is_eof_error || has_unclosed_structure
+}
+
+/// Helper function to get current step information from workflow engine
+#[derive(Debug, Clone)]
+struct StepInfo {
+    workflow_name: String,
+    step_num: usize,
+    total_steps: usize,
+    step_name: String,
+}
+
+fn get_current_step_info(engine: &crate::agent::engine::WorkflowEngine) -> Option<StepInfo> {
+    if let Some(workflow) = engine.current_workflow() {
+        if let Some((step_num, total_steps)) = engine.get_progress() {
+            if let Some(step) = engine.current_step() {
+                return Some(StepInfo {
+                    workflow_name: workflow.name.clone(),
+                    step_num,
+                    total_steps,
+                    step_name: step.name.clone(),
+                });
+            }
+        }
+    }
+    None
 }
