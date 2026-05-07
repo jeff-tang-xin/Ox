@@ -1,0 +1,18 @@
+jobs:
+  build:
+    # 定义一个包含多个操作系统的矩阵
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    
+    # 这里的 runs-on 会动态读取 matrix 中的 os 变量
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+    - name: Build
+      run: cargo build --verbose --locked
+    - name: Run tests
+      run: cargo test --verbose --locked
