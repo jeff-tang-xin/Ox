@@ -54,6 +54,15 @@ pub enum AgentToUiEvent {
         tool_call_id: String,
         chunk: String,
     },
+    /// Real-time tool execution progress (for long-running operations).
+    ToolProgress {
+        tool_call_id: String,
+        tool_name: String,
+        /// Progress message (e.g., "Writing chunk 3/5...")
+        message: String,
+        /// Optional progress percentage (0-100)
+        progress_percent: Option<u8>,
+    },
     /// Budget exceeded — request user confirmation to continue.
     BudgetExceeded {
         total_tokens: u32,
@@ -204,6 +213,8 @@ pub async fn run_agent_turn(
         } {
             match event {
                 LlmStreamEvent::TextDelta(text) => {
+                    // Simple approach: just pass through all text including think tags
+                    // The UI can decide how to display them (or we can strip them later)
                     let _ = ui_tx.send(AgentToUiEvent::TextChunk(text.clone()));
                     full_text.push_str(&text);
                 }
@@ -327,20 +338,53 @@ pub async fn run_agent_turn(
 
             // Skip truncated tool calls — return error so LLM can retry.
             if truncated_ids.contains(&tc.id) {
-                let error_msg = format!(
-                    "❌ JSON Truncation Error for tool '{}':\n\
-                     Arguments were truncated (incomplete JSON). This usually happens when:\n\
-                     • The response exceeded the token limit\n\
-                     • The content was cut off during transmission\n\n\
-                     💡 How to fix:\n\
-                     • Retry with a shorter or more concise request\n\
-                     • Break large operations into smaller steps\n\
-                     • Ensure complete JSON syntax with all brackets/braces closed\n\n\
-                     📝 Example of complete JSON:\n\
-                     {{\"path\": \"output.txt\", \"content\": \"Hello World\"}}\n\n\
-                     Please retry with complete arguments.",
-                    tc.name
+                // Special handling for file_write with large content
+                let is_file_write = tc.name == "file_write";
+                let content_length = tc.arguments.len();
+                
+                let error_msg = if is_file_write && content_length > 10000 {
+                    // Likely large file write that was truncated
+                    format!(
+                        "❌ Content Too Large - Arguments Truncated:\n\
+                         The 'content' parameter appears to be too large ({:.1} KB).\n\
+                         This usually happens when trying to write a large file in one call.\n\n\
+                         💡 Solutions (choose one):\n\n\
+                         1️⃣ Retry the request:\n\
+                            The system will automatically handle large files (>1 MB) using chunked writes.\n\
+                            Just resend the complete content without worrying about size.\n\n\
+                         2️⃣ Split into multiple operations:\n\
+                            - Write first part: {{\"path\": \"file.txt\", \"content\": \"part1...\"}}\n\
+                            - Use file_patch to append/modify remaining parts\n\n\
+                         3️⃣ Use file_patch for modifications:\n\
+                            If modifying existing file, use search/replace instead of rewriting entire file\n\n\
+                         📝 Note: Files >1 MB are automatically written in 512 KB chunks",
+                        content_length as f64 / 1024.0
+                    )
+                } else {
+                    // General truncation error
+                    format!(
+                        "❌ JSON Truncation Error for tool '{}':\n\
+                         Arguments were truncated (incomplete JSON). This usually happens when:\n\
+                         • The response exceeded the token limit\n\
+                         • The content was cut off during transmission\n\n\
+                         💡 How to fix:\n\
+                         • Retry with a shorter or more concise request\n\
+                         • Break large operations into smaller steps\n\
+                         • Ensure complete JSON syntax with all brackets/braces closed\n\n\
+                         📝 Example of complete JSON:\n\
+                         {{\"path\": \"output.txt\", \"content\": \"Hello World\"}}\n\n\
+                         Please retry with complete arguments.",
+                        tc.name
+                    )
+                };
+                
+                tracing::warn!(
+                    "Tool '{}' (id={}) had truncated arguments ({} bytes). Sending error to LLM.",
+                    tc.name,
+                    tc.id,
+                    content_length
                 );
+                
                 let result_msg = Message::ToolResult {
                     tool_call_id: tc.id.clone(),
                     content: error_msg.clone(),
@@ -399,6 +443,31 @@ pub async fn run_agent_turn(
                             name: tc.name.clone(),
                             id: tc.id.clone(),
                             detail: Some(cmd.to_string()),
+                        });
+                    }
+                }
+            } else if tc.name == "file_write" {
+                // For file_write, analyze arguments to show file size and write strategy
+                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    if let Some(content) = args_val.get("content").and_then(|v| v.as_str()) {
+                        let content_len = content.len();
+                        let path = args_val.get("path").and_then(|v| v.as_str()).unwrap_or("<unknown>");
+                        
+                        // Determine write strategy based on content size
+                        let strategy_detail = if content_len > 1024 * 1024 {  // > 1MB
+                            let chunk_count = (content_len + 512 * 1024 - 1) / (512 * 1024); // 512KB chunks
+                            format!("Large file ({} bytes) - will use chunked write ({} chunks of 512KB)", 
+                                   content_len, chunk_count)
+                        } else {
+                            format!("Small file ({} bytes) - will use atomic write", content_len)
+                        };
+                        
+                        let detail = format!("{} | {}", path, strategy_detail);
+                        
+                        let _ = ui_tx.send(AgentToUiEvent::ToolStart {
+                            name: tc.name.clone(),
+                            id: tc.id.clone(),
+                            detail: Some(detail),
                         });
                     }
                 }
@@ -640,7 +709,31 @@ pub async fn run_agent_turn(
                 }
             }
 
+            // Send ToolProgress event to indicate execution starting
+            let progress_msg = match tc.name.as_str() {
+                "file_write" => "Starting file write...",
+                "file_read" => "Reading file...",
+                "shell_exec" => "Executing command...",
+                "code_search" => "Searching code...",
+                "file_patch" => "Patching file...",
+                _ => "Executing...",
+            };
+            let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                message: progress_msg.to_string(),
+                progress_percent: Some(0),
+            });
+
             let result = tool.execute(args, &tool_ctx).await;
+
+            // Send completion progress event
+            let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                message: "Completed".to_string(),
+                progress_percent: Some(100),
+            });
 
             // If the tool changed working directory, update tool_ctx and notify UI.
             if let Some(new_dir) = result.new_working_dir.clone() {

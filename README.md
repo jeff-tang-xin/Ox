@@ -1270,9 +1270,5 @@ MIT License - Copyright (c) 2026 Jeff Tang
 ---
 
 **Made with ❤️ by Jeff Tang**
-```
-```
-```
-```
-```
+
 

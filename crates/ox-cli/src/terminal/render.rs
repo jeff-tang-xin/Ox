@@ -270,6 +270,13 @@ fn render_single_line(ol: &OutputLine, width: usize, md_renderer: &super::markdo
             }
             md_renderer.render_lines(s, width)
         }
+        OutputLine::ToolLog { tool_call_id: _, message, timestamp: _ } => {
+            // Tool execution logs in small dim font below tool card
+            vec![Line::from(vec![
+                Span::styled("   └─ ", Style::default().fg(TEXT_DIM)),
+                Span::styled(message.clone(), Style::default().fg(TEXT_DIM).add_modifier(Modifier::DIM)),
+            ])]
+        }
     }
 }
 

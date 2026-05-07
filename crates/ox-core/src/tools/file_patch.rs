@@ -165,12 +165,29 @@ impl Tool for FilePatchTool {
             1 => {
                 let new_content = content.replacen(search, replace, 1);
                 match fs::write(&path, &new_content) {
-                    Ok(()) => ToolOutput::success(format!(
-                        "Patched {} (replaced 1 occurrence)",
-                        display_path.display()
-                    )),
+                    Ok(()) => {
+                        // Update file index immediately for real-time availability
+                        if let Ok(relative_path) = path.strip_prefix(&ctx.working_dir) {
+                            let rel_str = relative_path.to_string_lossy();
+                            if let Err(e) = ctx.file_index.add_file(&rel_str) {
+                                tracing::warn!("Failed to update file index: {}", e);
+                            }
+                        }
+                        
+                        ToolOutput::success(format!(
+                            "✅ Successfully patched {} (replaced 1 occurrence)\n\
+                             💡 Tip: Use 'file_read' to verify the changes",
+                            display_path.display()
+                        ))
+                    }
                     Err(e) => {
-                        ToolOutput::error(format!("Failed to write {}: {e}", display_path.display()))
+                        ToolOutput::error(format!("❌ Failed to write {}: {}\n\n\
+                                                     💡 The search was found but writing failed.\n\
+                                                     🔍 Possible causes:\n\
+                                                     • Insufficient permissions\n\
+                                                     • Disk is full\n\
+                                                     • File is locked by another process",
+                                                    display_path.display(), e))
                     }
                 }
             }

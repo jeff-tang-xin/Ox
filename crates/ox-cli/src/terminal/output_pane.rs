@@ -7,6 +7,7 @@ pub enum OutputKind {
     Assistant,
     Tool,
     ToolResult,
+    ToolLog,
     System,
     Error,
 }
@@ -19,6 +20,12 @@ pub enum OutputLine {
     Assistant(String),
     Tool { name: String, detail: Option<String> },
     ToolResult { name: String, summary: String, is_error: bool },
+    /// Real-time tool execution log (displayed below tool card in small font)
+    ToolLog { 
+        tool_call_id: String,
+        message: String,
+        timestamp: std::time::Instant,
+    },
     System(String),
     Error(String),
     StreamingPartial(String),
@@ -33,6 +40,7 @@ impl OutputLine {
             Self::Assistant(_) => OutputKind::Assistant,
             Self::Tool { .. } => OutputKind::Tool,
             Self::ToolResult { .. } => OutputKind::ToolResult,
+            Self::ToolLog { .. } => OutputKind::ToolLog,
             Self::System(_) => OutputKind::System,
             Self::Error(_) => OutputKind::Error,
             Self::StreamingPartial(_) => OutputKind::Assistant,
@@ -47,6 +55,7 @@ impl OutputLine {
             Self::Assistant(s) => s,
             Self::Tool { name, .. } => name,
             Self::ToolResult { summary, .. } => summary,
+            Self::ToolLog { message, .. } => message,
             Self::System(s) => s,
             Self::Error(s) => s,
             Self::StreamingPartial(s) => s,
@@ -112,6 +121,18 @@ impl OutputPane {
             msg.to_string()
         };
         self.lines.push(OutputLine::Error(msg));
+        self.rendered_cache.push(None);
+        self.cache_valid = false;
+        self.trim_excess();
+    }
+
+    /// Push a real-time tool execution log line
+    pub fn push_tool_log(&mut self, tool_call_id: String, message: String) {
+        self.lines.push(OutputLine::ToolLog {
+            tool_call_id,
+            message,
+            timestamp: std::time::Instant::now(),
+        });
         self.rendered_cache.push(None);
         self.cache_valid = false;
         self.trim_excess();
@@ -289,6 +310,18 @@ impl OutputPane {
                     OutputLine::Markdown(format!("{}…[truncated]", &s[..end]))
                 } else {
                     OutputLine::Markdown(s)
+                }
+            }
+            OutputLine::ToolLog { tool_call_id, message, timestamp } => {
+                if message.len() > Self::MAX_LINE_LEN {
+                    let end = Self::safe_char_boundary(&message, Self::MAX_LINE_LEN);
+                    OutputLine::ToolLog {
+                        tool_call_id,
+                        message: format!("{}…[truncated]", &message[..end]),
+                        timestamp,
+                    }
+                } else {
+                    OutputLine::ToolLog { tool_call_id, message, timestamp }
                 }
             }
         }

@@ -227,10 +227,15 @@ fn summarize_tool_result(name: &str, output: &str) -> String {
 
 /// Extract file path from file_write output
 fn extract_file_path_from_output(output: &str) -> Option<String> {
-    // Output format: "Wrote 1234 bytes to /path/to/file"
+    // Output format: "✅ Successfully written 1234 bytes to /path/to/file..."
     if let Some(pos) = output.find("to ") {
-        let path_part = &output[pos + 3..];
-        Some(path_part.trim().to_string())
+        let after_to = &output[pos + 3..];
+        // Extract path until newline or end of string
+        if let Some(end_pos) = after_to.find('\n') {
+            Some(after_to[..end_pos].trim().to_string())
+        } else {
+            Some(after_to.trim().to_string())
+        }
     } else {
         None
     }
@@ -1053,6 +1058,17 @@ async fn run_app(
                                 }
                             }
                             
+                            if !app.user_scrolled { app.scroll_to_bottom(); }
+                            app.dirty = true;
+                        }
+                        AgentToUiEvent::ToolProgress { tool_call_id, tool_name, message, progress_percent } => {
+                            // Display real-time tool execution progress
+                            let progress_display = if let Some(percent) = progress_percent {
+                                format!("[{}] {} ({}%)", tool_name, message, percent)
+                            } else {
+                                format!("[{}] {}", tool_name, message)
+                            };
+                            app.output.push_tool_log(tool_call_id, progress_display);
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }

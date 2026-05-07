@@ -39,7 +39,7 @@ impl Tool for FileWriteTool {
                 },
                 "content": {
                     "type": "string",
-                    "description": "The content to write to the file"
+                    "description": "The content to write to the file. Large files (>1 MB) will be automatically written in chunks."
                 }
             },
             "required": ["content"]
@@ -189,6 +189,8 @@ impl Tool for FileWriteTool {
                 depth, display_path.display()
             );
         }
+
+        // Get content and determine write strategy
         let content = match args.get("content").and_then(|c| c.as_str()) {
             Some(c) => c,
             None => return ToolOutput::error(
@@ -200,19 +202,18 @@ impl Tool for FileWriteTool {
             ),
         };
 
-        // Check file size limit (5 MB)
-        const MAX_FILE_SIZE: usize = 5 * 1024 * 1024;
         let content_bytes = content.as_bytes();
-        if content_bytes.len() > MAX_FILE_SIZE {
-            return ToolOutput::error(format!(
-                "❌ File Too Large: Content is {:.2} MB (limit: {} MB)\n\n\
-                 💡 Recommendations:\n\
-                 • Split into multiple smaller files\n\
-                 • Use file_patch for incremental changes\n\
-                 • Compress or summarize the content",
-                content_bytes.len() as f64 / 1024.0 / 1024.0,
-                MAX_FILE_SIZE as f64 / 1024.0 / 1024.0
-            ));
+        
+        // Auto-detect large files and use chunked writing (>1 MB)
+        const AUTO_CHUNK_THRESHOLD: usize = 1 * 1024 * 1024; // 1 MB
+        const CHUNK_SIZE: usize = 512 * 1024; // 512 KB per chunk
+        
+        let is_large_file = content_bytes.len() > AUTO_CHUNK_THRESHOLD;
+        if is_large_file {
+            tracing::info!(
+                "[FILE_WRITE] Large file detected ({:.2} MB), using chunked write strategy",
+                content_bytes.len() as f64 / 1024.0 / 1024.0
+            );
         }
 
         // Validate content quality using shared validation logic
@@ -234,10 +235,18 @@ impl Tool for FileWriteTool {
                 ));
             }
 
-        // Atomic write with retry mechanism for transient failures
+        // Write file with automatic strategy selection
         let temp_path = create_temp_path(&path);
         
-        match atomic_write_with_retry(&temp_path, &path, content.as_bytes(), 3).await {
+        let result = if is_large_file {
+            // Automatic chunked write for large files (>1 MB)
+            chunked_write_with_retry(&temp_path, &path, content_bytes, CHUNK_SIZE, 3).await
+        } else {
+            // Standard atomic write for normal files
+            atomic_write_with_retry(&temp_path, &path, content_bytes, 3).await
+        };
+        
+        match result {
             Ok(bytes_written) => {
                 // Update file index immediately for real-time availability
                 if let Ok(relative_path) = path.strip_prefix(&ctx.working_dir) {
@@ -247,12 +256,21 @@ impl Tool for FileWriteTool {
                     }
                 }
                 
+                let size_info = if is_large_file {
+                    format!("\n📦 Strategy: Chunked write ({} chunks of {} KB)",
+                        (content_bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE,
+                        CHUNK_SIZE / 1024)
+                } else {
+                    String::new()
+                };
+                
                 ToolOutput::success(format!(
-                    "✅ Successfully written {} bytes to {}\n\
+                    "✅ Successfully written {} bytes to {}{}\n\
                      📄 Encoding: UTF-8 (without BOM)\n\
                      💡 Tip: Use 'file_read' to verify the content",
                     bytes_written,
-                    display_path.display()
+                    display_path.display(),
+                    size_info
                 ))
             },
             Err(e) => {
@@ -362,4 +380,107 @@ fn is_retryable_error(error: &str) -> bool {
     error.contains("disk I/O error") ||                  // Temporary disk issue
     error.contains("device or resource busy") ||
     error.contains("too many open files")                // File descriptor exhaustion
+}
+
+/// Write content in chunks with progress tracking
+async fn chunked_write_with_retry(
+    temp_path: &PathBuf,
+    target: &std::path::Path,
+    content: &[u8],
+    chunk_size: usize,
+    max_retries: u32,
+) -> Result<usize, String> {
+    let total_bytes = content.len();
+    let mut bytes_written = 0;
+    let mut last_error = String::new();
+    
+    for attempt in 1..=max_retries {
+        // Create temp file
+        let mut file = match fs::File::create(temp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                last_error = format!("Cannot create temporary file: {}", e);
+                if attempt < max_retries {
+                    tracing::warn!("[FILE_WRITE] Attempt {} failed: {}", attempt, last_error);
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                    continue;
+                }
+                return Err(last_error);
+            }
+        };
+        
+        // Write in chunks
+        let mut offset = 0;
+        let mut chunk_success = true;
+        
+        while offset < total_bytes {
+            let end = std::cmp::min(offset + chunk_size, total_bytes);
+            let chunk = &content[offset..end];
+            
+            match file.write_all(chunk) {
+                Ok(_) => {
+                    bytes_written = end;
+                    offset = end;
+                }
+                Err(e) => {
+                    chunk_success = false;
+                    last_error = format!("Failed to write chunk at offset {}: {}", offset, e);
+                    tracing::warn!("[FILE_WRITE] Chunk write failed: {}", last_error);
+                    break;
+                }
+            }
+        }
+        
+        if !chunk_success {
+            drop(file);
+            let _ = fs::remove_file(temp_path);
+            
+            if attempt < max_retries {
+                tracing::warn!("[FILE_WRITE] Attempt {} failed, retrying...", attempt);
+                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                continue;
+            }
+            return Err(format!("Failed after {} attempts: {}", max_retries, last_error));
+        }
+        
+        // Flush and sync
+        if let Err(e) = file.flush() {
+            drop(file);
+            let _ = fs::remove_file(temp_path);
+            return Err(format!("Failed to flush data: {}", e));
+        }
+        
+        if let Err(e) = file.sync_all() {
+            drop(file);
+            let _ = fs::remove_file(temp_path);
+            return Err(format!("Failed to sync to disk: {}", e));
+        }
+        
+        drop(file);
+        
+        // Atomic rename
+        match fs::rename(temp_path, target) {
+            Ok(_) => {
+                tracing::info!(
+                    "[FILE_WRITE] Chunked write successful: {} bytes in {} chunks",
+                    total_bytes,
+                    (total_bytes + chunk_size - 1) / chunk_size
+                );
+                return Ok(total_bytes);
+            }
+            Err(e) => {
+                last_error = format!("Failed to finalize file: {}", e);
+                let _ = fs::remove_file(temp_path);
+                
+                if attempt < max_retries {
+                    tracing::warn!("[FILE_WRITE] Rename failed, retrying...", );
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                    continue;
+                }
+                return Err(format!("Failed after {} attempts: {}", max_retries, last_error));
+            }
+        }
+    }
+    
+    Err(format!("Failed after {} attempts: {}", max_retries, last_error))
 }
