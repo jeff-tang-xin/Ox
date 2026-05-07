@@ -21,10 +21,9 @@ impl Tool for FileListTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory path or glob pattern (e.g. 'src/**/*.rs')"
+                    "description": "Directory path or glob pattern (e.g. 'src/**/*.rs'). Optional - if not provided, lists all indexed files."
                 }
-            },
-            "required": ["path"]
+            }
         })
     }
 
@@ -33,11 +32,52 @@ impl Tool for FileListTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
-        let path_str = match args.get("path").and_then(|p| p.as_str()) {
-            Some(p) => p,
-            None => return ToolOutput::error("Missing required parameter: path. Usage: {\"path\": \"<directory or glob pattern>\"}"),
-        };
+        // If no path provided, list all files from index
+        let path_str = args.get("path").and_then(|p| p.as_str());
+        
+        match path_str {
+            None => {
+                // List all files from database index
+                match ctx.file_index.list_all_files() {
+                    Ok(entries) => {
+                        if entries.is_empty() {
+                            return ToolOutput::success("No files found in index.");
+                        }
+                        
+                        // Format: [ID] path (file_type)
+                        let lines: Vec<String> = entries
+                            .iter()
+                            .map(|e| {
+                                let type_info = e.file_type
+                                    .as_ref()
+                                    .map(|t| format!(" (.{})", t))
+                                    .unwrap_or_default();
+                                format!("[{}] {}{}", e.id, e.full_path, type_info)
+                            })
+                            .collect();
+                        
+                        ToolOutput::success(format!(
+                            "Found {} files:\n{}",
+                            entries.len(),
+                            lines.join("\n")
+                        ))
+                    }
+                    Err(e) => ToolOutput::error(format!("Failed to query file index: {}", e)),
+                }
+            }
+            Some(path) => {
+                // Use traditional filesystem listing with path parameter
+                self.list_from_filesystem(path, ctx)
+            }
+        }
+    }
+}
 
+impl FileListTool {
+    /// Traditional filesystem listing (when path is provided)
+    fn list_from_filesystem(&self, path_str: &str, ctx: &ToolContext) -> ToolOutput {
+        use std::fs;
+        
         // Normalize path: trim whitespace and standardize separators
         let normalized_path = path_str.trim().replace('\\', "/");
         

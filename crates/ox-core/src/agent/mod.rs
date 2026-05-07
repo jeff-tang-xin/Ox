@@ -649,6 +649,7 @@ pub async fn run_agent_turn(
                     new_dir.clone(),
                     tool_ctx.config.clone(),
                     Arc::clone(&tool_ctx.memory),
+                    Arc::clone(&tool_ctx.file_index),
                 ));
                 let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
             }

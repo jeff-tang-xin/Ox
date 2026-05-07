@@ -5,6 +5,7 @@ pub mod cost;
 pub mod council;
 pub mod embedding;
 pub mod feedback;
+pub mod file_index;
 pub mod llm;
 pub mod memory;
 pub mod message;

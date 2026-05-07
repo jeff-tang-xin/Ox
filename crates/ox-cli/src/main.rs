@@ -537,11 +537,35 @@ async fn run_app(
     if rand::random::<f64>() < config.memory.janitor_run_on_startup_prob {
         memory_arc.run_janitor(0.3, config.memory.max_nodes);
     }
+    
+    // Initialize file index registry (supports multiple directories)
+    let file_index_db_dir = db_dir.join("file_indices");
+    let mut file_index_registry = ox_core::file_index::FileIndexRegistry::new(file_index_db_dir);
+    
+    // Get or create index for current working directory
+    let mut file_index_manager = file_index_registry.get_or_create(&rt_env.working_dir)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to initialize file index: {}. Using empty index.", e);
+            // Fallback: create in-memory database
+            Arc::new(
+                ox_core::file_index::FileIndexManager::new(&std::env::temp_dir().join("file_index.db"))
+                    .expect("file index with temp dir")
+            )
+        });
+    
+    // Start file system watcher for real-time updates
+    if let Err(e) = file_index_manager.start_file_watcher(rt_env.working_dir.clone()) {
+        tracing::warn!("Failed to start file watcher: {}. Will rely on periodic refresh.", e);
+    } else {
+        tracing::info!("File watcher started for real-time index updates");
+    }
+    
     let mut tool_ctx = Arc::new(ToolContext::new(
         rt_env.clone(),
         rt_env.working_dir.clone(),
         Arc::new(config.clone()),
         Arc::clone(&memory_arc),
+        Arc::clone(&file_index_manager),
     ));
 
     // Model name for cost recording.
@@ -1320,12 +1344,32 @@ async fn run_app(
                                         new_dir.display()
                                     )));
                                     refresh_header_info(&mut app, &rt_env, provider.is_some());
+                                    
+                                    // Switch file index to new directory
+                                    match file_index_registry.get_or_create(&new_dir) {
+                                        Ok(new_file_index) => {
+                                            file_index_manager = new_file_index;
+                                            tracing::info!("Switched file index to: {:?}", new_dir);
+                                            
+                                            // Start file watcher for the new directory
+                                            if let Err(e) = file_index_manager.start_file_watcher(new_dir.clone()) {
+                                                tracing::warn!("Failed to start file watcher for new dir: {}", e);
+                                            } else {
+                                                tracing::info!("File watcher started for: {:?}", new_dir);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Failed to switch file index: {}. Keeping current index.", e);
+                                        }
+                                    }
+                                    
                                     // Update tool_ctx for next agent turn.
                                     tool_ctx = Arc::new(ToolContext::new(
                                         rt_env.clone(),
                                         new_dir.clone(),
                                         Arc::new(config.clone()),
                                         Arc::clone(&memory_arc),
+                                        Arc::clone(&file_index_manager),
                                     ));
                                     if project_changed {
                                         app.output.push_system(&format!(

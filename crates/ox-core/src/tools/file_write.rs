@@ -27,14 +27,22 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to write (relative to working directory)"
+                    "description": "Path to the file to write (relative to working directory). Optional if using file_id or filename."
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Filename to search for in index. For new files, this creates the file."
+                },
+                "file_id": {
+                    "type": "integer",
+                    "description": "File ID from index for precise matching (for existing files)."
                 },
                 "content": {
                     "type": "string",
                     "description": "The content to write to the file"
                 }
             },
-            "required": ["path", "content"]
+            "required": ["content"]
         })
     }
 
@@ -43,29 +51,78 @@ impl Tool for FileWriteTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
-        let raw_path = match args.get("path").and_then(|p| p.as_str()) {
-            Some(p) if !p.is_empty() => p,
-            Some(_) => return ToolOutput::error(
-                "❌ Parameter Error: 'path' cannot be empty\n\n\
-                 💡 Example: {\"path\": \"output.txt\", \"content\": \"Hello World\"}"
-            ),
-            None => return ToolOutput::error(
-                "❌ Missing Required Parameter: 'path'\n\n\
-                 💡 How to fix:\n\
-                 • Add the 'path' parameter with the file location\n\
-                 • Path can be relative to working directory\n\n\
-                 📝 Example: {\"path\": \"output.txt\", \"content\": \"Your content here\"}"
-            ),
-        };
-        
-        // Normalize path: trim whitespace and standardize separators
-        let normalized_path = raw_path.trim().replace('\\', "/");
-        
-        // Handle absolute vs relative paths
-        let resolved_path = if std::path::Path::new(&normalized_path).is_absolute() {
-            std::path::PathBuf::from(&normalized_path)
+        // Determine file path from parameters (priority: file_id > filename > path)
+        let resolved_path = if let Some(file_id) = args.get("file_id").and_then(|id| id.as_i64()) {
+            // Method 1: Use file_id for precise matching
+            match ctx.file_index.find_by_id(file_id) {
+                Ok(Some(entry)) => ctx.working_dir.join(&entry.full_path),
+                Ok(None) => return ToolOutput::error(
+                    format!("❌ File Not Found: No file with ID {}\n\n\
+                             💡 How to fix:\n\
+                             • Use file_list tool to see available files and their IDs\n\
+                             • Or use 'filename' or 'path' parameter instead", file_id)
+                ),
+                Err(e) => return ToolOutput::error(format!("Failed to query file index: {}", e)),
+            }
+        } else if let Some(filename) = args.get("filename").and_then(|f| f.as_str()) {
+            // Method 2: Use filename (may have multiple matches)
+            match ctx.file_index.find_by_filename(filename) {
+                Ok(matches) if matches.len() == 1 => {
+                    ctx.working_dir.join(&matches[0].full_path)
+                }
+                Ok(matches) if matches.len() > 1 => {
+                    // Multiple matches - return options for LLM to choose
+                    let options: Vec<String> = matches
+                        .iter()
+                        .map(|e| format!("  [ID: {}] {}", e.id, e.full_path))
+                        .collect();
+                    
+                    return ToolOutput::error(
+                        format!("❌ Multiple Files Matched '{}':\n{}\n\n\
+                                 💡 How to fix:\n\
+                                 • Retry with 'file_id' parameter for precise matching\n\
+                                 • Example: {{\"file_id\": {}}}", 
+                                filename,
+                                options.join("\n"),
+                                matches[0].id)
+                    );
+                }
+                Ok(_) => {
+                    // File not in index - treat as new file creation
+                    ctx.working_dir.join(filename)
+                }
+                Err(e) => return ToolOutput::error(format!("Failed to query file index: {}", e)),
+            }
+        } else if let Some(raw_path) = args.get("path").and_then(|p| p.as_str()) {
+            // Method 3: Traditional path-based approach (backward compatible)
+            if raw_path.is_empty() {
+                return ToolOutput::error(
+                    "❌ Parameter Error: 'path' cannot be empty\n\n\
+                     💡 Example: {\"path\": \"output.txt\", \"content\": \"Hello World\"}"
+                );
+            }
+            
+            // Normalize path: trim whitespace and standardize separators
+            let normalized_path = raw_path.trim().replace('\\', "/");
+            
+            // Handle absolute vs relative paths
+            if std::path::Path::new(&normalized_path).is_absolute() {
+                std::path::PathBuf::from(&normalized_path)
+            } else {
+                ctx.working_dir.join(&normalized_path)
+            }
         } else {
-            ctx.working_dir.join(&normalized_path)
+            return ToolOutput::error(
+                "❌ Missing Required Parameter\n\n\
+                 💡 How to fix - provide ONE of:\n\
+                 • 'file_id': Precise file ID from index (for existing files)\n\
+                 • 'filename': Filename for new file or unique existing file\n\
+                 • 'path': Full relative path (traditional method)\n\n\
+                 📝 Examples:\n\
+                 {\"file_id\": 123, \"content\": \"...\"} - Write by ID\n\
+                 {\"filename\": \"new_file.txt\", \"content\": \"...\"} - Create new file\n\
+                 {\"path\": \"src/output.txt\", \"content\": \"...\"} - Write by path"
+            );
         };
         
         // Keep user-friendly path for error messages
@@ -182,6 +239,14 @@ impl Tool for FileWriteTool {
         
         match atomic_write_with_retry(&temp_path, &path, content.as_bytes(), 3).await {
             Ok(bytes_written) => {
+                // Update file index immediately for real-time availability
+                if let Ok(relative_path) = path.strip_prefix(&ctx.working_dir) {
+                    let rel_str = relative_path.to_string_lossy();
+                    if let Err(e) = ctx.file_index.add_file(&rel_str) {
+                        tracing::warn!("Failed to update file index: {}", e);
+                    }
+                }
+                
                 ToolOutput::success(format!(
                     "✅ Successfully written {} bytes to {}\n\
                      📄 Encoding: UTF-8 (without BOM)\n\

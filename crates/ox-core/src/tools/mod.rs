@@ -68,12 +68,26 @@ pub struct ToolContext {
     pub config: Arc<OxConfig>,
     /// Reference to the memory manager for knowledge retrieval
     pub memory: Arc<crate::memory::MemoryManager>,
+    /// Reference to the file index manager for file lookup
+    pub file_index: Arc<crate::file_index::FileIndexManager>,
 }
 
 impl ToolContext {
     /// Create a new ToolContext with the given runtime and working directory.
-    pub fn new(runtime: RuntimeEnvironment, working_dir: std::path::PathBuf, config: Arc<OxConfig>, memory: Arc<crate::memory::MemoryManager>) -> Self {
-        Self { runtime, working_dir, config, memory }
+    pub fn new(
+        runtime: RuntimeEnvironment,
+        working_dir: std::path::PathBuf,
+        config: Arc<OxConfig>,
+        memory: Arc<crate::memory::MemoryManager>,
+        file_index: Arc<crate::file_index::FileIndexManager>,
+    ) -> Self {
+        Self {
+            runtime,
+            working_dir,
+            config,
+            memory,
+            file_index,
+        }
     }
 }
 
