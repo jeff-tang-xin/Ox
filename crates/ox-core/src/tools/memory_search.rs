@@ -90,8 +90,9 @@ impl Tool for MemorySearchTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let query = match args.get("query").and_then(|q| q.as_str()) {
             Some(q) if !q.is_empty() => q,
-            _ => return ToolOutput::error(
-                "❌ Missing Required Parameter: 'query'\n\n\
+            _ => {
+                return ToolOutput::error(
+                    "❌ Missing Required Parameter: 'query'\n\n\
                  💡 How to use:\n\
                  • Describe what knowledge you need in natural language\n\
                  • Be specific about the type (architecture, conventions, preferences, etc.)\n\n\
@@ -99,15 +100,15 @@ impl Tool for MemorySearchTool {
                  {\"query\": \"authentication architecture\", \"scope\": \"project\"}\n\
                  {\"query\": \"error handling conventions\", \"scope\": \"project\"}\n\
                  {\"query\": \"user coding style preferences\", \"scope\": \"global\"}\n\
-                 {\"query\": \"common Rust web API patterns\", \"scope\": \"global\"}"
-            ),
+                 {\"query\": \"common Rust web API patterns\", \"scope\": \"global\"}",
+                );
+            }
         };
 
-        let scope = args.get("scope")
-            .and_then(|s| s.as_str())
-            .unwrap_or("both");
+        let scope = args.get("scope").and_then(|s| s.as_str()).unwrap_or("both");
 
-        let max_results = args.get("max_results")
+        let max_results = args
+            .get("max_results")
             .and_then(|m| m.as_u64())
             .unwrap_or(5)
             .min(20) as usize;
@@ -122,7 +123,6 @@ impl Tool for MemorySearchTool {
 
         // Perform the search
         let nodes = memory.retrieve(query, &project_id, max_results);
-        
 
         if nodes.is_empty() {
             return ToolOutput::success(format!(
@@ -136,24 +136,28 @@ impl Tool for MemorySearchTool {
         }
 
         // Format results with clear structure
-        let mut output = format!("🔍 Found {} relevant knowledge items for '{}':\n\n", nodes.len(), query);
-        
+        let mut output = format!(
+            "🔍 Found {} relevant knowledge items for '{}':\n\n",
+            nodes.len(),
+            query
+        );
+
         for (i, node) in nodes.iter().enumerate() {
             let scope_tag = if node.project_id.is_some() {
                 "[Project]"
             } else {
                 "[Global]"
             };
-            
+
             let type_tag = format!("[{}]", node.node_type.as_str());
-            
+
             // Calculate confidence score based on depth and recency
             let confidence = calculate_confidence(node);
             let confidence_bar = format_confidence_bar(confidence);
-            
+
             // Format source information
             let source_info = format_source(&node.source);
-            
+
             output.push_str(&format!(
                 "{}. {} {} (Depth: {} | Confidence: {})\n\
                    Source: {}\n\
@@ -169,8 +173,10 @@ impl Tool for MemorySearchTool {
         }
 
         // Add usage guidance
-        output.push_str("💡 Tip: Use this information to inform your approach. \
-                        If you need more details, try a more specific query.\n");
+        output.push_str(
+            "💡 Tip: Use this information to inform your approach. \
+                        If you need more details, try a more specific query.\n",
+        );
 
         ToolOutput::success(output)
     }
@@ -180,7 +186,7 @@ impl Tool for MemorySearchTool {
 fn calculate_confidence(node: &crate::memory::MemoryNode) -> f32 {
     // Depth is a good indicator of reliability (0-5 scale)
     let depth_score = (node.depth as f32 / 5.0).min(1.0);
-    
+
     // Node type affects confidence
     let type_weight = match node.node_type {
         crate::memory::MemoryNodeType::Architectural => 0.9,
@@ -193,7 +199,7 @@ fn calculate_confidence(node: &crate::memory::MemoryNode) -> f32 {
         crate::memory::MemoryNodeType::Pattern => 0.75,
         crate::memory::MemoryNodeType::Fact => 0.7,
     };
-    
+
     (depth_score * 0.6 + type_weight * 0.4).clamp(0.0, 1.0)
 }
 
@@ -201,7 +207,11 @@ fn calculate_confidence(node: &crate::memory::MemoryNode) -> f32 {
 fn format_confidence_bar(confidence: f32) -> String {
     let filled = (confidence * 10.0).round() as usize;
     let empty = 10 - filled;
-    format!("{}{:.0}%", "█".repeat(filled) + &"░".repeat(empty), confidence * 100.0)
+    format!(
+        "{}{:.0}%",
+        "█".repeat(filled) + &"░".repeat(empty),
+        confidence * 100.0
+    )
 }
 
 /// Format source information in human-readable form
@@ -212,5 +222,6 @@ fn format_source(source: &crate::memory::MemorySource) -> String {
         crate::memory::MemorySource::UserExplicit => "👤 User explicitly stated",
         crate::memory::MemorySource::CouncilConclusion => "⚖️ Council conclusion",
         crate::memory::MemorySource::Feedback => "💬 From user feedback",
-    }.to_string()
+    }
+    .to_string()
 }

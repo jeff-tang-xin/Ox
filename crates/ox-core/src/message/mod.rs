@@ -1,7 +1,7 @@
 mod session;
 mod task_plan;
 
-pub use session::Session;
+pub use session::{Session, SessionMeta};
 pub use task_plan::{TaskItem, TaskPlan, TaskStatus};
 
 use serde::{Deserialize, Serialize};

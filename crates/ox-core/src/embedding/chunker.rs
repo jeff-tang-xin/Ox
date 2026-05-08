@@ -48,6 +48,9 @@ pub struct ChunkerConfig {
     pub threshold_tokens: usize,
     /// Maximum tokens per chunk when splitting.
     pub max_chunk_tokens: usize,
+    /// Overlap ratio between adjacent chunks (0.0 - 0.2 recommended).
+    /// This ensures semantic continuity across chunks.
+    pub overlap_ratio: f32,
 }
 
 impl Default for ChunkerConfig {
@@ -55,6 +58,7 @@ impl Default for ChunkerConfig {
         Self {
             threshold_tokens: DEFAULT_CHUNK_THRESHOLD,
             max_chunk_tokens: DEFAULT_MAX_CHUNK_TOKENS,
+            overlap_ratio: 0.15, // 15% overlap by default
         }
     }
 }
@@ -78,8 +82,13 @@ impl SimpleChunker {
             .unwrap_or(text.len() / 4) // Fallback: roughly 4 chars per token
     }
 
-    /// Split text into chunks by token count.
-    pub fn split_text(&self, text: &str, max_tokens: usize) -> Vec<String> {
+    /// Split text into chunks by token count with sliding window overlap.
+    /// 
+    /// This implements the "semantic chunking + sliding window" strategy:
+    /// - Chunks are limited to max_tokens
+    /// - Adjacent chunks overlap by overlap_ratio (e.g., 15%)
+    /// - Ensures semantic continuity across chunk boundaries
+    pub fn split_text_with_overlap(&self, text: &str, max_tokens: usize, overlap_ratio: f32) -> Vec<String> {
         if text.is_empty() {
             return vec![];
         }
@@ -94,6 +103,10 @@ impl SimpleChunker {
             return vec![text.to_string()];
         }
 
+        // Calculate overlap size
+        let overlap_tokens = (max_tokens as f32 * overlap_ratio) as usize;
+        let stride = max_tokens.saturating_sub(overlap_tokens);
+        
         let mut chunks = Vec::new();
         let mut start = 0;
 
@@ -102,16 +115,28 @@ impl SimpleChunker {
             let chunk_ids = &ids[start..end];
 
             // Convert token IDs back to text
-            let chunk_text = self.tokenizer.decode(chunk_ids, true)
-                .unwrap_or_else(|_| {
-                    // Fallback: extract substring by characters
-                    let char_count = text.len() * chunk_ids.len() / ids.len();
-                    let start_char = text.len() * start / ids.len();
-                    text[start_char..(start_char + char_count).min(text.len())].to_string()
-                });
+            let chunk_text = self.tokenizer.decode(chunk_ids, true).unwrap_or_else(|_| {
+                // Fallback: extract substring by characters
+                let char_count = text.len() * chunk_ids.len() / ids.len();
+                let start_char = text.len() * start / ids.len();
+                text[start_char..(start_char + char_count).min(text.len())].to_string()
+            });
 
-            chunks.push(chunk_text.trim().to_string());
-            start = end;
+            if !chunk_text.trim().is_empty() {
+                chunks.push(chunk_text.trim().to_string());
+            }
+
+            // Move forward by stride (not full max_tokens) to create overlap
+            start += stride;
+            
+            // If we're at the last chunk and it's very small, merge with previous
+            if start >= ids.len() && chunks.len() > 1 {
+                let last_chunk = chunks.pop().unwrap();
+                if let Some(prev_chunk) = chunks.last_mut() {
+                    prev_chunk.push_str(" ");
+                    prev_chunk.push_str(&last_chunk);
+                }
+            }
         }
 
         if chunks.is_empty() {
@@ -120,12 +145,17 @@ impl SimpleChunker {
 
         chunks
     }
+
+    /// Split text into chunks by token count (legacy method without overlap).
+    pub fn split_text(&self, text: &str, max_tokens: usize) -> Vec<String> {
+        self.split_text_with_overlap(text, max_tokens, 0.0)
+    }
 }
 
-/// Convert messages to chunks using hybrid strategy.
+/// Convert messages to chunks using hybrid strategy with sliding window overlap.
 ///
 /// - Short messages: one chunk per message
-/// - Long messages: split into multiple chunks by token count
+/// - Long messages: split into multiple chunks with overlap (config.overlap_ratio)
 pub fn message_to_chunks(
     messages: &[Message],
     chunker: &SimpleChunker,
@@ -153,8 +183,12 @@ pub fn message_to_chunks(
                 total_chunks: 1,
             });
         } else {
-            // Long message: split into multiple chunks
-            let text_chunks = chunker.split_text(content, config.max_chunk_tokens);
+            // Long message: split into multiple chunks with overlap
+            let text_chunks = chunker.split_text_with_overlap(
+                content,
+                config.max_chunk_tokens,
+                config.overlap_ratio,
+            );
             let total = text_chunks.len();
 
             for (idx, text) in text_chunks.into_iter().enumerate() {
@@ -174,11 +208,7 @@ pub fn message_to_chunks(
 
 /// Alias for creating SimpleChunker from embedder's tokenizer.
 /// This is a convenience function that wraps the chunking logic.
-pub fn chunker(
-    tokenizer: Tokenizer,
-    config: &ChunkerConfig,
-    messages: &[Message],
-) -> Vec<Chunk> {
+pub fn chunker(tokenizer: Tokenizer, config: &ChunkerConfig, messages: &[Message]) -> Vec<Chunk> {
     let simple_chunker = SimpleChunker::new(tokenizer);
     message_to_chunks(messages, &simple_chunker, config)
 }

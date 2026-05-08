@@ -149,33 +149,48 @@ impl CouncilSession {
                 DebatePhase::Proposal(proposals) => {
                     out.push_str("──── Phase: Independent Proposals ────\n");
                     for p in proposals {
-                        let label = self.participants.get(p.participant_idx)
+                        let label = self
+                            .participants
+                            .get(p.participant_idx)
                             .map(|p| p.label())
                             .unwrap_or_else(|| "unknown".into());
-                        out.push_str(&format!("[{}] Proposal:\n  {}\n  Reasoning: {}\n\n",
-                            label, p.content, p.reasoning));
+                        out.push_str(&format!(
+                            "[{}] Proposal:\n  {}\n  Reasoning: {}\n\n",
+                            label, p.content, p.reasoning
+                        ));
                     }
                 }
                 DebatePhase::CrossReview(reviews) => {
                     out.push_str("──── Phase: Cross Review ────\n");
                     for r in reviews {
-                        let reviewer = self.participants.get(r.reviewer_idx)
+                        let reviewer = self
+                            .participants
+                            .get(r.reviewer_idx)
                             .map(|p| p.label())
                             .unwrap_or_else(|| "unknown".into());
-                        let target = self.participants.get(r.target_idx)
+                        let target = self
+                            .participants
+                            .get(r.target_idx)
                             .map(|p| p.label())
                             .unwrap_or_else(|| "unknown".into());
-                        out.push_str(&format!("[{} → {}] Score: {:.2}\n  {}\n\n",
-                            reviewer, target, r.score, r.critique));
+                        out.push_str(&format!(
+                            "[{} → {}] Score: {:.2}\n  {}\n\n",
+                            reviewer, target, r.score, r.critique
+                        ));
                     }
                 }
                 DebatePhase::Rebuttal(rebuttals) => {
                     out.push_str("──── Phase: Rebuttal ────\n");
                     for rb in rebuttals {
-                        let label = self.participants.get(rb.participant_idx)
+                        let label = self
+                            .participants
+                            .get(rb.participant_idx)
                             .map(|p| p.label())
                             .unwrap_or_else(|| "unknown".into());
-                        out.push_str(&format!("[{}] Response: {}\n", label, rb.response_to_critiques));
+                        out.push_str(&format!(
+                            "[{}] Response: {}\n",
+                            label, rb.response_to_critiques
+                        ));
                         if let Some(ref revised) = rb.revised_proposal {
                             out.push_str(&format!("  Revised proposal: {}\n", revised));
                         }
@@ -213,14 +228,60 @@ impl TopicCategory {
     pub fn classify(question: &str) -> Self {
         let q = question.to_lowercase();
         let keywords: &[(&[&str], TopicCategory)] = &[
-            (&["architect", "design", "system", "microservice", "monolith", "modular"], TopicCategory::Architecture),
-            (&["algorithm", "data structure", "sort", "search", "graph", "tree", "complexity"], TopicCategory::Algorithm),
-            (&["debug", "error", "bug", "fix", "crash", "trace", "stack"], TopicCategory::Debugging),
-            (&["review", "quality", "lint", "refactor", "clean", "style"], TopicCategory::CodeReview),
-            (&["deploy", "ci", "cd", "docker", "kubernetes", "infra"], TopicCategory::DevOps),
-            (&["ui", "ux", "frontend", "react", "vue", "css", "component"], TopicCategory::Frontend),
-            (&["database", "sql", "query", "index", "migration", "orm"], TopicCategory::Database),
-            (&["security", "auth", "encrypt", "token", "vulnerability", "sanitize"], TopicCategory::Security),
+            (
+                &[
+                    "architect",
+                    "design",
+                    "system",
+                    "microservice",
+                    "monolith",
+                    "modular",
+                ],
+                TopicCategory::Architecture,
+            ),
+            (
+                &[
+                    "algorithm",
+                    "data structure",
+                    "sort",
+                    "search",
+                    "graph",
+                    "tree",
+                    "complexity",
+                ],
+                TopicCategory::Algorithm,
+            ),
+            (
+                &["debug", "error", "bug", "fix", "crash", "trace", "stack"],
+                TopicCategory::Debugging,
+            ),
+            (
+                &["review", "quality", "lint", "refactor", "clean", "style"],
+                TopicCategory::CodeReview,
+            ),
+            (
+                &["deploy", "ci", "cd", "docker", "kubernetes", "infra"],
+                TopicCategory::DevOps,
+            ),
+            (
+                &["ui", "ux", "frontend", "react", "vue", "css", "component"],
+                TopicCategory::Frontend,
+            ),
+            (
+                &["database", "sql", "query", "index", "migration", "orm"],
+                TopicCategory::Database,
+            ),
+            (
+                &[
+                    "security",
+                    "auth",
+                    "encrypt",
+                    "token",
+                    "vulnerability",
+                    "sanitize",
+                ],
+                TopicCategory::Security,
+            ),
         ];
         for (kws, cat) in keywords {
             if kws.iter().any(|k| q.contains(k)) {
@@ -254,10 +315,19 @@ impl ModelCapabilityScore {
         }
     }
 
-    pub fn update(&mut self, topic: TopicCategory, proposal_adopted: bool, review_cited_ratio: f32) {
+    pub fn update(
+        &mut self,
+        topic: TopicCategory,
+        proposal_adopted: bool,
+        review_cited_ratio: f32,
+    ) {
         let ts = self.topic_scores.entry(topic).or_default();
         let alpha = 0.3_f32;
-        ts.proposal_adopted_rate = ema(ts.proposal_adopted_rate, if proposal_adopted { 1.0 } else { 0.0 }, alpha);
+        ts.proposal_adopted_rate = ema(
+            ts.proposal_adopted_rate,
+            if proposal_adopted { 1.0 } else { 0.0 },
+            alpha,
+        );
         ts.review_quality = ema(ts.review_quality, review_cited_ratio, alpha);
         ts.session_count += 1;
     }
@@ -268,10 +338,20 @@ impl ModelCapabilityScore {
         store: &crate::memory::store::MemoryStore,
     ) -> anyhow::Result<Self> {
         let mut scores = Self::new(provider.clone(), model.clone());
-        for cat in &[TopicCategory::Architecture, TopicCategory::Algorithm, TopicCategory::Debugging,
-                     TopicCategory::CodeReview, TopicCategory::DevOps, TopicCategory::Frontend,
-                     TopicCategory::Database, TopicCategory::Security, TopicCategory::General] {
-            if let Some((adopted, quality, count)) = store.load_model_capability(&provider, &model, cat.as_str())? {
+        for cat in &[
+            TopicCategory::Architecture,
+            TopicCategory::Algorithm,
+            TopicCategory::Debugging,
+            TopicCategory::CodeReview,
+            TopicCategory::DevOps,
+            TopicCategory::Frontend,
+            TopicCategory::Database,
+            TopicCategory::Security,
+            TopicCategory::General,
+        ] {
+            if let Some((adopted, quality, count)) =
+                store.load_model_capability(&provider, &model, cat.as_str())?
+            {
                 let mut ts = TopicScore::default();
                 ts.proposal_adopted_rate = adopted;
                 ts.review_quality = quality;
@@ -282,7 +362,10 @@ impl ModelCapabilityScore {
         Ok(scores)
     }
 
-    pub fn persist_to_store(&self, store: &crate::memory::store::MemoryStore) -> anyhow::Result<()> {
+    pub fn persist_to_store(
+        &self,
+        store: &crate::memory::store::MemoryStore,
+    ) -> anyhow::Result<()> {
         for (topic, score) in &self.topic_scores {
             store.save_model_capability(
                 &self.provider,
@@ -329,10 +412,12 @@ pub fn select_best_participants(
 
     // Load capability scores for all models on this topic
     let mut model_scores: HashMap<String, f32> = HashMap::new();
-    
+
     for model_name in available_models {
         let provider = crate::llm::resolve_provider_name(model_name);
-        if let Ok(Some((adopted, _quality, count))) = store.load_model_capability(provider, model_name, topic.as_str()) {
+        if let Ok(Some((adopted, _quality, count))) =
+            store.load_model_capability(provider, model_name, topic.as_str())
+        {
             // Score based on adoption rate and experience (session count)
             let experience_bonus = (count as f32).min(10.0) / 10.0 * 0.2; // Up to 0.2 bonus for experience
             let score = adopted * 0.8 + experience_bonus;
@@ -346,9 +431,10 @@ pub fn select_best_participants(
     // Sort by score descending
     let mut sorted: Vec<_> = model_scores.into_iter().collect();
     sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    
+
     // Take top N participants
-    sorted.into_iter()
+    sorted
+        .into_iter()
         .take(max_participants)
         .map(|(model, _)| model)
         .collect()
@@ -360,22 +446,43 @@ mod tests {
 
     #[test]
     fn topic_category_classify() {
-        assert_eq!(TopicCategory::classify("Should we use microservices architecture?"), TopicCategory::Architecture);
-        assert_eq!(TopicCategory::classify("Fix the null pointer bug in handler"), TopicCategory::Debugging);
-        assert_eq!(TopicCategory::classify("Deploy to kubernetes with CI/CD"), TopicCategory::DevOps);
-        assert_eq!(TopicCategory::classify("How to optimize SQL query?"), TopicCategory::Database);
-        assert_eq!(TopicCategory::classify("What color should the button be?"), TopicCategory::General);
+        assert_eq!(
+            TopicCategory::classify("Should we use microservices architecture?"),
+            TopicCategory::Architecture
+        );
+        assert_eq!(
+            TopicCategory::classify("Fix the null pointer bug in handler"),
+            TopicCategory::Debugging
+        );
+        assert_eq!(
+            TopicCategory::classify("Deploy to kubernetes with CI/CD"),
+            TopicCategory::DevOps
+        );
+        assert_eq!(
+            TopicCategory::classify("How to optimize SQL query?"),
+            TopicCategory::Database
+        );
+        assert_eq!(
+            TopicCategory::classify("What color should the button be?"),
+            TopicCategory::General
+        );
     }
 
     #[test]
     fn model_capability_ema_update() {
         let mut score = ModelCapabilityScore::new("openai".into(), "gpt-4o".into());
         score.update(TopicCategory::Architecture, true, 0.8);
-        assert_eq!(score.topic_scores[&TopicCategory::Architecture].session_count, 1);
+        assert_eq!(
+            score.topic_scores[&TopicCategory::Architecture].session_count,
+            1
+        );
         assert!(score.topic_scores[&TopicCategory::Architecture].proposal_adopted_rate > 0.0);
 
         score.update(TopicCategory::Architecture, false, 0.2);
-        assert_eq!(score.topic_scores[&TopicCategory::Architecture].session_count, 2);
+        assert_eq!(
+            score.topic_scores[&TopicCategory::Architecture].session_count,
+            2
+        );
     }
 
     #[test]
@@ -384,8 +491,16 @@ mod tests {
             id: "test".into(),
             question: "gRPC vs REST?".into(),
             participants: vec![
-                Participant { role: ParticipantRole::Proposer, provider: "openai".into(), model: "gpt-4o".into() },
-                Participant { role: ParticipantRole::Proposer, provider: "anthropic".into(), model: "claude".into() },
+                Participant {
+                    role: ParticipantRole::Proposer,
+                    provider: "openai".into(),
+                    model: "gpt-4o".into(),
+                },
+                Participant {
+                    role: ParticipantRole::Proposer,
+                    provider: "anthropic".into(),
+                    model: "claude".into(),
+                },
             ],
             rounds: 2,
             phases: vec![],
@@ -424,7 +539,11 @@ mod tests {
 
     #[test]
     fn participant_label() {
-        let p = Participant { role: ParticipantRole::Proposer, provider: "openai".into(), model: "gpt-4o".into() };
+        let p = Participant {
+            role: ParticipantRole::Proposer,
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+        };
         assert_eq!(p.label(), "openai:gpt-4o");
     }
 }

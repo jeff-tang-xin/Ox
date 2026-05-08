@@ -4,9 +4,7 @@
 #[derive(Debug)]
 pub enum RollbackDecision {
     /// No rollback needed, state saved
-    NoRollback {
-        current_score: f64,
-    },
+    NoRollback { current_score: f64 },
     /// Rollback is needed but no snapshot available
     NeedsRollback {
         current_score: f64,
@@ -30,7 +28,7 @@ impl RollbackManager {
         baseline_satisfaction: f64,
     ) -> RollbackDecision {
         let degradation = baseline_satisfaction - current_satisfaction;
-        
+
         if degradation > 0.2 {
             RollbackDecision::NeedsRollback {
                 current_score: current_satisfaction,
@@ -47,9 +45,9 @@ impl RollbackManager {
     /// Calculate composite satisfaction score from multiple signals
     pub fn calculate_satisfaction_score(
         &self,
-        explicit_feedback_rate: f64,  // good / total feedback
-        tool_success_rate: f64,        // successful tool calls / total
-        code_accept_rate: f64,         // accepted writes / total writes
+        explicit_feedback_rate: f64, // good / total feedback
+        tool_success_rate: f64,      // successful tool calls / total
+        code_accept_rate: f64,       // accepted writes / total writes
         has_explicit_feedback: bool,
     ) -> f64 {
         if has_explicit_feedback {
@@ -91,24 +89,24 @@ mod tests {
     #[test]
     fn test_rollback_decision_no_degradation() {
         let mut manager = RollbackManager::new();
-        
+
         let decision = manager.evaluate_and_maybe_rollback(
-            0.85,  // current
-            0.80,  // baseline
+            0.85, // current
+            0.80, // baseline
         );
-        
+
         matches!(decision, RollbackDecision::NoRollback { .. });
     }
 
     #[test]
     fn test_rollback_decision_with_degradation() {
         let mut manager = RollbackManager::new();
-        
+
         let decision = manager.evaluate_and_maybe_rollback(
-            0.50,  // current (degraded)
-            0.80,  // baseline
+            0.50, // current (degraded)
+            0.80, // baseline
         );
-        
+
         match decision {
             RollbackDecision::NeedsRollback { degradation, .. } => {
                 assert!(degradation > 0.2);

@@ -34,9 +34,7 @@ pub fn find_project_root(start_dir: &Path) -> Option<PathBuf> {
 /// Uses blake3 hash of the canonical path, truncated to 16 hex chars.
 pub fn compute_project_id(project_root: &Option<PathBuf>, cwd: &Path) -> String {
     let base = project_root.as_deref().unwrap_or(cwd);
-    let canonical = base
-        .canonicalize()
-        .unwrap_or_else(|_| base.to_path_buf());
+    let canonical = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
     hash.to_hex()[..16].to_string()
 }

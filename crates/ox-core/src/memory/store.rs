@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection, Result as SqlResult, Statement};
+use rusqlite::{Connection, Result as SqlResult, Statement, params};
 
 use super::{MemoryNode, MemoryNodeType, MemorySource};
 
@@ -22,7 +22,16 @@ CREATE TABLE IF NOT EXISTS memories (
     trace_2           REAL NOT NULL DEFAULT 0.0,
     trace_3           REAL NOT NULL DEFAULT 0.0,
     trace_4           REAL NOT NULL DEFAULT 0.0,
-    language_weight   REAL NOT NULL DEFAULT 0.5
+    language_weight   REAL NOT NULL DEFAULT 0.5,
+    
+    -- 🆕 LLM Judge feedback tracking
+    avg_llm_score     REAL NOT NULL DEFAULT 0.0,
+    judge_eval_count  INTEGER NOT NULL DEFAULT 0,
+    recent_score_0    REAL NOT NULL DEFAULT 0.0,
+    recent_score_1    REAL NOT NULL DEFAULT 0.0,
+    recent_score_2    REAL NOT NULL DEFAULT 0.0,
+    recent_score_3    REAL NOT NULL DEFAULT 0.0,
+    recent_score_4    REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
@@ -80,7 +89,7 @@ impl MemoryStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-        let mut store = Self { 
+        let mut store = Self {
             conn: Arc::new(conn),
             insert_stmt: Mutex::new(None),
         };
@@ -94,19 +103,25 @@ impl MemoryStore {
     }
 
     /// Get or create precompiled insert statement
-    fn get_insert_stmt(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Option<Statement<'static>>>> {
+    fn get_insert_stmt(
+        &self,
+    ) -> anyhow::Result<std::sync::MutexGuard<'_, Option<Statement<'static>>>> {
         let mut stmt_guard = self.insert_stmt.lock().unwrap();
         if stmt_guard.is_none() {
             // Prepare statement - note: we leak the statement to get 'static lifetime
             // This is safe because the connection lives as long as the store
             let raw_conn = Arc::as_ptr(&self.conn) as *mut Connection;
-            let stmt = unsafe { (&*raw_conn).prepare(
-                "INSERT OR REPLACE INTO memories
+            let stmt = unsafe {
+                (&*raw_conn).prepare(
+                    "INSERT OR REPLACE INTO memories
                  (id, content, node_type, depth, project_id, language, source,
                   created_at, last_accessed, is_project_critical,
-                  trace_0, trace_1, trace_2, trace_3, trace_4, language_weight)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
-            )? };
+                  trace_0, trace_1, trace_2, trace_3, trace_4, language_weight,
+                  avg_llm_score, judge_eval_count,
+                  recent_score_0, recent_score_1, recent_score_2, recent_score_3, recent_score_4)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                )?
+            };
             // Safety: We're transmuting the statement to 'static lifetime.
             // This is safe because: 1) The connection is Arc'd and won't be dropped
             // while the store exists. 2) We only drop statements when the store drops.
@@ -136,6 +151,13 @@ impl MemoryStore {
             node.traces[3],
             node.traces[4],
             node.language_weight,
+            node.avg_llm_score,
+            node.judge_eval_count,
+            node.recent_scores[0],
+            node.recent_scores[1],
+            node.recent_scores[2],
+            node.recent_scores[3],
+            node.recent_scores[4],
         ])?;
         Ok(())
     }
@@ -148,8 +170,10 @@ impl MemoryStore {
                 "INSERT OR REPLACE INTO memories
                  (id, content, node_type, depth, project_id, language, source,
                   created_at, last_accessed, is_project_critical,
-                  trace_0, trace_1, trace_2, trace_3, trace_4, language_weight)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
+                  trace_0, trace_1, trace_2, trace_3, trace_4, language_weight,
+                  avg_llm_score, judge_eval_count,
+                  recent_score_0, recent_score_1, recent_score_2, recent_score_3, recent_score_4)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
             )?;
             for node in nodes {
                 stmt.execute(params![
@@ -169,6 +193,13 @@ impl MemoryStore {
                     node.traces[3],
                     node.traces[4],
                     node.language_weight,
+                    node.avg_llm_score,
+                    node.judge_eval_count,
+                    node.recent_scores[0],
+                    node.recent_scores[1],
+                    node.recent_scores[2],
+                    node.recent_scores[3],
+                    node.recent_scores[4],
                 ])?;
             }
         }
@@ -189,7 +220,9 @@ impl MemoryStore {
             type_clause
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![project_id, limit as i64], |row| self.row_to_node(row))?;
+        let rows = stmt.query_map(params![project_id, limit as i64], |row| {
+            self.row_to_node(row)
+        })?;
         rows.collect::<SqlResult<Vec<_>>>().map_err(Into::into)
     }
 
@@ -209,14 +242,21 @@ impl MemoryStore {
         rows.collect::<SqlResult<Vec<_>>>().map_err(Into::into)
     }
 
-    pub fn search(&self, keyword: &str, project_id: Option<&str>, limit: usize) -> anyhow::Result<Vec<MemoryNode>> {
+    pub fn search(
+        &self,
+        keyword: &str,
+        project_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryNode>> {
         let pattern = format!("%{}%", keyword);
         let nodes = match project_id {
             Some(pid) => {
                 let sql = "SELECT * FROM memories WHERE content LIKE ?1 AND project_id = ?2 ORDER BY last_accessed DESC LIMIT ?3";
                 let mut stmt = self.conn.prepare(sql)?;
-                stmt.query_map(params![pattern, pid, limit as i64], |row| self.row_to_node(row))?
-                    .collect::<SqlResult<Vec<_>>>()?
+                stmt.query_map(params![pattern, pid, limit as i64], |row| {
+                    self.row_to_node(row)
+                })?
+                .collect::<SqlResult<Vec<_>>>()?
             }
             None => {
                 let sql = "SELECT * FROM memories WHERE content LIKE ?1 ORDER BY last_accessed DESC LIMIT ?2";
@@ -237,7 +277,10 @@ impl MemoryStore {
     }
 
     pub fn increment_depth(&self, id: &str) -> anyhow::Result<()> {
-        self.conn.execute("UPDATE memories SET depth = MIN(depth + 1, 5) WHERE id = ?1", params![id])?;
+        self.conn.execute(
+            "UPDATE memories SET depth = MIN(depth + 1, 5) WHERE id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -251,7 +294,8 @@ impl MemoryStore {
     }
 
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
-        self.conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM memories WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -357,10 +401,7 @@ impl MemoryStore {
         Ok(())
     }
 
-    pub fn load_ema_trend(
-        &self,
-        metric_name: &str,
-    ) -> anyhow::Result<Option<(f64, f64, u32)>> {
+    pub fn load_ema_trend(&self, metric_name: &str) -> anyhow::Result<Option<(f64, f64, u32)>> {
         let row = self.conn.query_row(
             "SELECT current_value, trend, sample_count FROM ema_trends
              WHERE metric_name = ?1",
@@ -388,8 +429,24 @@ impl MemoryStore {
             created_at: row.get(7)?,
             last_accessed: row.get(8)?,
             is_project_critical: row.get::<_, i32>(9)? != 0,
-            traces: [row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?],
+            traces: [
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+                row.get(13)?,
+                row.get(14)?,
+            ],
             language_weight: row.get(15)?,
+            // 🆕 LLM Judge feedback fields
+            avg_llm_score: row.get(16).unwrap_or(0.0),
+            judge_eval_count: row.get(17).unwrap_or(0),
+            recent_scores: [
+                row.get(18).unwrap_or(0.0),
+                row.get(19).unwrap_or(0.0),
+                row.get(20).unwrap_or(0.0),
+                row.get(21).unwrap_or(0.0),
+                row.get(22).unwrap_or(0.0),
+            ],
         })
     }
 }
@@ -440,7 +497,9 @@ mod tests {
         );
         store.insert(&node).unwrap();
 
-        let results = store.query_by_project("proj123", &[MemoryNodeType::Architectural], 10).unwrap();
+        let results = store
+            .query_by_project("proj123", &[MemoryNodeType::Architectural], 10)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "Uses tokio for async");
         assert_eq!(results[0].depth, 2);
@@ -452,15 +511,17 @@ mod tests {
         let path = dir.path().join("test.db");
         let store = MemoryStore::open(&path).unwrap();
 
-        let nodes: Vec<MemoryNode> = (0..5).map(|i| {
-            MemoryNode::new(
-                format!("Memory item {}", i),
-                MemoryNodeType::Fact,
-                Some("proj".into()),
-                "rust".into(),
-                MemorySource::ToolObservation,
-            )
-        }).collect();
+        let nodes: Vec<MemoryNode> = (0..5)
+            .map(|i| {
+                MemoryNode::new(
+                    format!("Memory item {}", i),
+                    MemoryNodeType::Fact,
+                    Some("proj".into()),
+                    "rust".into(),
+                    MemorySource::ToolObservation,
+                )
+            })
+            .collect();
 
         store.insert_batch(&nodes).unwrap();
         assert_eq!(store.count_by_project("proj").unwrap(), 5);
@@ -484,7 +545,9 @@ mod tests {
         );
         store.insert(&node).unwrap();
 
-        let results = store.query_overall(&[MemoryNodeType::BestPractice], 10).unwrap();
+        let results = store
+            .query_overall(&[MemoryNodeType::BestPractice], 10)
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -504,7 +567,9 @@ mod tests {
         store.insert(&node).unwrap();
         store.update_depth(&node.id, 5).unwrap();
 
-        let results = store.query_by_project("p", &[MemoryNodeType::Fact], 10).unwrap();
+        let results = store
+            .query_by_project("p", &[MemoryNodeType::Fact], 10)
+            .unwrap();
         assert_eq!(results[0].depth, 5);
     }
 }

@@ -1,9 +1,9 @@
 //! OpenAI-compatible SSE parser.
 
-use std::collections::{HashMap, HashSet};
-use crate::message::TokenUsage;
-use super::sse::{parse_json_values, SseEventBuffer};
 use super::LlmStreamEvent;
+use super::sse::{SseEventBuffer, parse_json_values};
+use crate::message::TokenUsage;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub struct OpenAiSseParser {
@@ -18,7 +18,9 @@ pub struct OpenAiSseParser {
 }
 
 impl Default for OpenAiSseParser {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OpenAiSseParser {
@@ -73,7 +75,7 @@ impl OpenAiSseParser {
             for choice in choices {
                 let index = choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                 self.seen_indices.insert(index);
-                
+
                 if let Some(finish_reason) = choice.get("finish_reason").and_then(|f| f.as_str()) {
                     if finish_reason == "tool_calls" || finish_reason == "stop" {
                         if self.active_tool_calls.contains(&index) {
@@ -84,20 +86,29 @@ impl OpenAiSseParser {
                         }
                     }
                 }
-                
+
                 if let Some(delta) = choice.get("delta") {
                     events.extend(self.process_delta(delta, index));
                 }
             }
         }
-        
+
         if let Some(usage) = json.get("usage").filter(|u| !u.is_null()) {
             events.push(LlmStreamEvent::Done {
                 usage: TokenUsage {
-                    prompt_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                    completion_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                    total_tokens: usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                }
+                    prompt_tokens: usage
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    completion_tokens: usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    total_tokens: usage
+                        .get("total_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                },
             });
         }
         events
@@ -105,21 +116,43 @@ impl OpenAiSseParser {
 
     fn process_delta(&mut self, delta: &serde_json::Value, index: u64) -> Vec<LlmStreamEvent> {
         let mut events = Vec::new();
-        
-        if let Some(content) = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty()) {
+
+        if let Some(content) = delta
+            .get("content")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+        {
             events.push(LlmStreamEvent::TextDelta(content.to_string()));
         }
-        
+
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tool_calls {
                 let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(index);
-                
-                let id = tc.get("id").and_then(|i| i.as_str()).map(|s| s.to_string())
-                    .or_else(|| tc.get("function").and_then(|f| f.get("id")).and_then(|i| i.as_str()).map(|s| s.to_string()));
-                
-                let name = tc.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string())
-                    .or_else(|| tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string()));
-                
+
+                let id = tc
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        tc.get("function")
+                            .and_then(|f| f.get("id"))
+                            .and_then(|i| i.as_str())
+                            .map(|s| s.to_string())
+                    });
+
+                let name = tc
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        tc.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                    });
+
                 if let (Some(id), Some(name)) = (&id, &name) {
                     // O(1) lookup using reverse map
                     let is_new = !self.id_to_index.contains_key(id.as_str());
@@ -128,18 +161,39 @@ impl OpenAiSseParser {
                         self.tool_call_names.insert(tc_index, name.clone());
                         self.active_tool_calls.insert(tc_index);
                         self.id_to_index.insert(id.clone(), tc_index);
-                        events.push(LlmStreamEvent::ToolCallStart { id: id.clone(), name: name.clone() });
+                        events.push(LlmStreamEvent::ToolCallStart {
+                            id: id.clone(),
+                            name: name.clone(),
+                        });
                     }
                 }
-                
-                let args = tc.get("arguments").and_then(|a| a.as_str()).map(|s| s.to_string())
-                    .or_else(|| tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).map(|s| s.to_string()));
-                
+
+                let args = tc
+                    .get("arguments")
+                    .and_then(|a| a.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        tc.get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .map(|s| s.to_string())
+                    });
+
                 if let Some(args) = args {
-                    let buffer = self.argument_buffers.entry(tc_index).or_insert_with(String::new);
+                    let buffer = self
+                        .argument_buffers
+                        .entry(tc_index)
+                        .or_insert_with(String::new);
                     buffer.push_str(&args);
-                    let tc_id = self.tool_call_ids.get(&tc_index).cloned().unwrap_or_else(|| format!("tool_call_{}", tc_index));
-                    events.push(LlmStreamEvent::ToolCallArgumentsDelta { id: tc_id, delta: args });
+                    let tc_id = self
+                        .tool_call_ids
+                        .get(&tc_index)
+                        .cloned()
+                        .unwrap_or_else(|| format!("tool_call_{}", tc_index));
+                    events.push(LlmStreamEvent::ToolCallArgumentsDelta {
+                        id: tc_id,
+                        delta: args,
+                    });
                 }
             }
         }
@@ -187,7 +241,11 @@ mod tests {
     fn test_simple_text_response() {
         let data = r#"data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}"#;
         let events = parse_events(data);
-        assert!(events.iter().any(|e| matches!(e, LlmStreamEvent::TextDelta(s) if s == "Hello")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, LlmStreamEvent::TextDelta(s) if s == "Hello"))
+        );
     }
 
     #[test]
@@ -198,14 +256,24 @@ mod tests {
 data: {"choices":[{"index":0,"finish_reason":"tool_calls"}]}"#;
         let events = parse_events(data);
         eprintln!("Events received: {:?}", events);
-        assert!(events.iter().any(|e| matches!(e, LlmStreamEvent::ToolCallEnd { id } if id == "call_abc")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, LlmStreamEvent::ToolCallEnd { id } if id == "call_abc"))
+        );
     }
 
     #[test]
     fn test_json_array_response() {
         let data = r#"data: [{"choices":[{"index":0,"delta":{"content":"A"}}]},{"choices":[{"index":0,"delta":{"content":"B"}}]}]"#;
         let events = parse_events(data);
-        let text_events: Vec<_> = events.iter().filter_map(|e| match e { LlmStreamEvent::TextDelta(s) => Some(s.clone()), _ => None }).collect();
+        let text_events: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                LlmStreamEvent::TextDelta(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
         assert!(text_events.contains(&"A".to_string()));
         assert!(text_events.contains(&"B".to_string()));
     }

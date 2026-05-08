@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -15,7 +15,11 @@ fn detect_cd_target(command: &str, current_dir: &Path) -> Option<PathBuf> {
     if !trimmed.starts_with("cd ") && !trimmed.starts_with("cd\t") && trimmed != "cd" {
         return None;
     }
-    let rest = if trimmed == "cd" { "" } else { trimmed[3..].trim() };
+    let rest = if trimmed == "cd" {
+        ""
+    } else {
+        trimmed[3..].trim()
+    };
     // Stop at && or ; (compound commands like `cd /tmp && ls`).
     let path_str = rest.split(&['&', ';'][..]).next().unwrap_or("").trim();
     // Strip surrounding quotes.
@@ -65,12 +69,15 @@ impl Tool for ShellExecTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let command = match args.get("command").and_then(|c| c.as_str()) {
             Some(c) if !c.is_empty() => c,
-            Some(_) => return ToolOutput::error(
-                "❌ Parameter Error: 'command' cannot be empty\n\n\
-                 💡 Example: {\"command\": \"ls -la\", \"timeout_ms\": 5000}"
-            ),
-            None => return ToolOutput::error(
-                "❌ Missing Required Parameter: 'command'\n\n\
+            Some(_) => {
+                return ToolOutput::error(
+                    "❌ Parameter Error: 'command' cannot be empty\n\n\
+                 💡 Example: {\"command\": \"ls -la\", \"timeout_ms\": 5000}",
+                );
+            }
+            None => {
+                return ToolOutput::error(
+                    "❌ Missing Required Parameter: 'command'\n\n\
                  💡 How to fix:\n\
                  • Add the 'command' parameter with your shell command\n\
                  • Command will run in the system shell (bash on Linux/Mac, cmd on Windows)\n\
@@ -78,8 +85,9 @@ impl Tool for ShellExecTool {
                  📝 Examples:\n\
                  {\"command\": \"ls -la\"} - List files\n\
                  {\"command\": \"cargo build\"} - Build Rust project\n\
-                 {\"command\": \"git status\"} - Check git status"
-            ),
+                 {\"command\": \"git status\"} - Check git status",
+                );
+            }
         };
         let timeout_ms = args
             .get("timeout_ms")
@@ -88,7 +96,7 @@ impl Tool for ShellExecTool {
 
         let shell = &ctx.runtime.shell;
         let mut cmd = Command::new(&shell.path);
-        
+
         // On Windows, set PowerShell output encoding to UTF-8 to avoid garbled Chinese text
         if cfg!(windows) && (shell.name == "powershell" || shell.name == "pwsh") {
             // Set UTF-8 encoding for PowerShell
@@ -160,9 +168,7 @@ impl Tool for ShellExecTool {
 
         match result {
             Ok((lines, status)) => {
-                let exit_code = status
-                    .map(|s| s.code().unwrap_or(-1))
-                    .unwrap_or(-1);
+                let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
 
                 // Truncate to last 50 lines for LLM context.
                 let truncated = if lines.len() > 50 {

@@ -1,8 +1,8 @@
 pub mod anthropic;
 pub mod openai;
 pub mod openai_sse;
-pub mod tokenizer;
 mod sse;
+pub mod tokenizer;
 pub mod universal_adapter;
 
 use crate::message::{Message, TokenUsage};
@@ -63,7 +63,12 @@ pub fn context_window_for_model(model: &str) -> u32 {
         _ if m.starts_with("gpt-3.5") => 16_385,
         _ if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => 200_000,
         // Anthropic models
-        _ if m.starts_with("claude-3") || m.starts_with("claude-opus") || m.starts_with("claude-sonnet") => 200_000,
+        _ if m.starts_with("claude-3")
+            || m.starts_with("claude-opus")
+            || m.starts_with("claude-sonnet") =>
+        {
+            200_000
+        }
         _ if m.starts_with("claude-2") => 100_000,
         _ if m.starts_with("claude") => 200_000,
         // DeepSeek
@@ -109,7 +114,9 @@ pub fn resolve_provider_name_with_config<'a>(
     // If prefix inference returned "openai" as default (no match), try default_provider.
     if inferred == "openai" && !config.default_provider.is_empty() {
         // Check if the model name actually matches a known prefix; if not, use default_provider.
-        let known_prefixes = ["gpt", "o1", "chatgpt", "claude", "deepseek", "gemini", "qwen", "glm"];
+        let known_prefixes = [
+            "gpt", "o1", "chatgpt", "claude", "deepseek", "gemini", "qwen", "glm",
+        ];
         let lower = model.to_lowercase();
         if !known_prefixes.iter().any(|p| lower.starts_with(p)) {
             return config.default_provider.as_str();
@@ -166,23 +173,24 @@ pub fn create_provider_with_info(
 
     // Resolve API key: env var overrides config.
     let env_key = format!("OX_{}_API_KEY", provider_name.to_uppercase());
-    let (api_key, api_key_source) = if let Some(key) = std::env::var(&env_key)
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        (key, ApiKeySource::EnvVar(env_key))
-    } else if !provider_cfg.api_key.is_empty() {
-        (provider_cfg.api_key.clone(), ApiKeySource::ConfigFile)
-    } else {
-        return Err(anyhow::anyhow!(
-            "{provider_name} API key not set. Set {env_key} env var or \
+    let (api_key, api_key_source) =
+        if let Some(key) = std::env::var(&env_key).ok().filter(|s| !s.is_empty()) {
+            (key, ApiKeySource::EnvVar(env_key))
+        } else if !provider_cfg.api_key.is_empty() {
+            (provider_cfg.api_key.clone(), ApiKeySource::ConfigFile)
+        } else {
+            return Err(anyhow::anyhow!(
+                "{provider_name} API key not set. Set {env_key} env var or \
              [models.providers.{provider_name}] api_key in ~/.ox/config.toml"
-        ));
-    };
+            ));
+        };
 
     // Resolve base_url: config > provider default.
     let (base_url, base_url_source) = if provider_cfg.base_url.is_empty() {
-        (default_base_url(&provider_name).to_string(), BaseUrlSource::Default)
+        (
+            default_base_url(&provider_name).to_string(),
+            BaseUrlSource::Default,
+        )
     } else {
         (provider_cfg.base_url.clone(), BaseUrlSource::ConfigFile)
     };
@@ -245,7 +253,10 @@ mod tests {
     #[test]
     fn test_default_base_url() {
         assert_eq!(default_base_url("openai"), "https://api.openai.com/v1");
-        assert_eq!(default_base_url("anthropic"), "https://api.anthropic.com/v1");
+        assert_eq!(
+            default_base_url("anthropic"),
+            "https://api.anthropic.com/v1"
+        );
         assert_eq!(default_base_url("deepseek"), "https://api.deepseek.com/v1");
         assert_eq!(default_base_url("unknown"), "https://api.openai.com/v1");
     }
@@ -254,21 +265,38 @@ mod tests {
     fn test_resolve_provider_name_with_config_explicit_mapping() {
         use crate::config::ModelsConfig;
         let mut config = ModelsConfig::default();
-        config.model_providers.insert("deepseek-v4-pro".to_string(), "openai".to_string());
+        config
+            .model_providers
+            .insert("deepseek-v4-pro".to_string(), "openai".to_string());
 
         // Explicit mapping takes priority.
-        assert_eq!(resolve_provider_name_with_config("deepseek-v4-pro", &config), "openai");
+        assert_eq!(
+            resolve_provider_name_with_config("deepseek-v4-pro", &config),
+            "openai"
+        );
         // Unmapped model falls back to prefix inference.
-        assert_eq!(resolve_provider_name_with_config("gpt-4o", &config), "openai");
-        assert_eq!(resolve_provider_name_with_config("claude-sonnet-4", &config), "anthropic");
+        assert_eq!(
+            resolve_provider_name_with_config("gpt-4o", &config),
+            "openai"
+        );
+        assert_eq!(
+            resolve_provider_name_with_config("claude-sonnet-4", &config),
+            "anthropic"
+        );
     }
 
     #[test]
     fn test_resolve_provider_name_with_config_empty_mapping() {
         use crate::config::ModelsConfig;
         let config = ModelsConfig::default();
-        assert_eq!(resolve_provider_name_with_config("deepseek-coder", &config), "deepseek");
-        assert_eq!(resolve_provider_name_with_config("gpt-4o", &config), "openai");
+        assert_eq!(
+            resolve_provider_name_with_config("deepseek-coder", &config),
+            "deepseek"
+        );
+        assert_eq!(
+            resolve_provider_name_with_config("gpt-4o", &config),
+            "openai"
+        );
     }
 
     #[test]
@@ -278,10 +306,22 @@ mod tests {
         config.default_provider = "openai".to_string();
 
         // Unknown model prefix falls back to default_provider.
-        assert_eq!(resolve_provider_name_with_config("my-custom-model", &config), "openai");
+        assert_eq!(
+            resolve_provider_name_with_config("my-custom-model", &config),
+            "openai"
+        );
         // Known prefix still uses prefix inference.
-        assert_eq!(resolve_provider_name_with_config("gpt-4o", &config), "openai");
-        assert_eq!(resolve_provider_name_with_config("claude-sonnet-4", &config), "anthropic");
-        assert_eq!(resolve_provider_name_with_config("deepseek-coder", &config), "deepseek");
+        assert_eq!(
+            resolve_provider_name_with_config("gpt-4o", &config),
+            "openai"
+        );
+        assert_eq!(
+            resolve_provider_name_with_config("claude-sonnet-4", &config),
+            "anthropic"
+        );
+        assert_eq!(
+            resolve_provider_name_with_config("deepseek-coder", &config),
+            "deepseek"
+        );
     }
 }

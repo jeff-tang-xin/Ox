@@ -27,7 +27,6 @@ pub struct OxConfig {
     pub spec: SpecConfig,
 }
 
-
 impl OxConfig {
     /// Load configuration from file, falling back to defaults for any missing field.
     /// If the file doesn't exist, returns full defaults.
@@ -108,58 +107,64 @@ impl OxConfig {
 }
 
 /// Default config.toml template with commented examples.
-const DEFAULT_CONFIG_TEMPLATE: &str = r##"# Ox CLI Configuration
+const DEFAULT_CONFIG_TEMPLATE: &str = r##"# ════════════════════════════════════════════════════════════
+# Ox CLI Configuration
 # Location: ~/.ox/config.toml
+# ════════════════════════════════════════════════════════════
 
+# ── General Settings ──────────────────────────────────────
 [general]
-# version = "2.1"
-# debug_mode = false
-# verbose = false
-# lang = "en"
+# version = "2.1"              # Config version (for future compatibility)
+# debug_mode = false           # Enable debug logging
+# verbose = false              # Show detailed output
+# lang = "en"                  # Language: "en", "zh", etc.
 
+# ── LLM Models ───────────────────────────────────────────
 [models]
-default = "gpt-4o"
-# backup = ["claude-sonnet-4", "gpt-4-turbo"]
-# adaptive_thinking = true
-# effort_level = "high"
+default = "gpt-4o"             # Default model to use
+# backup = ["claude-sonnet-4", "gpt-4-turbo"]  # Fallback models
+# adaptive_thinking = true     # Enable adaptive reasoning depth
+# effort_level = "high"        # Reasoning effort: "low", "medium", "high"
 
-# ── Provider configuration ──
+# ── Provider Configuration ───────────────────────────────
 # Each provider has its own section under [models.providers.<name>].
-# api_key can also be set via environment variable: OX_OPENAI_API_KEY, OX_ANTHROPIC_API_KEY, etc.
+# API keys can also be set via environment variables:
+#   OX_OPENAI_API_KEY, OX_ANTHROPIC_API_KEY, OX_DEEPSEEK_API_KEY
 # Environment variables take priority over config file values.
 
 [models.providers.openai]
-api_key = ""
-# base_url = "https://api.openai.com/v1"
-# max_tokens = 4096
-# stream_usage = true  # Enable for usage tracking (official OpenAI only)
+api_key = ""                   # Your OpenAI API key (sk-...)
+# base_url = "https://api.openai.com/v1"       # Custom API endpoint
+# max_tokens = 4096            # Maximum response tokens
+# stream_usage = true          # Enable usage tracking (official OpenAI only)
 
 [models.providers.anthropic]
-api_key = ""
-# base_url = "https://api.anthropic.com/v1"
-# max_tokens = 8192
+api_key = ""                   # Your Anthropic API key (sk-ant-...)
+# base_url = "https://api.anthropic.com/v1"    # Custom API endpoint
+# max_tokens = 8192            # Maximum response tokens
 
 [models.providers.deepseek]
-api_key = ""
-# base_url = "https://api.deepseek.com/v1"
-# max_tokens = 4096
+api_key = ""                   # Your DeepSeek API key
+# base_url = "https://api.deepseek.com/v1"     # Custom API endpoint
+# max_tokens = 4096            # Maximum response tokens
 
-# ── Explicit model→provider mapping ──
+# ── Advanced Model Configuration ─────────────────────────
 # Fallback provider when model name doesn't match any known prefix.
 # Example: default_provider = "openai"  (for OpenAI-compatible APIs like DashScope)
 # default_provider = "openai"
 
-# Explicit model→provider mapping (overrides prefix inference and default_provider).
+# Explicit model→provider mapping (overrides automatic detection).
+# Use this for custom model names or non-standard providers.
 # [models.model_providers]
 # "deepseek-v4-pro" = "openai"
+# "custom-model" = "anthropic"
 
-# ── Embedding Compression (KadaneDial) ──
+# ── Embedding Compression (KadaneDial) ───────────────────
 # Uses BGE embedding model for semantic context compression.
-# Triggers automatically when history tokens exceed history budget.
-# The history budget is calculated as: context_window * history_ratio (default 10%).
-# This ratio is controlled by [context] history_ratio below.
+# Automatically triggers when conversation history exceeds budget.
+# History budget = context_window × history_ratio (default 10%).
 #
-# To download a BGE model, use the /download-model command in Ox REPL:
+# To download a BGE model, use the /download-model command:
 #   /download-model                    # Downloads bge-small-zh-v1.5 (default)
 #   /download-model bge-base-zh-v1.5   # Downloads base model
 #   /download-model bge-large-zh-v1.5  # Downloads large model
@@ -170,117 +175,164 @@ api_key = ""
 #   - bge-large-zh-v1.5  (~1.2GB, best quality, slower)
 
 [models.embedding]
-enabled = false
-# model_path = "~/.ox/models/bge-small-zh-v1.5"  # Path to downloaded BGE model
-# threshold = 0.0   # Z-score threshold for relevance filtering (higher = stricter)
-# stop_threshold = 0.5  # Stop selecting segments when gain drops below this
-# max_segments = 5  # Maximum number of conversation segments to keep
-# min_segment_len = 2  # Minimum messages per segment
-# keep_recent = 4  # Always keep the N most recent messages uncompressed
-# chunk_threshold_tokens = 256  # Split messages longer than this into chunks
-# max_chunk_tokens = 512  # Maximum tokens per chunk when splitting long messages
+enabled = false              # Enable embedding-based compression
+# model_path = "~/.ox/models/bge-small-zh-v1.5"  # Path to BGE model
+# threshold = 0.0            # Z-score threshold (higher = stricter filtering)
+# stop_threshold = 0.5       # Stop selecting when gain drops below this
+# max_segments = 5           # Maximum conversation segments to keep
+# min_segment_len = 2        # Minimum messages per segment
+# keep_recent = 4            # Always keep N most recent messages
+# chunk_threshold_tokens = 256  # Split messages longer than this
+# max_chunk_tokens = 512     # Maximum tokens per chunk
 
+# ── REPL Settings ────────────────────────────────────────
 [repl]
-# history_file = "~/.ox/history"
-# max_history_entries = 10000
-# multiline_enabled = true
-# stream_output = true
-# syntax_highlight = true
+# history_file = "~/.ox/history"         # Command history file
+# max_history_entries = 10000            # Maximum history entries
+# multiline_enabled = true               # Enable multi-line input
+# stream_output = true                   # Stream responses in real-time
+# syntax_highlight = true                # Enable syntax highlighting
 
+# ── Terminal UI Settings ─────────────────────────────────
 [terminal]
-# split_view = true
-# output_ratio = 85
-# urgent_prefix = "!"
-# input_during_agent = true
+# split_view = true            # Split view mode (input/output panes)
+# output_ratio = 85            # Output pane height percentage (0-100)
+# urgent_prefix = "!"          # Prefix for urgent messages
+# input_during_agent = true    # Allow typing while agent is working
 
+# ── Session Management ───────────────────────────────────
 [session]
-# auto_restore = true
-# max_archived_sessions = 50
+# auto_restore = true          # Auto-restore last session on startup
+# max_archived_sessions = 50   # Maximum archived sessions to keep
 
+# ── Context Window Management ────────────────────────────
 [context]
-# max_history_turns = 20
-# memory_budget_tokens = 2000
-# history_budget_tokens = 50000
-# reply_reserve_tokens = 73000
-# history_ratio = 0.10  # 10% of context window for history (triggers compression when exceeded)
-# memory_ratio = 0.02    # 2% for memory context
-# system_prompt_ratio = 0.02  # 2% for system prompt
+# max_history_turns = 20       # Maximum conversation turns to keep
+# memory_budget_tokens = 2000  # Token budget for memory context
+# history_budget_tokens = 50000  # Token budget for conversation history
+# reply_reserve_tokens = 73000  # Reserve tokens for LLM response
+# history_ratio = 0.10         # History budget ratio (10% of context window)
+# memory_ratio = 0.02          # Memory budget ratio (2% of context window)
+# system_prompt_ratio = 0.02   # System prompt budget ratio (2%)
 
+# ── Tool Execution Settings ──────────────────────────────
 [tools]
-# auto_confirm_safe = true
-# confirm_writes = true
-# confirm_shell = true
-# shell_timeout_ms = 30000          # Shell命令超时时间（毫秒）
-# max_output_chars = 10000         # Shell输出最大字符数（默认10000，约200-300行）
-                                    # 推荐范围: 5000(快速) ~ 20000(详细) ~ 50000(最大)
+# auto_confirm_safe = true     # Auto-confirm safe tool executions
+# confirm_writes = true        # Require confirmation for file writes
+# confirm_shell = true         # Require confirmation for shell commands
+# shell_timeout_ms = 30000     # Shell command timeout (milliseconds)
+# max_output_chars = 10000     # Max shell output characters (≈200-300 lines)
+                                # Recommended: 5000(fast) ~ 20000(detailed) ~ 50000(max)
 
+# ── Agent Loop Settings ──────────────────────────────────
 [agent]
-# max_iterations = 25
-# max_per_turn_tokens = 500000
+# max_iterations = 25          # Maximum agent loop iterations per turn
+# max_per_turn_tokens = 500000  # Max tokens per turn before user confirmation
 
+# ── Council Mode (Multi-LLM Discussion) ──────────────────
 [council]
-# default_rounds = 2
-# max_rounds = 3
-# max_participants = 4
-# participants = ["gpt-4o", "claude-sonnet-4-20250514", "deepseek-coder"]
-# arbiter_model = "default"
-# early_convergence_threshold = 0.8
-# verbose_by_default = false
-# budget_warning = true
-# council_memory_decay_factor = 0.7
+# default_rounds = 2           # Default discussion rounds
+# max_rounds = 3               # Maximum discussion rounds
+# max_participants = 4         # Maximum participating LLMs
+# participants = ["gpt-4o", "claude-sonnet-4", "deepseek-coder"]
+# arbiter_model = "default"    # Model to arbitrate discussions
+# early_convergence_threshold = 0.8  # Early stop if agreement > 80%
+# verbose_by_default = false   # Show detailed council discussions
+# budget_warning = true        # Warn about high token costs
+# council_memory_decay_factor = 0.7  # Memory decay between rounds
 
+# ── Memory System ────────────────────────────────────────
 [memory]
-# max_nodes = 1000
-# alpha = 0.8
-# time_decay = 0.01
-# isolation_application = true
-# share_session_group = true
-# share_request = true
-# export_format = "json"
-# janitor_run_on_startup_prob = 0.2
+# max_nodes = 1000             # Maximum memory nodes to store
+# alpha = 0.8                  # Importance weight for new memories
+# time_decay = 0.01            # Time-based decay rate
+# isolation_application = true # Isolate memories by application
+# share_session_group = true   # Share memories within session group
+# share_request = true         # Share memories across requests
+# export_format = "json"       # Export format: "json" or "csv"
+# janitor_run_on_startup_prob = 0.2  # Probability of cleanup on startup (0.0-1.0)
 
+# Project-specific memory decay
 [memory.project_decay]
-# base_half_life = 30
-# critical_threshold = 0.3
+# base_half_life = 30          # Days until memory importance halves
+# critical_threshold = 0.3     # Below this, memory is considered low priority
 
+# Global memory decay
 [memory.overall_decay]
-# beta = 0.015
+# beta = 0.015                 # Global decay rate
 
-# Language-specific decay configurations
+# Language-specific decay configurations (optional)
+# Customize memory retention for different programming languages.
 # [memory.language_config.rust]
-# lambda = 0.02
-# max_retention_days = 30
-# traces = [0.1, 0.2, 0.3, 0.4, 0.5]
+# lambda = 0.02                # Decay rate for Rust memories
+# max_retention_days = 30      # Maximum days to retain
+# traces = [0.1, 0.2, 0.3, 0.4, 0.5]  # Depth-based retention weights
 
 # [memory.language_config.python]
 # lambda = 0.01
 # max_retention_days = 90
 # traces = [0.05, 0.15, 0.25, 0.35, 0.5]
 
+# Memory transformation (consolidate similar memories)
 [memory.transform]
-# interval_days = 7
-# batch_size = 20
-# daily_token_cap = 10000
-# trigger = "manual"  # "manual" (需 /memory transform) | "auto" (定期自动)
+# interval_days = 7            # Run transformation every N days
+# batch_size = 20              # Process N memories per batch
+# daily_token_cap = 10000      # Maximum tokens per day for transformation
+# trigger = "manual"           # "manual" (use /memory transform) | "auto" (automatic)
+
+# ── Behavior Rules (Coding Standards) ────────────────────
+# Define custom coding rules that override built-in behavior.
+# These rules are injected into the system prompt and MUST be followed.
+#
+# Option 1: Use built-in rules (set enforce_all = true)
+# Option 2: Define custom rules (fill custom_rules array)
+#
+# Custom rules take HIGHEST PRIORITY and override built-in rules.
+# Examples:
+#   - "Always use Result<T, E> for error handling instead of unwrap()"
+#   - "Prefer async/await over blocking operations for I/O"
+#   - "Add doc comments to all public functions"
+#   - "Follow Rust naming conventions (snake_case, PascalCase)"
 
 [behavior_rules]
-# enforce_safe_code = true
-# enforce_lint = true
-# enforce_format = true
-# enforce_tests = true
-# enforce_all = true
+# Built-in rule toggles (only used when custom_rules is empty)
+# enforce_safe_code = true     # Never bypass safety checks
+# enforce_lint = true          # Run lint before declaring complete
+# enforce_format = true        # Format code before writing files
+# enforce_tests = true         # Write tests for new functions
+# enforce_all = true           # Enable all built-in rules
 
+# Custom coding rules (overrides built-in rules when not empty)
+# custom_rules = [
+#     "Use Result<T, anyhow::Error> for all fallible operations",
+#     "Prefer async/await for I/O operations",
+#     "Add #[derive(Debug)] to all custom types",
+#     "Write integration tests for public APIs",
+#     "Log errors with context (request_id, user_id)",
+#     "Validate all user input before processing",
+#     "Document public APIs with /// doc comments",
+#     "Run cargo fmt and cargo clippy before committing"
+# ]
+
+# ── Safety Settings ──────────────────────────────────────
 [safety]
-# enable_sandbox = false
-# confirm_dangerous_ops = true
-# high_risk_apis = ["Command::new", "remove_dir_all", "fs::remove_dir_all", "os.remove", "os.rmdir"]
-# custom_rules = []
+# enable_sandbox = false       # Enable sandboxed execution
+# confirm_dangerous_ops = true # Require confirmation for dangerous operations
+# high_risk_apis = [           # APIs that require explicit confirmation
+#     "Command::new",
+#     "remove_dir_all",
+#     "fs::remove_dir_all",
+#     "os.remove",
+#     "os.rmdir"
+# ]
+# custom_rules = []            # Additional safety rules
 
+# ── Cost Management ──────────────────────────────────────
 [cost]
-# max_monthly_cost = 5.0
-# max_daily_cost = 2.0
-# budget_alert_threshold = 0.8
-# cost_transparency = true
+# max_monthly_cost = 5.0       # Maximum monthly spending (USD)
+# max_daily_cost = 2.0         # Maximum daily spending (USD)
+# budget_alert_threshold = 0.8 # Alert when reaching 80% of budget
+# cost_transparency = true     # Show cost breakdown after each response
 "##;
 
 // ──────────────────────────── Sections ────────────────────────────
@@ -463,8 +515,8 @@ pub struct EmbeddingConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            model_path: None,
+            enabled: true,  // 🆕 Default: ENABLED for better retrieval accuracy
+            model_path: None,  // Will use ~/.ox/models/bge-small-zh-v1.5 if not specified
             threshold: 0.0,
             stop_threshold: 0.5,
             max_segments: 5,
@@ -508,7 +560,8 @@ impl Default for ModelsConfig {
             providers: HashMap::new(),
             default_provider: String::new(),
             model_providers: HashMap::new(),
-            embedding: None,
+            // 🆕 Default: Enable embedding for memory re-ranking
+            embedding: Some(EmbeddingConfig::default()),
         }
     }
 }
@@ -528,10 +581,7 @@ impl ModelsConfig {
                 .and_then(|v| v.as_str())
                 && !key.is_empty()
             {
-                let entry = self
-                    .providers
-                    .entry(provider_name.to_string())
-                    .or_default();
+                let entry = self.providers.entry(provider_name.to_string()).or_default();
                 if entry.api_key.is_empty() {
                     entry.api_key = key.to_string();
                     tracing::warn!(
@@ -595,6 +645,9 @@ pub struct MemoryConfig {
     pub overall_decay: OverallDecayConfig,
     pub language_config: HashMap<String, LanguageDecayConfig>,
     pub transform: MemoryTransformConfig,
+    // 🆕 LLM Judge re-ranking configuration
+    pub enable_llm_judge: bool,
+    pub llm_judge_threshold: u8,
 }
 
 impl Default for MemoryConfig {
@@ -630,6 +683,9 @@ impl Default for MemoryConfig {
             overall_decay: OverallDecayConfig::default(),
             language_config: lang_config,
             transform: MemoryTransformConfig::default(),
+            // 🆕 LLM Judge defaults (enabled by default)
+            enable_llm_judge: true,  // Default: ENABLED
+            llm_judge_threshold: 7,   // Only keep memories with score >= 7
         }
     }
 }
@@ -699,7 +755,7 @@ pub struct BehaviorRulesConfig {
     pub enforce_format: bool,
     pub enforce_tests: bool,
     pub enforce_all: bool,
-    
+
     /// User-defined mandatory coding rules (replaces language-specific rules).
     /// These rules are injected into system prompt and MUST be followed.
     /// Custom rules override built-in behavior rules but NOT basic safety rules.
@@ -908,7 +964,10 @@ api_key = "sk-new"
         config.models.migrate_legacy(&raw);
 
         let openai = config.models.providers.get("openai").unwrap();
-        assert_eq!(openai.api_key, "sk-new", "New config should not be overwritten by legacy");
+        assert_eq!(
+            openai.api_key, "sk-new",
+            "New config should not be overwritten by legacy"
+        );
     }
 
     #[test]

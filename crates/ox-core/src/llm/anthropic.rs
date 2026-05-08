@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::llm::sse::SseEventBuffer;
-use crate::llm::{context_window_for_model, LlmProvider, LlmStreamEvent, ToolSchema};
+use crate::llm::{LlmProvider, LlmStreamEvent, ToolSchema, context_window_for_model};
 use crate::message::{Message, TokenUsage};
 
 pub struct AnthropicProvider {
@@ -102,23 +102,25 @@ impl LlmProvider for AnthropicProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
-            
+
             // Try to parse structured error info
             let err_msg = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
-                let error_type = json.get("error")
+                let error_type = json
+                    .get("error")
                     .and_then(|e| e.get("type"))
                     .and_then(|t| t.as_str())
                     .unwrap_or("unknown");
-                let error_message = json.get("error")
+                let error_message = json
+                    .get("error")
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
                     .unwrap_or(&body_text);
-                
+
                 format!("Anthropic API error [{status} {error_type}]: {error_message}")
             } else {
                 format!("Anthropic API error [{status}]: {body_text}")
             };
-            
+
             tracing::error!("{}", err_msg);
             let _ = tx.send(LlmStreamEvent::Error(err_msg));
             return Ok(());
@@ -133,12 +135,12 @@ impl LlmProvider for AnthropicProvider {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             let chunk_str = String::from_utf8_lossy(&chunk);
-            
+
             for line in chunk_str.lines() {
                 if sse_buffer.push_line(line) {
                     let data = sse_buffer.take_data();
                     let event_type = sse_buffer.event_type();
-                    
+
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
                         if process_anthropic_event(
                             event_type,
@@ -150,7 +152,7 @@ impl LlmProvider for AnthropicProvider {
                             done_sent = true;
                         }
                     }
-                    
+
                     sse_buffer.reset();
                 }
             }
@@ -185,11 +187,11 @@ fn process_anthropic_event(
 ) -> bool {
     match event_type {
         "message_start" => {
-            if let Some(usage) = json
-                .get("message")
-                .and_then(|m| m.get("usage"))
-            {
-                *prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            if let Some(usage) = json.get("message").and_then(|m| m.get("usage")) {
+                *prompt_tokens = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
             }
             false
         }
@@ -213,9 +215,14 @@ fn process_anthropic_event(
                         .unwrap_or("");
                     if !name.is_empty() {
                         block_index_to_id.insert(index, id.clone());
-                        let _ = tx.send(LlmStreamEvent::ToolCallStart { id, name: name.to_string() });
+                        let _ = tx.send(LlmStreamEvent::ToolCallStart {
+                            id,
+                            name: name.to_string(),
+                        });
                     } else {
-                        tracing::warn!("Anthropic tool_use block with empty name at index {index}, skipping");
+                        tracing::warn!(
+                            "Anthropic tool_use block with empty name at index {index}, skipping"
+                        );
                     }
                 }
             }
@@ -224,25 +231,19 @@ fn process_anthropic_event(
         "content_block_delta" => {
             let index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
             if let Some(delta) = json.get("delta") {
-                let delta_type = delta
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match delta_type {
                     "text_delta" => {
                         if let Some(text) = delta.get("text").and_then(|t| t.as_str())
-                            && !text.is_empty() {
-                                let _ = tx.send(LlmStreamEvent::TextDelta(text.to_string()));
-                            }
+                            && !text.is_empty()
+                        {
+                            let _ = tx.send(LlmStreamEvent::TextDelta(text.to_string()));
+                        }
                     }
                     "input_json_delta" => {
-                        if let Some(partial) =
-                            delta.get("partial_json").and_then(|p| p.as_str())
-                        {
-                            let id = block_index_to_id
-                                .get(&index)
-                                .cloned();
-                            
+                        if let Some(partial) = delta.get("partial_json").and_then(|p| p.as_str()) {
+                            let id = block_index_to_id.get(&index).cloned();
+
                             if let Some(id) = id {
                                 let _ = tx.send(LlmStreamEvent::ToolCallArgumentsDelta {
                                     id,
@@ -298,13 +299,13 @@ fn process_anthropic_event(
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("Unknown Anthropic error");
-            
+
             let full_error = format!("Anthropic stream error [{error_type}]: {error_msg}");
             tracing::error!("{}", full_error);
             let _ = tx.send(LlmStreamEvent::Error(full_error));
             false
         }
-        _ => false
+        _ => false,
     }
 }
 

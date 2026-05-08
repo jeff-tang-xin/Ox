@@ -3,7 +3,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::llm::openai_sse::OpenAiSseParser;
-use crate::llm::{context_window_for_model, LlmProvider, LlmStreamEvent, ToolSchema};
+use crate::llm::{LlmProvider, LlmStreamEvent, ToolSchema, context_window_for_model};
 use crate::message::{Message, TokenUsage};
 
 pub struct OpenAiProvider {
@@ -17,15 +17,25 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(model: String, api_key: String, base_url: String, max_tokens: Option<u32>, stream_usage: bool, disable_tools: bool) -> Self {
+    pub fn new(
+        model: String,
+        api_key: String,
+        base_url: String,
+        max_tokens: Option<u32>,
+        stream_usage: bool,
+        disable_tools: bool,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .unwrap_or_else(|e| {
-                tracing::warn!("Failed to build custom reqwest client: {}, using default", e);
+                tracing::warn!(
+                    "Failed to build custom reqwest client: {}, using default",
+                    e
+                );
                 reqwest::Client::new()
             });
-        
+
         Self {
             model,
             api_key,
@@ -50,10 +60,7 @@ impl LlmProvider for OpenAiProvider {
         tools: &[ToolSchema],
         tx: mpsc::UnboundedSender<LlmStreamEvent>,
     ) -> Result<()> {
-        let api_messages = messages
-            .iter()
-            .map(message_to_openai)
-            .collect::<Vec<_>>();
+        let api_messages = messages.iter().map(message_to_openai).collect::<Vec<_>>();
 
         let mut body = serde_json::json!({
             "model": self.model,
@@ -86,6 +93,9 @@ impl LlmProvider for OpenAiProvider {
             body["tools"] = serde_json::Value::Array(tool_defs);
         }
 
+        // Debug: Log the request body for troubleshooting
+        tracing::debug!("OpenAI request body: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
+
         let resp = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
@@ -94,22 +104,34 @@ impl LlmProvider for OpenAiProvider {
             .json(&body)
             .send()
             .await;
-        
+
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Failed to send request to {}: {}", self.base_url, e);
-                
+
                 let error_msg = if e.is_timeout() {
-                    format!("请求超时：无法连接到 {}\n\n可能原因：\n• 网络连接不稳定\n• API 服务器响应过慢\n• 防火墙阻止连接", self.base_url)
+                    format!(
+                        "请求超时：无法连接到 {}\n\n可能原因：\n• 网络连接不稳定\n• API 服务器响应过慢\n• 防火墙阻止连接",
+                        self.base_url
+                    )
                 } else if e.is_connect() {
-                    format!("连接失败：无法连接到 {}\n\n可能原因：\n• 网络连接中断\n• DNS 解析失败\n• 防火墙/代理阻止\n• API 服务不可用", self.base_url)
+                    format!(
+                        "连接失败：无法连接到 {}\n\n可能原因：\n• 网络连接中断\n• DNS 解析失败\n• 防火墙/代理阻止\n• API 服务不可用",
+                        self.base_url
+                    )
                 } else if e.is_request() {
-                    format!("请求错误：{}\n\n请检查：\n• API 密钥是否正确\n• base_url 是否配置正确\n• 模型名称是否有效", e)
+                    format!(
+                        "请求错误：{}\n\n请检查：\n• API 密钥是否正确\n• base_url 是否配置正确\n• 模型名称是否有效",
+                        e
+                    )
                 } else {
-                    format!("网络错误：{}\n\nURL: {}\n\n请检查网络连接或稍后重试。", e, self.base_url)
+                    format!(
+                        "网络错误：{}\n\nURL: {}\n\n请检查网络连接或稍后重试。",
+                        e, self.base_url
+                    )
                 };
-                
+
                 let _ = tx.send(LlmStreamEvent::Error(error_msg));
                 return Ok(());
             }
@@ -136,11 +158,11 @@ impl LlmProvider for OpenAiProvider {
                 Ok(chunk) => {
                     consecutive_errors = 0;
                     total_chunks_received += 1;
-                    
+
                     tracing::debug!("Received chunk: {} bytes", chunk.len());
-                    
+
                     let chunk_str = String::from_utf8_lossy(&chunk);
-                    
+
                     let events = parser.parse_chunk(&chunk_str);
                     for event in events {
                         match &event {
@@ -159,22 +181,29 @@ impl LlmProvider for OpenAiProvider {
                         e,
                         e
                     );
-                    
+
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        tracing::error!("Too many consecutive stream errors, aborting. Total chunks received before failure: {}", total_chunks_received);
+                        tracing::error!(
+                            "Too many consecutive stream errors, aborting. Total chunks received before failure: {}",
+                            total_chunks_received
+                        );
                         let _ = tx.send(LlmStreamEvent::Error(
                             format!("网络不稳定，流式响应中断（已接收 {} 个数据块）。请检查网络连接或稍后重试。", total_chunks_received)
                         ));
                         return Ok(());
                     }
-                    
+
                     tracing::debug!("Skipping failed chunk, continuing to receive data...");
                     continue;
                 }
             }
         }
 
-        tracing::info!("Stream ended: total_chunks={}, consecutive_errors={}", total_chunks_received, consecutive_errors);
+        tracing::info!(
+            "Stream ended: total_chunks={}, consecutive_errors={}",
+            total_chunks_received,
+            consecutive_errors
+        );
 
         // Finalize any remaining tool calls
         for event in parser.finalize() {

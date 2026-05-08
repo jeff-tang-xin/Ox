@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
@@ -34,7 +34,11 @@ impl Tool for WebFetchTool {
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> ToolOutput {
         let url = match args.get("url").and_then(|u| u.as_str()) {
             Some(u) => u,
-            None => return ToolOutput::error("Missing required parameter: url. Usage: {\"url\": \"<url>\"}"),
+            None => {
+                return ToolOutput::error(
+                    "Missing required parameter: url. Usage: {\"url\": \"<url>\"}",
+                );
+            }
         };
 
         let client = reqwest::Client::builder()
@@ -52,7 +56,12 @@ impl Tool for WebFetchTool {
                 match resp.text().await {
                     Ok(body) => {
                         let truncated = if body.len() > 10000 {
-                            let end = body.char_indices().take_while(|(i, _)| *i < 10000).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+                            let end = body
+                                .char_indices()
+                                .take_while(|(i, _)| *i < 10000)
+                                .last()
+                                .map(|(i, c)| i + c.len_utf8())
+                                .unwrap_or(0);
                             format!(
                                 "{}\n\n... (truncated, {} total chars)",
                                 &body[..end],

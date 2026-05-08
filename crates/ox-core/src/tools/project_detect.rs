@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
@@ -35,7 +35,7 @@ impl Tool for ProjectDetectTool {
             // Normalize path: trim whitespace and standardize separators
             let normalized_path = p.trim().replace('\\', "/");
             let resolved = ctx.working_dir.join(&normalized_path);
-            
+
             match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
                 Ok(validated) => validated,
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),

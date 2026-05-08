@@ -34,22 +34,22 @@ impl SessionState {
             is_active: true,
         }
     }
-    
+
     /// Set a session variable
     pub fn set_variable(&mut self, key: &str, value: &str) {
         self.variables.insert(key.to_string(), value.to_string());
     }
-    
+
     /// Get a session variable
     pub fn get_variable(&self, key: &str) -> Option<&String> {
         self.variables.get(key)
     }
-    
+
     /// Check if a variable exists and has a truthy value
     pub fn has_variable(&self, key: &str) -> bool {
         self.variables.contains_key(key)
     }
-    
+
     /// Advance to next workflow step
     pub fn advance_step(&mut self, total_steps: usize) -> bool {
         if self.current_step_index < total_steps - 1 {
@@ -60,17 +60,17 @@ impl SessionState {
             false
         }
     }
-    
+
     /// Mark that we're waiting for user confirmation
     pub fn wait_for_confirmation(&mut self) {
         self.awaiting_user_confirmation = true;
     }
-    
+
     /// Clear confirmation flag (after user confirms)
     pub fn clear_confirmation(&mut self) {
         self.awaiting_user_confirmation = false;
     }
-    
+
     /// Increment message count
     pub fn increment_message_count(&mut self) {
         self.message_count += 1;
@@ -94,54 +94,55 @@ impl StateRegistry {
             sessions: std::collections::HashMap::new(),
             current_session_id: None,
         };
-        
+
         // Register default validators
         registry.register_default_validators();
-        
+
         registry
     }
-    
+
     /// Register built-in validators
     fn register_default_validators(&mut self) {
         // Check if task type has been classified
         self.validators.insert(
             "check_task_classified".to_string(),
-            Box::new(|state| state.has_variable("task_type"))
+            Box::new(|state| state.has_variable("task_type")),
         );
-        
+
         // Check if spec file has been created
         self.validators.insert(
             "check_spec_file_exists".to_string(),
-            Box::new(|state| state.has_variable("spec_file_created"))
+            Box::new(|state| state.has_variable("spec_file_created")),
         );
-        
+
         // Check if spec has been confirmed by user
         self.validators.insert(
             "check_spec_confirmed".to_string(),
-            Box::new(|state| state.has_variable("spec_confirmed"))
+            Box::new(|state| state.has_variable("spec_confirmed")),
         );
-        
+
         // Check if task file has been created
         self.validators.insert(
             "check_task_file_exists".to_string(),
-            Box::new(|state| state.has_variable("task_file_created"))
+            Box::new(|state| state.has_variable("task_file_created")),
         );
-        
+
         // Check if task has been confirmed by user
         self.validators.insert(
             "check_task_confirmed".to_string(),
-            Box::new(|state| state.has_variable("task_confirmed"))
+            Box::new(|state| state.has_variable("task_confirmed")),
         );
     }
-    
+
     /// Register a custom validator
     pub fn register_validator<F>(&mut self, name: &str, validator: F)
     where
         F: Fn(&SessionState) -> bool + 'static,
     {
-        self.validators.insert(name.to_string(), Box::new(validator));
+        self.validators
+            .insert(name.to_string(), Box::new(validator));
     }
-    
+
     /// Run a validator
     pub fn validate(&self, validator_name: &str, state: &SessionState) -> bool {
         if let Some(validator) = self.validators.get(validator_name) {
@@ -151,30 +152,33 @@ impl StateRegistry {
             false
         }
     }
-    
+
     /// Create a new session
     pub fn create_session(&mut self, session_id: &str) -> &mut SessionState {
-        self.sessions.entry(session_id.to_string())
+        self.sessions
+            .entry(session_id.to_string())
             .or_insert_with(|| SessionState::new(session_id))
     }
-    
+
     /// Get current session
     pub fn current_session(&self) -> Option<&SessionState> {
-        self.current_session_id.as_ref()
+        self.current_session_id
+            .as_ref()
             .and_then(|id| self.sessions.get(id))
     }
-    
+
     /// Get mutable reference to current session
     pub fn current_session_mut(&mut self) -> Option<&mut SessionState> {
-        self.current_session_id.as_ref()
+        self.current_session_id
+            .as_ref()
             .and_then(|id| self.sessions.get_mut(id))
     }
-    
+
     /// Set current session
     pub fn set_current_session(&mut self, session_id: &str) {
         self.current_session_id = Some(session_id.to_string());
     }
-    
+
     /// Switch to a different session
     pub fn switch_session(&mut self, session_id: &str) -> Option<&mut SessionState> {
         if self.sessions.contains_key(session_id) {
@@ -182,7 +186,7 @@ impl StateRegistry {
             if let Some(old_session) = self.current_session_mut() {
                 old_session.is_active = false;
             }
-            
+
             // Activate new session
             self.current_session_id = Some(session_id.to_string());
             if let Some(new_session) = self.sessions.get_mut(session_id) {

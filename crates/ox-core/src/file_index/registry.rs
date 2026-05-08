@@ -18,7 +18,7 @@ impl FileIndexRegistry {
         if let Err(e) = std::fs::create_dir_all(&db_base_dir) {
             tracing::warn!("Failed to create db directory: {}", e);
         }
-        
+
         Self {
             indices: HashMap::new(),
             db_base_dir,
@@ -29,22 +29,21 @@ impl FileIndexRegistry {
     pub fn get_or_create(&mut self, dir: &Path) -> anyhow::Result<Arc<FileIndexManager>> {
         // 规范化路径（解析符号链接等）
         let canonical = dir.canonicalize().unwrap_or(dir.to_path_buf());
-        
+
         // 如果已有索引，直接返回
         if let Some(manager) = self.indices.get(&canonical) {
             tracing::debug!("Using cached file index for: {:?}", canonical);
             return Ok(Arc::clone(manager));
         }
-        
+
         // 创建新索引
         tracing::info!("Creating new file index for: {:?}", canonical);
-        let db_path = self.db_base_dir.join(format!(
-            "file_index_{}.db",
-            Self::dir_hash(&canonical)
-        ));
-        
+        let db_path = self
+            .db_base_dir
+            .join(format!("file_index_{}.db", Self::dir_hash(&canonical)));
+
         let manager = Arc::new(FileIndexManager::new(&db_path)?);
-        
+
         // 同步扫描 Git 仓库
         match manager.scan_from_git(&canonical) {
             Ok(count) => {
@@ -54,17 +53,19 @@ impl FileIndexRegistry {
                 tracing::warn!("Failed to scan git repo at {:?}: {}", canonical, e);
             }
         }
-        
+
         // 启动后台定期刷新
         let manager_clone = Arc::clone(&manager);
         let canonical_clone = canonical.clone();
         tokio::spawn(async move {
-            manager_clone.start_periodic_refresh(canonical_clone, 120).await;
+            manager_clone
+                .start_periodic_refresh(canonical_clone, 120)
+                .await;
         });
-        
+
         // 缓存索引
         self.indices.insert(canonical, Arc::clone(&manager));
-        
+
         Ok(manager)
     }
 
@@ -79,13 +80,13 @@ impl FileIndexRegistry {
         if self.indices.len() <= keep_recent {
             return;
         }
-        
+
         // 简单策略：保留最近的 N 个索引
         // TODO: 可以实现 LRU 缓存策略
         let to_remove = self.indices.len() - keep_recent;
         let mut keys: Vec<_> = self.indices.keys().cloned().collect();
         keys.sort(); // 确定性顺序
-        
+
         for key in keys.into_iter().take(to_remove) {
             self.indices.remove(&key);
             tracing::debug!("Removed cached file index for: {:?}", key);
@@ -96,7 +97,7 @@ impl FileIndexRegistry {
     fn dir_hash(dir: &Path) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
         dir.hash(&mut hasher);
         format!("{:x}", hasher.finish())
@@ -117,10 +118,10 @@ mod tests {
     async fn test_registry_creation() {
         let temp_dir = TempDir::new().unwrap();
         let db_dir = temp_dir.path().join("db");
-        
+
         let mut registry = FileIndexRegistry::new(db_dir.clone());
         assert_eq!(registry.cached_count(), 0);
-        
+
         // 数据库目录应该被创建
         assert!(db_dir.exists());
     }
@@ -129,17 +130,17 @@ mod tests {
     async fn test_get_or_create_same_dir() {
         let temp_dir = TempDir::new().unwrap();
         let db_dir = temp_dir.path().join("db");
-        
+
         let mut registry = FileIndexRegistry::new(db_dir);
-        
+
         // 第一次创建
         let manager1 = registry.get_or_create(temp_dir.path()).unwrap();
         assert_eq!(registry.cached_count(), 1);
-        
+
         // 第二次应该复用
         let manager2 = registry.get_or_create(temp_dir.path()).unwrap();
         assert_eq!(registry.cached_count(), 1);
-        
+
         // 应该是同一个实例
         assert!(Arc::ptr_eq(&manager1, &manager2));
     }

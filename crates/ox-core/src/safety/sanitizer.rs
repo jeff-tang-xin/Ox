@@ -11,7 +11,11 @@ impl DataSanitizer {
             (Regex::new(r"[\w.+-]+@[\w-]+\.[\w.]+").unwrap(), "[EMAIL]"),
             (Regex::new(r"\b\d{17}[\dXx]\b").unwrap(), "[ID_CARD]"),
             (Regex::new(r"\b\d{16,19}\b").unwrap(), "[BANK_CARD]"),
-            (Regex::new(r"(?i)(password|passwd|pwd|secret|token|api_key|apikey)\s*[:=]\s*\S+").unwrap(), "[REDACTED]"),
+            (
+                Regex::new(r"(?i)(password|passwd|pwd|secret|token|api_key|apikey)\s*[:=]\s*\S+")
+                    .unwrap(),
+                "[REDACTED]",
+            ),
         ];
         Self { patterns }
     }

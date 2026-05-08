@@ -87,6 +87,9 @@ mod tests {
 
     #[test]
     fn short_request_is_medium() {
-        assert_eq!(estimate_effort("Add a login button", 0), EffortLevel::Medium);
+        assert_eq!(
+            estimate_effort("Add a login button", 0),
+            EffortLevel::Medium
+        );
     }
 }

@@ -18,10 +18,17 @@ pub enum OutputLine {
     User(String),
     #[allow(dead_code)]
     Assistant(String),
-    Tool { name: String, detail: Option<String> },
-    ToolResult { name: String, summary: String, is_error: bool },
+    Tool {
+        name: String,
+        detail: Option<String>,
+    },
+    ToolResult {
+        name: String,
+        summary: String,
+        is_error: bool,
+    },
     /// Real-time tool execution log (displayed below tool card in small font)
-    ToolLog { 
+    ToolLog {
         tool_call_id: String,
         message: String,
         timestamp: std::time::Instant,
@@ -154,7 +161,8 @@ impl OutputPane {
                 }
             }
             _ => {
-                self.lines.push(OutputLine::StreamingPartial(chunk.to_string()));
+                self.lines
+                    .push(OutputLine::StreamingPartial(chunk.to_string()));
                 self.rendered_cache.push(None);
             }
         }
@@ -199,7 +207,8 @@ impl OutputPane {
         }
         self.cache_valid = true;
 
-        let total: usize = self.rendered_cache
+        let total: usize = self
+            .rendered_cache
             .iter()
             .map(|e| e.as_ref().map_or(0, |v| v.len()))
             .sum();
@@ -268,7 +277,11 @@ impl OutputPane {
                 }
             }
             OutputLine::Tool { name, detail } => OutputLine::Tool { name, detail },
-            OutputLine::ToolResult { name, summary, is_error } => {
+            OutputLine::ToolResult {
+                name,
+                summary,
+                is_error,
+            } => {
                 if summary.len() > Self::MAX_LINE_LEN {
                     let end = Self::safe_char_boundary(&summary, Self::MAX_LINE_LEN);
                     OutputLine::ToolResult {
@@ -277,7 +290,11 @@ impl OutputPane {
                         is_error,
                     }
                 } else {
-                    OutputLine::ToolResult { name, summary, is_error }
+                    OutputLine::ToolResult {
+                        name,
+                        summary,
+                        is_error,
+                    }
                 }
             }
             OutputLine::System(s) => {
@@ -312,7 +329,11 @@ impl OutputPane {
                     OutputLine::Markdown(s)
                 }
             }
-            OutputLine::ToolLog { tool_call_id, message, timestamp } => {
+            OutputLine::ToolLog {
+                tool_call_id,
+                message,
+                timestamp,
+            } => {
                 if message.len() > Self::MAX_LINE_LEN {
                     let end = Self::safe_char_boundary(&message, Self::MAX_LINE_LEN);
                     OutputLine::ToolLog {
@@ -321,7 +342,11 @@ impl OutputPane {
                         timestamp,
                     }
                 } else {
-                    OutputLine::ToolLog { tool_call_id, message, timestamp }
+                    OutputLine::ToolLog {
+                        tool_call_id,
+                        message,
+                        timestamp,
+                    }
                 }
             }
         }

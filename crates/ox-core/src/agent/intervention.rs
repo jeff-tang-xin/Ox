@@ -2,10 +2,7 @@
 #[derive(Debug, Clone)]
 pub enum InterventionType {
     /// User confirmation required to proceed
-    Confirmation {
-        message: String,
-        allow_reject: bool,
-    },
+    Confirmation { message: String, allow_reject: bool },
     /// User input required (text)
     InputRequired {
         prompt: String,
@@ -40,10 +37,13 @@ pub struct InterventionRequest {
 impl InterventionRequest {
     pub fn confirmation(message: &str, current_step: &str, mode: &str) -> Self {
         Self {
-            id: format!("confirm_{}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()),
+            id: format!(
+                "confirm_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            ),
             intervention_type: InterventionType::Confirmation {
                 message: message.to_string(),
                 allow_reject: true,
@@ -52,13 +52,16 @@ impl InterventionRequest {
             mode: mode.to_string(),
         }
     }
-    
+
     pub fn input_required(prompt: &str, current_step: &str, mode: &str) -> Self {
         Self {
-            id: format!("input_{}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()),
+            id: format!(
+                "input_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            ),
             intervention_type: InterventionType::InputRequired {
                 prompt: prompt.to_string(),
                 default_value: None,
@@ -99,22 +102,22 @@ impl InterventionManager {
             active_intervention: None,
         }
     }
-    
+
     /// Check if there's an active intervention waiting for user response
     pub fn has_active_intervention(&self) -> bool {
         self.active_intervention.is_some()
     }
-    
+
     /// Get the active intervention request
     pub fn get_active_intervention(&self) -> Option<&InterventionRequest> {
         self.active_intervention.as_ref()
     }
-    
+
     /// Queue a new intervention request
     pub fn queue_intervention(&mut self, request: InterventionRequest) {
         self.pending_requests.push(request);
     }
-    
+
     /// Activate the next pending intervention (if any)
     pub fn activate_next(&mut self) -> Option<&InterventionRequest> {
         if !self.pending_requests.is_empty() {
@@ -125,7 +128,7 @@ impl InterventionManager {
             None
         }
     }
-    
+
     /// Process user response to an intervention
     pub fn process_response(&mut self, response: InterventionResponse) -> InterventionAction {
         match response {
@@ -151,7 +154,7 @@ impl InterventionManager {
             }
         }
     }
-    
+
     /// Clear all pending interventions (e.g., when switching modes)
     pub fn clear_all(&mut self) {
         self.pending_requests.clear();

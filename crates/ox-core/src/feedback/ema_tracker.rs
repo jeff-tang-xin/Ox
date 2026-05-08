@@ -1,5 +1,5 @@
 /// Exponential Moving Average (EMA) trend tracker
-/// 
+///
 /// Tracks metrics over time using EMA to identify trends without requiring large datasets.
 /// Suitable for personal CLI tools with limited evolution_log data (< 200 entries).
 #[derive(Debug, Clone)]
@@ -32,14 +32,14 @@ impl EmatrendTracker {
             self.trend = 0.0;
         } else {
             let old_value = self.current_value;
-            
+
             // Update EMA value
             self.current_value = old_value + self.alpha * (new_value - old_value);
-            
+
             // Update trend (rate of change)
             self.trend = self.current_value - old_value;
         }
-        
+
         self.sample_count += 1;
     }
 
@@ -146,20 +146,16 @@ impl Emamanager {
     }
 
     /// Calculate code acceptance rate from override signals
-    pub fn calculate_accept_rate(
-        &mut self,
-        total_writes: u32,
-        accepted_writes: u32,
-    ) -> f64 {
+    pub fn calculate_accept_rate(&mut self, total_writes: u32, accepted_writes: u32) -> f64 {
         if total_writes == 0 {
             return 1.0; // No writes yet, assume perfect acceptance
         }
-        
+
         let rate = accepted_writes as f64 / total_writes as f64;
-        
+
         // Update EMA tracker for accept_rate
         self.update_metric("code_accept_rate", rate);
-        
+
         rate
     }
 }
@@ -190,7 +186,7 @@ mod tests {
         let mut tracker = EmatrendTracker::new(0.2);
         tracker.update(0.8);
         tracker.update(0.6);
-        
+
         // EMA should move towards 0.6 but not reach it immediately
         assert!(tracker.current_value < 0.8);
         assert!(tracker.current_value > 0.6);
@@ -204,17 +200,17 @@ mod tests {
         tracker.update(0.9);
         tracker.update(0.7);
         tracker.update(0.5);
-        
+
         assert_eq!(tracker.trend_direction(0.01), -1); // Decreasing
     }
 
     #[test]
     fn test_ema_manager_multiple_metrics() {
         let mut manager = Emamanager::new(0.2);
-        
+
         manager.update_metric("accept_rate", 0.8);
         manager.update_metric("satisfaction", 0.9);
-        
+
         assert!(manager.get_value("accept_rate").is_some());
         assert!(manager.get_value("satisfaction").is_some());
     }
@@ -223,7 +219,7 @@ mod tests {
     fn test_calculate_accept_rate() {
         let mut manager = Emamanager::new(0.2);
         let rate = manager.calculate_accept_rate(10, 7);
-        
+
         assert!((rate - 0.7).abs() < 0.01);
     }
 }

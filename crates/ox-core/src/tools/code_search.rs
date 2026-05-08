@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 
@@ -44,16 +44,20 @@ impl Tool for CodeSearchTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let pattern = match args.get("pattern").and_then(|p| p.as_str()) {
             Some(p) => p.to_string(),
-            None => return ToolOutput::error("Missing required parameter: pattern. Usage: {\"pattern\": \"<search text>\"}"),
+            None => {
+                return ToolOutput::error(
+                    "Missing required parameter: pattern. Usage: {\"pattern\": \"<search text>\"}",
+                );
+            }
         };
         let base = if let Some(p) = args.get("path").and_then(|p| p.as_str()) {
             // Normalize path: trim whitespace and standardize separators
             let normalized_path = p.trim().replace('\\', "/");
             let resolved = ctx.working_dir.join(&normalized_path);
-            
+
             // Keep user-friendly path for error messages
             let _display_base = resolved.clone();
-            
+
             match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
                 Ok(validated) => validated,
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
@@ -82,15 +86,18 @@ impl Tool for CodeSearchTool {
     }
 }
 
-fn search_files(pattern: &str, base: &Path, file_pattern: &str, working_dir: &Path) -> Result<ToolOutput, String> {
+fn search_files(
+    pattern: &str,
+    base: &Path,
+    file_pattern: &str,
+    working_dir: &Path,
+) -> Result<ToolOutput, String> {
     let re = match regex::Regex::new(pattern) {
         Ok(r) => r,
-        Err(_) => {
-            match regex::Regex::new(&regex::escape(pattern)) {
-                Ok(r) => r,
-                Err(e) => return Err(format!("Invalid pattern: {e}")),
-            }
-        }
+        Err(_) => match regex::Regex::new(&regex::escape(pattern)) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("Invalid pattern: {e}")),
+        },
     };
 
     let glob_pattern = base.join("**").join(file_pattern);
@@ -151,8 +158,8 @@ fn search_files(pattern: &str, base: &Path, file_pattern: &str, working_dir: &Pa
 fn is_binary_path(path: &Path) -> bool {
     let binary_exts = [
         "exe", "dll", "so", "dylib", "bin", "obj", "o", "a", "lib", "png", "jpg", "jpeg", "gif",
-        "bmp", "ico", "svg", "pdf", "zip", "tar", "gz", "7z", "rar", "wasm", "ttf", "otf",
-        "woff", "woff2", "mp3", "mp4", "avi", "mov", "pdb", "lock",
+        "bmp", "ico", "svg", "pdf", "zip", "tar", "gz", "7z", "rar", "wasm", "ttf", "otf", "woff",
+        "woff2", "mp3", "mp4", "avi", "mov", "pdb", "lock",
     ];
     path.extension()
         .and_then(|e| e.to_str())

@@ -22,13 +22,17 @@ fn load_tensor(tensors: &SafeTensors, name: &str, device: &Device) -> Option<Ten
 
     match s_dtype {
         SafetensorDType::F32 => {
-            let data: Vec<f32> = tensor_view.data().chunks_exact(4)
+            let data: Vec<f32> = tensor_view
+                .data()
+                .chunks_exact(4)
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect();
             Tensor::from_slice(&data, shape, device).ok()
         }
         SafetensorDType::F16 => {
-            let data: Vec<f32> = tensor_view.data().chunks_exact(2)
+            let data: Vec<f32> = tensor_view
+                .data()
+                .chunks_exact(2)
                 .map(|chunk| {
                     let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
                     half::f16::from_bits(bits).to_f32()
@@ -38,15 +42,26 @@ fn load_tensor(tensors: &SafeTensors, name: &str, device: &Device) -> Option<Ten
         }
         SafetensorDType::I64 => {
             // I64 tensors (like position_ids) - load as i64 and convert to appropriate type
-            let data: Vec<i64> = tensor_view.data().chunks_exact(8)
-                .map(|chunk| i64::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]]))
+            let data: Vec<i64> = tensor_view
+                .data()
+                .chunks_exact(8)
+                .map(|chunk| {
+                    i64::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                        chunk[7],
+                    ])
+                })
                 .collect();
             // Convert to u32 for use as indices, then to tensor
             let data_u32: Vec<u32> = data.iter().map(|&x| x as u32).collect();
             Tensor::from_slice(&data_u32, shape, device).ok()
         }
         _ => {
-            tracing::debug!("Skipping tensor {} with unsupported dtype {:?}", name, s_dtype);
+            tracing::debug!(
+                "Skipping tensor {} with unsupported dtype {:?}",
+                name,
+                s_dtype
+            );
             None
         }
     }
@@ -83,7 +98,8 @@ impl BgeEmbedder {
         let hidden_size = json_config["hidden_size"].as_u64().unwrap_or(512) as usize;
         let vocab_size = json_config["vocab_size"].as_u64().unwrap_or(30522) as usize;
         let num_hidden_layers = json_config["num_hidden_layers"].as_u64().unwrap_or(12) as usize;
-        let num_attention_heads = json_config["num_attention_heads"].as_u64().unwrap_or(12) as usize;
+        let num_attention_heads =
+            json_config["num_attention_heads"].as_u64().unwrap_or(12) as usize;
         let intermediate_size = json_config["intermediate_size"].as_u64().unwrap_or(3072) as usize;
         let max_position_embeddings = json_config["max_position_embeddings"]
             .as_u64()
@@ -144,7 +160,9 @@ impl BgeEmbedder {
     ///
     /// Returns a normalized L2 embedding vector.
     pub fn encode(&self, text: &str) -> Result<Vec<f32>> {
-        let encoding = self.tokenizer.encode(text, false)
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
             .map_err(|e| anyhow::anyhow!("Failed to tokenize: {}", e))?;
 
         let input_ids = encoding.get_ids();
@@ -162,10 +180,9 @@ impl BgeEmbedder {
 
         // Create tensors (truncate if necessary)
         let input_len = seq_len.min(self.max_position_embeddings);
-        let input_ids = Tensor::new(input_ids[..input_len].to_vec(), &self.device)?
-            .unsqueeze(0)?;
-        let attention_mask = Tensor::new(attention_mask[..input_len].to_vec(), &self.device)?
-            .unsqueeze(0)?;
+        let input_ids = Tensor::new(input_ids[..input_len].to_vec(), &self.device)?.unsqueeze(0)?;
+        let attention_mask =
+            Tensor::new(attention_mask[..input_len].to_vec(), &self.device)?.unsqueeze(0)?;
 
         // Forward pass through BERT (3 args: input_ids, attention_mask, token_type_ids)
         let output = self.model.forward(&input_ids, &attention_mask, None)?;
@@ -258,10 +275,8 @@ impl BgeEmbedder {
         }
 
         // Create batch tensors: [batch_size, max_len]
-        let input_ids =
-            Tensor::new(all_ids, &self.device)?.reshape((batch_size, max_len))?;
-        let attention_mask =
-            Tensor::new(all_mask, &self.device)?.reshape((batch_size, max_len))?;
+        let input_ids = Tensor::new(all_ids, &self.device)?.reshape((batch_size, max_len))?;
+        let attention_mask = Tensor::new(all_mask, &self.device)?.reshape((batch_size, max_len))?;
 
         // Single batched forward pass: [batch, seq] -> [batch, seq, hidden]
         let output = self.model.forward(&input_ids, &attention_mask, None)?;

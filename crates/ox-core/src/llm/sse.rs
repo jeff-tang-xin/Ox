@@ -1,5 +1,5 @@
 //! SSE (Server-Sent Events) parsing primitives.
-//! 
+//!
 //! Handles the SSE protocol details: event boundaries, data accumulation,
 //! and multi-line JSON support.
 
@@ -96,15 +96,21 @@ impl SseEventBuffer {
 /// - A single JSON object: `{"foo": "bar"}`
 /// - A JSON array: `[{"foo": "bar"}, {"baz": "qux"}]`
 /// - Multiple JSON values separated by newlines or other delimiters
-pub fn parse_json_values(input: &str) -> impl Iterator<Item = serde_json::Result<serde_json::Value>> + '_ {
+pub fn parse_json_values(
+    input: &str,
+) -> impl Iterator<Item = serde_json::Result<serde_json::Value>> + '_ {
     let input = input.trim();
-    
+
     // Try parsing as array first
     if input.starts_with('[') {
         // Try to parse as array
         if let Ok(arr) = serde_json::from_str::<serde_json::Value>(input) {
             if let Some(items) = arr.as_array() {
-                return items.iter().map(|v| Ok(v.clone())).collect::<Vec<_>>().into_iter();
+                return items
+                    .iter()
+                    .map(|v| Ok(v.clone()))
+                    .collect::<Vec<_>>()
+                    .into_iter();
             }
         }
         // Fallback: try to parse each element individually
@@ -122,11 +128,11 @@ pub fn parse_json_values(input: &str) -> impl Iterator<Item = serde_json::Result
         InObject { depth: u32 },
         InArray { depth: u32 },
     }
-    
+
     let mut state = State::Outside;
     let mut current = String::new();
     let mut results: Vec<serde_json::Result<serde_json::Value>> = Vec::new();
-    
+
     for ch in input.chars() {
         match state {
             State::Outside => {
@@ -143,15 +149,23 @@ pub fn parse_json_values(input: &str) -> impl Iterator<Item = serde_json::Result
             State::InObject { depth } | State::InArray { depth } => {
                 current.push(ch);
                 if ch == '{' || ch == '[' {
-                    let new_depth = if ch == '{' { 
-                        if matches!(state, State::InObject { .. }) { depth + 1 } else { depth }
-                    } else { 
-                        if matches!(state, State::InArray { .. }) { depth + 1 } else { depth }
+                    let new_depth = if ch == '{' {
+                        if matches!(state, State::InObject { .. }) {
+                            depth + 1
+                        } else {
+                            depth
+                        }
+                    } else {
+                        if matches!(state, State::InArray { .. }) {
+                            depth + 1
+                        } else {
+                            depth
+                        }
                     };
-                    state = if ch == '{' { 
-                        State::InObject { depth: new_depth } 
-                    } else { 
-                        State::InArray { depth: new_depth } 
+                    state = if ch == '{' {
+                        State::InObject { depth: new_depth }
+                    } else {
+                        State::InArray { depth: new_depth }
                     };
                 } else if ch == '}' || ch == ']' {
                     let new_depth = depth.saturating_sub(1);
@@ -164,27 +178,34 @@ pub fn parse_json_values(input: &str) -> impl Iterator<Item = serde_json::Result
                         current.clear();
                         state = State::Outside;
                     } else {
-                        state = if ch == '}' { 
-                            State::InObject { depth: new_depth } 
-                        } else { 
-                            State::InArray { depth: new_depth } 
+                        state = if ch == '}' {
+                            State::InObject { depth: new_depth }
+                        } else {
+                            State::InArray { depth: new_depth }
                         };
                     }
                 }
             }
         }
     }
-    
+
     // Handle any remaining content - ONLY if we're back to Outside state (complete JSON)
     // If still InObject/InArray, the JSON is incomplete (truncated stream) - skip it
     if !current.trim().is_empty() && matches!(state, State::Outside) {
         results.push(serde_json::from_str(current.trim()));
     } else if !current.trim().is_empty() {
         // Log truncated JSON for debugging but don't attempt to parse
-        tracing::debug!("Skipping incomplete JSON ({} chars): {}", current.len(), 
-            if current.len() > 100 { &current[..100] } else { &current });
+        tracing::debug!(
+            "Skipping incomplete JSON ({} chars): {}",
+            current.len(),
+            if current.len() > 100 {
+                &current[..100]
+            } else {
+                &current
+            }
+        );
     }
-    
+
     results.into_iter()
 }
 
@@ -195,7 +216,7 @@ mod tests {
     #[test]
     fn test_sse_event_buffer_basic() {
         let mut buf = SseEventBuffer::new();
-        
+
         assert!(!buf.push_line("event: message"));
         assert!(!buf.push_line("data: {\"foo\": \"bar\"}"));
         assert!(buf.push_line("")); // Event boundary
@@ -205,7 +226,7 @@ mod tests {
     #[test]
     fn test_sse_event_buffer_multiline_data() {
         let mut buf = SseEventBuffer::new();
-        
+
         buf.push_line("data: {");
         buf.push_line("data:   \"foo\": \"bar\"");
         buf.push_line("data: }");

@@ -22,10 +22,10 @@ const COLOR_BLOCKQUOTE_BORDER: Color = Color::Rgb(70, 100, 60);
 fn preprocess_markdown(text: &str) -> String {
     let mut result = String::with_capacity(text.len() + 100);
     let mut lines = text.lines().peekable();
-    
+
     while let Some(line) = lines.next() {
         result.push_str(line);
-        
+
         // Check if next line exists
         if let Some(&next_line) = lines.peek() {
             if !next_line.trim().is_empty() {
@@ -40,7 +40,7 @@ fn preprocess_markdown(text: &str) -> String {
             break;
         }
     }
-    
+
     result
 }
 
@@ -82,9 +82,24 @@ impl MarkdownRenderer {
                             result.push(Line::from(std::mem::take(&mut current_spans)));
                         }
                         let (prefix, style) = match level {
-                            HeadingLevel::H1 => ("▎ ", Style::default().fg(COLOR_HEADING).add_modifier(Modifier::BOLD)),
-                            HeadingLevel::H2 => ("▎ ", Style::default().fg(COLOR_HEADING).add_modifier(Modifier::BOLD)),
-                            HeadingLevel::H3 => ("  ", Style::default().fg(COLOR_HEADING).add_modifier(Modifier::BOLD)),
+                            HeadingLevel::H1 => (
+                                "▎ ",
+                                Style::default()
+                                    .fg(COLOR_HEADING)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            HeadingLevel::H2 => (
+                                "▎ ",
+                                Style::default()
+                                    .fg(COLOR_HEADING)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            HeadingLevel::H3 => (
+                                "  ",
+                                Style::default()
+                                    .fg(COLOR_HEADING)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
                             _ => ("  ", Style::default().fg(COLOR_HEADING)),
                         };
                         current_spans.push(Span::styled(prefix.to_string(), style));
@@ -134,11 +149,7 @@ impl MarkdownRenderer {
                     }
                     Tag::Link { .. } => {
                         let current = *style_stack.last().unwrap();
-                        style_stack.push(
-                            current
-                                .fg(COLOR_LINK)
-                                .add_modifier(Modifier::UNDERLINED),
-                        );
+                        style_stack.push(current.fg(COLOR_LINK).add_modifier(Modifier::UNDERLINED));
                     }
                     _ => {
                         style_stack.push(*style_stack.last().unwrap());
@@ -190,9 +201,7 @@ impl MarkdownRenderer {
                             result.push(Line::from(std::mem::take(&mut current_spans)));
                         }
                     }
-                    TagEnd::Strong
-                    | TagEnd::Emphasis
-                    | TagEnd::Link => {
+                    TagEnd::Strong | TagEnd::Emphasis | TagEnd::Link => {
                         style_stack.pop();
                     }
                     _ => {
@@ -264,13 +273,12 @@ impl MarkdownRenderer {
         let border_content_len = 3 + lang_label.len();
         let dash_count = available_width.saturating_sub(border_content_len).max(3);
         lines.push(Line::from(vec![
-            Span::styled(
-                "┌──".to_string(),
-                Style::default().fg(COLOR_CODE_BORDER),
-            ),
+            Span::styled("┌──".to_string(), Style::default().fg(COLOR_CODE_BORDER)),
             Span::styled(
                 lang_label.clone(),
-                Style::default().fg(COLOR_LANG_LABEL).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLOR_LANG_LABEL)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "─".repeat(dash_count),
@@ -292,19 +300,14 @@ impl MarkdownRenderer {
                 .unwrap_or_default();
 
             let gutter = format!(" {:>3} │ ", line_num);
-            let spans: Vec<Span<'static>> = std::iter::once(Span::styled(
-                gutter,
-                Style::default().fg(COLOR_CODE_GUTTER),
-            ))
-            .chain(ranges.into_iter().map(|(style, text)| {
-                let fg = Color::Rgb(
-                    style.foreground.r,
-                    style.foreground.g,
-                    style.foreground.b,
-                );
-                Span::styled(text.to_string(), Style::default().fg(fg).bg(COLOR_CODE_BG))
-            }))
-            .collect();
+            let spans: Vec<Span<'static>> =
+                std::iter::once(Span::styled(gutter, Style::default().fg(COLOR_CODE_GUTTER)))
+                    .chain(ranges.into_iter().map(|(style, text)| {
+                        let fg =
+                            Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                        Span::styled(text.to_string(), Style::default().fg(fg).bg(COLOR_CODE_BG))
+                    }))
+                    .collect();
 
             lines.push(Line::from(spans));
             line_num += 1;
@@ -358,23 +361,22 @@ mod tests {
     fn paragraph_continuity() {
         // Test that consecutive non-empty lines are properly separated
         let md = MarkdownRenderer::new();
-        let input = "This is a long paragraph\nwith multiple lines\nthat should be on separate lines";
+        let input =
+            "This is a long paragraph\nwith multiple lines\nthat should be on separate lines";
         let lines = md.render_lines(input, 80);
-        
+
         // With preprocess_markdown, each non-empty line becomes a separate rendered line
-        assert_eq!(lines.len(), 3, "Each non-empty line should be rendered separately");
-        
+        assert_eq!(
+            lines.len(),
+            3,
+            "Each non-empty line should be rendered separately"
+        );
+
         // Verify the content of each line
-        let line0_text: String = lines[0].spans.iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        let line1_text: String = lines[1].spans.iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        let line2_text: String = lines[2].spans.iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        
+        let line0_text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let line1_text: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        let line2_text: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+
         assert!(line0_text.contains("long paragraph"));
         assert!(line1_text.contains("multiple lines"));
         assert!(line2_text.contains("separate lines"));
@@ -386,15 +388,24 @@ mod tests {
         let md = MarkdownRenderer::new();
         let input = "Here's code:\n```rust\nfn main() {\n    println!(\"Hello\");\n}\n```\nDone.";
         let lines = md.render_lines(input, 80);
-        
+
         // Should have: text line + code block header + code lines + footer + text line
         assert!(lines.len() >= 6);
-        
+
         // First line should be the intro text
-        assert!(lines[0].spans.iter().any(|s| s.content.contains("Here's code:")));
-        
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("Here's code:"))
+        );
+
         // Last line should be the ending text
-        let last_line_text: String = lines.last().unwrap().spans.iter()
+        let last_line_text: String = lines
+            .last()
+            .unwrap()
+            .spans
+            .iter()
             .map(|s| s.content.as_ref())
             .collect();
         assert!(last_line_text.contains("Done."));

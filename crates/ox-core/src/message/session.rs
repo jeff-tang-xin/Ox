@@ -16,6 +16,20 @@ pub struct SessionMeta {
     pub created_at: String,
     pub updated_at: String,
     pub message_count: usize,
+    
+    // 🚨 Workflow state persistence
+    /// Current workflow mode (free/spec/council)
+    #[serde(default)]
+    pub workflow_mode: String,
+    /// Current workflow ID
+    #[serde(default)]
+    pub workflow_id: String,
+    /// Current step index in the workflow
+    #[serde(default)]
+    pub workflow_step_index: usize,
+    /// Requirement name (for Spec Mode, e.g., "order-optimization")
+    #[serde(default)]
+    pub requirement_name: Option<String>,
 }
 
 /// A persistent conversation session.
@@ -41,6 +55,10 @@ impl Session {
             created_at: now.clone(),
             updated_at: now,
             message_count: 0,
+            workflow_mode: String::new(),
+            workflow_id: String::new(),
+            workflow_step_index: 0,
+            requirement_name: None,
         };
 
         // Write meta as first line and keep file handle open.
@@ -87,10 +105,11 @@ impl Session {
             // Try to parse as meta.
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
                 && let Some(m) = val.get("_meta")
-                    && let Ok(m) = serde_json::from_value::<SessionMeta>(m.clone()) {
-                        meta = Some(m);
-                        continue;
-                    }
+                && let Ok(m) = serde_json::from_value::<SessionMeta>(m.clone())
+            {
+                meta = Some(m);
+                continue;
+            }
 
             // Try to parse as message. Skip malformed last line (crash safety).
             match serde_json::from_str::<Message>(line) {
@@ -114,6 +133,10 @@ impl Session {
             created_at: Utc::now().to_rfc3339(),
             updated_at: Utc::now().to_rfc3339(),
             message_count: messages.len(),
+            workflow_mode: String::new(),
+            workflow_id: String::new(),
+            workflow_step_index: 0,
+            requirement_name: None,
         });
 
         Ok(Some(Self {
@@ -207,20 +230,29 @@ impl Session {
         Ok(())
     }
 
-    /// Replace session messages with a compressed set and rewrite the JSONL file.
-    /// This persists the compression result so future loads start from the compressed state.
-    pub fn rewrite_messages(&mut self, messages: Vec<Message>) -> anyhow::Result<()> {
-        // Close existing file handle
+    /// 🚨 CRITICAL: Persist workflow state to JSONL file.
+    /// Call this whenever workflow state changes (mode activation, step advancement, etc.)
+    pub fn persist_workflow_state(
+        &mut self,
+        mode: &str,
+        workflow_id: &str,
+        step_index: usize,
+        requirement_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Update meta fields
+        self.meta.workflow_mode = mode.to_string();
+        self.meta.workflow_id = workflow_id.to_string();
+        self.meta.workflow_step_index = step_index;
+        self.meta.requirement_name = requirement_name.map(|s| s.to_string());
+        self.meta.updated_at = Utc::now().to_rfc3339();
+
+        // Rewrite file to persist updated meta
         if let Some(ref mut writer) = self.file_handle {
             writer.flush()?;
         }
         self.file_handle = None;
 
-        // Update meta
-        self.meta.message_count = messages.len();
-        self.meta.updated_at = Utc::now().to_rfc3339();
-
-        // Rewrite file: meta line + all messages
+        // Rewrite entire file: meta + messages
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -229,15 +261,20 @@ impl Session {
         let mut writer = BufWriter::new(file);
         let meta_line = serde_json::to_string(&serde_json::json!({"_meta": &self.meta}))?;
         writeln!(writer, "{meta_line}")?;
-        for msg in &messages {
+        for msg in &self.messages {
             let json = serde_json::to_string(msg)?;
             writeln!(writer, "{json}")?;
         }
         writer.flush()?;
         self.file_handle = Some(writer);
 
-        // Replace in-memory messages
-        self.messages = messages;
+        tracing::info!(
+            "Persisted workflow state: mode={}, workflow={}, step={}, requirement={:?}",
+            mode,
+            workflow_id,
+            step_index,
+            requirement_name
+        );
 
         Ok(())
     }
@@ -254,11 +291,7 @@ impl Session {
             .ok()
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .is_some_and(|ext| ext == "jsonl")
-                    })
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
                     .collect()
             })
             .unwrap_or_default();
@@ -322,10 +355,11 @@ impl Session {
 
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
                 && let Some(m) = val.get("_meta")
-                    && let Ok(m) = serde_json::from_value::<SessionMeta>(m.clone()) {
-                        meta = Some(m);
-                        continue;
-                    }
+                && let Ok(m) = serde_json::from_value::<SessionMeta>(m.clone())
+            {
+                meta = Some(m);
+                continue;
+            }
 
             match serde_json::from_str::<Message>(line) {
                 Ok(msg) => messages.push(msg),
@@ -343,6 +377,10 @@ impl Session {
             created_at: Utc::now().to_rfc3339(),
             updated_at: Utc::now().to_rfc3339(),
             message_count: messages.len(),
+            workflow_mode: String::new(),
+            workflow_id: String::new(),
+            workflow_step_index: 0,
+            requirement_name: None,
         });
 
         Ok(Some(Self {
@@ -384,9 +422,7 @@ mod tests {
         let dir = temp_dir();
         {
             let mut session = Session::new(dir.path(), "proj-1").unwrap();
-            session
-                .append_message(Message::user("Hello"))
-                .unwrap();
+            session.append_message(Message::user("Hello")).unwrap();
             session
                 .append_message(Message::assistant("Hi there!"))
                 .unwrap();

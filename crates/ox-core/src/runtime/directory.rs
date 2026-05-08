@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::{find_project_root, compute_project_id, RuntimeEnvironment};
+use super::{RuntimeEnvironment, compute_project_id, find_project_root};
 
 /// Result of a directory change attempt.
 #[derive(Debug)]

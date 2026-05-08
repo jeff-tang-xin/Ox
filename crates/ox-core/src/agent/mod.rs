@@ -1,21 +1,24 @@
+pub mod engine;
 pub mod interjection;
 pub mod interrupt;
+pub mod intervention;
+pub mod progress;
+pub mod session;
 pub mod ui_event;
 pub mod workflow;
-pub mod session;
-pub mod intervention;
-pub mod engine;
+
+pub use engine::StepDisplayInfo;
 
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::AgentConfig;
 use crate::llm::{LlmProvider, LlmStreamEvent};
-use crate::message::{Message, ToolCall, TokenUsage};
+use crate::message::{Message, TokenUsage, ToolCall};
 use crate::safety::TrustManager;
 use crate::tools::{SafetyLevel, ToolContext, ToolRegistry};
-use crate::config::AgentConfig;
 
 /// Events sent from the agent to the UI.
 #[derive(Debug, Clone)]
@@ -23,7 +26,11 @@ pub enum AgentToUiEvent {
     /// Streaming text from LLM.
     TextChunk(String),
     /// Agent is calling a tool.
-    ToolStart { name: String, id: String, detail: Option<String> },
+    ToolStart {
+        name: String,
+        id: String,
+        detail: Option<String>,
+    },
     /// Tool execution result.
     ToolResult {
         name: String,
@@ -50,10 +57,7 @@ pub enum AgentToUiEvent {
         high_risk_warning: Option<String>,
     },
     /// Incremental tool output chunk (for streaming tools like shell_exec).
-    ToolOutputChunk {
-        tool_call_id: String,
-        chunk: String,
-    },
+    ToolOutputChunk { tool_call_id: String, chunk: String },
     /// Real-time tool execution progress (for long-running operations).
     ToolProgress {
         tool_call_id: String,
@@ -118,7 +122,15 @@ pub async fn run_agent_turn(
         }
 
         // When iteration limit is reached, ask user whether to continue.
-        if iteration > 0 && iteration >= max_iterations {
+        // SKIP this check when workflow is active (workflow has its own confirmation mechanism)
+        let workflow_active = if let Some(ref engine_arc) = workflow_engine {
+            let engine = engine_arc.lock().await;
+            engine.is_workflow_active()
+        } else {
+            false
+        };
+
+        if !workflow_active && iteration > 0 && iteration >= max_iterations {
             let _ = ui_tx.send(AgentToUiEvent::IterationLimitReached { iteration });
 
             let should_continue = loop {
@@ -153,21 +165,41 @@ pub async fn run_agent_turn(
             iteration = 0;
         }
 
-        let _ = ui_tx.send(AgentToUiEvent::Status(
-            if iteration == 0 {
-                "Thinking...".to_string()
-            } else {
-                format!("Thinking... (iteration {})", iteration + 1)
-            }
-        ));
+        let _ = ui_tx.send(AgentToUiEvent::Status(if iteration == 0 {
+            "Thinking...".to_string()
+        } else {
+            format!("Thinking... (iteration {})", iteration + 1)
+        }));
 
         // Check for queued interjections before LLM call.
         while let Ok(ev) = ui_rx.try_recv() {
             if let ui_event::UiToAgentEvent::Interjection(text) = ev {
                 messages.push(Message::user(&text));
+                let _ = ui_tx.send(AgentToUiEvent::Status(format!("💬 User: {}", text.trim())));
+            }
+        }
+
+        // ── STRONG CONFIRMATION CHECK: Block LLM call if waiting for user confirmation ──
+        if let Some(ref engine_arc) = workflow_engine {
+            let engine = engine_arc.lock().await;
+
+            // Check if we're waiting for user confirmation
+            if engine.is_current_step_waiting_confirmation() {
+                tracing::info!(
+                    "Workflow engine is waiting for user confirmation - blocking LLM call"
+                );
+
+                // Send status to UI
                 let _ = ui_tx.send(AgentToUiEvent::Status(
-                    format!("💬 User: {}", text.trim())
+                    "⏸️ Waiting for your confirmation... Use /Y, /N, or /O".to_string(),
                 ));
+
+                // Return early without calling LLM
+                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                    new_messages,
+                    usage: total_usage,
+                });
+                return;
             }
         }
 
@@ -176,10 +208,25 @@ pub async fn run_agent_turn(
 
         let provider_clone = Arc::clone(&provider);
         let msgs = messages.clone();
-        // In planning mode, first iteration omits tool schemas so the LLM
-        // can only respond with text (the plan). Subsequent iterations use real schemas.
+
+        // Filter tool schemas based on current workflow step
         let schemas = if planning_mode && iteration == 0 {
-            vec![]
+            vec![] // Planning mode: no tools in first iteration
+        } else if let Some(ref engine_arc) = workflow_engine {
+            let engine = engine_arc.lock().await;
+            let allowed_tools = engine.get_allowed_tools();
+
+            if allowed_tools.is_empty() {
+                // Empty list means all tools allowed
+                tool_schemas.clone()
+            } else {
+                // Filter to only include allowed tools
+                tool_schemas
+                    .iter()
+                    .filter(|schema| allowed_tools.contains(&schema.name))
+                    .cloned()
+                    .collect()
+            }
         } else {
             tool_schemas.clone()
         };
@@ -273,11 +320,216 @@ pub async fn run_agent_turn(
         // If no tool calls, the turn is complete.
         if tool_calls.is_empty() {
             let msg = Message::Assistant {
-                content: full_text,
+                content: full_text.clone(), // Clone for workflow check
                 tool_calls: Vec::new(),
             };
             new_messages.push(msg.clone());
             messages.push(msg);
+
+            // ── Workflow Step Advancement Logic (before returning) ──
+            // Check if we should advance to the next workflow step
+            if let Some(ref engine_arc) = workflow_engine {
+                let mut engine = engine_arc.lock().await;
+
+                // Check if AI signaled step completion via [STEP_COMPLETE] marker
+                let ai_signaled_complete = full_text.contains("[STEP_COMPLETE]");
+                
+                // Also check for Phase completion messages
+                let phase_complete = full_text.contains("✅ Phase") && 
+                    (full_text.contains("Complete") || full_text.contains("complete"));
+
+                // Check if key operations were completed (e.g., file creation)
+                let key_operation_completed = new_messages.iter().any(|msg| {
+                    matches!(msg, Message::ToolResult { content, .. } if {
+                        // Detect successful file_write or file_patch
+                        content.contains("✅ Successfully written") ||
+                        content.contains("✅ File patched") ||
+                        content.contains("Successfully created")
+                    })
+                });
+                
+                // Check if there were tool errors that need attention
+                let has_tool_errors = new_messages.iter().any(|msg| {
+                    matches!(msg, Message::ToolResult { content, .. } if {
+                        content.contains("Missing Required Parameter") ||
+                        content.contains("JSON Parse Error") ||
+                        content.contains("❌")
+                    })
+                });
+                
+                // If there are tool errors, don't advance - let LLM retry
+                if has_tool_errors {
+                    tracing::warn!("⚠️ Tool execution failed, not advancing step. Letting LLM retry...");
+                    
+                    // Inject guidance message if it's a parameter error
+                    let has_param_error = new_messages.iter().any(|msg| {
+                        matches!(msg, Message::ToolResult { content, .. } if {
+                            content.contains("Missing Required Parameter")
+                        })
+                    });
+                    
+                    if has_param_error {
+                        messages.push(Message::user(
+                            "⚠️ IMPORTANT: Your tool call failed due to missing parameters.\n\n\
+                             When calling file_write, you MUST provide:\n\
+                             - 'path': The file path (e.g., '.ox/order-optimization/spec.md')\n\
+                             - 'content': The file content as a string\n\n\
+                             Example:\n\
+                             {{\"path\": \".ox/order-optimization/spec.md\", \"content\": \"# Title\\n\\nContent here\"}}\n\n\
+                             Please retry with COMPLETE parameters."
+                        ));
+                    }
+                    
+                    // Return without advancing
+                    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                        new_messages,
+                        usage: total_usage,
+                    });
+                    return;
+                }
+
+                // Advance step if:
+                // 1. AI explicitly signaled completion with [STEP_COMPLETE], OR
+                // 2. AI outputted Phase completion message (e.g., "✅ Phase 1 Complete!"), OR
+                // 3. Key operations were completed (file creation) AND step requires confirmation
+                // 
+                // NOTE: We rely on AI to signal completion, not on tool execution results.
+                // This allows AI to make multiple tool calls within a single phase.
+                let should_advance = ai_signaled_complete || phase_complete || key_operation_completed;
+                
+                // If AI completed work but forgot to signal, and step requires confirmation,
+                // we still need to wait for user's explicit command (/Y, /N, /O).
+                // The confirmation flag will be set when user inputs the command.
+
+                if should_advance && !engine.is_workflow_complete() {
+                    tracing::info!(
+                        "Advancing workflow step (AI signaled: {}, Key op completed: {})",
+                        ai_signaled_complete,
+                        key_operation_completed
+                    );
+                    
+                    // 🚨 PATH VALIDATION: Verify file paths before advancing (Spec/Council Mode only)
+                    let current_step = engine.current_step();
+                    let needs_path_validation = current_step.map(|step| {
+                        step.name == "phase_1_documentation" || step.name == "topic_definition"
+                    }).unwrap_or(false);
+                    
+                    if needs_path_validation {
+                        // Check if files were created in correct location (.ox/{name}/ not .ox/)
+                        let has_wrong_path = new_messages.iter().any(|msg| {
+                            matches!(msg, Message::ToolResult { content, .. } if {
+                                // Detect file_write to .ox/ directly (without subdirectory)
+                                content.contains(".ox/") && (
+                                    content.contains(".ox/spec.md") ||
+                                    content.contains(".ox/task.md") ||
+                                    content.contains(".ox/council_record.md")
+                                )
+                            })
+                        });
+                        
+                        if has_wrong_path {
+                            tracing::warn!("❌ Path validation failed: Files created in wrong location!");
+                            
+                            // Inject error message and force retry
+                            messages.push(Message::user(
+                                "❌ CRITICAL ERROR: Files were created in the WRONG location!\n\n\
+                                 Expected format: `.ox/{requirement_name}/spec.md`\n\
+                                 Your format: `.ox/spec.md` (MISSING requirement name!)\n\n\
+                                 💡 How to fix:\n\
+                                 1. Generate a requirement name (e.g., 'order-optimization')\n\
+                                 2. Create files in `.ox/order-optimization/` directory\n\
+                                 3. Example paths:\n\
+                                    - `.ox/order-optimization/spec.md`\n\
+                                    - `.ox/order-optimization/task.md`\n\n\
+                                 Please REDO Phase 1 with CORRECT paths now."
+                            ));
+                            
+                            // Don't advance - force LLM to retry
+                            let _ = ui_tx.send(AgentToUiEvent::Status(
+                                "❌ Path validation failed. Retrying Phase 1...".to_string()
+                            ));
+                            
+                            // Return early without advancing
+                            let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                                new_messages,
+                                usage: total_usage,
+                            });
+                            return;
+                        }
+                    }
+                    
+                    // 🚨 CONFIRMATION CHECK: Check if CURRENT step requires confirmation BEFORE advancing
+                    let current_step_requires_confirmation = engine.requires_user_confirmation();
+                    
+                    if current_step_requires_confirmation {
+                        tracing::info!("Current step requires user confirmation - setting flag and blocking next LLM call");
+                        
+                        // Set confirmation flag to block next LLM call
+                        engine.set_confirmation_flag();
+                        
+                        // Notify UI about waiting for confirmation
+                        if let Some(step_info) = get_current_step_info(&engine) {
+                            let status_msg = format!(
+                                "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
+                                step_info.step_name
+                            );
+                            let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
+                        }
+                        
+                        // DON'T advance yet - wait for user confirmation
+                        let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                            new_messages,
+                            usage: total_usage,
+                        });
+                        return;
+                    }
+
+                    // No confirmation needed, advance normally
+                    match engine.advance_step() {
+                        Ok(has_next_step) => {
+                            if has_next_step {
+                                // Check if the NEW step requires confirmation
+                                let needs_confirmation = engine.requires_user_confirmation();
+
+                                if needs_confirmation {
+                                    // Set confirmation flag to block next LLM call
+                                    engine.set_confirmation_flag();
+
+                                    tracing::info!(
+                                        "New step requires user confirmation - setting flag"
+                                    );
+                                }
+
+                                // Notify UI about step transition
+                                if let Some(step_info) = get_current_step_info(&engine) {
+                                    let status_msg = if needs_confirmation {
+                                        format!(
+                                            "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
+                                            step_info.step_name
+                                        )
+                                    } else {
+                                        format!(
+                                            "✅ Step completed. Moving to: {}",
+                                            step_info.step_name
+                                        )
+                                    };
+
+                                    let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
+                                }
+                            } else {
+                                // Workflow complete
+                                let _ = ui_tx.send(AgentToUiEvent::Status(
+                                    "🎉 Workflow completed!".to_string(),
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to advance workflow step: {}", e);
+                        }
+                    }
+                }
+            }
+
             let _ = ui_tx.send(AgentToUiEvent::TurnDone {
                 new_messages,
                 usage: total_usage,
@@ -297,7 +549,7 @@ pub async fn run_agent_turn(
                     Err(e) => {
                         // Check if this looks like truncation vs other JSON errors
                         let is_likely_truncated = is_likely_json_truncation(&tc.arguments, &e);
-                        
+
                         if is_likely_truncated {
                             tracing::warn!(
                                 "Truncated tool arguments for '{}' (len {}, error: {}), will return error to LLM",
@@ -332,7 +584,9 @@ pub async fn run_agent_turn(
         for tc in &tool_calls {
             // Check cancellation before each tool execution.
             if cancel_token.is_cancelled() {
-                let _ = ui_tx.send(AgentToUiEvent::Status("Interrupted before tool execution.".to_string()));
+                let _ = ui_tx.send(AgentToUiEvent::Status(
+                    "Interrupted before tool execution.".to_string(),
+                ));
                 break;
             }
 
@@ -341,7 +595,7 @@ pub async fn run_agent_turn(
                 // Special handling for file_write with large content
                 let is_file_write = tc.name == "file_write";
                 let content_length = tc.arguments.len();
-                
+
                 let error_msg = if is_file_write && content_length > 10000 {
                     // Likely large file write that was truncated
                     format!(
@@ -377,14 +631,14 @@ pub async fn run_agent_turn(
                         tc.name
                     )
                 };
-                
+
                 tracing::warn!(
                     "Tool '{}' (id={}) had truncated arguments ({} bytes). Sending error to LLM.",
                     tc.name,
                     tc.id,
                     content_length
                 );
-                
+
                 let result_msg = Message::ToolResult {
                     tool_call_id: tc.id.clone(),
                     content: error_msg.clone(),
@@ -399,30 +653,31 @@ pub async fn run_agent_turn(
                 continue;
             }
 
-            let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                "Running tool: {}",
-                tc.name
-            )));
+            let _ = ui_tx.send(AgentToUiEvent::Status(format!("Running tool: {}", tc.name)));
 
             // ── Workflow validation before execution ──
             if let Some(ref engine_arc) = workflow_engine {
                 let engine = engine_arc.lock().await;
-                
+
                 // Parse tool arguments for validation
                 let args_value = if !tc.arguments.trim().is_empty() {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or(serde_json::json!({}))
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        .unwrap_or(serde_json::json!({}))
                 } else {
                     serde_json::json!({})
                 };
-                
+
                 // Validate tool call against current workflow step
                 if let Err(e) = engine.validate_tool_call(&tc.name, &args_value) {
                     tracing::warn!("Workflow validation failed for tool '{}': {}", tc.name, e);
-                    
+
                     // Return error to LLM
                     let result_msg = Message::ToolResult {
                         tool_call_id: tc.id.clone(),
-                        content: format!("❌ Workflow Restriction: {}\n\n💡 Please follow the current workflow step requirements.", e),
+                        content: format!(
+                            "❌ Workflow Restriction: {}\n\n💡 Please follow the current workflow step requirements.",
+                            e
+                        ),
                     };
                     new_messages.push(result_msg.clone());
                     messages.push(result_msg);
@@ -451,19 +706,25 @@ pub async fn run_agent_turn(
                 if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                     if let Some(content) = args_val.get("content").and_then(|v| v.as_str()) {
                         let content_len = content.len();
-                        let path = args_val.get("path").and_then(|v| v.as_str()).unwrap_or("<unknown>");
-                        
+                        let path = args_val
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<unknown>");
+
                         // Determine write strategy based on content size
-                        let strategy_detail = if content_len > 1024 * 1024 {  // > 1MB
+                        let strategy_detail = if content_len > 1024 * 1024 {
+                            // > 1MB
                             let chunk_count = (content_len + 512 * 1024 - 1) / (512 * 1024); // 512KB chunks
-                            format!("Large file ({} bytes) - will use chunked write ({} chunks of 512KB)", 
-                                   content_len, chunk_count)
+                            format!(
+                                "Large file ({} bytes) - will use chunked write ({} chunks of 512KB)",
+                                content_len, chunk_count
+                            )
                         } else {
                             format!("Small file ({} bytes) - will use atomic write", content_len)
                         };
-                        
+
                         let detail = format!("{} | {}", path, strategy_detail);
-                        
+
                         let _ = ui_tx.send(AgentToUiEvent::ToolStart {
                             name: tc.name.clone(),
                             id: tc.id.clone(),
@@ -480,18 +741,19 @@ pub async fn run_agent_turn(
                     // Find similar tool names (simple string matching)
                     let mut suggestions: Vec<&str> = Vec::new();
                     for name in tool_registry.names() {
-                        if name.starts_with(&tc.name[..tc.name.len().min(3)]) ||
-                           tc.name.starts_with(&name[..name.len().min(3)]) {
+                        if name.starts_with(&tc.name[..tc.name.len().min(3)])
+                            || tc.name.starts_with(&name[..name.len().min(3)])
+                        {
                             suggestions.push(name);
                         }
                     }
-                    
+
                     let suggestion_text = if !suggestions.is_empty() {
                         format!("\n\n💡 Did you mean: {}?", suggestions.join(", "))
                     } else {
                         String::new()
                     };
-                    
+
                     let error_msg = format!(
                         "❌ Unknown tool: '{}'\n\n\
                          Available tools: {}{}\n\n\
@@ -501,9 +763,13 @@ pub async fn run_agent_turn(
                          • Tool names are case-sensitive",
                         tc.name, available, suggestion_text
                     );
-                    
-                    tracing::warn!("Unknown tool requested: '{}'. Available: {}", tc.name, available);
-                    
+
+                    tracing::warn!(
+                        "Unknown tool requested: '{}'. Available: {}",
+                        tc.name,
+                        available
+                    );
+
                     let result_msg = Message::ToolResult {
                         tool_call_id: tc.id.clone(),
                         content: error_msg.clone(),
@@ -523,16 +789,17 @@ pub async fn run_agent_turn(
             let safety_level = tool.safety_level();
 
             // Check if tool args reference a path outside working directory.
-            let path_outside = if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                if let Some(path_str) = args_val.get("path").and_then(|v| v.as_str()) {
-                    let resolved = tool_ctx.working_dir.join(path_str);
-                    !crate::safety::is_path_within_workdir(&resolved, &tool_ctx.working_dir)
+            let path_outside =
+                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    if let Some(path_str) = args_val.get("path").and_then(|v| v.as_str()) {
+                        let resolved = tool_ctx.working_dir.join(path_str);
+                        !crate::safety::is_path_within_workdir(&resolved, &tool_ctx.working_dir)
+                    } else {
+                        false
+                    }
                 } else {
                     false
-                }
-            } else {
-                false
-            };
+                };
 
             let should_confirm = if path_outside {
                 true // Path outside workdir always requires confirmation.
@@ -549,7 +816,13 @@ pub async fn run_agent_turn(
             if should_confirm {
                 // Build args_summary (truncated, sanitized).
                 let args_summary = if tc.arguments.len() > 200 {
-                    let end = tc.arguments.char_indices().take_while(|(i, _)| *i < 200).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+                    let end = tc
+                        .arguments
+                        .char_indices()
+                        .take_while(|(i, _)| *i < 200)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
                     format!("{}...(truncated)", &tc.arguments[..end])
                 } else {
                     tc.arguments.clone()
@@ -643,20 +916,27 @@ pub async fn run_agent_turn(
                 // LLM sent no arguments — treat as empty object (common for no-param tools).
                 serde_json::Value::Object(serde_json::Map::new())
             } else {
-                match serde_json::from_str(&tc.arguments) {
+                // Clean think tags from arguments before parsing
+                let cleaned_args = clean_think_tags(&tc.arguments);
+
+                match serde_json::from_str(&cleaned_args) {
                     Ok(v) => v,
                     Err(parse_err) => {
                         // Provide helpful guidance with examples
                         let example = match tc.name.as_str() {
                             "file_read" => "{\"path\": \"src/main.rs\", \"limit\": 100}",
-                            "file_write" => "{\"path\": \"output.txt\", \"content\": \"Hello World\"}",
-                            "file_patch" => "{\"path\": \"src/lib.rs\", \"edits\": [{\"old\": \"...\", \"new\": \"...\"}]}",
+                            "file_write" => {
+                                "{\"path\": \"output.txt\", \"content\": \"Hello World\"}"
+                            }
+                            "file_patch" => {
+                                "{\"path\": \"src/lib.rs\", \"edits\": [{\"old\": \"...\", \"new\": \"...\"}]}"
+                            }
                             "shell_exec" => "{\"command\": \"ls -la\", \"timeout_ms\": 5000}",
                             "file_search" => "{\"pattern\": \"*.rs\", \"path\": \"src/\"}",
                             "code_search" => "{\"query\": \"fn main\", \"path\": \"src/\"}",
                             _ => "{ /* check tool documentation */ }",
                         };
-                        
+
                         let error_msg = format!(
                             "❌ JSON Parse Error for tool '{}':\n{}\n\n\
                              💡 How to fix:\n\
@@ -667,11 +947,9 @@ pub async fn run_agent_turn(
                              📝 Correct format example:\n\
                              {}\n\n\
                              Please retry with corrected arguments.",
-                            tc.name,
-                            parse_err,
-                            example
+                            tc.name, parse_err, example
                         );
-                        
+
                         tracing::warn!(
                             "Tool argument parse error for '{}': {} | Raw: {}",
                             tc.name,
@@ -682,7 +960,7 @@ pub async fn run_agent_turn(
                                 &tc.arguments
                             }
                         );
-                        
+
                         let result_msg = Message::ToolResult {
                             tool_call_id: tc.id.clone(),
                             content: error_msg.clone(),
@@ -703,9 +981,10 @@ pub async fn run_agent_turn(
             while let Ok(ev) = ui_rx.try_recv() {
                 if let ui_event::UiToAgentEvent::Interjection(text) = ev {
                     messages.push(Message::user(&text));
-                    let _ = ui_tx.send(AgentToUiEvent::Status(
-                        format!("💬 User (before tool): {}", text.trim())
-                    ));
+                    let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                        "💬 User (before tool): {}",
+                        text.trim()
+                    )));
                 }
             }
 
@@ -727,13 +1006,15 @@ pub async fn run_agent_turn(
 
             let result = tool.execute(args, &tool_ctx).await;
 
-            // Send completion progress event
-            let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
-                tool_call_id: tc.id.clone(),
-                tool_name: tc.name.clone(),
-                message: "Completed".to_string(),
-                progress_percent: Some(100),
-            });
+            // Send completion progress event only if tool executed successfully
+            if !result.is_error {
+                let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.name.clone(),
+                    message: "Completed".to_string(),
+                    progress_percent: Some(100),
+                });
+            }
 
             // If the tool changed working directory, update tool_ctx and notify UI.
             if let Some(new_dir) = result.new_working_dir.clone() {
@@ -761,47 +1042,130 @@ pub async fn run_agent_turn(
             messages.push(result_msg);
         }
 
-        // ── Workflow Step Advancement Logic (after each iteration) ──
+        // ── Workflow Step Advancement Logic (after tool execution) ──
         // Check if we should advance to the next workflow step
+        // This handles cases where tools were executed in this iteration
         if let Some(ref engine_arc) = workflow_engine {
             let mut engine = engine_arc.lock().await;
-            
+
             // Check if AI signaled step completion via [STEP_COMPLETE] marker
             let ai_signaled_complete = full_text.contains("[STEP_COMPLETE]");
             
-            // Check if key operations were completed (e.g., file creation)
-            let key_operation_completed = new_messages.iter().any(|msg| {
-                matches!(msg, Message::ToolResult { content, .. } if {
-                    // Detect successful file_write or file_patch
-                    content.contains("✅ File written") || 
-                    content.contains("✅ File patched") ||
-                    content.contains("Successfully created")
-                })
-            });
+            // Also check for Phase completion messages
+            let phase_complete = full_text.contains("✅ Phase") && 
+                (full_text.contains("Complete") || full_text.contains("complete"));
             
             // Advance step if:
-            // 1. AI explicitly signaled completion, OR
-            // 2. Key operation completed AND current step doesn't require user confirmation
-            let should_advance = ai_signaled_complete || 
-                (key_operation_completed && !engine.requires_user_confirmation());
+            // 1. AI explicitly signaled completion with [STEP_COMPLETE], OR
+            // 2. AI outputted Phase completion message (e.g., "✅ Phase 1 Complete!")
+            // 
+            // NOTE: We do NOT advance based on tool execution results (file_write, etc.)
+            // because the AI may perform multiple operations within a single phase.
+            // We wait for the AI to explicitly signal completion.
+            let should_advance = ai_signaled_complete || phase_complete;
             
             if should_advance && !engine.is_workflow_complete() {
-                tracing::info!("Advancing workflow step (AI signaled: {}, Key op completed: {})", 
-                    ai_signaled_complete, key_operation_completed);
+                tracing::info!(
+                    "Advancing workflow step after tool execution (AI signaled: {}, Phase complete: {})",
+                    ai_signaled_complete,
+                    phase_complete
+                );
                 
+                // 🚨 PATH VALIDATION: Verify file paths before advancing (Spec/Council Mode only)
+                let current_step = engine.current_step();
+                let needs_path_validation = current_step.map(|step| {
+                    step.name == "phase_1_documentation" || step.name == "topic_definition"
+                }).unwrap_or(false);
+                
+                if needs_path_validation {
+                    // Check if files were created in correct location (.ox/{name}/ not .ox/)
+                    let has_wrong_path = new_messages.iter().any(|msg| {
+                        matches!(msg, Message::ToolResult { content, .. } if {
+                            content.contains(".ox/") && (
+                                content.contains(".ox/spec.md") ||
+                                content.contains(".ox/task.md") ||
+                                content.contains(".ox/council_record.md")
+                            )
+                        })
+                    });
+                    
+                    if has_wrong_path {
+                        tracing::warn!("❌ Path validation failed: Files created in wrong location!");
+                        
+                        messages.push(Message::user(
+                            "❌ CRITICAL ERROR: Files were created in the WRONG location!\n\n\
+                             Expected format: `.ox/{requirement_name}/spec.md`\n\
+                             Your format: `.ox/spec.md` (MISSING requirement name!)\n\n\
+                             💡 How to fix:\n\
+                             1. Generate a requirement name (e.g., 'order-optimization')\n\
+                             2. Create files in `.ox/order-optimization/` directory\n\
+                             3. Example paths:\n\
+                                - `.ox/order-optimization/spec.md`\n\
+                                - `.ox/order-optimization/task.md`\n\n\
+                             Please REDO Phase 1 with CORRECT paths now."
+                        ));
+                        
+                        let _ = ui_tx.send(AgentToUiEvent::Status(
+                            "❌ Path validation failed. Retrying Phase 1...".to_string()
+                        ));
+                        
+                        let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                            new_messages,
+                            usage: total_usage,
+                        });
+                        return;
+                    }
+                }
+                
+                // 🚨 CONFIRMATION CHECK: Check if CURRENT step requires confirmation BEFORE advancing
+                let current_step_requires_confirmation = engine.requires_user_confirmation();
+                
+                if current_step_requires_confirmation {
+                    tracing::info!("Current step requires user confirmation - setting flag and blocking next LLM call");
+                    
+                    engine.set_confirmation_flag();
+                    
+                    if let Some(step_info) = get_current_step_info(&engine) {
+                        let status_msg = format!(
+                            "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
+                            step_info.step_name
+                        );
+                        let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
+                    }
+                    
+                    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                        new_messages,
+                        usage: total_usage,
+                    });
+                    return;
+                }
+
+                // No confirmation needed, advance normally
                 match engine.advance_step() {
                     Ok(has_next_step) => {
                         if has_next_step {
-                            // Notify UI about step transition
+                            let needs_confirmation = engine.requires_user_confirmation();
+
+                            if needs_confirmation {
+                                engine.set_confirmation_flag();
+                                tracing::info!("New step requires user confirmation - setting flag");
+                            }
+
                             if let Some(step_info) = get_current_step_info(&engine) {
-                                let _ = ui_tx.send(AgentToUiEvent::Status(
+                                let status_msg = if needs_confirmation {
+                                    format!(
+                                        "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
+                                        step_info.step_name
+                                    )
+                                } else {
                                     format!("✅ Step completed. Moving to: {}", step_info.step_name)
-                                ));
+                                };
+
+                                let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
                             }
                         } else {
-                            // Workflow complete
                             let _ = ui_tx.send(AgentToUiEvent::Status(
-                                "🎉 Workflow completed!".to_string()
+                                "🎉 Workflow completed!".to_string(),
                             ));
                         }
                     }
@@ -825,27 +1189,29 @@ pub async fn run_agent_turn(
 }
 
 /// Heuristically determine if a JSON parse error is likely due to truncation.
-/// 
+///
 /// Truncation typically manifests as:
 /// - EOF errors (unexpected end of input)
 /// - Missing closing brackets/braces
 /// - Incomplete string literals
 fn is_likely_json_truncation(json_str: &str, error: &serde_json::Error) -> bool {
     let error_msg = error.to_string();
-    
+
     // Common truncation indicators
     let truncation_patterns = [
-        "EOF",                    // End of file unexpectedly
-        "expected `,` or `}`",   // Missing closing brace
-        "expected `,` or `]`",   // Missing closing bracket
-        "expected `\"`",         // Unclosed string
-        "control character",     // Cut off in middle of content
-        "invalid escape",        // Truncated escape sequence
+        "EOF",                 // End of file unexpectedly
+        "expected `,` or `}`", // Missing closing brace
+        "expected `,` or `]`", // Missing closing bracket
+        "expected `\"`",       // Unclosed string
+        "control character",   // Cut off in middle of content
+        "invalid escape",      // Truncated escape sequence
     ];
-    
+
     // Check if error message matches truncation patterns
-    let is_eof_error = truncation_patterns.iter().any(|pattern| error_msg.contains(pattern));
-    
+    let is_eof_error = truncation_patterns
+        .iter()
+        .any(|pattern| error_msg.contains(pattern));
+
     // Additional heuristic: check if the JSON looks incomplete
     let trimmed = json_str.trim();
     let has_unclosed_structure = (
@@ -858,7 +1224,7 @@ fn is_likely_json_truncation(json_str: &str, error: &serde_json::Error) -> bool 
         // Has unclosed quote
         (trimmed.matches('"').count() % 2 != 0)
     );
-    
+
     is_eof_error || has_unclosed_structure
 }
 
@@ -885,4 +1251,23 @@ fn get_current_step_info(engine: &crate::agent::engine::WorkflowEngine) -> Optio
         }
     }
     None
+}
+
+/// Remove think tags (<think>...</think>) from text.
+/// LLMs sometimes include thinking content in tool arguments, which breaks JSON parsing.
+fn clean_think_tags(text: &str) -> String {
+    use regex::Regex;
+
+    // Pattern to match <think>...</think> tags (case-insensitive)
+    static THINK_PATTERN: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?s)<think[^>]*>.*?</think>").unwrap());
+
+    // Also handle unclosed think tags
+    static UNCLOSED_THINK: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?s)<think[^>]*>.*$").unwrap());
+
+    let result = THINK_PATTERN.replace_all(text, "");
+    let result = UNCLOSED_THINK.replace_all(&result, "");
+
+    result.to_string()
 }

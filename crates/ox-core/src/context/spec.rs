@@ -1,16 +1,16 @@
-use std::path::Path;
 use anyhow::Result;
+use std::path::Path;
 
 /// Load spec from file, relative to project root.
 /// Returns the content if file exists, empty string if not.
 pub fn load_spec(project_root: &Path, file_path: &str) -> Result<String> {
     let spec_path = project_root.join(file_path);
-    
+
     if !spec_path.exists() {
         tracing::debug!("Spec file not found: {}", spec_path.display());
         return Ok(String::new());
     }
-    
+
     let content = std::fs::read_to_string(&spec_path)?;
     tracing::info!("Loaded spec from: {}", spec_path.display());
     Ok(content)
@@ -19,12 +19,12 @@ pub fn load_spec(project_root: &Path, file_path: &str) -> Result<String> {
 /// Save spec content to file, relative to project root.
 pub fn save_spec(project_root: &Path, file_path: &str, content: &str) -> Result<String> {
     let spec_path = project_root.join(file_path);
-    
+
     // Create parent directories if needed
     if let Some(parent) = spec_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     std::fs::write(&spec_path, content)?;
     tracing::info!("Saved spec to: {}", spec_path.display());
     Ok(spec_path.to_string_lossy().to_string())

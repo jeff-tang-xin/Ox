@@ -24,12 +24,9 @@ impl TrustManager {
         match safety {
             SafetyLevel::Safe => true,
             SafetyLevel::RequiresConfirmation => {
-                self.trusted_tools.contains(tool_name)
-                    || self.trusted_tools.contains("__all__")
+                self.trusted_tools.contains(tool_name) || self.trusted_tools.contains("__all__")
             }
-            SafetyLevel::Dangerous => {
-                self.trusted_tools.contains("__all__")
-            }
+            SafetyLevel::Dangerous => self.trusted_tools.contains("__all__"),
         }
     }
 
@@ -101,15 +98,12 @@ pub fn is_path_within_workdir(path: &Path, working_dir: &Path) -> bool {
 /// Resolve a path to an absolute path if it exists.
 /// For non-existent paths (e.g., new files), returns the path as-is.
 /// This is a convenience wrapper around PathBuf::join + canonicalize.
-pub fn validate_path_within_workdir(
-    path: &Path,
-    _working_dir: &Path,
-) -> anyhow::Result<PathBuf> {
+pub fn validate_path_within_workdir(path: &Path, _working_dir: &Path) -> anyhow::Result<PathBuf> {
     // Try to canonicalize if the path exists
     if path.exists() {
         return Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     }
-    
+
     // Path doesn't exist yet, return as-is
     Ok(path.to_path_buf())
 }

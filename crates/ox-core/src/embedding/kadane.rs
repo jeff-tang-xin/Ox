@@ -158,7 +158,8 @@ pub fn compress_with_kadane(scores: &[f32], config: &KadaneConfig) -> Compressio
     let mut current_max_gain = f32::INFINITY;
 
     // Step 3: Iteratively find max-gain segments
-    while selected_segments.len() < config.max_segments && current_max_gain >= config.stop_threshold {
+    while selected_segments.len() < config.max_segments && current_max_gain >= config.stop_threshold
+    {
         // Run Kadane's algorithm
         let (start, end, max_sum) = kadane_max_subarray(&gains);
 
@@ -210,7 +211,11 @@ pub fn compress_with_kadane(scores: &[f32], config: &KadaneConfig) -> Compressio
 ///
 /// Given original messages and selected indices, returns the compressed context
 /// while preserving the first few messages (important for conversation coherence).
-pub fn filter_messages(messages: &[Message], indices: &[usize], keep_recent: usize) -> Vec<Message> {
+pub fn filter_messages(
+    messages: &[Message],
+    indices: &[usize],
+    keep_recent: usize,
+) -> Vec<Message> {
     if messages.is_empty() {
         return vec![];
     }
@@ -240,7 +245,10 @@ pub fn filter_messages(messages: &[Message], indices: &[usize], keep_recent: usi
     all_indices.dedup();
 
     // Extract messages
-    all_indices.iter().filter_map(|&i| messages.get(i).cloned()).collect()
+    all_indices
+        .iter()
+        .filter_map(|&i| messages.get(i).cloned())
+        .collect()
 }
 
 #[cfg(test)]

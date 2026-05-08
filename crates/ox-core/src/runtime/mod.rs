@@ -1,7 +1,7 @@
 pub mod directory;
 mod project;
 
-pub use directory::{change_directory, DirectoryChangeResult};
+pub use directory::{DirectoryChangeResult, change_directory};
 pub use project::{compute_project_id, find_project_root};
 
 use std::path::PathBuf;
@@ -176,8 +176,7 @@ fn detect_shell(os: &Os) -> ShellInfo {
             }
         }
         _ => {
-            let shell_path =
-                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             let name = std::path::Path::new(&shell_path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -209,9 +208,10 @@ fn detect_project_language(root: &std::path::Path) -> String {
         if marker.contains('*') {
             // Glob pattern — check if any matching file exists.
             if let Ok(pattern) = glob::glob(&root.join(marker).to_string_lossy())
-                && pattern.into_iter().any(|e| e.is_ok()) {
-                    return (*lang).into();
-                }
+                && pattern.into_iter().any(|e| e.is_ok())
+            {
+                return (*lang).into();
+            }
         } else if root.join(marker).exists() {
             return (*lang).into();
         }

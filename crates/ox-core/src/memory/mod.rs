@@ -5,6 +5,11 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+/// Default value for recent_scores array
+fn default_recent_scores() -> [f32; 5] {
+    [0.0; 5]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryNode {
     pub id: String,
@@ -19,6 +24,17 @@ pub struct MemoryNode {
     pub is_project_critical: bool,
     pub traces: [f32; 5],
     pub language_weight: f64,
+    
+    // 🆕 LLM Judge feedback tracking
+    /// Average relevance score from LLM judge (0-10)
+    #[serde(default)]
+    pub avg_llm_score: f32,
+    /// Number of times evaluated by LLM judge
+    #[serde(default)]
+    pub judge_eval_count: u32,
+    /// Recent scores for trend analysis (last 5 evaluations)
+    #[serde(default = "default_recent_scores")]
+    pub recent_scores: [f32; 5],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,7 +95,10 @@ impl MemoryNodeType {
     }
 
     pub fn is_immediate_write(&self) -> bool {
-        matches!(self, Self::Style | Self::Architectural | Self::AntiPattern | Self::MetaSkill | Self::Council)
+        matches!(
+            self,
+            Self::Style | Self::Architectural | Self::AntiPattern | Self::MetaSkill | Self::Council
+        )
     }
 
     pub fn is_long_term(&self) -> bool {
@@ -90,21 +109,29 @@ impl MemoryNodeType {
 // ── Decay strategies ──
 
 pub fn calculate_project_decay(node: &MemoryNode, base_half_life: u64) -> f32 {
-    if node.is_project_critical { return 1.0; }
+    if node.is_project_critical {
+        return 1.0;
+    }
     let age_secs = (chrono::Utc::now().timestamp() - node.last_accessed).max(0);
     let age_days = age_secs as f32 / 86400.0;
     let short_term = (-age_days / (base_half_life as f32 * 0.3)).exp();
-    let long_term  = (-age_days / (base_half_life as f32 * 5.0)).exp();
+    let long_term = (-age_days / (base_half_life as f32 * 5.0)).exp();
     (0.7 * short_term + 0.3 * long_term).clamp(0.0, 1.0)
 }
 
 pub fn calculate_overall_decay(node: &MemoryNode, traces_config: &[f32]) -> f32 {
     let t = ((chrono::Utc::now().timestamp() - node.last_accessed).max(0) as f32) / 86400.0;
-    let traces_sum: f32 = node.traces.iter()
+    let traces_sum: f32 = node
+        .traces
+        .iter()
         .zip(traces_config.iter())
         .map(|(trace, tau)| trace * (-t / tau).exp())
         .sum();
-    let base = if traces_config.is_empty() { 0.5 } else { traces_sum / traces_config.len() as f32 };
+    let base = if traces_config.is_empty() {
+        0.5
+    } else {
+        traces_sum / traces_config.len() as f32
+    };
     (base * node.language_weight as f32 + node.depth as f32 * 0.5).clamp(0.0, 1.0)
 }
 
@@ -124,6 +151,53 @@ pub fn composite_score(node: &MemoryNode, half_life: u64) -> f32 {
     node.depth as f32 * 0.5 + decay * 0.3 + recency * 0.2
 }
 
+// ── Memory chunking utilities ──
+
+/// Split long text into overlapping chunks for better semantic preservation.
+/// 
+/// # Arguments
+/// * `text` - The text to split
+/// * `max_chunk_len` - Maximum length of each chunk (in characters)
+/// * `overlap_ratio` - Overlap ratio between chunks (0.0-1.0, typically 0.15)
+/// 
+/// # Returns
+/// Vector of chunk strings with overlap
+fn split_with_overlap(text: &str, max_chunk_len: usize, overlap_ratio: f32) -> Vec<String> {
+    if text.len() <= max_chunk_len {
+        return vec![text.to_string()];
+    }
+    
+    let mut chunks = Vec::new();
+    let step = (max_chunk_len as f32 * (1.0 - overlap_ratio)) as usize;
+    let mut start = 0;
+    
+    while start < text.len() {
+        let end = (start + max_chunk_len).min(text.len());
+        
+        // Try to break at word boundary to avoid cutting words
+        let chunk_end = if end < text.len() {
+            // Find last space before end
+            text[start..end]
+                .rfind(' ')
+                .map(|pos| start + pos)
+                .unwrap_or(end)
+        } else {
+            end
+        };
+        
+        chunks.push(text[start..chunk_end].to_string());
+        
+        // Move to next chunk with overlap
+        start = if chunk_end + step > text.len() {
+            break;  // Last chunk
+        } else {
+            chunk_end + step - (max_chunk_len as f32 * overlap_ratio) as usize
+        };
+    }
+    
+    chunks
+}
+
 // ── Janitor ──
 
 impl MemoryManager {
@@ -131,14 +205,23 @@ impl MemoryManager {
         if let Some(ref store) = self.project_store {
             if let Ok(all) = store.query_by_project(
                 "",
-                &[MemoryNodeType::Fact, MemoryNodeType::Style, MemoryNodeType::Architectural, MemoryNodeType::Business, MemoryNodeType::AntiPattern],
+                &[
+                    MemoryNodeType::Fact,
+                    MemoryNodeType::Style,
+                    MemoryNodeType::Architectural,
+                    MemoryNodeType::Business,
+                    MemoryNodeType::AntiPattern,
+                ],
                 max_nodes + 100,
             ) {
                 let max_cleanup = (all.len() / 10).max(1);
                 let mut expired = Vec::new();
                 for node in &all {
-                    if node.is_project_critical { continue; }
-                    let days = (chrono::Utc::now().timestamp() - node.last_accessed).max(0) as f32 / 86400.0;
+                    if node.is_project_critical {
+                        continue;
+                    }
+                    let days = (chrono::Utc::now().timestamp() - node.last_accessed).max(0) as f32
+                        / 86400.0;
                     let should_cleanup = match node.depth {
                         0..=1 => days > 30.0,
                         2 => {
@@ -152,7 +235,9 @@ impl MemoryManager {
                     };
                     if should_cleanup {
                         expired.push(&node.id);
-                        if expired.len() >= max_cleanup { break; }
+                        if expired.len() >= max_cleanup {
+                            break;
+                        }
                     }
                 }
                 for id in &expired {
@@ -174,20 +259,39 @@ mod decay_tests {
 
     #[test]
     fn project_decay_critical_is_one() {
-        let node = MemoryNode::new("test".into(), MemoryNodeType::Fact, Some("p".into()), "rust".into(), MemorySource::ToolObservation).with_critical();
+        let node = MemoryNode::new(
+            "test".into(),
+            MemoryNodeType::Fact,
+            Some("p".into()),
+            "rust".into(),
+            MemorySource::ToolObservation,
+        )
+        .with_critical();
         assert_eq!(calculate_project_decay(&node, 30), 1.0);
     }
 
     #[test]
     fn project_decay_fresh_is_high() {
-        let node = MemoryNode::new("test".into(), MemoryNodeType::Fact, Some("p".into()), "rust".into(), MemorySource::ToolObservation);
+        let node = MemoryNode::new(
+            "test".into(),
+            MemoryNodeType::Fact,
+            Some("p".into()),
+            "rust".into(),
+            MemorySource::ToolObservation,
+        );
         let decay = calculate_project_decay(&node, 30);
         assert!(decay > 0.9);
     }
 
     #[test]
     fn overall_decay_fresh_is_reasonable() {
-        let node = MemoryNode::new("test".into(), MemoryNodeType::BestPractice, None, "rust".into(), MemorySource::LlmExtraction);
+        let node = MemoryNode::new(
+            "test".into(),
+            MemoryNodeType::BestPractice,
+            None,
+            "rust".into(),
+            MemorySource::LlmExtraction,
+        );
         let decay = calculate_overall_decay(&node, &[0.1, 0.2, 0.3, 0.4, 0.5]);
         assert!(decay > 0.0);
     }
@@ -253,6 +357,10 @@ impl MemoryNode {
             is_project_critical: false,
             traces: [0.2, 0.2, 0.2, 0.2, 0.2],
             language_weight: 0.5,
+            // 🆕 LLM Judge feedback fields
+            avg_llm_score: 0.0,
+            judge_eval_count: 0,
+            recent_scores: [0.0; 5],
         }
     }
 
@@ -305,31 +413,81 @@ impl WriteBuffer {
 // ── Extractor (启发式记忆提取) ──
 
 impl MemoryNode {
-    pub fn extract_from_tool_call(tool_name: &str, tool_args: &str, project_id: &str, language: &str) -> Option<Self> {
+    pub fn extract_from_tool_call(
+        tool_name: &str,
+        tool_args: &str,
+        project_id: &str,
+        language: &str,
+    ) -> Option<Self> {
         match tool_name {
             "file_write" | "file_patch" => {
-                if tool_args.len() < 20 { return None; }
+                if tool_args.len() < 20 {
+                    return None;
+                }
                 let content = if tool_args.len() > 400 {
-                    format!("{}...", &tool_args[..tool_args.char_indices().take(400).last().map(|(i,_)| i).unwrap_or(0)])
+                    format!(
+                        "{}...",
+                        &tool_args[..tool_args
+                            .char_indices()
+                            .take(400)
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0)]
+                    )
                 } else {
                     tool_args.to_string()
                 };
                 if contains_architectural_keywords(&content) {
-                    Some(Self::new(content, MemoryNodeType::Architectural, Some(project_id.into()), language.into(), MemorySource::ToolObservation))
+                    Some(Self::new(
+                        content,
+                        MemoryNodeType::Architectural,
+                        Some(project_id.into()),
+                        language.into(),
+                        MemorySource::ToolObservation,
+                    ))
                 } else if contains_business_keywords(&content) {
-                    Some(Self::new(content, MemoryNodeType::Business, Some(project_id.into()), language.into(), MemorySource::ToolObservation))
+                    Some(Self::new(
+                        content,
+                        MemoryNodeType::Business,
+                        Some(project_id.into()),
+                        language.into(),
+                        MemorySource::ToolObservation,
+                    ))
                 } else {
-                    Some(Self::new(content, MemoryNodeType::Fact, Some(project_id.into()), language.into(), MemorySource::ToolObservation))
+                    Some(Self::new(
+                        content,
+                        MemoryNodeType::Fact,
+                        Some(project_id.into()),
+                        language.into(),
+                        MemorySource::ToolObservation,
+                    ))
                 }
             }
             "shell_exec" => {
-                if tool_args.contains("error") || tool_args.contains("Error") || tool_args.contains("failed") {
+                if tool_args.contains("error")
+                    || tool_args.contains("Error")
+                    || tool_args.contains("failed")
+                {
                     let content = if tool_args.len() > 400 {
-                        format!("{}...", &tool_args[..tool_args.char_indices().take(400).last().map(|(i,_)| i).unwrap_or(0)])
+                        format!(
+                            "{}...",
+                            &tool_args[..tool_args
+                                .char_indices()
+                                .take(400)
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0)]
+                        )
                     } else {
                         tool_args.to_string()
                     };
-                    Some(Self::new(content, MemoryNodeType::AntiPattern, Some(project_id.into()), language.into(), MemorySource::ToolObservation))
+                    Some(Self::new(
+                        content,
+                        MemoryNodeType::AntiPattern,
+                        Some(project_id.into()),
+                        language.into(),
+                        MemorySource::ToolObservation,
+                    ))
                 } else {
                     None
                 }
@@ -338,13 +496,29 @@ impl MemoryNode {
         }
     }
 
-    pub fn extract_from_conversation(assistant_content: &str, project_id: &str, language: &str) -> Option<Self> {
+    pub fn extract_from_conversation(
+        assistant_content: &str,
+        project_id: &str,
+        language: &str,
+    ) -> Option<Self> {
         if contains_architectural_keywords(assistant_content) {
             let content: String = assistant_content.chars().take(300).collect();
-            Some(Self::new(content, MemoryNodeType::Architectural, Some(project_id.into()), language.into(), MemorySource::LlmExtraction))
+            Some(Self::new(
+                content,
+                MemoryNodeType::Architectural,
+                Some(project_id.into()),
+                language.into(),
+                MemorySource::LlmExtraction,
+            ))
         } else if contains_user_preference(assistant_content) {
             let content: String = assistant_content.chars().take(200).collect();
-            Some(Self::new(content, MemoryNodeType::Style, Some(project_id.into()), language.into(), MemorySource::LlmExtraction))
+            Some(Self::new(
+                content,
+                MemoryNodeType::Style,
+                Some(project_id.into()),
+                language.into(),
+                MemorySource::LlmExtraction,
+            ))
         } else {
             None
         }
@@ -352,23 +526,56 @@ impl MemoryNode {
 }
 
 fn contains_architectural_keywords(text: &str) -> bool {
-    let keywords = ["module", "struct ", "trait ", "interface", "abstract ", "impl ", "enum ", "protocol", "architecture", "design pattern"];
+    let keywords = [
+        "module",
+        "struct ",
+        "trait ",
+        "interface",
+        "abstract ",
+        "impl ",
+        "enum ",
+        "protocol",
+        "architecture",
+        "design pattern",
+    ];
     keywords.iter().any(|k| text.to_lowercase().contains(k))
 }
 
 fn contains_business_keywords(text: &str) -> bool {
-    let keywords = ["api", "endpoint", "model", "schema", "service", "handler", "controller", "repository", "entity"];
+    let keywords = [
+        "api",
+        "endpoint",
+        "model",
+        "schema",
+        "service",
+        "handler",
+        "controller",
+        "repository",
+        "entity",
+    ];
     keywords.iter().any(|k| text.to_lowercase().contains(k))
 }
 
 fn contains_user_preference(text: &str) -> bool {
-    let keywords = ["以后都", "不要用", "always use", "never use", "prefer", "avoid", "习惯", "偏好", "应该用", "选型"];
+    let keywords = [
+        "以后都",
+        "不要用",
+        "always use",
+        "never use",
+        "prefer",
+        "avoid",
+        "习惯",
+        "偏好",
+        "应该用",
+        "选型",
+    ];
     keywords.iter().any(|k| text.to_lowercase().contains(k))
 }
 
 // ── MemoryManager (门面) ──
 
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 use crate::config::MemoryConfig;
 
@@ -376,6 +583,8 @@ pub struct MemoryManager {
     project_store: Option<store::MemoryStore>,
     overall_store: store::MemoryStore,
     write_buffer: Mutex<WriteBuffer>,
+    // 🆕 Query cache for repeated searches
+    query_cache: Mutex<HashMap<String, (Vec<MemoryNode>, chrono::DateTime<chrono::Utc>)>>,
 }
 
 impl Clone for MemoryManager {
@@ -384,12 +593,17 @@ impl Clone for MemoryManager {
             project_store: self.project_store.clone(),
             overall_store: self.overall_store.clone(),
             write_buffer: Mutex::new(WriteBuffer::new()),
+            query_cache: Mutex::new(HashMap::new()),  // Don't clone cache
         }
     }
 }
 
 impl MemoryManager {
-    pub fn init(runtime_ox_home: &PathBuf, project_id: &str, config: &MemoryConfig) -> anyhow::Result<Self> {
+    pub fn init(
+        runtime_ox_home: &PathBuf,
+        project_id: &str,
+        config: &MemoryConfig,
+    ) -> anyhow::Result<Self> {
         let db_dir = runtime_ox_home.join("db");
         let overall_path = db_dir.join("memories_overall.db");
         let overall_store = store::MemoryStore::open(&overall_path)?;
@@ -410,6 +624,7 @@ impl MemoryManager {
             project_store,
             overall_store,
             write_buffer: Mutex::new(WriteBuffer::new()),
+            query_cache: Mutex::new(HashMap::new()),  // Initialize empty cache
         })
     }
 
@@ -452,49 +667,209 @@ impl MemoryManager {
         }
     }
 
-    pub fn update_from_turn(&self, messages: &[crate::message::Message], project_id: &str, language: &str) {
+    pub fn update_from_turn(
+        &self,
+        messages: &[crate::message::Message],
+        project_id: &str,
+        language: &str,
+    ) {
+        // Track successful tool calls for learning
+        let mut successful_tools = Vec::new();
+        
         for msg in messages {
-            if let crate::message::Message::Assistant { content, tool_calls } = msg {
+            if let crate::message::Message::Assistant {
+                content,
+                tool_calls,
+            } = msg
+            {
+                // Extract knowledge from tool calls
                 for tc in tool_calls {
-                    if let Some(node) = MemoryNode::extract_from_tool_call(&tc.name, &tc.arguments, project_id, language) {
+                    if let Some(node) = MemoryNode::extract_from_tool_call(
+                        &tc.name,
+                        &tc.arguments,
+                        project_id,
+                        language,
+                    ) {
                         self.store(node);
+                        successful_tools.push(tc.name.clone());
                     }
                 }
-                if let Some(node) = MemoryNode::extract_from_conversation(content, project_id, language) {
+                
+                // Extract knowledge from conversation content
+                if let Some(node) =
+                    MemoryNode::extract_from_conversation(content, project_id, language)
+                {
                     self.store(node);
                 }
             }
         }
+        
+        // Log learning statistics for debugging
+        if !successful_tools.is_empty() {
+            tracing::debug!(
+                "[LEARNING] Extracted {} memories from tools: {:?}",
+                successful_tools.len(),
+                successful_tools
+            );
+        }
     }
 
-    pub fn retrieve(&self, query: &str, project_id: &Option<&str>, limit: usize) -> Vec<MemoryNode> {
-        let mut results = Vec::new();
-
-        if let Some(pid) = project_id {
-            if let Some(ref store) = self.project_store {
-                if let Ok(mems) = store.query_by_project(pid, &[MemoryNodeType::Architectural, MemoryNodeType::Business, MemoryNodeType::Style], limit) {
-                    results.extend(mems);
+    /// Multi-path memory retrieval with entity-based expansion and optional re-ranking.
+    /// 
+    /// This enhanced version performs parallel searches across multiple paths:
+    /// 1. Original query (semantic search)
+    /// 2. Extracted entities (file names, function names, technical terms)
+    /// 3. Type-specific queries (architecture, style, best practices)
+    /// 
+    /// Results are merged, deduplicated, ranked by composite score, and optionally
+    /// re-ranked using cross-encoding for higher accuracy.
+    /// 
+    /// # Arguments
+    /// * `query` - Search query
+    /// * `project_id` - Optional project ID for scoped search
+    /// * `limit` - Maximum number of results to return
+    /// * `embedder` - Optional BGE embedder for re-ranking (if None, skips re-ranking)
+    /// * `rerank_top_k` - Number of results after re-ranking (default: same as limit)
+    pub fn retrieve_with_rerank(
+        &self,
+        query: &str,
+        project_id: &Option<&str>,
+        limit: usize,
+        embedder: Option<&crate::embedding::BgeEmbedder>,
+        rerank_top_k: Option<usize>,
+    ) -> Vec<MemoryNode> {
+        // Step 1: Multi-path retrieval (get more candidates than needed)
+        let retrieve_limit = if embedder.is_some() {
+            // If re-ranking is enabled, retrieve more candidates
+            (limit * 2).max(limit + 5)
+        } else {
+            limit
+        };
+        
+        let mut results = self.retrieve(query, project_id, retrieve_limit);
+        
+        // Step 2: Re-rank if embedder is provided
+        if let Some(emb) = embedder {
+            let top_k = rerank_top_k.unwrap_or(limit);
+            
+            tracing::info!("[MEMORY] Re-ranking {} memories (target: {})", results.len(), top_k);
+            
+            match crate::embedding::rerank_memories(emb, query, results.clone(), top_k) {
+                Ok(reranked) => {
+                    tracing::info!("[MEMORY] Re-ranking complete, returned {} memories", reranked.len());
+                    return reranked;
+                }
+                Err(e) => {
+                    tracing::warn!("[MEMORY] Re-ranking failed: {}, falling back to original ranking", e);
+                    // Fall back to original ranking
+                    results.truncate(limit);
+                    return results;
                 }
             }
         }
-
-        if let Ok(mems) = self.overall_store.query_overall(&[MemoryNodeType::BestPractice, MemoryNodeType::Pattern, MemoryNodeType::MetaSkill], limit) {
-            results.extend(mems);
+        
+        // No re-ranking, just truncate to limit
+        results.truncate(limit);
+        results
+    }
+    
+    /// Legacy retrieve method (without re-ranking).
+    /// Use retrieve_with_rerank for better accuracy.
+    pub fn retrieve(
+        &self,
+        query: &str,
+        project_id: &Option<&str>,
+        limit: usize,
+    ) -> Vec<MemoryNode> {
+        // 🆕 Check cache first
+        let cache_key = format!("{}:{:?}:{}", query, project_id, limit);
+        if let Some((cached, timestamp)) = self.query_cache.lock().unwrap().get(&cache_key) {
+            let age_secs = chrono::Utc::now().signed_duration_since(*timestamp).num_seconds();
+            if age_secs < 300 {  // Cache TTL: 5 minutes
+                tracing::debug!("[MEMORY CACHE] Hit for query: {}", query);
+                return cached.clone();
+            }
         }
-
+        
+        let mut all_results: std::collections::HashMap<String, (MemoryNode, f32)> = std::collections::HashMap::new();
+        
+        // 🎯 PATH 1: Original semantic query (weight: 1.0)
         if !query.is_empty() {
             if let Some(pid) = project_id {
-                if let Ok(mems) = self.project_store.as_ref().unwrap_or_else(|| &self.overall_store).search(query, Some(pid), limit) {
+                if let Ok(mems) = self
+                    .project_store
+                    .as_ref()
+                    .unwrap_or_else(|| &self.overall_store)
+                    .search(query, Some(pid), limit)
+                {
                     for m in mems {
-                        if !results.iter().any(|r| r.id == m.id) {
-                            results.push(m);
-                        }
+                        all_results.entry(m.id.clone())
+                            .or_insert_with(|| (m, 1.0));
                     }
                 }
             }
         }
-
-        results.retain(|n| {
+        
+        // 🎯 PATH 2: Entity-based retrieval (weight: 0.8)
+        let entities = self.extract_query_entities(query);
+        for entity in &entities {
+            if let Some(pid) = project_id {
+                if let Ok(mems) = self
+                    .project_store
+                    .as_ref()
+                    .unwrap_or_else(|| &self.overall_store)
+                    .search(entity, Some(pid), 3)  // Limit per entity
+                {
+                    for m in mems {
+                        all_results.entry(m.id.clone())
+                            .and_modify(|(_, score)| *score = (*score + 0.8).min(2.0))
+                            .or_insert_with(|| (m, 0.8));
+                    }
+                }
+            }
+        }
+        
+        // 🎯 PATH 3: Type-specific project memories (weight: 0.6)
+        if let Some(pid) = project_id {
+            if let Some(ref store) = self.project_store {
+                if let Ok(mems) = store.query_by_project(
+                    pid,
+                    &[
+                        MemoryNodeType::Architectural,
+                        MemoryNodeType::Business,
+                        MemoryNodeType::Style,
+                    ],
+                    limit / 2,  // Reduced limit for type-specific
+                ) {
+                    for m in mems {
+                        all_results.entry(m.id.clone())
+                            .and_modify(|(_, score)| *score = (*score + 0.6).min(2.0))
+                            .or_insert_with(|| (m, 0.6));
+                    }
+                }
+            }
+        }
+        
+        // 🎯 PATH 4: Global best practices (weight: 0.5)
+        if let Ok(mems) = self.overall_store.query_overall(
+            &[
+                MemoryNodeType::BestPractice,
+                MemoryNodeType::Pattern,
+                MemoryNodeType::MetaSkill,
+            ],
+            limit / 2,
+        ) {
+            for m in mems {
+                all_results.entry(m.id.clone())
+                    .and_modify(|(_, score)| *score = (*score + 0.5).min(2.0))
+                    .or_insert_with(|| (m, 0.5));
+            }
+        }
+        
+        // Convert to vector and apply decay filter
+        let mut results: Vec<(MemoryNode, f32)> = all_results.into_values().collect();
+        
+        results.retain(|(n, _)| {
             let decay = if n.project_id.is_some() {
                 calculate_project_decay(n, 30)
             } else {
@@ -502,18 +877,91 @@ impl MemoryManager {
             };
             decay > 0.3 || n.is_project_critical
         });
-
-        results.sort_by(|a, b| {
-            composite_score(b, 30).partial_cmp(&composite_score(a, 30)).unwrap_or(std::cmp::Ordering::Equal)
+        
+        // Sort by combined score (relevance weight + composite score + LLM feedback boost)
+        results.sort_by(|(a, weight_a), (b, weight_b)| {
+            let base_score_a = composite_score(a, 30) * weight_a;
+            let base_score_b = composite_score(b, 30) * weight_b;
+            
+            // 🆕 Add LLM score boost for high-quality memories
+            let llm_boost_a = if a.avg_llm_score > 0.0 {
+                (a.avg_llm_score / 10.0) * 0.3  // Up to +30% boost
+            } else {
+                0.0
+            };
+            let llm_boost_b = if b.avg_llm_score > 0.0 {
+                (b.avg_llm_score / 10.0) * 0.3
+            } else {
+                0.0
+            };
+            
+            let final_score_a = base_score_a * (1.0 + llm_boost_a);
+            let final_score_b = base_score_b * (1.0 + llm_boost_b);
+            
+            final_score_b.partial_cmp(&final_score_a).unwrap_or(std::cmp::Ordering::Equal)
         });
-
+        
+        // Extract just the nodes, truncate to limit
         results.truncate(limit);
-        results
+        let final_results: Vec<MemoryNode> = results.into_iter().map(|(node, _)| node).collect();
+        
+        // 🆕 Cache the results
+        self.query_cache.lock().unwrap().insert(
+            cache_key,
+            (final_results.clone(), chrono::Utc::now())
+        );
+        
+        final_results
+    }
+    
+    /// Extract key entities from query for multi-path retrieval.
+    /// Focuses on: file names, function names, technical terms.
+    fn extract_query_entities(&self, query: &str) -> Vec<String> {
+        let mut entities = Vec::new();
+        
+        // 1. Extract file paths and names
+        if let Ok(file_pattern) = regex::Regex::new(r"[\w.-]+\.(rs|toml|json|md|py|js|ts|go)") {
+            for mat in file_pattern.find_iter(query) {
+                let file_name = mat.as_str().to_string();
+                if !entities.contains(&file_name) {
+                    entities.push(file_name);
+                }
+            }
+        }
+        
+        // 2. Extract code identifiers (backtick-wrapped)
+        if let Ok(ident_pattern) = regex::Regex::new(r"`([\w_]+)`") {
+            for mat in ident_pattern.find_iter(query) {
+                let ident = mat.as_str().trim_matches('`').to_string();
+                if ident.len() > 2 && !entities.contains(&ident) {
+                    entities.push(ident);
+                }
+            }
+        }
+        
+        // 3. Extract technical terms
+        let tech_terms = [
+            "authentication", "authorization", "database", "api", "http",
+            "async", "await", "error handling", "testing", "deployment",
+            "refactor", "optimize", "performance", "security"
+        ];
+        let query_lower = query.to_lowercase();
+        for term in &tech_terms {
+            if query_lower.contains(term) && !entities.iter().any(|e| e.to_lowercase() == *term) {
+                entities.push(term.to_string());
+            }
+        }
+        
+        // Limit to top 5 most relevant entities
+        entities.truncate(5);
+        entities
     }
 
     pub fn flush(&self) {
         let batch = self.write_buffer.lock().unwrap().drain();
-        if batch.is_empty() { return; }
+        if batch.is_empty() {
+            return;
+        }
         for node in &batch {
             if node.node_type.is_long_term() || node.project_id.is_none() {
                 if let Err(e) = self.overall_store.insert(node) {
@@ -529,14 +977,39 @@ impl MemoryManager {
     }
 
     pub fn format_memory_context(&self, nodes: &[MemoryNode], use_xml: bool) -> String {
-        if nodes.is_empty() { return String::new(); }
+        if nodes.is_empty() {
+            return String::new();
+        }
 
         if use_xml {
             // XML format for compatible APIs
             let mut out = String::from("<relevant_memories>\n");
             for n in nodes.iter().take(8) {
-                let content: String = n.content.chars().take(120).collect();
-                out.push_str(&format!("  <memory depth=\"{}\" type=\"{}\">{}</memory>\n", n.depth, n.node_type, content));
+                // 🆕 Dynamic truncation based on LLM score with chunking
+                let max_len = if n.avg_llm_score >= 8.0 {
+                    350  // High-score memory: preserve more context
+                } else if n.avg_llm_score >= 6.0 {
+                    250  // Medium-score memory: normal length
+                } else if n.avg_llm_score > 0.0 {
+                    180  // Low-score memory: concise
+                } else {
+                    250  // Unrated memory: default length
+                };
+                
+                // 🆕 Use sliding window chunking for long memories
+                let content = if n.content.len() > max_len * 2 {
+                    // For very long memories, use first chunk with overlap
+                    let chunks = split_with_overlap(&n.content, max_len, 0.15);
+                    format!("{}...", chunks[0])
+                } else if n.content.len() > max_len {
+                    format!("{}...", &n.content[..max_len])
+                } else {
+                    n.content.clone()
+                };
+                out.push_str(&format!(
+                    "  <memory depth=\"{}\" type=\"{}\">{}</memory>\n",
+                    n.depth, n.node_type, content
+                ));
             }
             out.push_str("</relevant_memories>");
             out
@@ -544,7 +1017,27 @@ impl MemoryManager {
             // Plain text format for MiniMax and similar APIs
             let mut out = String::from("Relevant context:\n");
             for n in nodes.iter().take(5) {
-                let content: String = n.content.chars().take(150).collect();
+                // 🆕 Dynamic truncation based on LLM score with chunking
+                let max_len = if n.avg_llm_score >= 8.0 {
+                    400  // High-score memory: preserve more context
+                } else if n.avg_llm_score >= 6.0 {
+                    280  // Medium-score memory: normal length
+                } else if n.avg_llm_score > 0.0 {
+                    200  // Low-score memory: concise
+                } else {
+                    280  // Unrated memory: default length
+                };
+                
+                // 🆕 Use sliding window chunking for long memories
+                let content = if n.content.len() > max_len * 2 {
+                    // For very long memories, use first chunk with overlap
+                    let chunks = split_with_overlap(&n.content, max_len, 0.15);
+                    format!("{}...", chunks[0])
+                } else if n.content.len() > max_len {
+                    format!("{}...", &n.content[..max_len])
+                } else {
+                    n.content.clone()
+                };
                 out.push_str(&format!("- {}\n", content));
             }
             out
@@ -566,7 +1059,11 @@ impl MemoryManager {
     }
 
     pub fn stats(&self, project_id: &str) -> (usize, usize) {
-        let project_count = self.project_store.as_ref().and_then(|s| s.count_by_project(project_id).ok()).unwrap_or(0);
+        let project_count = self
+            .project_store
+            .as_ref()
+            .and_then(|s| s.count_by_project(project_id).ok())
+            .unwrap_or(0);
         let overall_count = self.overall_store.count_overall().unwrap_or(0);
         (project_count, overall_count)
     }
@@ -581,9 +1078,254 @@ impl MemoryManager {
             let _ = self.overall_store.increment_depth(id);
         }
     }
+    
+    /// 🆕 Update memory with LLM judge feedback.
+    /// 
+    /// This creates a feedback loop where high-scoring memories are reinforced
+    /// and low-scoring memories are weakened or eventually deleted.
+    /// 
+    /// # Arguments
+    /// * `memory_id` - ID of the memory to update
+    /// * `llm_score` - Score from LLM judge (0-10)
+    /// * `project_id` - Optional project ID for scoped update
+    pub fn update_with_llm_feedback(&self, memory_id: &str, llm_score: f32, project_id: Option<&str>) {
+        tracing::debug!(
+            "[MEMORY FEEDBACK] Updating memory {} with LLM score: {:.1}",
+            memory_id,
+            llm_score
+        );
+        
+        // Try to update in project store first, then overall store
+        let stores = if let Some(pid) = project_id {
+            vec![
+                (self.project_store.as_ref(), Some(pid)),
+                (Some(&self.overall_store), None),
+            ]
+        } else {
+            vec![(Some(&self.overall_store), None)]
+        };
+        
+        for (store_opt, _pid) in stores {
+            if let Some(store) = store_opt {
+                // Fetch current memory state
+                if let Ok(mut node) = self.fetch_memory_by_id(memory_id, store) {
+                    // Update recent scores (sliding window)
+                    let mut scores = node.recent_scores;
+                    scores.rotate_left(1);  // Shift left
+                    scores[4] = llm_score;   // Add new score at end
+                    node.recent_scores = scores;
+                    
+                    // Update eval count
+                    node.judge_eval_count += 1;
+                    
+                    // Update average score (exponential moving average)
+                    let alpha = 0.3;  // Weight for new score
+                    node.avg_llm_score = node.avg_llm_score * (1.0 - alpha) + llm_score * alpha;
+                    
+                    // Adjust depth based on score
+                    if llm_score >= 7.0 {
+                        // High score: reinforce
+                        node.depth = (node.depth + 1).min(10);
+                        tracing::debug!("[MEMORY FEEDBACK] Reinforced memory {} (depth={})", memory_id, node.depth);
+                    } else if llm_score < 5.0 {
+                        // Low score: weaken
+                        if node.depth > 0 {
+                            node.depth -= 1;
+                            tracing::debug!("[MEMORY FEEDBACK] Weakened memory {} (depth={})", memory_id, node.depth);
+                        }
+                        
+                        // Check if should be deleted (consistently low scores)
+                        let low_score_count = node.recent_scores.iter()
+                            .filter(|&&s| s > 0.0 && s < 5.0)
+                            .count();
+                        
+                        if low_score_count >= 3 && node.depth == 0 {
+                            tracing::info!(
+                                "[MEMORY FEEDBACK] Deleting consistently low-scoring memory {}",
+                                memory_id
+                            );
+                            let _ = store.delete(memory_id);
+                            return;
+                        }
+                    }
+                    
+                    // Save updated memory
+                    if let Err(e) = store.insert(&node) {
+                        tracing::warn!("[MEMORY FEEDBACK] Failed to save updated memory: {}", e);
+                    }
+                    
+                    return;  // Successfully updated
+                }
+            }
+        }
+        
+        tracing::warn!("[MEMORY FEEDBACK] Memory {} not found for update", memory_id);
+    }
+    
+    /// 🆕 Batch update multiple memories with LLM feedback (more efficient)
+    /// 
+    /// This method uses a single transaction to update all memories,
+    /// reducing database overhead significantly.
+    pub fn update_with_llm_feedback_batch(
+        &self,
+        feedbacks: Vec<(String, f32)>,  // (memory_id, score)
+        project_id: Option<&str>,
+    ) {
+        if feedbacks.is_empty() {
+            return;
+        }
+        
+        tracing::info!(
+            "[MEMORY FEEDBACK BATCH] Updating {} memories with batch operation",
+            feedbacks.len()
+        );
+        
+        // Collect all updated nodes
+        let mut updated_nodes = Vec::new();
+        
+        // Try to update in project store first, then overall store
+        let stores = if let Some(pid) = project_id {
+            vec![
+                (self.project_store.as_ref(), Some(pid)),
+                (Some(&self.overall_store), None),
+            ]
+        } else {
+            vec![(Some(&self.overall_store), None)]
+        };
+        
+        for (store_opt, _pid) in stores {
+            if let Some(store) = store_opt {
+                let mut updated_count = 0;
+                
+                for (memory_id, score) in &feedbacks {
+                    // Fetch current memory state
+                    if let Ok(mut node) = self.fetch_memory_by_id(memory_id, store) {
+                        // Update recent scores (sliding window)
+                        let mut scores = node.recent_scores;
+                        scores.rotate_left(1);
+                        scores[4] = *score;
+                        node.recent_scores = scores;
+                        
+                        // Update eval count
+                        node.judge_eval_count += 1;
+                        
+                        // Update average score (exponential moving average)
+                        let alpha = 0.3;
+                        node.avg_llm_score = node.avg_llm_score * (1.0 - alpha) + score * alpha;
+                        
+                        // Adjust depth based on score
+                        if *score >= 7.0 {
+                            node.depth = (node.depth + 1).min(10);
+                        } else if *score < 5.0 && node.depth > 0 {
+                            node.depth -= 1;
+                            
+                            // Check if should be deleted
+                            let low_score_count = node.recent_scores.iter()
+                                .filter(|&&s| s > 0.0 && s < 5.0)
+                                .count();
+                            
+                            if low_score_count >= 3 && node.depth == 0 {
+                                let _ = store.delete(memory_id);
+                                updated_count += 1;
+                                continue;
+                            }
+                        }
+                        
+                        updated_nodes.push(node);
+                        updated_count += 1;
+                    }
+                }
+                
+                // Use insert_batch for efficient bulk update
+                if !updated_nodes.is_empty() {
+                    if let Err(e) = store.insert_batch(&updated_nodes) {
+                        tracing::warn!("[MEMORY FEEDBACK BATCH] Failed to batch insert: {}", e);
+                    } else {
+                        tracing::info!(
+                            "[MEMORY FEEDBACK BATCH] Successfully updated {} memories",
+                            updated_count
+                        );
+                    }
+                }
+                
+                return;  // Successfully processed in this store
+            }
+        }
+    }
+    
+    /// Helper to fetch a memory by ID from a specific store
+    fn fetch_memory_by_id(
+        &self,
+        memory_id: &str,
+        store: &store::MemoryStore,
+    ) -> anyhow::Result<MemoryNode> {
+        // Query all types to find the memory
+        let all_types = &[
+            MemoryNodeType::Fact,
+            MemoryNodeType::Style,
+            MemoryNodeType::Architectural,
+            MemoryNodeType::AntiPattern,
+            MemoryNodeType::Business,
+            MemoryNodeType::BestPractice,
+            MemoryNodeType::Pattern,
+            MemoryNodeType::MetaSkill,
+        ];
+        
+        // Try project query first
+        if let Ok(nodes) = store.query_by_project("", all_types, 1000) {
+            if let Some(node) = nodes.into_iter().find(|n| n.id == memory_id) {
+                return Ok(node);
+            }
+        }
+        
+        anyhow::bail!("Memory {} not found", memory_id)
+    }
 
     /// Get a reference to the overall memory store
     pub fn overall_store(&self) -> &store::MemoryStore {
         &self.overall_store
     }
+    
+    /// Get learning statistics for a project
+    pub fn get_learning_stats(&self, project_id: &str) -> LearningStats {
+        let (project_count, overall_count) = self.stats(project_id);
+        
+        // Count memories by type
+        let mut type_counts = std::collections::HashMap::new();
+        
+        if let Some(ref store) = self.project_store {
+            if let Ok(nodes) = store.query_by_project(
+                project_id,
+                &[
+                    MemoryNodeType::Fact,
+                    MemoryNodeType::Style,
+                    MemoryNodeType::Architectural,
+                    MemoryNodeType::AntiPattern,
+                    MemoryNodeType::Business,
+                    MemoryNodeType::BestPractice,
+                    MemoryNodeType::Pattern,
+                    MemoryNodeType::MetaSkill,
+                ],
+                1000,
+            ) {
+                for node in &nodes {
+                    *type_counts.entry(node.node_type.as_str()).or_insert(0) += 1;
+                }
+            }
+        }
+        
+        LearningStats {
+            project_memories: project_count,
+            overall_memories: overall_count,
+            memories_by_type: type_counts,
+        }
+    }
+}
+
+/// Statistics about learned knowledge
+#[derive(Debug, Clone)]
+pub struct LearningStats {
+    pub project_memories: usize,
+    pub overall_memories: usize,
+    pub memories_by_type: std::collections::HashMap<&'static str, usize>,
 }

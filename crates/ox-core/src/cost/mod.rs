@@ -129,7 +129,11 @@ impl CostTracker {
     pub fn summary_short(&self) -> String {
         let daily_tokens = self.daily_prompt_tokens + self.daily_completion_tokens;
         if self.monthly_cost_usd > 0.0 {
-            format!("${:.2}/mo · {}tk today", self.monthly_cost_usd, daily_tokens / 1000)
+            format!(
+                "${:.2}/mo · {}tk today",
+                self.monthly_cost_usd,
+                daily_tokens / 1000
+            )
         } else {
             format!("{}tk today", daily_tokens / 1000)
         }
@@ -147,10 +151,10 @@ impl CostTracker {
 
 /// Estimate USD cost for an API call based on model and token usage.
 /// Uses approximate per-token pricing (as of 2024-2025).
-fn estimate_cost(model: &str, usage: &TokenUsage) -> f64 {
+pub fn estimate_cost(model: &str, usage: &TokenUsage) -> f64 {
     let m = model.to_lowercase();
     let (prompt_rate, completion_rate) = match () {
-        _ if m.starts_with("gpt-4o") => (2.50, 10.00),          // per 1M tokens
+        _ if m.starts_with("gpt-4o") => (2.50, 10.00), // per 1M tokens
         _ if m.starts_with("gpt-4-turbo") => (10.00, 30.00),
         _ if m.starts_with("gpt-4") => (30.00, 60.00),
         _ if m.starts_with("gpt-3.5") => (0.50, 1.50),

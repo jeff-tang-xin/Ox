@@ -14,7 +14,7 @@ pub struct WriteRecord {
 #[derive(Debug, Clone)]
 pub struct OverrideSignal {
     pub path: PathBuf,
-    pub change_ratio: f64,  // 0.0~1.0, proportion of changes
+    pub change_ratio: f64, // 0.0~1.0, proportion of changes
     pub time_elapsed: Duration,
 }
 
@@ -38,12 +38,15 @@ impl CodeOverrideDetector {
     pub fn register_write(&mut self, path: PathBuf, content: &str) {
         let content_hash = hash_content(content);
         let line_count = content.lines().count();
-        
-        self.recent_writes.insert(path, WriteRecord {
-            content_hash,
-            line_count,
-            timestamp: Instant::now(),
-        });
+
+        self.recent_writes.insert(
+            path,
+            WriteRecord {
+                content_hash,
+                line_count,
+                timestamp: Instant::now(),
+            },
+        );
     }
 
     /// Detect overrides before next user input
@@ -73,7 +76,7 @@ impl CodeOverrideDetector {
             // Compare current content with Ox's version
             if let Ok(current_content) = std::fs::read_to_string(path) {
                 let current_hash = hash_content(&current_content);
-                
+
                 if current_hash == record.content_hash {
                     // No changes - accepted
                     continue;
@@ -81,8 +84,12 @@ impl CodeOverrideDetector {
 
                 // Calculate change ratio
                 let current_lines = current_content.lines().count();
-                let change_ratio = calculate_diff_ratio(record.content_hash, record.line_count, 
-                                                        current_hash, current_lines);
+                let change_ratio = calculate_diff_ratio(
+                    record.content_hash,
+                    record.line_count,
+                    current_hash,
+                    current_lines,
+                );
 
                 signals.push(OverrideSignal {
                     path: path.clone(),
@@ -110,7 +117,7 @@ impl CodeOverrideDetector {
 fn hash_content(content: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    
+
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
     hasher.finish()
@@ -135,7 +142,7 @@ fn calculate_diff_ratio(old_hash: u64, old_lines: usize, new_hash: u64, new_line
 
     let line_diff = (old_lines as i64 - new_lines as i64).abs() as f64;
     let ratio = line_diff / max_lines as f64;
-    
+
     // Clamp to [0.0, 1.0]
     ratio.min(1.0)
 }
@@ -160,8 +167,8 @@ pub fn map_override_to_feedback(change_ratio: f64) -> Option<ImplicitFeedback> {
 /// Implicit feedback signal types
 #[derive(Debug, Clone, Copy)]
 pub enum ImplicitFeedback {
-    WeakNegative,      // weight: 0.3
-    StrongNegative,    // weight: 0.8
+    WeakNegative,       // weight: 0.3
+    StrongNegative,     // weight: 0.8
     VeryStrongNegative, // weight: 1.0
 }
 
@@ -209,9 +216,18 @@ mod tests {
     #[test]
     fn test_map_override_to_feedback() {
         assert!(map_override_to_feedback(0.02).is_none());
-        assert!(matches!(map_override_to_feedback(0.15), Some(ImplicitFeedback::WeakNegative)));
-        assert!(matches!(map_override_to_feedback(0.50), Some(ImplicitFeedback::StrongNegative)));
-        assert!(matches!(map_override_to_feedback(1.0), Some(ImplicitFeedback::VeryStrongNegative)));
+        assert!(matches!(
+            map_override_to_feedback(0.15),
+            Some(ImplicitFeedback::WeakNegative)
+        ));
+        assert!(matches!(
+            map_override_to_feedback(0.50),
+            Some(ImplicitFeedback::StrongNegative)
+        ));
+        assert!(matches!(
+            map_override_to_feedback(1.0),
+            Some(ImplicitFeedback::VeryStrongNegative)
+        ));
     }
 
     #[test]

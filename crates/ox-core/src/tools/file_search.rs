@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
@@ -38,16 +38,20 @@ impl Tool for FileSearchTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let pattern = match args.get("pattern").and_then(|p| p.as_str()) {
             Some(p) => p,
-            None => return ToolOutput::error("Missing required parameter: pattern. Usage: {\"pattern\": \"<glob pattern>\"}"),
+            None => {
+                return ToolOutput::error(
+                    "Missing required parameter: pattern. Usage: {\"pattern\": \"<glob pattern>\"}",
+                );
+            }
         };
         let base = if let Some(p) = args.get("path").and_then(|p| p.as_str()) {
             // Normalize path: trim whitespace and standardize separators
             let normalized_path = p.trim().replace('\\', "/");
             let resolved = ctx.working_dir.join(&normalized_path);
-            
+
             // Keep user-friendly path for error messages
             let _display_base = resolved.clone();
-            
+
             match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
                 Ok(validated) => validated,
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),

@@ -32,13 +32,15 @@ impl EventHandler {
                     match event::read() {
                         Ok(CrosstermEvent::Key(key))
                             if key.kind == KeyEventKind::Press
-                                && tx.send(Event::Key(key)).is_err() => {
-                                    break;
-                                }
+                                && tx.send(Event::Key(key)).is_err() =>
+                        {
+                            break;
+                        }
                         Ok(CrosstermEvent::Resize(w, h))
-                            if tx.send(Event::Resize(w, h)).is_err() => {
-                                break;
-                            }
+                            if tx.send(Event::Resize(w, h)).is_err() =>
+                        {
+                            break;
+                        }
                         // Mouse scroll events are handled directly in main loop via event::read()
                         // to avoid stdin pollution from ANSI sequences.
                         _ => {}
@@ -51,7 +53,10 @@ impl EventHandler {
             }
         });
 
-        Self { rx, _thread: thread }
+        Self {
+            rx,
+            _thread: thread,
+        }
     }
 
     pub async fn recv(&mut self) -> Option<Event> {

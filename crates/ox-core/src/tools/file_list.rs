@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
@@ -34,7 +34,7 @@ impl Tool for FileListTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         // If no path provided, list all files from index
         let path_str = args.get("path").and_then(|p| p.as_str());
-        
+
         match path_str {
             None => {
                 // List all files from database index
@@ -43,19 +43,20 @@ impl Tool for FileListTool {
                         if entries.is_empty() {
                             return ToolOutput::success("No files found in index.");
                         }
-                        
+
                         // Format: [ID] path (file_type)
                         let lines: Vec<String> = entries
                             .iter()
                             .map(|e| {
-                                let type_info = e.file_type
+                                let type_info = e
+                                    .file_type
                                     .as_ref()
                                     .map(|t| format!(" (.{})", t))
                                     .unwrap_or_default();
                                 format!("[{}] {}{}", e.id, e.full_path, type_info)
                             })
                             .collect();
-                        
+
                         ToolOutput::success(format!(
                             "Found {} files:\n{}",
                             entries.len(),
@@ -77,20 +78,21 @@ impl FileListTool {
     /// Traditional filesystem listing (when path is provided)
     fn list_from_filesystem(&self, path_str: &str, ctx: &ToolContext) -> ToolOutput {
         use std::fs;
-        
+
         // Normalize path: trim whitespace and standardize separators
         let normalized_path = path_str.trim().replace('\\', "/");
-        
+
         // Path traversal protection.
         let resolved_path = ctx.working_dir.join(&normalized_path);
-        
+
         // Keep user-friendly path for error messages
         let display_path = resolved_path.clone();
-        
-        let validated_path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
-            Ok(p) => p,
-            Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
-        };
+
+        let validated_path =
+            match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
+                Ok(p) => p,
+                Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
+            };
 
         // Check if it's a glob pattern.
         if path_str.contains('*') || path_str.contains('?') {
@@ -101,9 +103,7 @@ impl FileListTool {
                     for entry in entries {
                         match entry {
                             Ok(path) => {
-                                let relative = path
-                                    .strip_prefix(&ctx.working_dir)
-                                    .unwrap_or(&path);
+                                let relative = path.strip_prefix(&ctx.working_dir).unwrap_or(&path);
                                 results.push(relative.display().to_string());
                             }
                             Err(e) => {
@@ -140,10 +140,9 @@ impl FileListTool {
                     items.sort();
                     ToolOutput::success(items.join("\n"))
                 }
-                Err(e) => ToolOutput::error(format!(
-                    "Failed to list {}: {e}",
-                    display_path.display()
-                )),
+                Err(e) => {
+                    ToolOutput::error(format!("Failed to list {}: {e}", display_path.display()))
+                }
             }
         }
     }

@@ -1,8 +1,8 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
 use super::app::App;
 use super::input_pane::InputPane;
@@ -34,15 +34,19 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
 
     // Calculate dynamic header height (max 3 lines to save space)
     let header_height = app.header_info.len().min(3) as u16 + 1;
-    
+
     // Input pane: 2 lines for normal mode, 3 lines for confirmation mode
-    let input_height = if app.pending_confirmation.is_some() { 3 } else { 2 };
+    let input_height = if app.pending_confirmation.is_some() {
+        3
+    } else {
+        2
+    };
 
     let chunks = Layout::vertical([
-        Constraint::Length(header_height),      // Header
-        Constraint::Min(5),                      // Main output (flexible)
-        Constraint::Length(1),                   // Status bar
-        Constraint::Length(input_height),        // Input pane (dynamic)
+        Constraint::Length(header_height), // Header
+        Constraint::Min(5),                // Main output (flexible)
+        Constraint::Length(1),             // Status bar
+        Constraint::Length(input_height),  // Input pane (dynamic)
     ])
     .split(area);
 
@@ -61,10 +65,19 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 
     // Line 1: Main title
     lines.push(Line::from(vec![
-        Span::styled(" ◆ ".to_string(), Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
-        Span::styled("Ox".to_string(), Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ◆ ".to_string(),
+            Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Ox".to_string(),
+            Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" v0.1.0".to_string(), Style::default().fg(TEXT_DIM)),
-        Span::styled(" — AI Programming Assistant".to_string(), Style::default().fg(TEXT)),
+        Span::styled(
+            " — AI Programming Assistant".to_string(),
+            Style::default().fg(TEXT),
+        ),
     ]));
 
     // Line 2: Workflow status (if active) - use cached data to avoid locking
@@ -73,28 +86,42 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         let filled = (wf_info.step_num * 10 / wf_info.total_steps) as usize;
         let empty = 10 - filled;
         let progress_bar = "█".repeat(filled) + &"░".repeat(empty);
-        
+
         lines.push(Line::from(vec![
             Span::styled(" 📋 ".to_string(), Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{}", wf_info.workflow_name), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" | Step {}/{}", wf_info.step_num, wf_info.total_steps), Style::default().fg(TEXT)),
-            Span::styled(format!(" [{}] {}%", progress_bar, progress_pct), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{}", wf_info.workflow_name),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" | Step {}/{}", wf_info.step_num, wf_info.total_steps),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled(
+                format!(" [{}] {}%", progress_bar, progress_pct),
+                Style::default().fg(Color::Green),
+            ),
         ]));
-        
+
         // Current step name
         lines.push(Line::from(vec![
             Span::styled("   → ".to_string(), Style::default().fg(TEXT_DIM)),
-            Span::styled(wf_info.step_name.clone(), Style::default().fg(STREAMING).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                wf_info.step_name.clone(),
+                Style::default().fg(STREAMING).add_modifier(Modifier::BOLD),
+            ),
         ]));
     }
 
     // Additional header info (max remaining lines)
     let max_info_lines = if app.workflow_engine.is_some() {
-        area.height.saturating_sub(3) as usize  // Reserve 3 lines for workflow
+        area.height.saturating_sub(3) as usize // Reserve 3 lines for workflow
     } else {
-        area.height.saturating_sub(1) as usize  // Only reserve 1 line for title
+        area.height.saturating_sub(1) as usize // Only reserve 1 line for title
     };
-    
+
     for info in &app.header_info {
         if lines.len() < area.height as usize - 1 && lines.len() <= max_info_lines {
             lines.push(Line::from(vec![
@@ -104,24 +131,31 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let bottom_border = if lines.len() < area.height as usize - 1 { Borders::BOTTOM } else { Borders::NONE };
+    let bottom_border = if lines.len() < area.height as usize - 1 {
+        Borders::BOTTOM
+    } else {
+        Borders::NONE
+    };
     let block = Block::default()
         .borders(bottom_border)
         .border_style(Style::default().fg(BORDER))
         .style(Style::default().bg(BG));
 
-    let para = Paragraph::new(lines).block(block).style(Style::default().bg(BG));
+    let para = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().bg(BG));
     frame.render_widget(para, area);
 }
 
 fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
-    let sidebar_w = if app.sessions.is_empty() { 0 } else { app.sidebar_width.min(area.width / 4) };
+    let sidebar_w = if app.sessions.is_empty() {
+        0
+    } else {
+        app.sidebar_width.min(area.width / 4)
+    };
 
-    let main_chunks = Layout::horizontal([
-        Constraint::Min(1),
-        Constraint::Length(sidebar_w),
-    ])
-    .split(area);
+    let main_chunks =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(sidebar_w)]).split(area);
 
     render_chat(frame, app, main_chunks[0]);
 
@@ -133,7 +167,7 @@ fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     // Store chat area bounds for mouse scroll detection
     app.chat_area = Some((area.x, area.y, area.width, area.height));
-    
+
     let spinner_frame = app.spinner_frame;
     let scroll_offset = app.scroll_offset;
 
@@ -156,7 +190,9 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         .title_style(if app.agent_running {
             Style::default().fg(STREAMING).add_modifier(Modifier::BOLD)
         } else if app.user_scrolled {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(BLUE).add_modifier(Modifier::BOLD)
         })
@@ -169,9 +205,10 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let md = &app.md_renderer;
     let out = &mut app.output;
-    let (lines, _total) = out.get_visible_lines(output_width, inner_height, scroll_offset, |ol, w| {
-        render_single_line(ol, w, md)
-    });
+    let (lines, _total) =
+        out.get_visible_lines(output_width, inner_height, scroll_offset, |ol, w| {
+            render_single_line(ol, w, md)
+        });
 
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -180,12 +217,19 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_single_line(ol: &OutputLine, width: usize, md_renderer: &super::markdown::MarkdownRenderer) -> Vec<Line<'static>> {
+fn render_single_line(
+    ol: &OutputLine,
+    width: usize,
+    md_renderer: &super::markdown::MarkdownRenderer,
+) -> Vec<Line<'static>> {
     match ol {
         OutputLine::User(s) => {
             // User messages with distinct background
             vec![Line::from(vec![
-                Span::styled(" ▸ ".to_string(), Style::default().fg(USER_COLOR).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " ▸ ".to_string(),
+                    Style::default().fg(USER_COLOR).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(s.clone(), Style::default().fg(TEXT_BRIGHT)),
             ])]
         }
@@ -195,7 +239,10 @@ fn render_single_line(ol: &OutputLine, width: usize, md_renderer: &super::markdo
             }
             let rendered = md_renderer.render_lines(s, width);
             if rendered.is_empty() {
-                vec![Line::from(Span::styled(s.clone(), Style::default().fg(TEXT)))]
+                vec![Line::from(Span::styled(
+                    s.clone(),
+                    Style::default().fg(TEXT),
+                ))]
             } else {
                 rendered
             }
@@ -203,8 +250,14 @@ fn render_single_line(ol: &OutputLine, width: usize, md_renderer: &super::markdo
         OutputLine::Tool { name, detail } => {
             // Tool calls with subtle background indicator
             let mut spans = vec![
-                Span::styled(" ⚙ ".to_string(), Style::default().fg(TOOL_COLOR).bg(Color::Rgb(40, 40, 30))),
-                Span::styled(name.clone(), Style::default().fg(TOOL_COLOR).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " ⚙ ".to_string(),
+                    Style::default().fg(TOOL_COLOR).bg(Color::Rgb(40, 40, 30)),
+                ),
+                Span::styled(
+                    name.clone(),
+                    Style::default().fg(TOOL_COLOR).add_modifier(Modifier::BOLD),
+                ),
             ];
             if let Some(cmd) = detail {
                 spans.push(Span::styled(
@@ -214,15 +267,25 @@ fn render_single_line(ol: &OutputLine, width: usize, md_renderer: &super::markdo
             }
             vec![Line::from(spans)]
         }
-        OutputLine::ToolResult { name: _, summary, is_error } => {
+        OutputLine::ToolResult {
+            name: _,
+            summary,
+            is_error,
+        } => {
             // Tool results with clear success/error indicators
-            let (icon, color, bg) = if *is_error { 
-                (" ✗ ", TOOL_ERR, Color::Rgb(50, 20, 20)) 
-            } else { 
-                (" ✓ ", TOOL_OK, Color::Rgb(20, 40, 20)) 
+            let (icon, color, bg) = if *is_error {
+                (" ✗ ", TOOL_ERR, Color::Rgb(50, 20, 20))
+            } else {
+                (" ✓ ", TOOL_OK, Color::Rgb(20, 40, 20))
             };
             vec![Line::from(vec![
-                Span::styled(icon, Style::default().fg(color).add_modifier(Modifier::BOLD).bg(bg)),
+                Span::styled(
+                    icon,
+                    Style::default()
+                        .fg(color)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(bg),
+                ),
                 Span::styled(summary.clone(), Style::default().fg(color)),
             ])]
         }
@@ -236,8 +299,17 @@ fn render_single_line(ol: &OutputLine, width: usize, md_renderer: &super::markdo
         OutputLine::Error(s) => {
             // Error messages with prominent styling
             vec![Line::from(vec![
-                Span::styled(" ✗ ".to_string(), Style::default().fg(ERR_COLOR).add_modifier(Modifier::BOLD).bg(Color::Rgb(60, 10, 10))),
-                Span::styled(s.clone(), Style::default().fg(ERR_COLOR).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " ✗ ".to_string(),
+                    Style::default()
+                        .fg(ERR_COLOR)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(Color::Rgb(60, 10, 10)),
+                ),
+                Span::styled(
+                    s.clone(),
+                    Style::default().fg(ERR_COLOR).add_modifier(Modifier::BOLD),
+                ),
             ])]
         }
         OutputLine::StreamingPartial(s) => {
@@ -258,7 +330,10 @@ fn render_single_line(ol: &OutputLine, width: usize, md_renderer: &super::markdo
                 let mut lines = rendered;
                 if let Some(last) = lines.last_mut() {
                     let mut new_spans: Vec<Span<'static>> = last.spans.drain(..).collect();
-                    new_spans.push(Span::styled("▌".to_string(), Style::default().fg(STREAMING)));
+                    new_spans.push(Span::styled(
+                        "▌".to_string(),
+                        Style::default().fg(STREAMING),
+                    ));
                     *last = Line::from(new_spans);
                 }
                 lines
@@ -270,11 +345,18 @@ fn render_single_line(ol: &OutputLine, width: usize, md_renderer: &super::markdo
             }
             md_renderer.render_lines(s, width)
         }
-        OutputLine::ToolLog { tool_call_id: _, message, timestamp: _ } => {
+        OutputLine::ToolLog {
+            tool_call_id: _,
+            message,
+            timestamp: _,
+        } => {
             // Tool execution logs in small dim font below tool card
             vec![Line::from(vec![
                 Span::styled("   └─ ", Style::default().fg(TEXT_DIM)),
-                Span::styled(message.clone(), Style::default().fg(TEXT_DIM).add_modifier(Modifier::DIM)),
+                Span::styled(
+                    message.clone(),
+                    Style::default().fg(TEXT_DIM).add_modifier(Modifier::DIM),
+                ),
             ])]
         }
     }
@@ -296,7 +378,10 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         };
         let icon = if entry.is_active { "▸" } else { " " };
         let info_short: String = entry.info.chars().take(area.width as usize - 4).collect();
-        lines.push(Line::from(Span::styled(format!(" {icon} {info_short}"), style)));
+        lines.push(Line::from(Span::styled(
+            format!(" {icon} {info_short}"),
+            style,
+        )));
     }
 
     let block = Block::default()
@@ -304,7 +389,9 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(BORDER))
         .style(Style::default().bg(BG));
 
-    let para = Paragraph::new(lines).block(block).style(Style::default().bg(BG));
+    let para = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().bg(BG));
     frame.render_widget(para, area);
 }
 
@@ -313,14 +400,20 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
 
     // Left side: Model and working directory (essential info)
     let left_parts: Vec<Span> = vec![
-        Span::styled(format!(" {} ", app.model_name), status_style.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {} ", app.model_name),
+            status_style.add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" │ ", status_style),
         Span::styled(format!(" {} ", app.working_dir), status_style),
     ];
 
     // Right side: Message count and cost (compact format)
     let running_indicator = if app.agent_running { "⏳ " } else { "" };
-    let right_text = format!("{}{} msgs | {}", running_indicator, app.message_count, app.cost_summary);
+    let right_text = format!(
+        "{}{} msgs | {}",
+        running_indicator, app.message_count, app.cost_summary
+    );
     let right_len = right_text.len() as u16;
 
     let left_line = Line::from(left_parts);
@@ -348,11 +441,29 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
 
 fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64) {
     let (prompt, prompt_style) = if app.pending_confirmation.is_some() {
-        ("❯ Y/N/T > ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD).bg(BG_INPUT))
+        (
+            "❯ Y/N/T > ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+                .bg(BG_INPUT),
+        )
     } else if app.agent_running {
-        ("▸ ox > ", Style::default().fg(STREAMING).add_modifier(Modifier::BOLD).bg(BG_INPUT))
+        (
+            "▸ ox > ",
+            Style::default()
+                .fg(STREAMING)
+                .add_modifier(Modifier::BOLD)
+                .bg(BG_INPUT),
+        )
     } else {
-        ("ox > ", Style::default().fg(BLUE).add_modifier(Modifier::BOLD).bg(BG_INPUT))
+        (
+            "ox > ",
+            Style::default()
+                .fg(BLUE)
+                .add_modifier(Modifier::BOLD)
+                .bg(BG_INPUT),
+        )
     };
     let prompt_len = prompt.len();
 
@@ -365,7 +476,11 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
             .border_style(Style::default().fg(Color::Yellow))
             .style(Style::default().bg(BG_INPUT))
             .title(" Confirmation Mode ")
-            .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .title_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
     } else {
         Block::default()
             .borders(Borders::TOP)
@@ -375,16 +490,13 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
 
     // Calculate available width for input text (excluding borders and padding)
     let input_width = area.width.saturating_sub(2) as usize; // -2 for left/right borders
-    
+
     // Get visible content based on available width
     let (visible_text, scroll_offset) = app.input.get_visible_content(input_width);
-    
+
     let paragraph = Paragraph::new(Line::from(vec![
         Span::styled(prompt.to_string(), prompt_style),
-        Span::styled(
-            visible_text,
-            Style::default().fg(TEXT_BRIGHT).bg(BG_INPUT),
-        ),
+        Span::styled(visible_text, Style::default().fg(TEXT_BRIGHT).bg(BG_INPUT)),
     ]))
     .block(block);
 
@@ -397,10 +509,10 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         ""
     };
     let cursor_visual_offset = InputPane::visual_width(visible_before_cursor);
-    
+
     let cursor_x = area.x + 1 + prompt_len as u16 + cursor_visual_offset as u16;
     let cursor_y = area.y + 1;
-    
+
     // Only set cursor if it's within the visible area
     if cursor_x < area.x + area.width - 1 && cursor_x >= area.x {
         frame.set_cursor_position((cursor_x, cursor_y));

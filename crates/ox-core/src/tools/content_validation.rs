@@ -1,31 +1,31 @@
 /// Shared content validation utilities for file write/patch operations.
-/// 
+///
 /// This module provides consistent validation logic across all file modification tools
 /// to prevent garbled/corrupted text from being written.
 
 /// Validate file content to prevent garbled/corrupted text from being written.
-/// 
+///
 /// This is the unified validation function used by both `file_write` and `file_patch`.
-/// 
+///
 /// # Validation Checks
 /// 1. **Null bytes** - Definite corruption indicator (always rejected)
 /// 2. **Replacement characters (U+FFFD)** - Warn if >5% and >10 chars (not blocked)
 /// 3. **Control characters** - Reject if >10% of content (relaxed for code)
-/// 
+///
 /// # Returns
 /// - `Ok(())` if content passes all checks
 /// - `Err(String)` if content contains definite corruption (null bytes or excessive control chars)
-/// 
+///
 /// # Examples
 /// ```
 /// use ox_core::tools::content_validation::validate_content;
-/// 
+///
 /// // Valid content
 /// assert!(validate_content("Hello World").is_ok());
-/// 
+///
 /// // Content with emoji (allowed)
 /// assert!(validate_content("Hello 😀 World").is_ok());
-/// 
+///
 /// // Content with null bytes (rejected)
 /// assert!(validate_content("Hello\x00World").is_err());
 /// ```
@@ -38,19 +38,21 @@ pub fn validate_content(content: &str) -> Result<(), String> {
                     💡 This indicates:\n\
                     • Binary data mixed with text\n\
                     • Severe encoding errors\n\n\
-                     Please verify and regenerate the content.".to_string());
+                     Please verify and regenerate the content."
+            .to_string());
     }
 
     // Check 2: Detect excessive replacement characters (U+FFFD - relaxed threshold)
     if total_chars > 0 {
         let fffd_count = content.matches('\u{FFFD}').count();
         let fffd_ratio = fffd_count as f64 / total_chars as f64;
-        
+
         // Only reject if >5% of content is replacement characters AND count > 10
         if fffd_ratio > 0.05 && fffd_count > 10 {
             tracing::warn!(
                 "[CONTENT_VALIDATION] High replacement character ratio: {} chars ({:.1}%)",
-                fffd_count, fffd_ratio * 100.0
+                fffd_count,
+                fffd_ratio * 100.0
             );
             // Don't block, just warn - LLM might generate special symbols
         }
@@ -65,12 +67,13 @@ pub fn validate_content(content: &str) -> Result<(), String> {
                     && !c.is_ascii_graphic()
                     && !c.is_ascii_punctuation()
                     && !matches!(*c, '\n' | '\r' | '\t')
-                    && (*c as u32) < 0x20  // Control characters only
+                    && (*c as u32) < 0x20 // Control characters only
             })
             .count();
 
         let ratio = non_printable_count as f64 / total_chars as f64;
-        if ratio > 0.10 {  // >10% non-printable
+        if ratio > 0.10 {
+            // >10% non-printable
             return Err(format!(
                 "❌ Suspicious Content: {:.1}% control characters detected\n\n\
                  💡 This suggests:\n\

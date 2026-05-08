@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
@@ -65,7 +65,11 @@ impl Tool for GitDiffTool {
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let mut git_args = vec!["diff"];
-        if args.get("staged").and_then(|s| s.as_bool()).unwrap_or(false) {
+        if args
+            .get("staged")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false)
+        {
             git_args.push("--cached");
         }
 
@@ -74,13 +78,13 @@ impl Tool for GitDiffTool {
             // Normalize path: trim whitespace and standardize separators
             let normalized_path = path.trim().replace('\\', "/");
             let resolved = ctx.working_dir.join(&normalized_path);
-            
+
             match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
                 Ok(validated) => {
                     git_args.push("--");
                     path_str = validated.to_string_lossy().to_string();
                     git_args.push(&path_str);
-                },
+                }
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
             }
         }
@@ -126,19 +130,20 @@ impl Tool for GitCommitTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let message = match args.get("message").and_then(|m| m.as_str()) {
             Some(m) => m,
-            None => return ToolOutput::error("Missing required parameter: message. Usage: {\"message\": \"<commit message>\"}"),
+            None => {
+                return ToolOutput::error(
+                    "Missing required parameter: message. Usage: {\"message\": \"<commit message>\"}",
+                );
+            }
         };
 
         // Stage files.
-        let files = args
-            .get("files")
-            .and_then(|f| f.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-            });
+        let files = args.get("files").and_then(|f| f.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        });
 
         let stage_result = if let Some(files) = &files {
             // Validate each file path before staging
@@ -147,20 +152,28 @@ impl Tool for GitCommitTool {
                 // Normalize path: trim whitespace and standardize separators
                 let normalized_path = file.trim().replace('\\', "/");
                 let resolved = ctx.working_dir.join(&normalized_path);
-                
+
                 match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
                     Ok(validated) => {
                         // Convert back to relative path for git add
                         if let Ok(relative) = validated.strip_prefix(&ctx.working_dir) {
                             validated_files.push(relative.to_string_lossy().to_string());
                         } else {
-                            return ToolOutput::error(format!("Path validation failed for '{}': outside working directory", file));
+                            return ToolOutput::error(format!(
+                                "Path validation failed for '{}': outside working directory",
+                                file
+                            ));
                         }
-                    },
-                    Err(e) => return ToolOutput::error(format!("Path validation failed for '{}': {}", file, e)),
+                    }
+                    Err(e) => {
+                        return ToolOutput::error(format!(
+                            "Path validation failed for '{}': {}",
+                            file, e
+                        ));
+                    }
                 }
             }
-            
+
             let mut git_args = vec!["add"];
             let file_refs: Vec<&str> = validated_files.iter().map(|s| s.as_str()).collect();
             git_args.extend(file_refs);

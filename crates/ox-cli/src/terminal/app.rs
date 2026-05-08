@@ -1,22 +1,33 @@
 use super::input_pane::InputPane;
 use super::markdown::MarkdownRenderer;
 use super::output_pane::{OutputLine, OutputPane};
-use std::sync::Arc;
 use ox_core::agent::engine::WorkflowEngine;
 use ox_core::agent::session::SessionState;
+use std::sync::Arc;
+
+/// Session action signaled by slash commands, processed in the main event loop.
+#[derive(Debug, Clone, Default)]
+pub enum SessionAction {
+    #[default]
+    None,
+    New,
+    Resume {
+        filename: String,
+    },
+}
 
 /// Workflow state machine for Spec and Council modes
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkflowState {
     /// Free exploration mode (default)
     Free,
-    
+
     /// Spec mode workflow states
     Spec {
         step: SpecWorkflowStep,
         spec_content: String,
     },
-    
+
     /// Council mode workflow states
     Council {
         step: CouncilWorkflowStep,
@@ -67,6 +78,8 @@ pub struct WorkflowDisplayInfo {
     pub step_name: String,
     pub step_prompt: Option<String>,
     pub allows_code_modification: bool,
+    /// 🚨 Requirement name for Spec mode (e.g., "order-optimization")
+    pub requirement_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -113,13 +126,20 @@ pub struct App {
     pub message_count: usize,
     pub user_scrolled: bool,
     pub pending_confirmation: Option<PendingConfirmation>,
-    pub ui_to_agent_tx: Option<tokio::sync::mpsc::UnboundedSender<ox_core::agent::ui_event::UiToAgentEvent>>,
+    pub ui_to_agent_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<ox_core::agent::ui_event::UiToAgentEvent>>,
     pub pending_discuss: Option<(String, Option<u8>, bool)>,
     pub last_council_session: Option<ox_core::council::CouncilSession>,
     pub pending_model_switch: Option<String>,
     pub pending_compression: Option<PendingCompression>,
     /// Pending spec content for auto-planning (set by /spec command)
     pub pending_spec_planning: Option<String>,
+    /// 🚨 Pending smart naming request (LLM-based name generation)
+    pub pending_smart_naming: Option<crate::spec_helpers::PendingSmartNaming>,
+    /// Flag indicating user requested revision feedback via /O command
+    pub pending_revision_feedback: bool,
+    /// Flag indicating user approved workflow progression via /Y command
+    pub pending_workflow_approval: bool,
     /// Message count at last compression. Used to avoid re-compressing
     /// when no new messages have been added since last compression.
     pub last_compression_msg_count: usize,
@@ -134,24 +154,24 @@ pub struct App {
     pub last_spinner_frame: u64,
     /// Chat area bounds for mouse scroll detection (x, y, width, height)
     pub chat_area: Option<(u16, u16, u16, u16)>,
-    
+
     // Implicit feedback system
     pub override_detector: ox_core::feedback::CodeOverrideDetector,
     pub ema_manager: ox_core::feedback::Emamanager,
     pub rollback_manager: ox_core::feedback::RollbackManager,
-    
+
     // Tracking counters for implicit feedback
     pub total_file_writes: u32,
     pub accepted_file_writes: u32,
     pub explicit_feedback_count: u32,
     pub good_feedback_count: u32,
-    
+
     // Workflow state machine for Spec and Council modes
     pub workflow_state: WorkflowState,
-    
+
     // Cached workflow display info (updated each tick to avoid locking in render)
     pub workflow_display: Option<WorkflowDisplayInfo>,
-    
+
     // Backward compatibility fields (deprecated, use workflow_state instead)
     #[deprecated(note = "Use workflow_state instead")]
     pub spec_content: String,
@@ -159,9 +179,19 @@ pub struct App {
     pub spec_active: bool,
     #[deprecated(note = "Use workflow_state instead")]
     pub spec_edit_mode: bool,
-    
+
     // Workflow engine for Spec and Council modes (wrapped in Arc for sharing)
     pub workflow_engine: Option<Arc<tokio::sync::Mutex<WorkflowEngine>>>,
+
+    // Fields needed by slash command handlers
+    /// Session action signaled by slash commands, processed in the main event loop.
+    pub session_action: SessionAction,
+    /// Compression manager reference for debugging commands.
+    pub compression_manager: Option<ox_core::embedding::CompressionManager>,
+    /// Provider resolution info for debugging commands.
+    pub resolve_info: Option<ox_core::llm::ProviderResolveInfo>,
+    /// Flag to clear compressed cache when session is cleaned.
+    pub pending_compressed_cache_clear: bool,
 }
 
 impl App {
@@ -188,6 +218,9 @@ impl App {
             pending_model_switch: None,
             pending_compression: None,
             pending_spec_planning: None,
+            pending_smart_naming: None,
+            pending_revision_feedback: false,
+            pending_workflow_approval: false,
             last_compression_msg_count: 0,
             compression_in_progress: false,
             trusted_all: false,
@@ -196,20 +229,20 @@ impl App {
             sidebar_width: 22,
             last_spinner_frame: 0,
             chat_area: None,
-            
+
             // Implicit feedback system initialization
             override_detector: ox_core::feedback::CodeOverrideDetector::new(300), // 5 min window
-            ema_manager: ox_core::feedback::Emamanager::new(0.2), // alpha = 0.2
+            ema_manager: ox_core::feedback::Emamanager::new(0.2),                 // alpha = 0.2
             rollback_manager: ox_core::feedback::RollbackManager::new(),
             total_file_writes: 0,
             accepted_file_writes: 0,
             explicit_feedback_count: 0,
             good_feedback_count: 0,
-            
+
             // Workflow state machine (default to Free mode)
             workflow_state: WorkflowState::Free,
             workflow_display: None,
-            
+
             // Backward compatibility fields (deprecated)
             #[allow(deprecated)]
             spec_content: String::new(),
@@ -217,9 +250,15 @@ impl App {
             spec_active: false,
             #[allow(deprecated)]
             spec_edit_mode: false,
-            
+
             // Workflow engine (initialized later with session ID)
             workflow_engine: None,
+
+            // Slash command context fields
+            session_action: SessionAction::None,
+            compression_manager: None,
+            resolve_info: None,
+            pending_compressed_cache_clear: false,
         }
     }
 
@@ -283,22 +322,24 @@ impl App {
     pub fn mark_spinner_rendered(&mut self) {
         self.last_spinner_frame = self.spinner_frame;
     }
-    
+
     // ===== Workflow State Machine Helpers =====
-    
+
     /// Check if currently in Spec mode
     pub fn is_spec_mode(&self) -> bool {
         matches!(self.workflow_state, WorkflowState::Spec { .. })
     }
-    
+
     /// Get current spec content (if in Spec mode)
     pub fn get_spec_content(&self) -> Option<&str> {
         match &self.workflow_state {
-            WorkflowState::Spec { spec_content, .. } if !spec_content.is_empty() => Some(spec_content),
+            WorkflowState::Spec { spec_content, .. } if !spec_content.is_empty() => {
+                Some(spec_content)
+            }
             _ => None,
         }
     }
-    
+
     /// Activate Spec mode with initial requirement
     pub fn activate_spec_mode(&mut self, requirement: String) {
         self.workflow_state = WorkflowState::Spec {
@@ -306,7 +347,7 @@ impl App {
             spec_content: requirement,
         };
     }
-    
+
     /// Transition to next Spec workflow step
     pub fn advance_spec_step(&mut self) {
         if let WorkflowState::Spec { step, spec_content } = &self.workflow_state {
@@ -324,12 +365,12 @@ impl App {
             };
         }
     }
-    
+
     /// Deactivate Spec mode and return to Free mode
     pub fn deactivate_spec_mode(&mut self) {
         self.workflow_state = WorkflowState::Free;
     }
-    
+
     /// Activate Council mode with topic
     pub fn activate_council_mode(&mut self, topic: Option<String>) {
         self.workflow_state = WorkflowState::Council {
@@ -337,7 +378,7 @@ impl App {
             topic,
         };
     }
-    
+
     /// Transition to next Council workflow step
     pub fn advance_council_step(&mut self) {
         if let WorkflowState::Council { step, topic } = &self.workflow_state {
@@ -355,23 +396,53 @@ impl App {
             };
         }
     }
-    
+
     /// Deactivate Council mode and return to Free mode
     pub fn deactivate_council_mode(&mut self) {
         self.workflow_state = WorkflowState::Free;
     }
-    
+
     /// Initialize workflow engine (called after session is created)
-    pub fn init_workflow_engine(&mut self, session_id: &str) {
-        let session_state = Arc::new(tokio::sync::Mutex::new(
-            SessionState::new(session_id)
-        ));
-        let mut engine = WorkflowEngine::new(session_state);
+    pub fn init_workflow_engine(&mut self, session_id: &str, session_meta: &ox_core::message::SessionMeta) {
+        // 🚨 Restore workflow state from persisted metadata
+        let mut session_state = SessionState::new(session_id);
         
+        // Restore workflow mode and step index if available
+        if !session_meta.workflow_mode.is_empty() {
+            session_state.current_mode = session_meta.workflow_mode.clone();
+            session_state.current_workflow = session_meta.workflow_id.clone();
+            session_state.current_step_index = session_meta.workflow_step_index;
+            
+            tracing::info!(
+                "Restored workflow state: mode={}, workflow={}, step={}",
+                session_state.current_mode,
+                session_state.current_workflow,
+                session_state.current_step_index
+            );
+        }
+        
+        // Restore requirement name if available
+        if let Some(ref req_name) = session_meta.requirement_name {
+            session_state.set_variable("requirement_name", req_name);
+            tracing::info!("Restored requirement name: {}", req_name);
+        }
+        
+        let session_state_arc = Arc::new(tokio::sync::Mutex::new(session_state));
+        let mut engine = WorkflowEngine::new(session_state_arc);
+
         // Activate initial workflow based on current mode
-        if self.spec_active {
+        if self.spec_active || session_meta.workflow_mode == "spec" {
             if let Err(e) = engine.activate_workflow("spec_workflow") {
                 tracing::warn!("Failed to activate spec workflow: {}", e);
+            } else {
+                // 🚨 Restore step index if we're in Spec Mode
+                if session_meta.workflow_step_index > 0 && session_meta.workflow_step_index < 6 {
+                    // Advance to the saved step
+                    for _ in 0..session_meta.workflow_step_index {
+                        let _ = engine.advance_step();
+                    }
+                    tracing::info!("Advanced to step {}/6", session_meta.workflow_step_index + 1);
+                }
             }
         } else {
             // Default to free workflow
@@ -379,23 +450,32 @@ impl App {
                 tracing::warn!("Failed to activate free workflow: {}", e);
             }
         }
-        
+
         self.workflow_engine = Some(Arc::new(tokio::sync::Mutex::new(engine)));
     }
-    
+
     /// Get cloned Arc reference to workflow engine (for passing to async tasks)
     pub fn workflow_engine_arc(&self) -> Option<Arc<tokio::sync::Mutex<WorkflowEngine>>> {
         self.workflow_engine.clone()
     }
-    
+
     /// Update cached workflow display info (call from main loop tick)
     pub fn update_workflow_display(&mut self) {
         if let Some(ref engine_arc) = self.workflow_engine {
             // Use try_lock to avoid blocking - if locked, skip this update
             if let Ok(engine) = engine_arc.try_lock() {
                 if let Some(workflow) = engine.current_workflow() {
+                    // Don't display free_workflow (it's a trivial single-step workflow)
+                    if workflow.name == "free_workflow" {
+                        self.workflow_display = None;
+                        return;
+                    }
+                    
                     if let Some(step) = engine.current_step() {
                         if let Some((step_num, total_steps)) = engine.get_progress() {
+                            // 🚨 Extract requirement name from workflow engine
+                            let requirement_name = engine.get_variable("requirement_name");
+                            
                             self.workflow_display = Some(WorkflowDisplayInfo {
                                 workflow_name: workflow.name.clone(),
                                 step_num,
@@ -403,6 +483,7 @@ impl App {
                                 step_name: step.name.clone(),
                                 step_prompt: engine.get_step_system_prompt(),
                                 allows_code_modification: engine.allows_code_modification(),
+                                requirement_name,
                             });
                             return;
                         }

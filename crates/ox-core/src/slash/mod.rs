@@ -1,7 +1,9 @@
 // Parsed slash command.
 #[derive(Debug, Clone)]
 pub enum SlashCommand {
-    Help { topic: Option<String> },
+    Help {
+        topic: Option<String>,
+    },
     Exit,
     Cancel,
     New,
@@ -9,28 +11,57 @@ pub enum SlashCommand {
     Clean,
     Cost,
     Plan,
-    Trust { tools: Vec<String>, all: bool },
+    Trust {
+        tools: Vec<String>,
+        all: bool,
+    },
     Untrust,
-    Model { name: Option<String> },
-    Cd { path: Option<String> },
+    Model {
+        name: Option<String>,
+    },
+    Cd {
+        path: Option<String>,
+    },
     Debug,
     Init,
     Sessions,
-    Resume { filename: String },
-    Remember { content: String },
-    Forget { keyword: String },
+    Resume {
+        filename: String,
+    },
+    Remember {
+        content: String,
+    },
+    Forget {
+        keyword: String,
+    },
     Memory,
-    Feedback { category: String },
-    Discuss { question: Option<String>, rounds: Option<u8>, verbose: bool },
-    Council { action: String },
+    Feedback {
+        category: String,
+    },
+    Discuss {
+        question: Option<String>,
+        rounds: Option<u8>,
+        verbose: bool,
+    },
+    Council {
+        action: String,
+    },
     Reload,
-    DownloadModel { model_name: Option<String> },
+    DownloadModel {
+        model_name: Option<String>,
+    },
     Spec {
         /// Subcommand: status, show, on, off, edit, clear, or inline content
         action: String,
     },
     Free,
-    Unknown { cmd: String },
+    // Workflow confirmation commands
+    Approve, // /Y - Approve and proceed
+    Reject,  // /N - Reject and abort
+    Revise,  // /O - Provide feedback for revision
+    Unknown {
+        cmd: String,
+    },
 }
 
 /// Parse a slash command string into a structured command.
@@ -57,10 +88,7 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
                     all: true,
                 }
             } else {
-                let tools: Vec<String> = args
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect();
+                let tools: Vec<String> = args.split_whitespace().map(|s| s.to_string()).collect();
                 SlashCommand::Trust { tools, all: false }
             }
         }
@@ -123,7 +151,11 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
             } else {
                 Some(question_parts.join(" "))
             };
-            SlashCommand::Discuss { question, rounds, verbose }
+            SlashCommand::Discuss {
+                question,
+                rounds,
+                verbose,
+            }
         }
         "council" => SlashCommand::Council {
             action: args.to_string(),
@@ -140,6 +172,10 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
             action: args.to_string(),
         },
         "free" => SlashCommand::Free,
+        // Workflow confirmation commands
+        "y" | "Y" => SlashCommand::Approve,
+        "n" | "N" => SlashCommand::Reject,
+        "o" | "O" => SlashCommand::Revise,
         _ => SlashCommand::Unknown {
             cmd: cmd.to_string(),
         },
@@ -195,7 +231,10 @@ Commands:
   /spec <action>    Spec mode (on/off/edit/status) - structured workflow
   /free             Switch to free mode (deactivate any workflow)
   /reload           Reload session from disk (JSONL)
-  /download-model [name] Download embedding model (default: bge-small-zh-v1.5)"
+  /download-model [name] Download embedding model (default: bge-small-zh-v1.5)
+  /y                Approve and proceed to next phase (workflow confirmation)
+  /n                Reject and abort workflow
+  /o                Provide feedback for revision"
             .to_string(),
     }
 }

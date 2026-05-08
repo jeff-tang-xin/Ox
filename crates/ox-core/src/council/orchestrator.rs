@@ -2,17 +2,22 @@ use std::sync::Arc;
 
 use crate::config::{CouncilConfig, ModelsConfig};
 use crate::llm::{self, LlmProvider, LlmStreamEvent};
-use crate::message::Message;
 use crate::memory::store::MemoryStore;
+use crate::message::Message;
 
-use super::{Arbitration, CouncilSession, CouncilTokenUsage, DebatePhase, Participant, ParticipantRole, Proposal, Rebuttal, Review, TopicCategory};
+use super::{
+    Arbitration, CouncilSession, CouncilTokenUsage, DebatePhase, Participant, ParticipantRole,
+    Proposal, Rebuttal, Review, TopicCategory,
+};
 
-async fn call_model_simple(models_config: &ModelsConfig, model: &str, system: &str, user: &str) -> anyhow::Result<(String, u32, u32)> {
+async fn call_model_simple(
+    models_config: &ModelsConfig,
+    model: &str,
+    system: &str,
+    user: &str,
+) -> anyhow::Result<(String, u32, u32)> {
     let (provider, _) = llm::create_provider_with_info(model, models_config)?;
-    let messages = vec![
-        Message::system(system),
-        Message::user(user),
-    ];
+    let messages = vec![Message::system(system), Message::user(user)];
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LlmStreamEvent>();
     let provider: Arc<dyn LlmProvider> = Arc::from(provider);
@@ -79,7 +84,9 @@ impl CouncilOrchestrator {
 
         let participant_models = self.resolve_participants()?;
         if participant_models.len() < 2 {
-            anyhow::bail!("Council requires at least 2 different models. Configure council.participants in ~/.ox/config.toml");
+            anyhow::bail!(
+                "Council requires at least 2 different models. Configure council.participants in ~/.ox/config.toml"
+            );
         }
 
         let mut session = CouncilSession {
@@ -94,7 +101,9 @@ impl CouncilOrchestrator {
         };
 
         // Phase 1: Proposals
-        let (proposals, tokens) = self.run_proposals(&session, question, context_messages).await?;
+        let (proposals, tokens) = self
+            .run_proposals(&session, question, context_messages)
+            .await?;
         session.token_usage.add(tokens.0, tokens.1, 0.0);
         session.phases.push(DebatePhase::Proposal(proposals));
 
@@ -110,7 +119,9 @@ impl CouncilOrchestrator {
             _ => &empty_reviews,
         };
         let all_high = !last_reviews.is_empty()
-            && last_reviews.iter().all(|r| r.score >= self.council_config.early_convergence_threshold as f32);
+            && last_reviews
+                .iter()
+                .all(|r| r.score >= self.council_config.early_convergence_threshold as f32);
 
         // Phase 3: Rebuttals (skip if early convergence and rounds > 1)
         if rounds > 1 && !all_high {
@@ -124,8 +135,10 @@ impl CouncilOrchestrator {
                 session.phases.push(DebatePhase::CrossReview(reviews));
             }
         } else if all_high {
-            tracing::warn!("Council early convergence: all review scores >= {:.2}, skipping rebuttals",
-                self.council_config.early_convergence_threshold);
+            tracing::warn!(
+                "Council early convergence: all review scores >= {:.2}, skipping rebuttals",
+                self.council_config.early_convergence_threshold
+            );
         }
 
         // Phase 4: Arbitration
@@ -142,20 +155,28 @@ impl CouncilOrchestrator {
         Ok(session)
     }
 
-    fn update_capability_scores(&self, session: &CouncilSession, store: &MemoryStore) -> anyhow::Result<()> {
+    fn update_capability_scores(
+        &self,
+        session: &CouncilSession,
+        store: &MemoryStore,
+    ) -> anyhow::Result<()> {
         let topic = TopicCategory::classify(&session.question);
-        
+
         // Determine which proposal was adopted (from arbitration)
-        let primary_source = session.arbitration.as_ref()
+        let primary_source = session
+            .arbitration
+            .as_ref()
             .map(|a| a.primary_source_idx)
             .unwrap_or(0);
 
         // Update each participant's capability score
         for (idx, participant) in session.participants.iter().enumerate() {
             let proposal_adopted = idx == primary_source;
-            
+
             // Calculate review quality based on reviews received
-            let reviews_received: Vec<&Review> = session.phases.iter()
+            let reviews_received: Vec<&Review> = session
+                .phases
+                .iter()
                 .filter_map(|p| match p {
                     DebatePhase::CrossReview(reviews) => Some(reviews),
                     _ => None,
@@ -168,7 +189,8 @@ impl CouncilOrchestrator {
                 0.5 // Default if no reviews
             } else {
                 // Higher average score means better quality
-                reviews_received.iter().map(|r| r.score).sum::<f32>() / reviews_received.len() as f32
+                reviews_received.iter().map(|r| r.score).sum::<f32>()
+                    / reviews_received.len() as f32
             };
 
             // Load existing scores or create new
@@ -176,18 +198,25 @@ impl CouncilOrchestrator {
                 participant.provider.clone(),
                 participant.model.clone(),
                 store,
-            ).unwrap_or_else(|_| crate::council::ModelCapabilityScore::new(
-                participant.provider.clone(),
-                participant.model.clone(),
-            ));
+            )
+            .unwrap_or_else(|_| {
+                crate::council::ModelCapabilityScore::new(
+                    participant.provider.clone(),
+                    participant.model.clone(),
+                )
+            });
 
             // Update with this session's results
             scores.update(topic, proposal_adopted, review_cited_ratio);
 
             // Persist back to store
             if let Err(e) = scores.persist_to_store(store) {
-                tracing::warn!("Failed to persist capability scores for {}:{} - {}", 
-                    participant.provider, participant.model, e);
+                tracing::warn!(
+                    "Failed to persist capability scores for {}:{} - {}",
+                    participant.provider,
+                    participant.model,
+                    e
+                );
             }
         }
 
@@ -197,7 +226,8 @@ impl CouncilOrchestrator {
     fn resolve_participants(&self) -> anyhow::Result<Vec<Participant>> {
         let mut participants = Vec::new();
         for model_name in &self.council_config.participants {
-            let provider_name = llm::resolve_provider_name_with_config(model_name, &self.models_config);
+            let provider_name =
+                llm::resolve_provider_name_with_config(model_name, &self.models_config);
             participants.push(Participant {
                 role: ParticipantRole::Proposer,
                 provider: provider_name.to_string(),
@@ -206,7 +236,10 @@ impl CouncilOrchestrator {
         }
         participants.truncate(self.council_config.max_participants as usize);
         if participants.len() < 2 {
-            anyhow::bail!("Need at least 2 participants for council, got {}", participants.len());
+            anyhow::bail!(
+                "Need at least 2 participants for council, got {}",
+                participants.len()
+            );
         }
         Ok(participants)
     }
@@ -221,15 +254,15 @@ impl CouncilOrchestrator {
         let system = proposal_system_prompt();
         let user = format!("Question: {}\n\nContext:\n{}", question, context_summary);
 
-        let futures_vec: Vec<_> = session.participants.iter()
+        let futures_vec: Vec<_> = session
+            .participants
+            .iter()
             .map(|participant| {
                 let mc = self.models_config.clone();
                 let model = participant.model.clone();
                 let system = system.clone();
                 let user = user.clone();
-                tokio::spawn(async move {
-                    call_model_simple(&mc, &model, &system, &user).await
-                })
+                tokio::spawn(async move { call_model_simple(&mc, &model, &system, &user).await })
             })
             .collect();
 
@@ -265,7 +298,10 @@ impl CouncilOrchestrator {
         Ok((proposals, (total_prompt, total_completion)))
     }
 
-    async fn run_reviews(&self, session: &CouncilSession) -> anyhow::Result<(Vec<Review>, (u32, u32))> {
+    async fn run_reviews(
+        &self,
+        session: &CouncilSession,
+    ) -> anyhow::Result<(Vec<Review>, (u32, u32))> {
         let proposals = match session.phases.iter().find_map(|p| match p {
             DebatePhase::Proposal(ps) => Some(ps),
             _ => None,
@@ -276,27 +312,37 @@ impl CouncilOrchestrator {
 
         let system = review_system_prompt();
 
-        let mut tasks: Vec<(usize, usize, tokio::task::JoinHandle<anyhow::Result<(String, u32, u32)>>)> = Vec::new();
+        let mut tasks: Vec<(
+            usize,
+            usize,
+            tokio::task::JoinHandle<anyhow::Result<(String, u32, u32)>>,
+        )> = Vec::new();
 
         for (reviewer_idx, reviewer) in session.participants.iter().enumerate() {
             for (target_idx, target_proposal) in proposals.iter().enumerate() {
-                if reviewer_idx == target_idx { continue; }
+                if reviewer_idx == target_idx {
+                    continue;
+                }
 
-                let target_label = session.participants.get(target_idx)
+                let target_label = session
+                    .participants
+                    .get(target_idx)
                     .map(|p| p.label())
                     .unwrap_or_else(|| "unknown".into());
 
                 let user = format!(
                     "You are reviewing the proposal from {}.\n\nTheir proposal: {}\nTheir reasoning: {}\n\nQuestion: {}\n\nProvide your critique and a score (0.0-1.0) for this proposal.",
-                    target_label, target_proposal.content, target_proposal.reasoning, session.question
+                    target_label,
+                    target_proposal.content,
+                    target_proposal.reasoning,
+                    session.question
                 );
 
                 let mc = self.models_config.clone();
                 let model = reviewer.model.clone();
                 let sys = system.clone();
-                let handle = tokio::spawn(async move {
-                    call_model_simple(&mc, &model, &sys, &user).await
-                });
+                let handle =
+                    tokio::spawn(async move { call_model_simple(&mc, &model, &sys, &user).await });
                 tasks.push((reviewer_idx, target_idx, handle));
             }
         }
@@ -305,10 +351,14 @@ impl CouncilOrchestrator {
         let mut total_prompt = 0u32;
         let mut total_completion = 0u32;
         for (reviewer_idx, target_idx, handle) in tasks {
-            let target_label = session.participants.get(target_idx)
+            let target_label = session
+                .participants
+                .get(target_idx)
                 .map(|p| p.label())
                 .unwrap_or_else(|| "unknown".into());
-            let reviewer_label = session.participants.get(reviewer_idx)
+            let reviewer_label = session
+                .participants
+                .get(reviewer_idx)
                 .map(|p| p.label())
                 .unwrap_or_else(|| "unknown".into());
             match handle.await {
@@ -324,7 +374,11 @@ impl CouncilOrchestrator {
                     });
                 }
                 _ => {
-                    tracing::warn!("Council review failed for {} → {}", reviewer_label, target_label);
+                    tracing::warn!(
+                        "Council review failed for {} → {}",
+                        reviewer_label,
+                        target_label
+                    );
                 }
             }
         }
@@ -332,14 +386,23 @@ impl CouncilOrchestrator {
         Ok((reviews, (total_prompt, total_completion)))
     }
 
-    async fn run_rebuttals(&self, session: &CouncilSession) -> anyhow::Result<(Vec<Rebuttal>, (u32, u32))> {
+    async fn run_rebuttals(
+        &self,
+        session: &CouncilSession,
+    ) -> anyhow::Result<(Vec<Rebuttal>, (u32, u32))> {
         let empty_proposals = Vec::new();
-        let proposals: &Vec<Proposal> = session.phases.iter().find_map(|p| match p {
-            DebatePhase::Proposal(ps) => Some(ps),
-            _ => None,
-        }).unwrap_or(&empty_proposals);
+        let proposals: &Vec<Proposal> = session
+            .phases
+            .iter()
+            .find_map(|p| match p {
+                DebatePhase::Proposal(ps) => Some(ps),
+                _ => None,
+            })
+            .unwrap_or(&empty_proposals);
 
-        let reviews: Vec<&Review> = session.phases.iter()
+        let reviews: Vec<&Review> = session
+            .phases
+            .iter()
             .filter_map(|p| match p {
                 DebatePhase::CrossReview(rs) => Some(rs.iter().collect::<Vec<_>>()),
                 _ => None,
@@ -354,20 +417,31 @@ impl CouncilOrchestrator {
 
         for (idx, participant) in session.participants.iter().enumerate() {
             let my_proposal = proposals.iter().find(|p| p.participant_idx == idx);
-            let my_reviews: Vec<&&Review> = reviews.iter().filter(|r| r.target_idx == idx).collect();
+            let my_reviews: Vec<&&Review> =
+                reviews.iter().filter(|r| r.target_idx == idx).collect();
 
-            if my_reviews.is_empty() { continue; }
+            if my_reviews.is_empty() {
+                continue;
+            }
 
-            let review_summary: String = my_reviews.iter().map(|r| {
-                let reviewer_label = session.participants.get(r.reviewer_idx)
-                    .map(|p| p.label())
-                    .unwrap_or_else(|| "unknown".into());
-                format!("[{} score={:.2}] {}", reviewer_label, r.score, r.critique)
-            }).collect::<Vec<_>>().join("\n");
+            let review_summary: String = my_reviews
+                .iter()
+                .map(|r| {
+                    let reviewer_label = session
+                        .participants
+                        .get(r.reviewer_idx)
+                        .map(|p| p.label())
+                        .unwrap_or_else(|| "unknown".into());
+                    format!("[{} score={:.2}] {}", reviewer_label, r.score, r.critique)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
 
             let user = format!(
                 "Your proposal: {}\n\nCritiques from others:\n{}\n\nQuestion: {}\n\nRespond to the critiques. You may revise your proposal if persuaded.",
-                my_proposal.map(|p| p.content.as_str()).unwrap_or("(no proposal)"),
+                my_proposal
+                    .map(|p| p.content.as_str())
+                    .unwrap_or("(no proposal)"),
                 review_summary,
                 session.question
             );
@@ -379,7 +453,9 @@ impl CouncilOrchestrator {
                     let (response_text, revised) = parse_rebuttal_response(&response);
                     rebuttals.push(Rebuttal {
                         participant_idx: idx,
-                        original_proposal: my_proposal.map(|p| p.content.clone()).unwrap_or_default(),
+                        original_proposal: my_proposal
+                            .map(|p| p.content.clone())
+                            .unwrap_or_default(),
                         response_to_critiques: response_text,
                         revised_proposal: revised,
                     });
@@ -413,7 +489,8 @@ impl CouncilOrchestrator {
             session.question, context_summary, discussion_summary
         );
 
-        let (response, pt, ct) = call_model_simple(&self.models_config, arbiter_model, &system, &user).await?;
+        let (response, pt, ct) =
+            call_model_simple(&self.models_config, arbiter_model, &system, &user).await?;
 
         let arbitration = parse_arbitration_response(&response, session.participants.len());
         Ok((arbitration, (pt, ct)))
@@ -428,7 +505,8 @@ fn proposal_system_prompt() -> String {
      Format your response as:\n\
      PROPOSAL: <your proposal>\n\
      REASONING: <your reasoning>\n\n\
-     Be specific and practical. State your position clearly.".to_string()
+     Be specific and practical. State your position clearly."
+        .to_string()
 }
 
 fn review_system_prompt() -> String {
@@ -437,7 +515,8 @@ fn review_system_prompt() -> String {
      Format your response as:\n\
      CRITIQUE: <your critique>\n\
      SCORE: <number 0.0 to 1.0>\n\n\
-     Be fair but thorough. Consider practical implications.".to_string()
+     Be fair but thorough. Consider practical implications."
+        .to_string()
 }
 
 fn rebuttal_system_prompt() -> String {
@@ -446,7 +525,8 @@ fn rebuttal_system_prompt() -> String {
      Format your response as:\n\
      RESPONSE: <your response to critiques>\n\
      REVISED: <your revised proposal, or \"none\" if unchanged>\n\n\
-     Be open to valid criticism but defend well-reasoned positions.".to_string()
+     Be open to valid criticism but defend well-reasoned positions."
+        .to_string()
 }
 
 fn arbitration_system_prompt() -> String {
@@ -459,7 +539,8 @@ fn arbitration_system_prompt() -> String {
      DISAGREEMENTS: <comma-separated key disagreements>\n\
      CONFIDENCE: <number 0.0 to 1.0>\n\
      COMPARISON: <brief comparison of proposals>\n\n\
-     Be thorough and balanced. Acknowledge trade-offs.".to_string()
+     Be thorough and balanced. Acknowledge trade-offs."
+        .to_string()
 }
 
 // ── Response parsers ──
@@ -539,7 +620,8 @@ fn parse_arbitration_response(response: &str, _num_participants: usize) -> Arbit
         } else if let Some(rest) = trimmed.strip_prefix("REASONING:") {
             reasoning = rest.trim().to_string();
         } else if let Some(rest) = trimmed.strip_prefix("DISAGREEMENTS:") {
-            disagreements = rest.split(',')
+            disagreements = rest
+                .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -578,7 +660,9 @@ fn summarize_context(messages: &[Message], max_chars: usize) -> String {
             Message::Assistant { content, .. } => format!("[Assistant] {}", content),
             Message::ToolResult { content, .. } => format!("[Tool] {}", content),
         };
-        if summary.len() + text.len() + 1 > max_chars { break; }
+        if summary.len() + text.len() + 1 > max_chars {
+            break;
+        }
         summary.push_str(&text);
         summary.push('\n');
     }
@@ -593,24 +677,44 @@ fn format_discussion_summary(session: &CouncilSession) -> String {
             DebatePhase::Proposal(proposals) => {
                 out.push_str("=== Proposals ===\n");
                 for p in proposals {
-                    let label = session.participants.get(p.participant_idx)
+                    let label = session
+                        .participants
+                        .get(p.participant_idx)
                         .map(|p| p.label())
                         .unwrap_or_else(|| "?".into());
-                    out.push_str(&format!("[{}] {} (reasoning: {})\n", label, p.content, p.reasoning));
+                    out.push_str(&format!(
+                        "[{}] {} (reasoning: {})\n",
+                        label, p.content, p.reasoning
+                    ));
                 }
             }
             DebatePhase::CrossReview(reviews) => {
                 out.push_str("=== Reviews ===\n");
                 for r in reviews {
-                    let reviewer = session.participants.get(r.reviewer_idx).map(|p| p.label()).unwrap_or_else(|| "?".into());
-                    let target = session.participants.get(r.target_idx).map(|p| p.label()).unwrap_or_else(|| "?".into());
-                    out.push_str(&format!("[{}→{} score={:.2}] {}\n", reviewer, target, r.score, r.critique));
+                    let reviewer = session
+                        .participants
+                        .get(r.reviewer_idx)
+                        .map(|p| p.label())
+                        .unwrap_or_else(|| "?".into());
+                    let target = session
+                        .participants
+                        .get(r.target_idx)
+                        .map(|p| p.label())
+                        .unwrap_or_else(|| "?".into());
+                    out.push_str(&format!(
+                        "[{}→{} score={:.2}] {}\n",
+                        reviewer, target, r.score, r.critique
+                    ));
                 }
             }
             DebatePhase::Rebuttal(rebuttals) => {
                 out.push_str("=== Rebuttals ===\n");
                 for rb in rebuttals {
-                    let label = session.participants.get(rb.participant_idx).map(|p| p.label()).unwrap_or_else(|| "?".into());
+                    let label = session
+                        .participants
+                        .get(rb.participant_idx)
+                        .map(|p| p.label())
+                        .unwrap_or_else(|| "?".into());
                     out.push_str(&format!("[{}] {}\n", label, rb.response_to_critiques));
                     if let Some(ref revised) = rb.revised_proposal {
                         out.push_str(&format!("  Revised: {}\n", revised));
