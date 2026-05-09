@@ -146,6 +146,12 @@ impl LlmProvider for OpenAiProvider {
             return Ok(());
         }
 
+        tracing::info!(
+            "[LLM STREAM] Starting stream to {} (model: {})",
+            self.base_url,
+            self.model
+        );
+        
         let mut stream = resp.bytes_stream();
         let mut parser = OpenAiSseParser::new();
         let mut done_sent = false;
@@ -159,7 +165,9 @@ impl LlmProvider for OpenAiProvider {
                     consecutive_errors = 0;
                     total_chunks_received += 1;
 
-                    tracing::debug!("Received chunk: {} bytes", chunk.len());
+                    if total_chunks_received % 10 == 1 {  // Log every 10 chunks to avoid spam
+                        tracing::debug!("[LLM STREAM] Received chunk #{}: {} bytes", total_chunks_received, chunk.len());
+                    }
 
                     let chunk_str = String::from_utf8_lossy(&chunk);
 
@@ -175,7 +183,7 @@ impl LlmProvider for OpenAiProvider {
                 Err(e) => {
                     consecutive_errors += 1;
                     tracing::warn!(
-                        "Stream chunk error (consecutive: {}/{}): {} - Error type: {:?}",
+                        "[LLM STREAM] ⚠️ Chunk error (consecutive: {}/{}): {} - Error type: {:?}",
                         consecutive_errors,
                         MAX_CONSECUTIVE_ERRORS,
                         e,
@@ -200,9 +208,10 @@ impl LlmProvider for OpenAiProvider {
         }
 
         tracing::info!(
-            "Stream ended: total_chunks={}, consecutive_errors={}",
+            "[LLM STREAM] Stream ended: total_chunks={}, consecutive_errors={}, done_sent={}",
             total_chunks_received,
-            consecutive_errors
+            consecutive_errors,
+            done_sent
         );
 
         // Finalize any remaining tool calls

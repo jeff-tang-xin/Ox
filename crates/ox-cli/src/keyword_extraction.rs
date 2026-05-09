@@ -12,20 +12,33 @@ pub fn extract_keywords_from_response(response: &str) -> Option<KeywordExtractio
         // 尝试解析 JSON
         match serde_json::from_str::<KeywordExtraction>(json_str) {
             Ok(keywords) => {
-                tracing::debug!(
-                    "[KEYWORD EXTRACTION] Extracted {} keywords, {} topics",
+                tracing::info!(
+                    "[KEYWORD EXTRACTION] ✅ Extracted {} keywords, {} topics, {} files",
                     keywords.keywords.len(),
-                    keywords.topics.len()
+                    keywords.topics.len(),
+                    keywords.related_files.len()
+                );
+                tracing::debug!(
+                    "[KEYWORD EXTRACTION] Keywords: {:?}",
+                    keywords.keywords
                 );
                 return Some(keywords);
             }
             Err(e) => {
-                tracing::warn!("[KEYWORD EXTRACTION] Failed to parse JSON: {}", e);
+                tracing::warn!(
+                    "[KEYWORD EXTRACTION] ❌ Failed to parse JSON: {}\nJSON content: {}",
+                    e,
+                    json_str.chars().take(200).collect::<String>()
+                );
                 return None;
             }
         }
     }
     
+    tracing::debug!(
+        "[KEYWORD EXTRACTION] ⚠️ No JSON block found in response (length: {} chars)",
+        response.len()
+    );
     None
 }
 

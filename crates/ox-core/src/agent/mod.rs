@@ -255,6 +255,7 @@ pub async fn run_agent_turn(
             ev = llm_rx.recv() => ev,
             _ = cancel_token.cancelled() => {
                 // Cancellation requested — stop receiving LLM events.
+                tracing::warn!("[AGENT] ⚠️ Cancellation token triggered, stopping LLM stream");
                 None
             }
         } {
@@ -288,6 +289,12 @@ pub async fn run_agent_turn(
                 }
                 LlmStreamEvent::ToolCallEnd { .. } => {}
                 LlmStreamEvent::Done { usage } => {
+                    tracing::info!(
+                        "[AGENT] ✅ LLM stream completed (prompt: {}, completion: {}, total: {})",
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.total_tokens
+                    );
                     total_usage.prompt_tokens += usage.prompt_tokens;
                     total_usage.completion_tokens += usage.completion_tokens;
                     total_usage.total_tokens += usage.total_tokens;

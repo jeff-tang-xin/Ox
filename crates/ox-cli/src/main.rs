@@ -820,11 +820,18 @@ async fn run_app(
                             cost_tracker.record(&model_name, &usage);
                             memory_arc.update_from_turn(&new_messages, &rt_env.project_id, &rt_env.project_language);
 
+                            tracing::info!(
+                                "[AGENT TURN] ✅ Turn completed successfully, {} new messages",
+                                new_messages.len()
+                            );
+
                             // 🆕 Extract keywords from LLM response for semantic learning
+                            let mut keywords_extracted_count = 0;
                             for msg in &new_messages {
                                 if let Message::Assistant { content, .. } = msg {
                                     // Try to extract keywords from the response
                                     if let Some(extracted) = keyword_extraction::extract_keywords_from_response(content) {
+                                        keywords_extracted_count += 1;
                                         // Get the last user query
                                         let last_user_query = target_session.messages.iter()
                                             .rev()
@@ -838,6 +845,13 @@ async fn run_app(
                                         memory_arc.record_llm_keywords(last_user_query, extracted);
                                     }
                                 }
+                            }
+                            
+                            if keywords_extracted_count == 0 && !new_messages.is_empty() {
+                                tracing::debug!(
+                                    "[KEYWORD EXTRACTION] ⚠️ No keywords extracted from {} assistant messages",
+                                    new_messages.iter().filter(|m| matches!(m, Message::Assistant { .. })).count()
+                                );
                             }
 
                             // === IMPLICIT FEEDBACK: Evaluate satisfaction ===
