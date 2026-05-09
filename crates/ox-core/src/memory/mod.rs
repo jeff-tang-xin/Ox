@@ -1,7 +1,9 @@
 pub mod store;
+pub mod semantic;  // 🆕 Semantic association manager
 
 use std::fmt;
 use std::sync::Mutex;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +37,11 @@ pub struct MemoryNode {
     /// Recent scores for trend analysis (last 5 evaluations)
     #[serde(default = "default_recent_scores")]
     pub recent_scores: [f32; 5],
+    
+    // 🆕 File association for context-aware retrieval
+    /// Related file paths (e.g., ["src/auth.rs", "src/middleware/mod.rs"])
+    #[serde(default)]
+    pub related_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +368,8 @@ impl MemoryNode {
             avg_llm_score: 0.0,
             judge_eval_count: 0,
             recent_scores: [0.0; 5],
+            // 🆕 File association
+            related_files: Vec::new(),
         }
     }
 
@@ -371,6 +380,24 @@ impl MemoryNode {
 
     pub fn with_language_weight(mut self, weight: f64) -> Self {
         self.language_weight = weight;
+        self
+    }
+
+    /// Add a related file path to this memory
+    pub fn with_related_file(mut self, file_path: &str) -> Self {
+        if !self.related_files.contains(&file_path.to_string()) {
+            self.related_files.push(file_path.to_string());
+        }
+        self
+    }
+
+    /// Add multiple related file paths
+    pub fn with_related_files(mut self, file_paths: &[String]) -> Self {
+        for path in file_paths {
+            if !self.related_files.contains(path) {
+                self.related_files.push(path.clone());
+            }
+        }
         self
     }
 }
@@ -424,6 +451,12 @@ impl MemoryNode {
                 if tool_args.len() < 20 {
                     return None;
                 }
+                
+                // Extract file path from tool args (JSON format)
+                let related_file = serde_json::from_str::<serde_json::Value>(tool_args)
+                    .ok()
+                    .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()));
+                
                 let content = if tool_args.len() > 400 {
                     format!(
                         "{}...",
@@ -437,30 +470,60 @@ impl MemoryNode {
                 } else {
                     tool_args.to_string()
                 };
-                if contains_architectural_keywords(&content) {
-                    Some(Self::new(
+                
+                let mut node = if contains_architectural_keywords(&content) {
+                    Self::new(
                         content,
                         MemoryNodeType::Architectural,
                         Some(project_id.into()),
                         language.into(),
                         MemorySource::ToolObservation,
-                    ))
+                    )
                 } else if contains_business_keywords(&content) {
-                    Some(Self::new(
+                    Self::new(
                         content,
                         MemoryNodeType::Business,
                         Some(project_id.into()),
                         language.into(),
                         MemorySource::ToolObservation,
-                    ))
+                    )
                 } else {
-                    Some(Self::new(
+                    Self::new(
                         content,
                         MemoryNodeType::Fact,
                         Some(project_id.into()),
                         language.into(),
                         MemorySource::ToolObservation,
-                    ))
+                    )
+                };
+                
+                // Attach file path if extracted
+                if let Some(file_path) = related_file {
+                    node = node.with_related_file(&file_path);
+                }
+                
+                Some(node)
+            }
+            "file_read" => {
+                // Extract file path for read operations too
+                let related_file = serde_json::from_str::<serde_json::Value>(tool_args)
+                    .ok()
+                    .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()));
+                
+                if let Some(file_path) = related_file {
+                    let content = format!("Read file: {}", file_path);
+                    Some(
+                        Self::new(
+                            content,
+                            MemoryNodeType::Fact,
+                            Some(project_id.into()),
+                            language.into(),
+                            MemorySource::ToolObservation,
+                        )
+                        .with_related_file(&file_path)
+                    )
+                } else {
+                    None
                 }
             }
             "shell_exec" => {
@@ -574,8 +637,8 @@ fn contains_user_preference(text: &str) -> bool {
 
 // ── MemoryManager (门面) ──
 
-use std::path::PathBuf;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::MemoryConfig;
 
@@ -585,6 +648,8 @@ pub struct MemoryManager {
     write_buffer: Mutex<WriteBuffer>,
     // 🆕 Query cache for repeated searches
     query_cache: Mutex<HashMap<String, (Vec<MemoryNode>, chrono::DateTime<chrono::Utc>)>>,
+    // 🆕 Semantic association manager for dynamic query expansion
+    semantic_manager: Option<semantic::SemanticAssociationManager>,
 }
 
 impl Clone for MemoryManager {
@@ -594,6 +659,7 @@ impl Clone for MemoryManager {
             overall_store: self.overall_store.clone(),
             write_buffer: Mutex::new(WriteBuffer::new()),
             query_cache: Mutex::new(HashMap::new()),  // Don't clone cache
+            semantic_manager: self.semantic_manager.clone(),
         }
     }
 }
@@ -620,11 +686,24 @@ impl MemoryManager {
 
         let _max_nodes = config.max_nodes;
 
+        // Initialize semantic association manager (open new connection to same database)
+        let overall_path = db_dir.join("memories_overall.db");
+        let semantic_manager = if let Ok(conn) = rusqlite::Connection::open(&overall_path) {
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;").ok();
+            Some(semantic::SemanticAssociationManager::new(
+                Arc::new(std::sync::Mutex::new(conn)),
+            ))
+        } else {
+            tracing::warn!("Failed to open semantic database");
+            None
+        };
+
         Ok(Self {
             project_store,
             overall_store,
             write_buffer: Mutex::new(WriteBuffer::new()),
             query_cache: Mutex::new(HashMap::new()),  // Initialize empty cache
+            semantic_manager,
         })
     }
 
@@ -714,6 +793,19 @@ impl MemoryManager {
         }
     }
 
+    /// 🆕 Record LLM-extracted keywords for semantic learning (synchronous, fast)
+    pub fn record_llm_keywords(
+        &self,
+        user_query: &str,
+        extracted: semantic::KeywordExtraction,
+    ) {
+        if let Some(ref manager) = self.semantic_manager {
+            if let Err(e) = manager.record_llm_keywords(user_query, &extracted) {
+                tracing::warn!("[SEMANTIC LEARNING] Failed to record keywords: {}", e);
+            }
+        }
+    }
+
     /// Multi-path memory retrieval with entity-based expansion and optional re-ranking.
     /// 
     /// This enhanced version performs parallel searches across multiple paths:
@@ -791,20 +883,35 @@ impl MemoryManager {
             }
         }
         
+        // 🆕 Step 1: Query expansion using semantic associations
+        let mut expanded_queries = vec![query.to_string()];
+        if let Some(ref manager) = self.semantic_manager {
+            if let Ok(related) = manager.get_related_terms(query, 0.6) {
+                expanded_queries.extend(related);
+                tracing::debug!(
+                    "[SEMANTIC EXPANSION] '{}' → {:?}",
+                    query,
+                    expanded_queries
+                );
+            }
+        }
+        
         let mut all_results: std::collections::HashMap<String, (MemoryNode, f32)> = std::collections::HashMap::new();
         
-        // 🎯 PATH 1: Original semantic query (weight: 1.0)
-        if !query.is_empty() {
-            if let Some(pid) = project_id {
-                if let Ok(mems) = self
-                    .project_store
-                    .as_ref()
-                    .unwrap_or_else(|| &self.overall_store)
-                    .search(query, Some(pid), limit)
-                {
-                    for m in mems {
-                        all_results.entry(m.id.clone())
-                            .or_insert_with(|| (m, 1.0));
+        // 🎯 PATH 1: Original + expanded queries (weight: 1.0)
+        for search_term in &expanded_queries {
+            if !search_term.is_empty() {
+                if let Some(pid) = project_id {
+                    if let Ok(mems) = self
+                        .project_store
+                        .as_ref()
+                        .unwrap_or_else(|| &self.overall_store)
+                        .search(search_term, Some(pid), limit)
+                    {
+                        for m in mems {
+                            all_results.entry(m.id.clone())
+                                .or_insert_with(|| (m, 1.0));
+                        }
                     }
                 }
             }
@@ -913,6 +1020,64 @@ impl MemoryManager {
         
         final_results
     }
+
+    /// Retrieve memories related to specific files.
+    /// 
+    /// This is useful when the user is working on specific files and wants
+    /// context-aware memory retrieval.
+    /// 
+    /// # Arguments
+    /// * `file_paths` - List of file paths to search for related memories
+    /// * `project_id` - Optional project ID for scoped search
+    /// * `limit` - Maximum number of results to return
+    pub fn retrieve_by_files(
+        &self,
+        file_paths: &[String],
+        project_id: &Option<&str>,
+        limit: usize,
+    ) -> Vec<MemoryNode> {
+        if file_paths.is_empty() {
+            return Vec::new();
+        }
+
+        let mut all_results: std::collections::HashMap<String, (MemoryNode, f32)> = std::collections::HashMap::new();
+
+        // Search for memories that have related_files matching any of the provided paths
+        for file_path in file_paths {
+            let search_term = file_path.split('/').last().unwrap_or(file_path); // Also search by filename
+            
+            if let Some(pid) = project_id {
+                if let Some(ref store) = self.project_store {
+                    if let Ok(mems) = store.search(search_term, Some(pid), limit) {
+                        for m in mems {
+                            // Only include if it has related files
+                            if !m.related_files.is_empty() {
+                                // Boost score if file_path matches exactly
+                                let boost = if m.related_files.contains(file_path) {
+                                    1.5
+                                } else {
+                                    1.0
+                                };
+                                
+                                all_results.entry(m.id.clone())
+                                    .and_modify(|(_, score)| *score = (*score + boost).min(2.0))
+                                    .or_insert_with(|| (m, boost));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Convert to vector and sort by score
+        let mut results: Vec<(MemoryNode, f32)> = all_results.into_values().collect();
+        results.sort_by(|(_, score_a), (_, score_b)| {
+            score_b.partial_cmp(score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        results.truncate(limit);
+        results.into_iter().map(|(node, _)| node).collect()
+    }
     
     /// Extract key entities from query for multi-path retrieval.
     /// Focuses on: file names, function names, technical terms.
@@ -1002,7 +1167,13 @@ impl MemoryManager {
                     let chunks = split_with_overlap(&n.content, max_len, 0.15);
                     format!("{}...", chunks[0])
                 } else if n.content.len() > max_len {
-                    format!("{}...", &n.content[..max_len])
+                    // 🚨 FIX: Use char boundary to avoid slicing in the middle of UTF-8 characters
+                    let char_boundary = n.content
+                        .char_indices()
+                        .nth(max_len)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(n.content.len());
+                    format!("{}...", &n.content[..char_boundary])
                 } else {
                     n.content.clone()
                 };
@@ -1034,7 +1205,13 @@ impl MemoryManager {
                     let chunks = split_with_overlap(&n.content, max_len, 0.15);
                     format!("{}...", chunks[0])
                 } else if n.content.len() > max_len {
-                    format!("{}...", &n.content[..max_len])
+                    // 🚨 FIX: Use char boundary to avoid slicing in the middle of UTF-8 characters
+                    let char_boundary = n.content
+                        .char_indices()
+                        .nth(max_len)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(n.content.len());
+                    format!("{}...", &n.content[..char_boundary])
                 } else {
                     n.content.clone()
                 };

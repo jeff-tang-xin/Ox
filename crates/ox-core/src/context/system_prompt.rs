@@ -70,6 +70,9 @@ pub fn build_system_prompt(
     // 6. Runtime environment.
     parts.push(rt_env.system_prompt_block());
 
+    // 7. 🆕 Keyword extraction requirement (for semantic learning)
+    parts.push(KEYWORD_EXTRACTION_REQUIREMENT.to_string());
+
     parts.join("\n\n")
 }
 
@@ -211,3 +214,75 @@ For multi-step tasks, state a brief plan:
 - Stay within project directory. Flag if task requires touching files outside it
 - Never output secrets, credentials, or API keys found in files
 - Clean up temporary files you create (test scripts, debug logs, scratch files) when done";
+
+/// 🆕 Keyword extraction requirement for semantic learning
+const KEYWORD_EXTRACTION_REQUIREMENT: &str = "\
+## Smart Keyword Extraction (CONDITIONAL)
+
+You have the ability to extract keywords from conversations to improve future search accuracy.
+
+**Your task**: At the END of your response, output a JSON block with keywords **IF AND ONLY IF** this conversation contains valuable technical knowledge worth remembering.
+
+### When to extract (output JSON):
+✅ Code implementation, debugging, or refactoring
+✅ Architecture decisions or design patterns
+✅ Project-specific conventions or best practices
+✅ Problem-solving with technical details
+✅ New concepts, tools, or libraries discussed
+
+### When NOT to extract (skip JSON):
+❌ Casual greetings or small talk
+❌ Simple acknowledgments (\"ok\", \"thanks\", \"got it\")
+❌ Repetitive content already covered
+❌ Pure opinion or preference discussions without technical value
+
+### Output format (only when valuable):
+```json
+{
+  \"keywords\": [\"keyword1\", \"keyword2\"],
+  \"topics\": [\"topic1\", \"topic2\"],
+  \"related_files\": [\"path/to/file.rs\"]
+}
+```
+
+### Rules:
+- Extract 3-8 key technical terms from the conversation
+- Include both English and Chinese terms if applicable (e.g., [\"登录\", \"login\", \"authentication\"])
+- Identify mentioned file paths or code elements
+- Topics should be broader categories (e.g., \"security\", \"api\", \"database\")
+- Keep keywords concise and relevant
+
+### Examples:
+
+**Example 1 - Valuable (extract):**
+User: \"登录是怎么做的？\"
+Assistant:
+这个项目使用 JWT 进行身份认证。主要流程如下：
+1. 用户提交用户名密码到 POST /api/v1/auth/login
+2. 后端验证凭据，生成 JWT token
+3. 客户端存储 token，后续请求携带在 Header 中
+
+关键文件：
+- src/auth.rs: 认证逻辑
+- src/middleware/auth_middleware.rs: token 验证
+
+```json
+{
+  \"keywords\": [\"authentication\", \"JWT\", \"login\", \"token\", \"认证\", \"登录\"],
+  \"topics\": [\"security\", \"api\", \"middleware\"],
+  \"related_files\": [\"src/auth.rs\", \"src/middleware/auth_middleware.rs\"]
+}
+```
+
+**Example 2 - Not valuable (skip JSON):**
+User: \"你好\"
+Assistant:
+你好！有什么我可以帮你的吗？
+(No JSON output)
+
+**Important**: 
+- If you're unsure, err on the side of extracting (better to have extra data than miss important knowledge)
+- The JSON block will be automatically removed before showing to user
+- If not valuable, just respond normally without any JSON
+
+**⚠️ REMEMBER**: Only output JSON when the conversation has genuine technical value.";

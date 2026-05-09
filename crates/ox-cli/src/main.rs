@@ -3,6 +3,7 @@ mod spec_helpers;
 pub mod slash_commands;
 pub mod middleware;
 pub mod helpers;
+pub mod keyword_extraction;  // 🆕 Keyword extraction from LLM responses
 
 use std::io;
 use std::sync::Arc;
@@ -818,6 +819,26 @@ async fn run_app(
                             }
                             cost_tracker.record(&model_name, &usage);
                             memory_arc.update_from_turn(&new_messages, &rt_env.project_id, &rt_env.project_language);
+
+                            // 🆕 Extract keywords from LLM response for semantic learning
+                            for msg in &new_messages {
+                                if let Message::Assistant { content, .. } = msg {
+                                    // Try to extract keywords from the response
+                                    if let Some(extracted) = keyword_extraction::extract_keywords_from_response(content) {
+                                        // Get the last user query
+                                        let last_user_query = target_session.messages.iter()
+                                            .rev()
+                                            .find_map(|m| match m {
+                                                Message::User { content } => Some(content.as_str()),
+                                                _ => None,
+                                            })
+                                            .unwrap_or("");
+                                        
+                                        // Record keywords (synchronous, fast operation)
+                                        memory_arc.record_llm_keywords(last_user_query, extracted);
+                                    }
+                                }
+                            }
 
                             // === IMPLICIT FEEDBACK: Evaluate satisfaction ===
                             // Calculate composite satisfaction score
