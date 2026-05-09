@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS memories (
     recent_score_1    REAL NOT NULL DEFAULT 0.0,
     recent_score_2    REAL NOT NULL DEFAULT 0.0,
     recent_score_3    REAL NOT NULL DEFAULT 0.0,
-    recent_score_4    REAL NOT NULL DEFAULT 0.0
+    recent_score_4    REAL NOT NULL DEFAULT 0.0,
+    
+    -- 🆕 File association (JSON array)
+    related_files     TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
@@ -60,7 +63,34 @@ CREATE TABLE IF NOT EXISTS ema_trends (
     sample_count        INTEGER NOT NULL DEFAULT 0,
     last_updated        INTEGER NOT NULL,
     PRIMARY KEY (metric_name)
-);"#;
+);
+
+-- 🆕 Semantic associations for dynamic query expansion
+CREATE TABLE IF NOT EXISTS semantic_associations (
+    source_term         TEXT NOT NULL,
+    target_term         TEXT NOT NULL,
+    association_type    TEXT NOT NULL CHECK(association_type IN ('synonym', 'co_occurrence', 'hierarchy', 'user_defined')),
+    strength            REAL NOT NULL DEFAULT 0.5 CHECK(strength >= 0 AND strength <= 1.0),
+    co_occurrence_count INTEGER NOT NULL DEFAULT 1,
+    created_at          INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    last_updated        INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    PRIMARY KEY (source_term, target_term)
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_source ON semantic_associations(source_term);
+CREATE INDEX IF NOT EXISTS idx_semantic_target ON semantic_associations(target_term);
+
+-- 🆕 Search history for learning user behavior
+CREATE TABLE IF NOT EXISTS search_history (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    query               TEXT NOT NULL,
+    timestamp           INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    results_count       INTEGER NOT NULL,
+    clicked_result_id   TEXT,
+    session_id          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_timestamp ON search_history(timestamp);"#;
 
 pub struct MemoryStore {
     conn: Arc<Connection>,
@@ -102,6 +132,11 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Get a clone of the Arc<Connection> for semantic manager
+    pub fn get_connection(&self) -> Arc<Connection> {
+        Arc::clone(&self.conn)
+    }
+
     /// Get or create precompiled insert statement
     fn get_insert_stmt(
         &self,
@@ -118,8 +153,9 @@ impl MemoryStore {
                   created_at, last_accessed, is_project_critical,
                   trace_0, trace_1, trace_2, trace_3, trace_4, language_weight,
                   avg_llm_score, judge_eval_count,
-                  recent_score_0, recent_score_1, recent_score_2, recent_score_3, recent_score_4)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                  recent_score_0, recent_score_1, recent_score_2, recent_score_3, recent_score_4,
+                  related_files)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
                 )?
             };
             // Safety: We're transmuting the statement to 'static lifetime.
@@ -134,6 +170,10 @@ impl MemoryStore {
     pub fn insert(&self, node: &MemoryNode) -> anyhow::Result<()> {
         let mut stmt_guard = self.get_insert_stmt()?;
         let stmt = stmt_guard.as_mut().unwrap();
+        
+        // Serialize related_files to JSON
+        let related_files_json = serde_json::to_string(&node.related_files).unwrap_or_else(|_| "[]".to_string());
+        
         stmt.execute(params![
             node.id,
             node.content,
@@ -158,6 +198,7 @@ impl MemoryStore {
             node.recent_scores[2],
             node.recent_scores[3],
             node.recent_scores[4],
+            related_files_json,
         ])?;
         Ok(())
     }
@@ -172,10 +213,13 @@ impl MemoryStore {
                   created_at, last_accessed, is_project_critical,
                   trace_0, trace_1, trace_2, trace_3, trace_4, language_weight,
                   avg_llm_score, judge_eval_count,
-                  recent_score_0, recent_score_1, recent_score_2, recent_score_3, recent_score_4)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                  recent_score_0, recent_score_1, recent_score_2, recent_score_3, recent_score_4,
+                  related_files)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
             )?;
             for node in nodes {
+                let related_files_json = serde_json::to_string(&node.related_files).unwrap_or_else(|_| "[]".to_string());
+                
                 stmt.execute(params![
                     node.id,
                     node.content,
@@ -200,6 +244,7 @@ impl MemoryStore {
                     node.recent_scores[2],
                     node.recent_scores[3],
                     node.recent_scores[4],
+                    related_files_json,
                 ])?;
             }
         }
@@ -416,6 +461,10 @@ impl MemoryStore {
     }
 
     fn row_to_node(&self, row: &rusqlite::Row) -> SqlResult<MemoryNode> {
+        // Try to get related_files from column 23 (if exists), otherwise default to empty vec
+        let related_files_json: String = row.get(23).unwrap_or_else(|_| "[]".to_string());
+        let related_files: Vec<String> = serde_json::from_str(&related_files_json).unwrap_or_default();
+        
         Ok(MemoryNode {
             id: row.get(0)?,
             content: row.get(1)?,
@@ -447,6 +496,8 @@ impl MemoryStore {
                 row.get(21).unwrap_or(0.0),
                 row.get(22).unwrap_or(0.0),
             ],
+            // 🆕 File association
+            related_files,
         })
     }
 }

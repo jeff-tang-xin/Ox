@@ -15,6 +15,22 @@ pub struct FileIndexEntry {
     pub file_type: Option<String>,
 }
 
+/// 目录条目（用于层级导航）
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    pub file_count: usize,
+}
+
+/// 目录列表结果（用于层级导航）
+#[derive(Debug, Clone)]
+pub struct DirectoryListing {
+    pub path: String,
+    pub subdirs: Vec<DirEntry>,
+    pub files: Vec<FileIndexEntry>,
+    pub total_file_count: usize,
+}
+
 /// 文件索引管理器
 pub struct FileIndexManager {
     conn: Arc<Mutex<Connection>>,
@@ -156,6 +172,135 @@ impl FileIndexManager {
         }
 
         Ok(results)
+    }
+
+    /// 获取指定目录下的子目录和文件概览（层级导航）
+    /// 
+    /// # Arguments
+    /// * `dir_path` - 目录路径（空字符串表示根目录）
+    /// * `recursive` - 是否递归（当前未实现，保留接口）
+    /// 
+    /// # Returns
+    /// 包含子目录列表、文件列表和统计信息的结构化数据
+    pub fn list_directory(
+        &self,
+        dir_path: &str,
+        _recursive: bool,
+    ) -> anyhow::Result<DirectoryListing> {
+        let conn = self.conn.lock().unwrap();
+        
+        // Normalize path: ensure it ends with '/' for consistent matching
+        let normalized_dir = if dir_path.is_empty() || dir_path == "." {
+            String::new()
+        } else {
+            dir_path.trim_end_matches('/').to_string() + "/"
+        };
+
+        // 1. Get subdirectories with file counts (using SQL aggregation)
+        let subdir_query = if normalized_dir.is_empty() {
+            // Root level: extract top-level directories
+            "SELECT 
+                CASE 
+                    WHEN instr(full_path, '/') > 0 
+                    THEN substr(full_path, 1, instr(full_path, '/') - 1)
+                    ELSE ''
+                END as dirname,
+                COUNT(*) as count
+             FROM file_index
+             WHERE full_path LIKE '%/%'
+             GROUP BY dirname
+             HAVING dirname != ''
+             ORDER BY count DESC"
+        } else {
+            // Subdirectory level
+            &format!(
+                "SELECT 
+                    CASE 
+                        WHEN instr(substr(full_path, {}), '/') > 0 
+                        THEN substr(full_path, {}, instr(substr(full_path, {}), '/') - 1)
+                        ELSE ''
+                    END as dirname,
+                    COUNT(*) as count
+                 FROM file_index
+                 WHERE full_path LIKE '{}%'
+                 AND length(full_path) > length('{}')
+                 GROUP BY dirname
+                 HAVING dirname != ''
+                 ORDER BY count DESC",
+                normalized_dir.len() + 1,
+                normalized_dir.len() + 1,
+                normalized_dir.len() + 1,
+                normalized_dir,
+                normalized_dir
+            )
+        };
+
+        let mut stmt = conn.prepare(subdir_query)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut subdirs = Vec::new();
+        for row in rows {
+            let (name, count) = row?;
+            subdirs.push(DirEntry {
+                name,
+                file_count: count as usize,
+            });
+        }
+
+        // 2. Get files directly under this directory (LIMIT to prevent overload)
+        let file_query = if normalized_dir.is_empty() {
+            // Root level: files without '/' in path
+            "SELECT id, filename, full_path, file_type 
+             FROM file_index 
+             WHERE full_path NOT LIKE '%/%'
+             ORDER BY filename
+             LIMIT 100"
+        } else {
+            // Subdirectory: files directly under this dir
+            &format!(
+                "SELECT id, filename, full_path, file_type 
+                 FROM file_index 
+                 WHERE full_path LIKE '{}%'
+                 AND substr(full_path, {}) NOT LIKE '%/%'
+                 ORDER BY filename
+                 LIMIT 100",
+                normalized_dir,
+                normalized_dir.len() + 1
+            )
+        };
+
+        let mut stmt = conn.prepare(file_query)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(FileIndexEntry {
+                id: row.get(0)?,
+                filename: row.get(1)?,
+                full_path: row.get(2)?,
+                file_type: row.get(3)?,
+            })
+        })?;
+
+        let mut files = Vec::new();
+        for row in rows {
+            files.push(row?);
+        }
+
+        // 3. Count total files in this directory (including subdirectories)
+        let total_count_query = if normalized_dir.is_empty() {
+            "SELECT COUNT(*) FROM file_index"
+        } else {
+            &format!("SELECT COUNT(*) FROM file_index WHERE full_path LIKE '{}%'", normalized_dir)
+        };
+
+        let total_file_count: i64 = conn.query_row(total_count_query, [], |row| row.get(0))?;
+
+        Ok(DirectoryListing {
+            path: dir_path.to_string(),
+            subdirs,
+            files,
+            total_file_count: total_file_count as usize,
+        })
     }
 
     /// 删除文件索引

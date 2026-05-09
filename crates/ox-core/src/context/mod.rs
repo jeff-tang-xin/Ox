@@ -10,6 +10,82 @@ pub use system_prompt::build_system_prompt;
 use crate::llm::tokenizer::estimate_tokens;
 use crate::message::Message;
 
+/// User intent detection for smart context assembly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserIntent {
+    /// User is exploring project structure (e.g., "show me the project", "what files are there")
+    Exploration,
+    /// User is asking about specific code logic (e.g., "how does auth work", "explain this function")
+    CodeUnderstanding,
+    /// User wants to modify code (e.g., "add a feature", "fix this bug")
+    CodeModification,
+    /// General conversation or unclear intent
+    General,
+}
+
+/// Detect user intent from their query.
+pub fn detect_intent(query: &str) -> UserIntent {
+    let query_lower = query.to_lowercase();
+    
+    // Exploration keywords
+    let exploration_keywords = [
+        "show me", "list", "what files", "project structure", "directory",
+        "explore", "browse", "overview", "structure"
+    ];
+    if exploration_keywords.iter().any(|k| query_lower.contains(k)) {
+        return UserIntent::Exploration;
+    }
+    
+    // Code understanding keywords
+    let understanding_keywords = [
+        "how does", "explain", "what is", "understand", "logic",
+        "implementation", "work", "function", "method"
+    ];
+    if understanding_keywords.iter().any(|k| query_lower.contains(k)) {
+        return UserIntent::CodeUnderstanding;
+    }
+    
+    // Code modification keywords
+    let modification_keywords = [
+        "add", "create", "modify", "change", "update", "fix",
+        "implement", "refactor", "delete", "remove"
+    ];
+    if modification_keywords.iter().any(|k| query_lower.contains(k)) {
+        return UserIntent::CodeModification;
+    }
+    
+    UserIntent::General
+}
+
+/// Extract recently accessed file paths from message history.
+/// This helps identify which files the user is currently working on.
+pub fn extract_recent_files(history: &[Message], max_files: usize) -> Vec<String> {
+    use regex::Regex;
+    
+    let mut files = Vec::new();
+    let file_pattern = Regex::new(r"[\w./-]+\.(rs|toml|json|md|py|js|ts|go|css|html)").unwrap();
+    
+    // Scan recent messages (last 10) for file paths
+    let recent_messages = history.iter().rev().take(10);
+    
+    for msg in recent_messages {
+        let content = match msg {
+            Message::User { content } | Message::Assistant { content, .. } => content,
+            Message::ToolResult { content, .. } => content,
+            _ => continue,
+        };
+        
+        for mat in file_pattern.find_iter(content) {
+            let file_path = mat.as_str().to_string();
+            if !files.contains(&file_path) && files.len() < max_files {
+                files.push(file_path);
+            }
+        }
+    }
+    
+    files
+}
+
 /// Token budget allocation for a given model context window.
 #[derive(Debug, Clone)]
 pub struct TokenBudgets {
@@ -78,6 +154,36 @@ impl ContextBuilder {
             history: (context_window as f32 * self.history_ratio) as u32,
             reply_reserve: (context_window as f32 * self.reply_reserve_ratio) as u32,
             total: context_window,
+        }
+    }
+
+    /// Adjust budgets based on user intent for smarter context allocation.
+    pub fn budgets_for_intent(&self, context_window: u32, intent: UserIntent) -> TokenBudgets {
+        match intent {
+            UserIntent::Exploration => {
+                // Exploration mode: more history for context, less memory
+                TokenBudgets {
+                    system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
+                    memory: (context_window as f32 * 0.01) as u32,  // Reduce to 1%
+                    history: (context_window as f32 * 0.15) as u32,  // Increase to 15%
+                    reply_reserve: (context_window as f32 * 0.83) as u32,
+                    total: context_window,
+                }
+            }
+            UserIntent::CodeUnderstanding | UserIntent::CodeModification => {
+                // Development mode: more memory for relevant code knowledge
+                TokenBudgets {
+                    system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
+                    memory: (context_window as f32 * 0.05) as u32,  // Increase to 5%
+                    history: (context_window as f32 * 0.08) as u32,  // Slightly reduce to 8%
+                    reply_reserve: (context_window as f32 * 0.86) as u32,
+                    total: context_window,
+                }
+            }
+            UserIntent::General => {
+                // General mode: use default ratios
+                self.budgets(context_window)
+            }
         }
     }
 
