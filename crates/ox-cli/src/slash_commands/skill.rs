@@ -22,22 +22,26 @@ pub fn handle_skill_command(
     _memory: &std::sync::Arc<ox_core::memory::MemoryManager>,
     _cost_tracker: &mut ox_core::cost::CostTracker,
     _trust_manager: &std::sync::Arc<std::sync::Mutex<ox_core::safety::TrustManager>>,
-) -> CommandResult {
+) -> crate::slash_commands::CommandResult {
     let parts: Vec<&str> = args.split_whitespace().collect();
     
     if parts.is_empty() {
         show_skill_help(app);
-        return CommandResult::Success;
+        return crate::slash_commands::CommandResult::Success;
     }
     
     match parts[0] {
-        "list" => handle_skill_list(app, rt_env),
+        "list" => {
+            handle_skill_list(app, rt_env);
+            crate::slash_commands::CommandResult::Success
+        }
         "show" => {
             if parts.len() < 2 {
                 app.output.push_system("Usage: /skill show <id>");
             } else {
                 handle_skill_show(app, parts[1], rt_env);
             }
+            crate::slash_commands::CommandResult::Success
         }
         "create" => {
             if parts.len() < 2 {
@@ -51,18 +55,21 @@ pub fn handle_skill_command(
                 };
                 handle_skill_create(app, id, &desc, rt_env);
             }
+            crate::slash_commands::CommandResult::Success
         }
         "create-llm" => {
             if parts.len() < 2 {
                 app.output.push_system("Usage: /skill create-llm <description>");
                 app.output.push_system("Example: /skill create-llm Rust error handling best practices");
+                crate::slash_commands::CommandResult::Success
             } else {
                 let desc = parts[1..].join(" ");
-                handle_skill_create_llm(app, &desc, rt_env);
+                handle_skill_create_llm(app, &desc, rt_env)
             }
         }
         "reflect" => {
             handle_skill_reflect(app, rt_env);
+            crate::slash_commands::CommandResult::Success
         }
         "delete" => {
             if parts.len() < 2 {
@@ -70,13 +77,13 @@ pub fn handle_skill_command(
             } else {
                 handle_skill_delete(app, parts[1], rt_env);
             }
+            crate::slash_commands::CommandResult::Success
         }
         _ => {
             show_skill_help(app);
+            crate::slash_commands::CommandResult::Success
         }
     }
-    
-    CommandResult::Success
 }
 
 /// 显示帮助信息
@@ -219,63 +226,22 @@ fn handle_skill_delete(app: &mut AppState, id: &str, rt_env: &RuntimeEnvironment
 }
 
 /// 使用 LLM 辅助创建 Skill
-fn handle_skill_create_llm(app: &mut AppState, description: &str, rt_env: &RuntimeEnvironment) {
-    // 生成 Skill ID
-    let id = description
-        .split_whitespace()
-        .take(5)
-        .map(|w| w.to_lowercase())
-        .collect::<Vec<_>>()
-        .join("-")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-')
-        .collect::<String>();
+fn handle_skill_create_llm(app: &mut AppState, description: &str, _rt_env: &RuntimeEnvironment) -> crate::slash_commands::CommandResult {
+    use ox_core::context::SKILL_CREATION_PROMPT;
     
-    // 确定保存路径（默认项目级）
-    let skills_dir = rt_env.working_dir.join(".ox").join("skills");
-    let skill_path = skills_dir.join(format!("{}.md", id));
+    // 构建 prompt
+    let prompt = SKILL_CREATION_PROMPT.replace("{task_description}", description);
     
-    // 检查是否已存在
-    if skill_path.exists() {
-        app.output.push_system(&format!("❌ Skill already exists: {}", id));
-        return;
-    }
+    // 显示提示信息
+    app.output.push_system(&format!(
+        "🤖 Generating Skill for: {}\n\nPlease wait for LLM to generate content...",
+        description
+    ));
     
-    // 生成模板（让用户手动编辑）
-    let name = id.replace('-', " ");
-    let template = format!(
-        "---\n\
-         name: {}\n\
-         description: {}\n\
-         ---\n\n\
-         # {}\n\n\
-         ## When to Use\n\
-         - \n\n\
-         ## Steps\n\
-         1. \n\n\
-         ## Anti-patterns\n\
-         - \n\n\
-         ## Example\n\
-         ```\n\
-         // Add your example here\n\
-         ```\n",
-        id,
-        description,
-        name.chars().next().unwrap_or(' ').to_uppercase().collect::<String>() + &name[1..]
-    );
-    
-    // 保存文件
-    match std::fs::write(&skill_path, &template) {
-        Ok(_) => {
-            app.output.push_system(&format!(
-                "✅ Created Skill template: {}\n\nEdit the file to customize:\n{}",
-                id,
-                skill_path.display()
-            ));
-        }
-        Err(e) => {
-            app.output.push_system(&format!("❌ Failed to create Skill: {}", e));
-        }
+    // 返回 LLM 请求，由主流程处理
+    crate::slash_commands::CommandResult::LlmRequest {
+        prompt,
+        description: format!("Create skill: {}", description),
     }
 }
 

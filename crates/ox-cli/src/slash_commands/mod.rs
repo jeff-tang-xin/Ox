@@ -27,10 +27,16 @@ pub type CommandHandler = fn(
 /// Command execution result
 #[derive(Debug)]
 pub enum CommandResult {
-    /// Command executed successfully
+    /// Command executed successfully (no further action needed)
     Success,
     /// Command requires async processing (handled in main loop)
     AsyncPending,
+    /// Command needs LLM to generate content
+    /// Contains: (prompt, callback_description)
+    LlmRequest { 
+        prompt: String,
+        description: String,
+    },
     /// Command failed with error message
     Error(String),
     /// Unknown command
