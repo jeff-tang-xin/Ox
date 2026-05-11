@@ -215,6 +215,7 @@ For multi-step tasks, state a brief plan:
 - New file or complete rewrite (>50% changed) → `file_write`
 - Small edit to existing file (<50% changed) → `file_patch`
 - **⚠️ MUST ask user confirmation BEFORE any write/patch operation**
+- **💡 IMPORTANT for `file_write`**: Large files (>1 MB) are automatically written in chunks - you can provide the full content without worrying about size limits
 
 ### System & External
 - Run shell commands (including Git) -> shell_exec

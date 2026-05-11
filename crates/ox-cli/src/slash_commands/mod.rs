@@ -99,6 +99,7 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     registry.register(session::RESUME_COMMAND);
     registry.register(session::SESSIONS_COMMAND);
     registry.register(session::CLEAN_COMMAND);
+    registry.register(session::CLEAR_CACHE_COMMAND);
     
     // Model management
     registry.register(model::MODEL_COMMAND);

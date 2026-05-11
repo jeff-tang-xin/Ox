@@ -579,10 +579,20 @@ pub async fn run_agent_turn(
             }
         }
 
-        // Push assistant message with tool calls.
+        // ✅ CRITICAL FIX: Filter out truncated tool_calls from the Assistant message.
+        // Truncated tool calls have already been handled (error ToolResult added),
+        // so they should NOT appear in the Assistant message to avoid confusing
+        // the compression logic and causing "tool call result does not follow tool call" errors.
+        let valid_tool_calls: Vec<_> = tool_calls
+            .iter()
+            .filter(|tc| !truncated_ids.contains(&tc.id))
+            .cloned()
+            .collect();
+
+        // Push assistant message with ONLY valid (non-truncated) tool calls.
         let assistant_msg = Message::Assistant {
             content: full_text.clone(), // Clone to keep full_text for workflow advancement check
-            tool_calls: tool_calls.clone(),
+            tool_calls: valid_tool_calls,
         };
         new_messages.push(assistant_msg.clone());
         messages.push(assistant_msg);
@@ -992,6 +1002,41 @@ pub async fn run_agent_turn(
                         "💬 User (before tool): {}",
                         text.trim()
                     )));
+                }
+            }
+
+            // ── Pre-execution validation for file_write tool ──
+            if tc.name == "file_write" {
+                let has_path = args.get("path").is_some();
+                let has_filename = args.get("filename").is_some();
+                let has_file_id = args.get("file_id").is_some();
+                
+                if !has_path && !has_filename && !has_file_id {
+                    // Return error to LLM before executing
+                    let error_msg = "❌ CRITICAL ERROR: Missing 'path' parameter for file_write!\n\n\
+                                     💡 For NEW files, you MUST provide a COMPLETE path:\n\
+                                     • Include directory structure (e.g., 'src/utils/helper.rs')\n\
+                                     • NOT just filename (e.g., 'helper.rs' is WRONG)\n\n\
+                                     📝 Correct Examples:\n\
+                                     {\"path\": \"src/main.rs\", \"content\": \"...\"}\n\
+                                     {\"path\": \"docs/guide.md\", \"content\": \"...\"}\n\
+                                     {\"path\": \"tests/unit_test.rs\", \"content\": \"...\"}\n\n\
+                                     ❌ Wrong Example:\n\
+                                     {\"content\": \"...\"} ← NO PATH PROVIDED!\n\
+                                     {\"filename\": \"main.rs\"} ← Only works for EXISTING files!";
+                    
+                    let result_msg = Message::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: error_msg.to_string(),
+                    };
+                    new_messages.push(result_msg.clone());
+                    messages.push(result_msg);
+                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                        name: tc.name.clone(),
+                        output: error_msg.to_string(),
+                        is_error: true,
+                    });
+                    continue;
                 }
             }
 

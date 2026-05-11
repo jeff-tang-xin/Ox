@@ -15,7 +15,14 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create or overwrite a file. Use ONLY for new files or complete rewrites (>50% changed). For small edits, use file_patch."
+        "Create or overwrite a file. Use ONLY for new files or complete rewrites (>50% changed). For small edits, use file_patch.\n\n\
+         ⚠️ CRITICAL: You MUST provide the 'path' parameter with a COMPLETE file path:\n\
+         • For NEW files: Always specify full relative path (e.g., 'src/output.txt', 'docs/readme.md')\n\
+         • For EXISTING files: Can use 'path', 'filename', or 'file_id'\n\n\
+         💡 IMPORTANT: Large files (>1 MB) are automatically written in chunks - you can provide the full content without worrying about size limits!\n\n\
+         💡 Examples:\n\
+         - New file: {\"path\": \"src/utils/helper.rs\", \"content\": \"...\"}\n\
+         - Existing: {\"filename\": \"main.rs\", \"content\": \"...\"}"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -24,19 +31,19 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path (relative). Required unless using filename or file_id."
+                    "description": "⚠️ ALWAYS REQUIRED for new files: Complete relative path including directories (e.g., 'src/main.rs', 'docs/guide.md'). For existing files, can also use filename or file_id instead."
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Filename for new/existing file. Alternative to path."
+                    "description": "Alternative for EXISTING files only: Search by filename in index. NOT recommended for new files (use 'path' instead)."
                 },
                 "file_id": {
                     "type": "integer",
-                    "description": "File ID from index. For existing files only."
+                    "description": "Alternative for EXISTING files only: Precise file ID from index. Use file_list to get IDs. Cannot be used for new files."
                 },
                 "content": {
                     "type": "string",
-                    "description": "✅ REQUIRED: File content. Large files (>1 MB) auto-chunked."
+                    "description": "✅ REQUIRED: The content to write to the file. Large files (>1 MB) will be automatically written in chunks."
                 }
             },
             "required": ["content"],
@@ -46,8 +53,9 @@ impl Tool for FileWriteTool {
                 {"required": ["file_id"]}
             ],
             "examples": [
-                {"path": "output.txt", "content": "Hello World"},
-                {"path": "src/main.rs", "content": "fn main() {}"}
+                {"path": "src/new_file.rs", "content": "// New file with full path"},
+                {"path": "docs/tutorial.md", "content": "# Tutorial"},
+                {"filename": "existing.rs", "content": "// Modifying existing file"}
             ]
         })
     }
@@ -120,17 +128,17 @@ impl Tool for FileWriteTool {
             }
         } else {
             return ToolOutput::error(
-                "❌ Missing Required Parameter: No path specified\n\n\
-                 💡 You MUST provide ONE of:\n\
-                 • 'path': Full relative path (most common)\n\
-                 • 'filename': Filename for new/existing file\n\
-                 • 'file_id': Precise file ID from index\n\n\
+                "❌ CRITICAL ERROR: Missing 'path' parameter for file_write!\n\n\
+                 💡 For NEW files, you MUST provide a COMPLETE path:\n\
+                 • Include directory structure (e.g., 'src/utils/helper.rs')\n\
+                 • NOT just filename (e.g., 'helper.rs' is WRONG)\n\n\
                  📝 Correct Examples:\n\
-                 {\"path\": \"src/output.txt\", \"content\": \"Hello\"}\n\
-                 {\"filename\": \"new_file.txt\", \"content\": \"Content\"}\n\
-                 {\"file_id\": 123, \"content\": \"Updated content\"}\n\n\
+                 {\"path\": \"src/main.rs\", \"content\": \"...\"}\n\
+                 {\"path\": \"docs/guide.md\", \"content\": \"...\"}\n\
+                 {\"path\": \"tests/unit_test.rs\", \"content\": \"...\"}\n\n\
                  ❌ Wrong Example:\n\
-                 {\"content\": \"Hello\"} ← Missing path parameter!"
+                 {\"content\": \"...\"} ← NO PATH PROVIDED!\n\
+                 {\"filename\": \"main.rs\"} ← Only works for EXISTING files!"
             );
         };
 
