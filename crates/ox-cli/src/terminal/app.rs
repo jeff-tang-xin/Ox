@@ -14,6 +14,8 @@ pub enum SessionAction {
     Resume {
         filename: String,
     },
+    /// Smart switch: go to next session, or reverse if at end
+    SwitchNext,
 }
 
 /// Workflow state machine for Spec and Council modes
@@ -152,8 +154,6 @@ pub struct App {
     pub sidebar_width: u16,
     /// Track last spinner frame to avoid unnecessary renders
     pub last_spinner_frame: u64,
-    /// Chat area bounds for mouse scroll detection (x, y, width, height)
-    pub chat_area: Option<(u16, u16, u16, u16)>,
 
     // Implicit feedback system
     pub override_detector: ox_core::feedback::CodeOverrideDetector,
@@ -228,7 +228,6 @@ impl App {
             sessions: Vec::new(),
             sidebar_width: 22,
             last_spinner_frame: 0,
-            chat_area: None,
 
             // Implicit feedback system initialization
             override_detector: ox_core::feedback::CodeOverrideDetector::new(300), // 5 min window

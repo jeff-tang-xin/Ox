@@ -11,7 +11,7 @@ use crate::tools::ToolRegistry;
 /// via the API's function calling mechanism — NOT duplicated here.
 pub fn build_system_prompt(
     rt_env: &RuntimeEnvironment,
-    _tool_registry: &ToolRegistry,
+    tool_registry: &ToolRegistry,
     persona: Option<&str>,
     behavior_rules: Option<&crate::config::BehaviorRulesConfig>,
     spec_content: Option<&str>,
@@ -24,7 +24,25 @@ pub fn build_system_prompt(
     // 2. Workflow rules (actionable, not abstract).
     parts.push(WORKFLOW_RULES.to_string());
 
-    // 3. Behavior rules (user-configured).
+    // 3. 🆕 Inject Skills as special tools
+    if !tool_registry.skills.is_empty() {
+        parts.push("## Available Skills (Special Tools)\n".to_string());
+        parts.push(
+            "You have access to the following Skills. These are reusable patterns and best practices.\n\
+             Review them and apply when relevant to the current task.\n\n".to_string()
+        );
+        
+        for skill in &tool_registry.skills {
+            parts.push(format!("### Skill: {}\n\n", skill.name));
+            parts.push(format!("{}\n\n", skill.content));
+        }
+        
+        parts.push(
+            "**Usage Rule**: Skills are reference materials. Use them as guidance, not rigid templates.\n\n".to_string()
+        );
+    }
+
+    // 4. Behavior rules (user-configured).
     if let Some(br) = behavior_rules {
         let mut rules = Vec::new();
 
@@ -85,6 +103,30 @@ You help developers write, debug, refactor, and understand code.\n\
 Respond in the same language the user uses. Be concise and direct.";
 
 const WORKFLOW_RULES: &str = "\
+## ⚠️ MANDATORY: Read System-Level Skills First (HIGHEST PRIORITY)
+
+**BEFORE responding to ANY user request, you MUST read and understand these system-level Skills:**
+
+### Global Skills (Apply to ALL projects):
+1. **coding-principles** - Four core coding rules you MUST follow in ALL code
+2. **concise-communication** - How to communicate clearly without unnecessary verbosity
+3. **engineering-practices** - Universal software engineering best practices
+
+### Project Skills (Specific to current project):
+- Check `.ox/skills/` directory for project-specific conventions
+- These override global practices when they conflict
+- Examples: project architecture patterns, team-specific workflows, custom tooling
+
+**These Skills are loaded automatically into your context.** They define:
+- How you should think before coding
+- What makes good vs bad code
+- How to structure files and documentation
+- Communication style expectations
+
+**FAILURE TO FOLLOW THESE SKILLS WILL RESULT IN REJECTED WORK.**
+
+---
+
 ## ⚠️ CRITICAL: Edit Before Execute (HIGHEST PRIORITY)
 
 **BEFORE using ANY editing tool or shell command, you MUST stop and ask the user for confirmation.**
@@ -125,54 +167,6 @@ Is this plan acceptable? Please confirm or suggest improvements.
 ```
 
 **⚠️ VIOLATION CONSEQUENCE**: If you skip this confirmation step, the user will reject your changes and you must restart.
-
-## Core Principles (MANDATORY)
-
-Apply these principles in ALL code you write.
-
-### 1. Think Before Coding
-
-**When in doubt, ASK. Never assume or guess.**
-
-- If request is ambiguous, ask clarifying questions FIRST
-- If multiple interpretations exist, present them and ask which one
-- If uncertain about requirements, STOP and ask
-- NEVER proceed when confused — always clarify first
-- Better to ask ONE question than waste time on wrong solution
-
-### 2. Simplicity First
-
-**Minimum code that solves the problem. Nothing speculative.**
-
-- No features beyond what was asked
-- No abstractions for single-use code
-- No \"flexibility\" or \"configurability\" unless requested
-- If it could be simpler, simplify it
-
-### 3. Surgical Changes
-
-**Touch only what you must. Clean up only your own mess.**
-
-- Don't improve adjacent code, comments, or formatting
-- Don't refactor things that aren't broken
-- Match existing style even if you'd do it differently
-- Remove imports/variables/functions YOUR changes made unused
-- Don't remove pre-existing dead code unless asked
-
-### 4. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-- \"Add validation\" -> Write tests for invalid inputs, then make them pass
-- \"Fix the bug\" -> Reproduce it with a test, then fix
-- \"Refactor X\" -> Ensure tests pass before and after
-
-For multi-step tasks, state a brief plan:
-```
-1. [Step] -> verify: [check]
-2. [Step] -> verify: [check]
-```
 
 ## Context Management
 
@@ -233,7 +227,20 @@ For multi-step tasks, state a brief plan:
 - Do not delete files or run destructive commands without explicit user request
 - Stay within project directory. Flag if task requires touching files outside it
 - Never output secrets, credentials, or API keys found in files
-- Clean up temporary files you create (test scripts, debug logs, scratch files) when done";
+- Clean up temporary files you create (test scripts, debug logs, scratch files) when done
+
+## Task Completion & Reflection
+
+**When you complete a significant task**, you may suggest reflection to the user:
+
+```
+✅ Task completed!
+
+If you discovered a reusable pattern or best practice, you can save it as a Skill for future use:
+/skill reflect - Automatically analyze and create a Skill from this task
+```
+
+This is OPTIONAL - only suggest when genuinely valuable.";
 
 /// 🆕 Keyword extraction requirement for semantic learning
 const KEYWORD_EXTRACTION_REQUIREMENT: &str = "\

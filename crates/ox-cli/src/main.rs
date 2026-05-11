@@ -14,8 +14,6 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-#[cfg(not(target_os = "windows"))]
-use crossterm::event::EnableMouseCapture;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -60,8 +58,6 @@ async fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
-    #[cfg(not(target_os = "windows"))]
-    stdout.execute(EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -71,8 +67,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    #[cfg(not(target_os = "windows"))]
-    io::stdout().execute(crossterm::event::DisableMouseCapture)?;
     io::stdout().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
@@ -254,7 +248,14 @@ async fn run_app(
     );
 
     // Create tool registry (tool context will be created after memory initialization)
-    let tool_registry = Arc::new(ToolRegistry::new());
+    let mut tool_registry = ToolRegistry::new();
+    
+    // Load Skills from filesystem
+    if let Err(e) = tool_registry.load_skills(&rt_env) {
+        tracing::warn!("Failed to load skills: {}", e);
+    }
+    
+    let tool_registry = Arc::new(tool_registry);
 
     // Initialize command registry
     let command_registry = slash_commands::CommandRegistry::new();
@@ -572,12 +573,42 @@ async fn run_app(
                                 } else {
                                     let project_id = rt_env.project_id.clone();
                                     match Session::new(&session_dir, &project_id) {
-                                        Ok(s) => {
+                                        Ok(mut s) => {
+                                            // ✅ Archive current session before creating new one
+                                            if let Err(e) = session.archive(&session_dir) {
+                                                tracing::warn!("Failed to archive current session: {e}");
+                                            }
+                                            
+                                            // ✅ Set default working directory for new session
+                                            let default_wd = rt_env.working_dir.to_string_lossy().to_string();
+                                            if let Err(e) = s.update_working_dir(&default_wd) {
+                                                tracing::warn!("Failed to set default working dir: {}", e);
+                                            }
+                                            
                                             session = s;
                                             app.output.clear();
                                             app.output.push_system("New session started.");
                                             helpers::refresh_header_info(&mut app, &rt_env, provider.is_some());
                                             app.message_count = 0;
+
+                                            // 🔄 Re-render sidebar after /new command
+                                            app.sessions.clear();
+                                            let archived = Session::list_archived(&session_dir);
+                                            for (filename, info) in archived {
+                                                app.sessions.push(terminal::app::SessionEntry {
+                                                    filename,
+                                                    info,
+                                                    is_active: false,
+                                                });
+                                            }
+                                            app.sessions.insert(
+                                                0,
+                                                terminal::app::SessionEntry {
+                                                    filename: "current".to_string(),
+                                                    info: helpers::session_display_name(&session),
+                                                    is_active: true,
+                                                },
+                                            );
 
                                             // Reinitialize workflow engine for new session
                                             app.init_workflow_engine(&session.meta.id, &session.meta);
@@ -612,11 +643,46 @@ async fn run_app(
                                                 tracing::warn!("Failed to archive: {e}");
                                             }
                                             session = archived;
+                                            
+                                            // ✅ Restore session working directory
+                                            if let Some(ref wd) = session.meta.working_dir {
+                                                if let Ok(path) = std::path::PathBuf::from(wd).canonicalize() {
+                                                    if let Err(e) = std::env::set_current_dir(&path) {
+                                                        tracing::warn!("Failed to restore working dir: {}", e);
+                                                    } else {
+                                                        rt_env.working_dir = path.clone();
+                                                        app.output.push_system(&format!(
+                                                            "Restored working directory: {}",
+                                                            path.display()
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            
                                             helpers::replay_session_history(&mut app, &session.messages, &rt_env, provider.is_some());
                                             app.output.push_system(&format!(
                                                 "Session restored: {} messages from {}",
                                                 session.messages.len(), filename
                                             ));
+                                            
+                                            // 🔄 Re-render sidebar after /resume command
+                                            app.sessions.clear();
+                                            let archived_list = Session::list_archived(&session_dir);
+                                            for (fname, info) in archived_list {
+                                                app.sessions.push(terminal::app::SessionEntry {
+                                                    filename: fname,
+                                                    info,
+                                                    is_active: false,
+                                                });
+                                            }
+                                            app.sessions.insert(
+                                                0,
+                                                terminal::app::SessionEntry {
+                                                    filename: "current".to_string(),
+                                                    info: helpers::session_display_name(&session),
+                                                    is_active: true,
+                                                },
+                                            );
                                             
                                             // Load compressed context for resumed session
                                             compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
@@ -628,6 +694,107 @@ async fn run_app(
                                             app.output.push_system(&format!("Failed to resume: {e}"));
                                         }
                                     }
+                                }
+                            }
+                            SessionAction::SwitchNext => {
+                                // Smart switch: find current session index and switch to next (or previous if at end)
+                                let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
+                                
+                                // Find the index of the current active session
+                                let current_index = app.sessions.iter().position(|s| s.is_active);
+                                
+                                if let Some(idx) = current_index {
+                                    // Determine direction: default forward, reverse if at end
+                                    let total = app.sessions.len();
+                                    let next_idx = if idx + 1 < total {
+                                        idx + 1  // Go forward
+                                    } else {
+                                        idx.saturating_sub(1)  // At end, go backward
+                                    };
+                                    
+                                    // Make sure we're not staying on the same session
+                                    if next_idx != idx {
+                                        if let Some(entry) = app.sessions.get(next_idx) {
+                                            let filename = entry.filename.clone();
+                                            
+                                            // Resume the selected session
+                                            if app.agent_running {
+                                                match Session::load_archived(&session_dir, &filename) {
+                                                    Ok(Some(archived)) => {
+                                                        background_session = Some(std::mem::replace(&mut session, archived));
+                                                        app.ui_to_agent_tx = None;
+                                                        compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+                                                    }
+                                                    _ => {}
+                                                }
+                                            } else {
+                                                match Session::load_archived(&session_dir, &filename) {
+                                                    Ok(Some(archived)) => {
+                                                        if let Err(e) = session.archive(&session_dir) {
+                                                            tracing::warn!("Failed to archive: {e}");
+                                                        }
+                                                        session = archived;
+                                                        
+                                                        // Restore working directory
+                                                        if let Some(ref wd) = session.meta.working_dir {
+                                                            if let Ok(path) = std::path::PathBuf::from(wd).canonicalize() {
+                                                                if let Err(e) = std::env::set_current_dir(&path) {
+                                                                    tracing::warn!("Failed to restore working dir: {}", e);
+                                                                } else {
+                                                                    rt_env.working_dir = path.clone();
+                                                                    app.output.push_system(&format!(
+                                                                        "Restored working directory: {}",
+                                                                        path.display()
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                        
+                                                        helpers::replay_session_history(&mut app, &session.messages, &rt_env, provider.is_some());
+                                                        app.output.push_system(&format!(
+                                                            "Session switched: {} messages from {}",
+                                                            session.messages.len(), filename
+                                                        ));
+                                                        
+                                                        // ✅ Force UI refresh after session switch
+                                                        app.dirty = true;
+                                                        app.scroll_to_bottom();
+                                                        
+                                                        // Re-render sidebar
+                                                        app.sessions.clear();
+                                                        let archived = Session::list_archived(&session_dir);
+                                                        for (fname, info) in archived {
+                                                            app.sessions.push(terminal::app::SessionEntry {
+                                                                filename: fname,
+                                                                info,
+                                                                is_active: false,
+                                                            });
+                                                        }
+                                                        app.sessions.insert(
+                                                            0,
+                                                            terminal::app::SessionEntry {
+                                                                filename: "current".to_string(),
+                                                                info: helpers::session_display_name(&session),
+                                                                is_active: true,
+                                                            },
+                                                        );
+                                                        
+                                                        compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+                                                    }
+                                                    Ok(None) => {
+                                                        app.output.push_system(&format!("Session '{}' not found.", filename));
+                                                    }
+                                                    Err(e) => {
+                                                        app.output.push_system(&format!("Failed to resume: {e}"));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        app.output.push_system("Only one session available.");
+                                    }
+                                } else {
+                                    app.output.push_system("No active session found.");
                                 }
                             }
                             SessionAction::None => {}
@@ -1127,6 +1294,12 @@ async fn run_app(
                                     )));
                                     helpers::refresh_header_info(&mut app, &rt_env, provider.is_some());
 
+                                    // ✅ Update session working directory and persist
+                                    let working_dir_str = new_dir.to_string_lossy().to_string();
+                                    if let Err(e) = session.update_working_dir(&working_dir_str) {
+                                        tracing::warn!("Failed to update session working dir: {}", e);
+                                    }
+
                                     // Switch file index to new directory
                                     match file_index_registry.get_or_create(&new_dir) {
                                         Ok(new_file_index) => {
@@ -1200,12 +1373,30 @@ async fn run_app(
                             app.last_compression_msg_count = source_msg_count;
                             app.compression_in_progress = false;
                         }
+                        AgentToUiEvent::WorkflowCompleted { task_description, execution_summary } => {
+                            // Trigger auto-reflection to update Skills
+                            tracing::info!(
+                                "[AUTO-REFLECT] Workflow completed. Task: {}, Summary: {}",
+                                task_description,
+                                execution_summary
+                            );
+                            
+                            // TODO: Implement actual reflection logic here
+                            // For now, just log the event
+                            app.output.push_line(OutputLine::System(
+                                "\n🤖 Auto-reflection triggered (pending implementation)...".to_string()
+                            ));
+                        }
                     }
                 }
             }
         }
 
         if app.should_quit {
+            // ✅ DO NOT archive on exit - keep session.jsonl for auto-restore
+            // Session will be archived only when user explicitly creates a new one (/new)
+            
+            // Flush memory to disk
             memory_arc.flush();
             break;
         }

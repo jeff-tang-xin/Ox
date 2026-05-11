@@ -56,6 +56,12 @@ pub fn handle_new(
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
+    // 🚫 Block session switching when agent is running
+    if app.agent_running {
+        app.output.push_system("⚠️ Cannot create new session while agent is running. Wait for current operation to complete.");
+        return CommandResult::Success;
+    }
+    
     app.session_action = SessionAction::New;
     CommandResult::Success
 }
@@ -70,10 +76,18 @@ pub fn handle_resume(
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
+    // 🚫 Block session switching when agent is running
+    if app.agent_running {
+        app.output.push_system("⚠️ Cannot switch session while agent is running. Wait for current operation to complete.");
+        return CommandResult::Success;
+    }
+    
     let filename = args.trim();
     if filename.is_empty() {
-        app.output.push_system("Usage: /resume <filename>  (use /sessions to list)");
+        // No argument provided - use smart switch
+        app.session_action = SessionAction::SwitchNext;
     } else {
+        // Specific filename provided
         app.session_action = SessionAction::Resume {
             filename: filename.to_string(),
         };

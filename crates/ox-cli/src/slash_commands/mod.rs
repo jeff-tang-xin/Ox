@@ -128,6 +128,9 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     registry.register(system::FREE_COMMAND);
     registry.register(system::CANCEL_COMMAND);
     registry.register(system::CLEAR_COMMAND);
+    
+    // Skill management
+    registry.register(skill::SKILL_COMMAND);
 }
 
 // Import command modules (removed spec, council, workflow)
@@ -138,3 +141,4 @@ mod trust;
 mod memory;
 mod feedback;
 mod system;
+mod skill;

@@ -86,6 +86,13 @@ pub enum AgentToUiEvent {
         /// Number of original session messages that were compressed.
         source_msg_count: usize,
     },
+    /// Workflow completed — trigger auto-reflection to update Skills.
+    WorkflowCompleted {
+        /// Task description (user's original request)
+        task_description: String,
+        /// Execution summary (what was done)
+        execution_summary: String,
+    },
 }
 
 /// Run a complete agent turn: LLM -> tool_calls -> execute -> loop -> text.

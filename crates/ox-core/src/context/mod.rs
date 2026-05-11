@@ -1,9 +1,11 @@
 pub mod compressed_store;
 mod effort;
+pub mod skill_prompts;
 mod spec;
 mod system_prompt;
 
 pub use effort::{EffortLevel, estimate_effort};
+pub use skill_prompts::SKILL_CREATION_PROMPT;
 pub use spec::{TASK_TYPE_PROMPT, load_spec, save_spec, spec_exists};
 pub use system_prompt::build_system_prompt;
 

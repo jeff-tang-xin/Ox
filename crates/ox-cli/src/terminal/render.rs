@@ -165,9 +165,6 @@ fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
-    // Store chat area bounds for mouse scroll detection
-    app.chat_area = Some((area.x, area.y, area.width, area.height));
-
     let spinner_frame = app.spinner_frame;
     let scroll_offset = app.scroll_offset;
 
