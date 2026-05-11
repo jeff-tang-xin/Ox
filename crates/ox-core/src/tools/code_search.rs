@@ -13,7 +13,7 @@ impl Tool for CodeSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search for a text pattern in file contents. Returns matching lines with file paths and line numbers."
+        "Search for text/regex patterns in file contents. Returns matching lines with file paths and line numbers."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -22,18 +22,22 @@ impl Tool for CodeSearchTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Text or regex pattern to search for in file contents"
+                    "description": "✅ REQUIRED: Text or regex pattern to search for."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in (default: working directory)"
+                    "description": "Directory to search in. Default: working directory."
                 },
                 "file_pattern": {
                     "type": "string",
-                    "description": "Glob pattern to filter files (e.g. '*.rs', '*.py')"
+                    "description": "Glob pattern to filter files (e.g., '*.rs'). Default: all files."
                 }
             },
-            "required": ["pattern"]
+            "required": ["pattern"],
+            "examples": [
+                {"pattern": "fn main"},
+                {"pattern": "pub struct", "file_pattern": "*.rs"}
+            ]
         })
     }
 

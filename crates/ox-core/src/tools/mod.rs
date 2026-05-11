@@ -5,9 +5,7 @@ pub mod file_patch;
 pub mod file_read;
 pub mod file_search;
 pub mod file_write;
-pub mod git_commit;
-pub mod git_diff;
-pub mod git_status;
+pub mod intent_classifier;  // 新增：意图分类器
 pub mod memory_search;
 pub mod project_detect;
 pub mod shell_exec;
@@ -136,9 +134,6 @@ impl ToolRegistry {
         registry.register(Box::new(code_search::CodeSearchTool));
         registry.register(Box::new(shell_exec::ShellExecTool));
         registry.register(Box::new(project_detect::ProjectDetectTool));
-        registry.register(Box::new(git_status::GitStatusTool));
-        registry.register(Box::new(git_diff::GitDiffTool));
-        registry.register(Box::new(git_commit::GitCommitTool));
         registry.register(Box::new(web_fetch::WebFetchTool));
         registry.register(Box::new(memory_search::MemorySearchTool));
 

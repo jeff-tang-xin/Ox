@@ -34,22 +34,7 @@ impl Tool for MemorySearchTool {
     }
 
     fn description(&self) -> &str {
-        "Actively search project and global knowledge base for relevant context. \
-         Use this tool when you need to: (1) understand project architecture or conventions, \
-         (2) recall previous work or decisions, (3) check user preferences, \
-         (4) find best practices or avoid known pitfalls. \
-         Queries are semantic - describe what you need in natural language.\n\n\
-         💡 Query Tips:\n\
-         - Be specific about the TYPE of information (architecture, error handling, coding style)\n\
-         - Include technology keywords (Rust, axum, tokio, sqlx, etc.)\n\
-         - Mention if you need project-specific or general knowledge\n\n\
-         📝 Example Queries:\n\
-         • \"authentication architecture and JWT setup\"\n\
-         • \"error handling conventions and AppError type\"\n\
-         • \"database connection pool configuration\"\n\
-         • \"user's preferred code style and formatting\"\n\
-         • \"common Rust web API patterns and best practices\"\n\
-         • \"previous issues with async/await and how they were solved\""
+        "Search project and global knowledge base for relevant context. Use to recall architecture, conventions, user preferences, or past solutions."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -58,28 +43,28 @@ impl Tool for MemorySearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural language query describing what knowledge you need. \
-                                   Be specific about the type of information (e.g., 'architecture', \
-                                   'error handling', 'coding style', 'authentication')."
+                    "description": "✅ REQUIRED: Natural language query. Describe what knowledge you need."
                 },
                 "scope": {
                     "type": "string",
                     "enum": ["project", "global", "both"],
-                    "description": "Search scope: 'project' for current project only, \
-                                   'global' for cross-project knowledge, \
-                                   'both' for comprehensive search (default: both)",
+                    "description": "Search scope. Default: both.",
                     "default": "both"
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum number of results to return (default: 5, max: 20). \
-                                   Use smaller numbers for focused queries, larger for exploration.",
+                    "description": "Max results (1-20). Default: 5.",
                     "default": 5,
                     "minimum": 1,
                     "maximum": 20
                 }
             },
-            "required": ["query"]
+            "required": ["query"],
+            "examples": [
+                {"query": "authentication architecture", "scope": "project"},
+                {"query": "error handling conventions", "scope": "project"},
+                {"query": "coding style preferences", "scope": "global"}
+            ]
         })
     }
 

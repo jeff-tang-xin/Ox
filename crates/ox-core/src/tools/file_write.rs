@@ -15,15 +15,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create a new file or completely overwrite an existing file with new content. \
-         Use this ONLY for: (1) creating brand new files, (2) rewriting entire files (>50% changed). \
-         For small edits to existing files, use file_patch instead. \
-         Automatically creates parent directories if they don't exist.\n\n\
-         ⚠️ IMPORTANT: You MUST provide ONE of these parameters:\n\
-         • 'path': Relative path (e.g., 'src/output.txt')\n\
-         • 'filename': Filename to search in index\n\
-         • 'file_id': File ID from index\n\n\
-         💡 Example: {\"path\": \"output.txt\", \"content\": \"Hello World\"}"
+        "Create or overwrite a file. Use ONLY for new files or complete rewrites (>50% changed). For small edits, use file_patch."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -32,19 +24,19 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "⚠️ REQUIRED (unless using filename/file_id): Path to the file to write (relative to working directory). Example: 'src/output.txt'"
+                    "description": "File path (relative). Required unless using filename or file_id."
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Alternative to 'path': Filename to search for in index. For new files, this creates the file."
+                    "description": "Filename for new/existing file. Alternative to path."
                 },
                 "file_id": {
                     "type": "integer",
-                    "description": "Alternative to 'path': File ID from index for precise matching (for existing files). Use file_list to see available IDs."
+                    "description": "File ID from index. For existing files only."
                 },
                 "content": {
                     "type": "string",
-                    "description": "✅ REQUIRED: The content to write to the file. Large files (>1 MB) will be automatically written in chunks."
+                    "description": "✅ REQUIRED: File content. Large files (>1 MB) auto-chunked."
                 }
             },
             "required": ["content"],
@@ -52,6 +44,10 @@ impl Tool for FileWriteTool {
                 {"required": ["path"]},
                 {"required": ["filename"]},
                 {"required": ["file_id"]}
+            ],
+            "examples": [
+                {"path": "output.txt", "content": "Hello World"},
+                {"path": "src/main.rs", "content": "fn main() {}"}
             ]
         })
     }

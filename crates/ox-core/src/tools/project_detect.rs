@@ -11,7 +11,7 @@ impl Tool for ProjectDetectTool {
     }
 
     fn description(&self) -> &str {
-        "Detect the project type, language, and framework by examining marker files in the project root."
+        "Detect project type, language, and framework by examining marker files (Cargo.toml, package.json, etc.)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -20,9 +20,13 @@ impl Tool for ProjectDetectTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory to analyze (default: working directory)"
+                    "description": "Directory to analyze. Default: working directory."
                 }
-            }
+            },
+            "examples": [
+                {},
+                {"path": "my-project/"}
+            ]
         })
     }
 

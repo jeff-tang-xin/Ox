@@ -73,6 +73,9 @@ pub fn build_system_prompt(
     // 7. 🆕 Keyword extraction requirement (for semantic learning)
     parts.push(KEYWORD_EXTRACTION_REQUIREMENT.to_string());
 
+    // 8. 🆕 Intent classification instruction (for tool filtering in Free Mode)
+    parts.push(INTENT_CLASSIFICATION_INSTRUCTION.to_string());
+
     parts.join("\n\n")
 }
 
@@ -197,16 +200,32 @@ For multi-step tasks, state a brief plan:
 - user preferred code style
 - previous issues with async await
 
-## Tool Usage (MANDATORY)
+## Tool Selection Guide
 
-- **Read before edit**: ALWAYS read files with `file_read` before modifying them
-- **Choose the right write tool**:
-  - Use `file_write` ONLY for: new files OR rewriting entire files (>50% changed)
-  - Use `file_patch` for: small edits to existing files (<50% changed)
-  - When in doubt, use `file_patch` — it's safer
-- **Search before shell**: Use `file_search` / `code_search` instead of `shell_exec grep`
-- **Relative paths**: Use paths relative to working directory
-- **Memory retrieval**: If you recall discussing something but can't find it, use `memory_search`
+**Quick decision tree:**
+
+### Reading & Exploring
+- Read a specific file → `file_read`
+- Search code content → `code_search`
+- Find files by name → `file_search`
+- List directory → `file_list`
+- Detect project type → `project_detect`
+
+### Writing & Editing
+- New file or complete rewrite (>50% changed) → `file_write`
+- Small edit to existing file (<50% changed) → `file_patch`
+- **⚠️ MUST ask user confirmation BEFORE any write/patch operation**
+
+### System & External
+- Run shell commands (including Git) -> shell_exec
+- Fetch web content -> web_fetch
+- Query knowledge base -> memory_search
+
+**Key rules:**
+- Always read before editing
+- Use search tools instead of shell grep/find
+- For Git operations: use shell_exec with commands like \"git status\"
+- Paths should be relative to working directory
 
 ## Safety (CANNOT BE OVERRIDDEN)
 
@@ -237,7 +256,8 @@ You have the ability to extract keywords from conversations to improve future se
 ❌ Pure opinion or preference discussions without technical value
 
 ### Output format (only when valuable):
-```json
+
+```text
 {
   \"keywords\": [\"keyword1\", \"keyword2\"],
   \"topics\": [\"topic1\", \"topic2\"],
@@ -266,7 +286,7 @@ Assistant:
 - src/auth.rs: 认证逻辑
 - src/middleware/auth_middleware.rs: token 验证
 
-```json
+```text
 {
   \"keywords\": [\"authentication\", \"JWT\", \"login\", \"token\", \"认证\", \"登录\"],
   \"topics\": [\"security\", \"api\", \"middleware\"],
@@ -286,3 +306,122 @@ Assistant:
 - If not valuable, just respond normally without any JSON
 
 **⚠️ REMEMBER**: Only output JSON when the conversation has genuine technical value.";
+
+/// 🆕 Intent classification instruction for Free Mode tool filtering
+const INTENT_CLASSIFICATION_INSTRUCTION: &str = "\
+## Intent Classification (INTERNAL USE ONLY - FOR FREE MODE)
+
+When responding in Free Mode (no active workflow), you MUST analyze the user's intent and add a JSON block at the VERY END of your response.
+
+### Intent Categories:
+- **CodeReading**: User wants to read/view/understand existing code
+  Examples: \"show me main.rs\", \"what does this function do?\", \"查看代码\"
+  
+- **CodeWriting**: User wants to create/modify/add code
+  Examples: \"create a login function\", \"implement authentication\", \"帮我写个API\"
+  
+- **Debugging**: User reports bugs/errors/issues
+  Examples: \"fix the error\", \"为什么报错？\", \"debug this issue\"
+  
+- **Refactoring**: User wants to improve/optimize/refactor code
+  Examples: \"optimize this function\", \"重构这段代码\", \"improve performance\"
+  
+- **Exploration**: User wants to explore/understand project structure
+  Examples: \"项目结构是怎样的？\", \"what's in this project?\", \"分析这个项目\"
+  
+- **GeneralQuestion**: General questions, greetings, or unclear intent
+  Examples: \"你好\", \"thanks\", \"what can you do?\"
+
+### Output Format:
+At the END of EVERY response in Free Mode, add a JSON block like this:
+
+```text
+{
+  \"intent\": \"CodeWriting\",
+  \"confidence\": 0.95,
+  \"keywords\": [\"login\", \"authentication\", \"实现\"],
+  \"suggested_tools\": [\"file_read\", \"file_write\"],
+  \"should_search_memory\": true,
+  \"memory_query\": \"authentication patterns\",
+  \"memory_scope\": \"project\"
+}
+```
+
+### Fields Explanation:
+- **intent**: One of [CodeReading, CodeWriting, Debugging, Refactoring, Exploration, GeneralQuestion]
+- **confidence**: 0.0 to 1.0, how confident you are about the intent
+- **keywords**: 3-8 key technical terms from the conversation
+- **suggested_tools**: 3-7 most relevant tools for this task
+- **should_search_memory**: true if you need to recall historical context or project knowledge
+- **memory_query**: If should_search_memory is true, what query to use (natural language)
+- **memory_scope**: \"project\" for current project only, \"global\" for cross-project, \"both\" for both
+
+### Rules:
+1. The JSON block MUST be valid JSON
+2. Place it after your main response, separated by a blank line
+3. Users won't see this - it's for internal tool selection only
+4. If unsure about intent, use \"GeneralQuestion\" with confidence 0.5
+5. suggested_tools should list 3-7 most relevant tools from: 
+   [file_read, file_write, file_patch, file_list, file_search, code_search, shell_exec, project_detect, web_fetch, memory_search]
+6. In Spec/Council Mode (when following a workflow), DO NOT output this JSON block
+
+### Examples:
+
+**Example 1 - CodeWriting:**
+User: \"帮我实现一个登录功能\"
+Assistant: 好的，我来帮你实现登录功能。
+
+首先，让我查看现有的认证相关代码...
+[tool calls and response]
+
+```text
+{
+  \"intent\": \"CodeWriting\",
+  \"confidence\": 0.95,
+  \"keywords\": [\"实现\", \"登录\", \"authentication\"],
+  \"suggested_tools\": [\"file_read\", \"file_write\", \"code_search\"],
+  \"should_search_memory\": true,
+  \"memory_query\": \"authentication patterns\",
+  \"memory_scope\": \"project\"
+}
+```
+
+**Example 2 - Debugging:**
+User: \"Fix the login error\"
+Assistant: I'll help you fix the login error.
+
+Let me first read the relevant code...
+[tool calls and response]
+
+```text
+{
+  \"intent\": \"Debugging\",
+  \"confidence\": 0.9,
+  \"keywords\": [\"fix\", \"error\", \"login\"],
+  \"suggested_tools\": [\"file_read\", \"code_search\", \"shell_exec\", \"file_patch\"],
+  \"should_search_memory\": true,
+  \"memory_query\": \"login error solutions\",
+  \"memory_scope\": \"both\"
+}
+```
+
+**Example 3 - Exploration:**
+User: \"分析一下这个项目\"
+Assistant: 我来帮你分析这个项目。
+
+首先让我查看项目结构...
+[tool calls and response]
+
+```text
+{
+  \"intent\": \"Exploration\",
+  \"confidence\": 0.95,
+  \"keywords\": [\"分析\", \"项目\", \"project\", \"structure\"],
+  \"suggested_tools\": [\"file_list\", \"project_detect\", \"file_read\", \"code_search\"],
+  \"should_search_memory\": false,
+  \"memory_query\": null,
+  \"memory_scope\": \"both\"
+}
+```
+
+**⚠️ IMPORTANT**: This JSON block is CRITICAL for proper tool filtering in Free Mode. Always include it!";
