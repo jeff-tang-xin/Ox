@@ -39,6 +39,13 @@ pub const CLEAN_COMMAND: CommandMeta = CommandMeta {
     handler: handle_clean,
 };
 
+pub const CLEAR_CACHE_COMMAND: CommandMeta = CommandMeta {
+    name: "clear-cache",
+    aliases: &["cc"],
+    description: "Clear compressed context cache (fixes API errors)",
+    handler: handle_clear_cache,
+};
+
 pub fn handle_new(
     app: &mut AppState,
     _args: &str,
@@ -49,6 +56,12 @@ pub fn handle_new(
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
+    // 🚫 Block session switching when agent is running
+    if app.agent_running {
+        app.output.push_system("⚠️ Cannot create new session while agent is running. Wait for current operation to complete.");
+        return CommandResult::Success;
+    }
+    
     app.session_action = SessionAction::New;
     CommandResult::Success
 }
@@ -63,10 +76,18 @@ pub fn handle_resume(
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
+    // 🚫 Block session switching when agent is running
+    if app.agent_running {
+        app.output.push_system("⚠️ Cannot switch session while agent is running. Wait for current operation to complete.");
+        return CommandResult::Success;
+    }
+    
     let filename = args.trim();
     if filename.is_empty() {
-        app.output.push_system("Usage: /resume <filename>  (use /sessions to list)");
+        // No argument provided - use smart switch
+        app.session_action = SessionAction::SwitchNext;
     } else {
+        // Specific filename provided
         app.session_action = SessionAction::Resume {
             filename: filename.to_string(),
         };
@@ -127,6 +148,25 @@ pub fn handle_clean(
         app.pending_compressed_cache_clear = true;
         app.output.push_system("Session cleared. All messages removed.");
     }
+    CommandResult::Success
+}
+
+pub fn handle_clear_cache(
+    app: &mut AppState,
+    _args: &str,
+    _session: &mut Session,
+    _rt_env: &mut RuntimeEnvironment,
+    _config: &OxConfig,
+    _memory: &Arc<MemoryManager>,
+    _cost_tracker: &mut CostTracker,
+    _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
+) -> CommandResult {
+    // Mark compressed cache for clearing
+    app.pending_compressed_cache_clear = true;
+    app.output.push_system("
+🗑️ Compressed context cache will be cleared on next iteration.
+💡 This fixes 'tool call result does not follow tool call' errors.
+🔄 The cache will be regenerated automatically during next compression.");
     CommandResult::Success
 }
 

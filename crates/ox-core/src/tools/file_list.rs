@@ -12,7 +12,7 @@ impl Tool for FileListTool {
     }
 
     fn description(&self) -> &str {
-        "List files and directories at a path. Supports glob patterns."
+        "List files and directories. Supports glob patterns. Use to explore project structure."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -21,9 +21,14 @@ impl Tool for FileListTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory path or glob pattern (e.g. 'src/**/*.rs'). Optional - if not provided, lists all indexed files."
+                    "description": "Directory path or glob pattern (e.g., 'src/**/*.rs'). Default: list all indexed files."
                 }
-            }
+            },
+            "examples": [
+                {},
+                {"path": "src/"},
+                {"path": "**/*.rs"}
+            ]
         })
     }
 

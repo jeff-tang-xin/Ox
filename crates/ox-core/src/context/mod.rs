@@ -1,9 +1,11 @@
 pub mod compressed_store;
 mod effort;
+pub mod skill_prompts;
 mod spec;
 mod system_prompt;
 
 pub use effort::{EffortLevel, estimate_effort};
+pub use skill_prompts::SKILL_CREATION_PROMPT;
 pub use spec::{TASK_TYPE_PROMPT, load_spec, save_spec, spec_exists};
 pub use system_prompt::build_system_prompt;
 
@@ -273,6 +275,9 @@ impl ContextBuilder {
 /// IMPORTANT: OpenAI API requires strict matching between tool_calls and tool_results.
 /// If we send a ToolResult with an ID that doesn't exist in any Assistant's tool_calls,
 /// the API will return error 400 "tool result's tool id not found".
+///
+/// CRITICAL FIX: We must ensure tool_call and tool_result are kept together as a pair.
+/// If either is missing due to truncation, BOTH should be removed to maintain consistency.
 pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     // Collect all tool_call_ids from Assistant messages in a single pass
     let mut assistant_call_ids = std::collections::HashSet::with_capacity(messages.len());
@@ -302,46 +307,28 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
         }
     });
 
-    // Step 2: For orphaned tool_calls (no matching ToolResult), we have two options:
-    // Option A: Strip the tool_call from the Assistant (current behavior)
-    // Option B: Remove the entire Assistant message
-    //
-    // We choose Option A because:
-    // - The Assistant might have other content besides tool_calls
-    // - Removing the entire message could lose important context
-    // - OpenAI allows Assistant messages with empty tool_calls array
-    //
-    // HOWEVER: We must NOT strip tool_calls if the Assistant ONLY has tool_calls
-    // and no text content, because that would create an empty Assistant message.
-    for msg in messages.iter_mut() {
-        if let Message::Assistant {
-            content,
-            tool_calls,
-        } = msg
-        {
-            let original_count = tool_calls.len();
-            tool_calls.retain(|tc| result_call_ids.contains(&tc.id));
-
-            // If we removed all tool_calls and there's no content, mark for removal
-            if tool_calls.is_empty() && content.trim().is_empty() && original_count > 0 {
-                tracing::debug!(
-                    "Removing empty Assistant message (had {} orphaned tool_calls)",
-                    original_count
-                );
-            }
-        }
-    }
-
-    // Step 3: Remove Assistant messages that are now completely empty
+    // ✅ CRITICAL FIX: Remove orphaned tool_calls (no matching ToolResult)
+    // We MUST remove the entire Assistant message if it has tool_calls but no results,
+    // because sending incomplete tool_call/tool_result pairs will cause API errors.
+    // 
+    // Reason: If we keep an Assistant with tool_calls but remove the ToolResult,
+    // then when we try to send a new ToolResult later, the API will complain
+    // that the tool_call ID doesn't exist (because it was truncated).
     messages.retain(|m| {
-        if let Message::Assistant {
-            content,
-            tool_calls,
-        } = m
-        {
-            !(content.trim().is_empty() && tool_calls.is_empty())
+        if let Message::Assistant { tool_calls, content, .. } = m {
+            // Keep if:
+            // 1. Has text content (even without tool_calls)
+            // 2. OR has tool_calls AND all of them have matching ToolResults
+            if !content.trim().is_empty() {
+                true  // Has content, keep it
+            } else if tool_calls.is_empty() {
+                true  // No tool_calls, keep it (might be pure text response)
+            } else {
+                // Has tool_calls - check if ALL of them have matching ToolResults
+                tool_calls.iter().all(|tc| result_call_ids.contains(&tc.id))
+            }
         } else {
-            true
+            true  // Not an Assistant message, keep it
         }
     });
 }

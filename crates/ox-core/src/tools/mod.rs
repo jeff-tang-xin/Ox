@@ -5,9 +5,7 @@ pub mod file_patch;
 pub mod file_read;
 pub mod file_search;
 pub mod file_write;
-pub mod git_commit;
-pub mod git_diff;
-pub mod git_status;
+pub mod intent_classifier;  // 新增：意图分类器
 pub mod memory_search;
 pub mod project_detect;
 pub mod shell_exec;
@@ -113,6 +111,8 @@ pub trait Tool: Send + Sync {
 /// Registry of all available tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    /// Skills loaded from files (treated as special composite tools)
+    pub skills: Vec<crate::skill::Skill>,
 }
 
 impl Default for ToolRegistry {
@@ -126,6 +126,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             tools: HashMap::new(),
+            skills: Vec::new(),
         };
 
         registry.register(Box::new(file_read::FileReadTool));
@@ -136,13 +137,26 @@ impl ToolRegistry {
         registry.register(Box::new(code_search::CodeSearchTool));
         registry.register(Box::new(shell_exec::ShellExecTool));
         registry.register(Box::new(project_detect::ProjectDetectTool));
-        registry.register(Box::new(git_status::GitStatusTool));
-        registry.register(Box::new(git_diff::GitDiffTool));
-        registry.register(Box::new(git_commit::GitCommitTool));
         registry.register(Box::new(web_fetch::WebFetchTool));
         registry.register(Box::new(memory_search::MemorySearchTool));
 
         registry
+    }
+    
+    /// Load Skills from filesystem and register them
+    pub fn load_skills(&mut self, rt_env: &crate::runtime::RuntimeEnvironment) -> anyhow::Result<()> {
+        use crate::skill::SkillLoader;
+        
+        let loader = SkillLoader::new(
+            rt_env.ox_home_dir.join("skills"),
+            rt_env.working_dir.join(".ox").join("skills")
+        );
+        
+        self.skills = loader.load_enabled_skills()?;
+        
+        tracing::info!("Loaded {} skills", self.skills.len());
+        
+        Ok(())
     }
 
     fn register(&mut self, tool: Box<dyn Tool>) {
@@ -154,16 +168,36 @@ impl ToolRegistry {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
-    /// Get all tool schemas for LLM API calls.
+    /// Get all tool schemas for LLM API calls (includes Skills as special tools).
     pub fn schemas(&self) -> Vec<crate::llm::ToolSchema> {
-        self.tools
+        let mut schemas: Vec<crate::llm::ToolSchema> = self.tools
             .values()
             .map(|t| crate::llm::ToolSchema {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 parameters: t.parameters_schema(),
             })
-            .collect()
+            .collect();
+        
+        // Add Skills as special composite tools
+        for skill in &self.skills {
+            schemas.push(crate::llm::ToolSchema {
+                name: format!("skill:{}", skill.id),
+                description: format!(
+                    "Skill: {} - {}\n\n{}",
+                    skill.name,
+                    skill.description,
+                    skill.content
+                ),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "description": "This skill provides guidance. No parameters needed."
+                }),
+            });
+        }
+        
+        schemas
     }
 
     /// List all tool names.

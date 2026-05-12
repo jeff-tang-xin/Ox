@@ -30,6 +30,11 @@ pub struct SessionMeta {
     /// Requirement name (for Spec Mode, e.g., "order-optimization")
     #[serde(default)]
     pub requirement_name: Option<String>,
+    
+    // 📁 Session-scoped working directory
+    /// Working directory for this session (relative to project root or absolute path)
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 /// A persistent conversation session.
@@ -59,6 +64,7 @@ impl Session {
             workflow_id: String::new(),
             workflow_step_index: 0,
             requirement_name: None,
+            working_dir: None,
         };
 
         // Write meta as first line and keep file handle open.
@@ -137,6 +143,7 @@ impl Session {
             workflow_id: String::new(),
             workflow_step_index: 0,
             requirement_name: None,
+            working_dir: None,
         });
 
         Ok(Some(Self {
@@ -279,6 +286,37 @@ impl Session {
         Ok(())
     }
 
+    /// 📁 Update session working directory and persist to disk.
+    pub fn update_working_dir(&mut self, working_dir: &str) -> anyhow::Result<()> {
+        self.meta.working_dir = Some(working_dir.to_string());
+        self.meta.updated_at = Utc::now().to_rfc3339();
+
+        // Rewrite file to persist updated meta
+        if let Some(ref mut writer) = self.file_handle {
+            writer.flush()?;
+        }
+        self.file_handle = None;
+
+        // Rewrite entire file: meta + messages
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.file_path)?;
+        let mut writer = BufWriter::new(file);
+        let meta_line = serde_json::to_string(&serde_json::json!({"_meta": &self.meta}))?;
+        writeln!(writer, "{meta_line}")?;
+        for msg in &self.messages {
+            let json = serde_json::to_string(msg)?;
+            writeln!(writer, "{json}")?;
+        }
+        writer.flush()?;
+        self.file_handle = Some(writer);
+
+        tracing::info!("Updated session working directory: {}", working_dir);
+        Ok(())
+    }
+
     /// List archived sessions in the sessions/ directory.
     /// Returns (filename, display_info) pairs sorted by most recent first.
     pub fn list_archived(session_dir: &Path) -> Vec<(String, String)> {
@@ -315,15 +353,48 @@ impl Session {
                 // Try to read first line for meta info.
                 let file = File::open(e.path()).ok()?;
                 let reader = BufReader::new(file);
-                let first_line = reader.lines().next()?.ok()?;
-                let val: serde_json::Value = serde_json::from_str(&first_line).ok()?;
+                let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+                
+                if lines.is_empty() {
+                    return None;
+                }
+                
+                // Parse meta from first line
+                let first_line = &lines[0];
+                let val: serde_json::Value = serde_json::from_str(first_line).ok()?;
                 let meta = val.get("_meta")?;
                 let id = meta.get("id")?.as_str().unwrap_or("?");
                 let count = meta.get("message_count")?.as_u64().unwrap_or(0);
                 let created = meta.get("created_at")?.as_str().unwrap_or("?");
+                
+                // Extract session name from first user message
+                let session_name = lines.iter()
+                    .skip(1) // Skip meta line
+                    .find_map(|line| {
+                        serde_json::from_str::<Message>(line).ok()
+                            .and_then(|msg| match msg {
+                                Message::User { content } => {
+                                    let trimmed = content.trim();
+                                    if trimmed.is_empty() {
+                                        None
+                                    } else {
+                                        let first_line = trimmed.lines().next().unwrap_or(trimmed);
+                                        let display = if first_line.chars().count() > 20 {
+                                            format!("{}..", first_line.chars().take(20).collect::<String>())
+                                        } else {
+                                            first_line.to_string()
+                                        };
+                                        Some(display)
+                                    }
+                                }
+                                _ => None,
+                            })
+                    })
+                    .unwrap_or_else(|| "new session".to_string());
+                
                 // Shorten the timestamp for display.
                 let short_time: String = created.chars().take(16).collect();
-                Some((name, format!("{short_time}  [{count} msgs]  id:{:.8}", id)))
+                Some((name, format!("{short_time}  {session_name}")))
             })
             .collect()
     }
@@ -381,6 +452,7 @@ impl Session {
             workflow_id: String::new(),
             workflow_step_index: 0,
             requirement_name: None,
+            working_dir: None,
         });
 
         Ok(Some(Self {

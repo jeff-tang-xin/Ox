@@ -11,7 +11,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file. Returns the full text content."
+        "Read file contents. Use for viewing code, configs, or docs."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -20,25 +20,30 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read (relative to working directory). Optional if using file_id or filename."
+                    "description": "File path (relative). Required unless using file_id or filename."
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Filename to search for in index. Returns error if multiple matches found."
+                    "description": "Filename to search in index. Errors if multiple matches."
                 },
                 "file_id": {
                     "type": "integer",
-                    "description": "File ID from index for precise matching. Use this when filename has multiple matches."
+                    "description": "File ID from index (most reliable). Use file_list to get IDs."
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Line number to start reading from (1-based, optional)"
+                    "description": "Start line (1-based). Default: 1."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of lines to read (optional)"
+                    "description": "Max lines to read. Default: unlimited. Recommended: 100-500 for large files."
                 }
-            }
+            },
+            "examples": [
+                {"path": "src/main.rs"},
+                {"path": "config.toml", "limit": 100},
+                {"file_id": 123}
+            ]
         })
     }
 

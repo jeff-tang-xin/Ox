@@ -41,8 +41,6 @@ impl EventHandler {
                         {
                             break;
                         }
-                        // Mouse scroll events are handled directly in main loop via event::read()
-                        // to avoid stdin pollution from ANSI sequences.
                         _ => {}
                     }
                 } else {

@@ -14,6 +14,8 @@ pub enum SessionAction {
     Resume {
         filename: String,
     },
+    /// Smart switch: go to next session, or reverse if at end
+    SwitchNext,
 }
 
 /// Workflow state machine for Spec and Council modes
@@ -82,6 +84,19 @@ pub struct WorkflowDisplayInfo {
     pub requirement_name: Option<String>,
 }
 
+/// Unified LLM task to be processed in the main event loop
+#[derive(Debug, Clone)]
+pub enum PendingLlmTask {
+    /// Generate skill from description
+    SkillCreate { prompt: String, description: String },
+    /// Spec planning
+    SpecPlanning { spec_content: String },
+    /// Workflow approval (Y command)
+    WorkflowApproval { context: String },
+    /// Smart naming for requirement
+    SmartNaming { content: String },
+}
+
 #[derive(Debug)]
 pub enum UserInput {
     Text(String),
@@ -98,10 +113,25 @@ pub struct PendingConfirmation {
 
 #[derive(Debug, Clone)]
 pub struct SessionEntry {
-    #[allow(dead_code)]
-    pub filename: String,
+    /// Session file name (e.g., "session_001.jsonl")
+    pub id: String,
+    /// Project ID this session belongs to
+    pub project_id: String,
+    /// Display info (time, message count, etc.)
     pub info: String,
     pub is_active: bool,
+}
+
+impl SessionEntry {
+    /// Get full path to session file
+    pub fn full_path(&self, sessions_root: &std::path::Path) -> std::path::PathBuf {
+        sessions_root.join(&self.project_id).join(&self.id)
+    }
+    
+    /// Get display name with project prefix
+    pub fn display_name(&self) -> String {
+        format!("[{}] {}", self.project_id, self.info)
+    }
 }
 
 /// Deferred compression: set by handle_key_event, processed by main loop after render.
@@ -132,13 +162,20 @@ pub struct App {
     pub last_council_session: Option<ox_core::council::CouncilSession>,
     pub pending_model_switch: Option<String>,
     pub pending_compression: Option<PendingCompression>,
-    /// Pending spec content for auto-planning (set by /spec command)
+    /// 🆕 Unified pending LLM task (replaces multiple flags)
+    pub pending_llm_task: Option<PendingLlmTask>,
+    /// Deprecated: use pending_llm_task instead
+    #[deprecated(note = "Use pending_llm_task instead")]
     pub pending_spec_planning: Option<String>,
     /// 🚨 Pending smart naming request (LLM-based name generation)
+    /// Deprecated: use pending_llm_task instead
+    #[deprecated(note = "Use pending_llm_task instead")]
     pub pending_smart_naming: Option<crate::spec_helpers::PendingSmartNaming>,
     /// Flag indicating user requested revision feedback via /O command
     pub pending_revision_feedback: bool,
     /// Flag indicating user approved workflow progression via /Y command
+    /// Deprecated: use pending_llm_task instead
+    #[deprecated(note = "Use pending_llm_task instead")]
     pub pending_workflow_approval: bool,
     /// Message count at last compression. Used to avoid re-compressing
     /// when no new messages have been added since last compression.
@@ -152,8 +189,6 @@ pub struct App {
     pub sidebar_width: u16,
     /// Track last spinner frame to avoid unnecessary renders
     pub last_spinner_frame: u64,
-    /// Chat area bounds for mouse scroll detection (x, y, width, height)
-    pub chat_area: Option<(u16, u16, u16, u16)>,
 
     // Implicit feedback system
     pub override_detector: ox_core::feedback::CodeOverrideDetector,
@@ -217,9 +252,13 @@ impl App {
             last_council_session: None,
             pending_model_switch: None,
             pending_compression: None,
+            pending_llm_task: None,  // 🆕 Unified LLM task
+            #[allow(deprecated)]
             pending_spec_planning: None,
+            #[allow(deprecated)]
             pending_smart_naming: None,
             pending_revision_feedback: false,
+            #[allow(deprecated)]
             pending_workflow_approval: false,
             last_compression_msg_count: 0,
             compression_in_progress: false,
@@ -228,7 +267,6 @@ impl App {
             sessions: Vec::new(),
             sidebar_width: 22,
             last_spinner_frame: 0,
-            chat_area: None,
 
             // Implicit feedback system initialization
             override_detector: ox_core::feedback::CodeOverrideDetector::new(300), // 5 min window

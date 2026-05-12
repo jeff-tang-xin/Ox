@@ -27,10 +27,16 @@ pub type CommandHandler = fn(
 /// Command execution result
 #[derive(Debug)]
 pub enum CommandResult {
-    /// Command executed successfully
+    /// Command executed successfully (no further action needed)
     Success,
     /// Command requires async processing (handled in main loop)
     AsyncPending,
+    /// Command needs LLM to generate content
+    /// Contains: (prompt, callback_description)
+    LlmRequest { 
+        prompt: String,
+        description: String,
+    },
     /// Command failed with error message
     Error(String),
     /// Unknown command
@@ -99,6 +105,7 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     registry.register(session::RESUME_COMMAND);
     registry.register(session::SESSIONS_COMMAND);
     registry.register(session::CLEAN_COMMAND);
+    registry.register(session::CLEAR_CACHE_COMMAND);
     
     // Model management
     registry.register(model::MODEL_COMMAND);
@@ -127,6 +134,9 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     registry.register(system::FREE_COMMAND);
     registry.register(system::CANCEL_COMMAND);
     registry.register(system::CLEAR_COMMAND);
+    
+    // Skill management
+    registry.register(skill::SKILL_COMMAND);
 }
 
 // Import command modules (removed spec, council, workflow)
@@ -137,3 +147,4 @@ mod trust;
 mod memory;
 mod feedback;
 mod system;
+mod skill;

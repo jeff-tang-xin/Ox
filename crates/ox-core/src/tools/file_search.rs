@@ -11,7 +11,7 @@ impl Tool for FileSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search for files by name pattern. Recursively searches from the working directory."
+        "Search for files by name pattern (glob). Recursively searches from working directory."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -20,14 +20,18 @@ impl Tool for FileSearchTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Glob pattern to match file names (e.g. '*.rs', 'Cargo.*')"
+                    "description": "✅ REQUIRED: Glob pattern (e.g., '*.rs', 'Cargo.*')"
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in (default: working directory)"
+                    "description": "Directory to search in. Default: working directory."
                 }
             },
-            "required": ["pattern"]
+            "required": ["pattern"],
+            "examples": [
+                {"pattern": "*.rs"},
+                {"pattern": "Cargo.*", "path": "src/"}
+            ]
         })
     }
 

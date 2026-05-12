@@ -15,15 +15,14 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create a new file or completely overwrite an existing file with new content. \
-         Use this ONLY for: (1) creating brand new files, (2) rewriting entire files (>50% changed). \
-         For small edits to existing files, use file_patch instead. \
-         Automatically creates parent directories if they don't exist.\n\n\
-         ⚠️ IMPORTANT: You MUST provide ONE of these parameters:\n\
-         • 'path': Relative path (e.g., 'src/output.txt')\n\
-         • 'filename': Filename to search in index\n\
-         • 'file_id': File ID from index\n\n\
-         💡 Example: {\"path\": \"output.txt\", \"content\": \"Hello World\"}"
+        "Create or overwrite a file. Use ONLY for new files or complete rewrites (>50% changed). For small edits, use file_patch.\n\n\
+         ⚠️ CRITICAL: You MUST provide the 'path' parameter with a COMPLETE file path:\n\
+         • For NEW files: Always specify full relative path (e.g., 'src/output.txt', 'docs/readme.md')\n\
+         • For EXISTING files: Can use 'path', 'filename', or 'file_id'\n\n\
+         💡 IMPORTANT: Large files (>1 MB) are automatically written in chunks - you can provide the full content without worrying about size limits!\n\n\
+         💡 Examples:\n\
+         - New file: {\"path\": \"src/utils/helper.rs\", \"content\": \"...\"}\n\
+         - Existing: {\"filename\": \"main.rs\", \"content\": \"...\"}"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -32,15 +31,15 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "⚠️ REQUIRED (unless using filename/file_id): Path to the file to write (relative to working directory). Example: 'src/output.txt'"
+                    "description": "⚠️ ALWAYS REQUIRED for new files: Complete relative path including directories (e.g., 'src/main.rs', 'docs/guide.md'). For existing files, can also use filename or file_id instead."
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Alternative to 'path': Filename to search for in index. For new files, this creates the file."
+                    "description": "Alternative for EXISTING files only: Search by filename in index. NOT recommended for new files (use 'path' instead)."
                 },
                 "file_id": {
                     "type": "integer",
-                    "description": "Alternative to 'path': File ID from index for precise matching (for existing files). Use file_list to see available IDs."
+                    "description": "Alternative for EXISTING files only: Precise file ID from index. Use file_list to get IDs. Cannot be used for new files."
                 },
                 "content": {
                     "type": "string",
@@ -52,6 +51,11 @@ impl Tool for FileWriteTool {
                 {"required": ["path"]},
                 {"required": ["filename"]},
                 {"required": ["file_id"]}
+            ],
+            "examples": [
+                {"path": "src/new_file.rs", "content": "// New file with full path"},
+                {"path": "docs/tutorial.md", "content": "# Tutorial"},
+                {"filename": "existing.rs", "content": "// Modifying existing file"}
             ]
         })
     }
@@ -124,17 +128,17 @@ impl Tool for FileWriteTool {
             }
         } else {
             return ToolOutput::error(
-                "❌ Missing Required Parameter: No path specified\n\n\
-                 💡 You MUST provide ONE of:\n\
-                 • 'path': Full relative path (most common)\n\
-                 • 'filename': Filename for new/existing file\n\
-                 • 'file_id': Precise file ID from index\n\n\
+                "❌ CRITICAL ERROR: Missing 'path' parameter for file_write!\n\n\
+                 💡 For NEW files, you MUST provide a COMPLETE path:\n\
+                 • Include directory structure (e.g., 'src/utils/helper.rs')\n\
+                 • NOT just filename (e.g., 'helper.rs' is WRONG)\n\n\
                  📝 Correct Examples:\n\
-                 {\"path\": \"src/output.txt\", \"content\": \"Hello\"}\n\
-                 {\"filename\": \"new_file.txt\", \"content\": \"Content\"}\n\
-                 {\"file_id\": 123, \"content\": \"Updated content\"}\n\n\
+                 {\"path\": \"src/main.rs\", \"content\": \"...\"}\n\
+                 {\"path\": \"docs/guide.md\", \"content\": \"...\"}\n\
+                 {\"path\": \"tests/unit_test.rs\", \"content\": \"...\"}\n\n\
                  ❌ Wrong Example:\n\
-                 {\"content\": \"Hello\"} ← Missing path parameter!"
+                 {\"content\": \"...\"} ← NO PATH PROVIDED!\n\
+                 {\"filename\": \"main.rs\"} ← Only works for EXISTING files!"
             );
         };
 

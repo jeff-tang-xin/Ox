@@ -12,9 +12,7 @@ impl Tool for FilePatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply a targeted edit to an existing file by replacing specific text. \
-         Use this for small changes (<50% of file). The search string must match EXACTLY ONCE in the file. \
-         For creating new files or rewriting entire files, use file_write instead."
+        "Apply small edits to existing files (<50% changed). Search text must match exactly once. For new files or large rewrites, use file_write."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -23,31 +21,31 @@ impl Tool for FilePatchTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file (relative to working directory). Optional if using file_id or filename."
+                    "description": "File path (relative). Required unless using file_id or filename."
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Filename to search for in index. Must be unique."
+                    "description": "Filename to search in index. Must be unique."
                 },
                 "file_id": {
                     "type": "integer",
-                    "description": "File ID from index for precise matching."
+                    "description": "File ID from index (most reliable)."
                 },
                 "search": {
                     "type": "string",
-                    "description": "The EXACT text to find and replace. Must match exactly once in the file. Include enough context to be unique."
+                    "description": "✅ REQUIRED: Exact text to find. Must match exactly once. Include enough context for uniqueness."
                 },
                 "replace": {
                     "type": "string",
-                    "description": "The replacement text. Use \\n for newlines. Escape special characters properly in JSON."
+                    "description": "✅ REQUIRED: Replacement text. Use \\n for newlines."
                 }
             },
             "required": ["search", "replace"],
             "examples": [
                 {
-                    "file_id": 123,
-                    "search": "fn old_function() {\n    println!(\"old\");\n}",
-                    "replace": "fn new_function() {\n    println!(\"new\");\n}"
+                    "path": "src/main.rs",
+                    "search": "fn old_func() {\n    println!(\"old\");\n}",
+                    "replace": "fn new_func() {\n    println!(\"new\");\n}"
                 }
             ]
         })

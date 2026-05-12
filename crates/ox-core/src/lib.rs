@@ -11,5 +11,6 @@ pub mod memory;
 pub mod message;
 pub mod runtime;
 pub mod safety;
+pub mod skill;
 pub mod slash;
 pub mod tools;

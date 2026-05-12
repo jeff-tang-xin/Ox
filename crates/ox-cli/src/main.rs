@@ -14,8 +14,6 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-#[cfg(not(target_os = "windows"))]
-use crossterm::event::EnableMouseCapture;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -60,8 +58,6 @@ async fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
-    #[cfg(not(target_os = "windows"))]
-    stdout.execute(EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -71,8 +67,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    #[cfg(not(target_os = "windows"))]
-    io::stdout().execute(crossterm::event::DisableMouseCapture)?;
     io::stdout().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
@@ -171,11 +165,7 @@ async fn run_app(
         .as_ref()
         .map(|p| p.model_name().to_string())
         .unwrap_or_else(|| "echo".to_string());
-    app.working_dir = rt_env
-        .working_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| rt_env.working_dir.display().to_string());
+    app.working_dir = rt_env.working_dir.display().to_string();
     app.message_count = 0;
 
     // Set header info (fixed, non-scrolling).
@@ -233,28 +223,59 @@ async fn run_app(
     let project_root_for_display = rt_env.project_root.as_ref().map(|p| p.as_path());
     spec_helpers::display_incomplete_tasks(&mut app, project_root_for_display);
 
-    // Populate sidebar with archived sessions.
+    // Populate sidebar with archived sessions from ALL projects.
     {
-        let archived = Session::list_archived(&session_dir);
-        for (filename, info) in archived {
-            app.sessions.push(terminal::app::SessionEntry {
-                filename,
-                info,
-                is_active: false,
-            });
+        let sessions_root = rt_env.ox_home_dir.join("sessions");
+        if sessions_root.exists() {
+            // Iterate through all project directories
+            if let Ok(project_dirs) = std::fs::read_dir(&sessions_root) {
+                for project_entry in project_dirs.flatten() {
+                    let project_path = project_entry.path();
+                    if !project_path.is_dir() {
+                        continue;
+                    }
+                    
+                    // Extract project name from directory name
+                    let project_id = project_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    
+                    // Load sessions from this project
+                    let archived = Session::list_archived(&project_path);
+                    for (filename, info) in archived {
+                        app.sessions.push(terminal::app::SessionEntry {
+                            id: filename,
+                            project_id: project_id.clone(),
+                            info,
+                            is_active: false,
+                        });
+                    }
+                }
+            }
         }
     }
+    
+    // Insert current session at the top
     app.sessions.insert(
         0,
         terminal::app::SessionEntry {
-            filename: "current".to_string(),
+            id: "session.jsonl".to_string(),
+            project_id: rt_env.project_id.clone(),
             info: helpers::session_display_name(&session),
             is_active: true,
         },
     );
 
     // Create tool registry (tool context will be created after memory initialization)
-    let tool_registry = Arc::new(ToolRegistry::new());
+    let mut tool_registry = ToolRegistry::new();
+    
+    // Load Skills from filesystem
+    if let Err(e) = tool_registry.load_skills(&rt_env) {
+        tracing::warn!("Failed to load skills: {}", e);
+    }
+    
+    let tool_registry = Arc::new(tool_registry);
 
     // Initialize command registry
     let command_registry = slash_commands::CommandRegistry::new();
@@ -572,12 +593,61 @@ async fn run_app(
                                 } else {
                                     let project_id = rt_env.project_id.clone();
                                     match Session::new(&session_dir, &project_id) {
-                                        Ok(s) => {
+                                        Ok(mut s) => {
+                                            // ✅ Archive current session before creating new one
+                                            if let Err(e) = session.archive(&session_dir) {
+                                                tracing::warn!("Failed to archive current session: {e}");
+                                            }
+                                            
+                                            // ✅ Set default working directory for new session
+                                            let default_wd = rt_env.working_dir.to_string_lossy().to_string();
+                                            if let Err(e) = s.update_working_dir(&default_wd) {
+                                                tracing::warn!("Failed to set default working dir: {}", e);
+                                            }
+                                            
                                             session = s;
                                             app.output.clear();
                                             app.output.push_system("New session started.");
                                             helpers::refresh_header_info(&mut app, &rt_env, provider.is_some());
                                             app.message_count = 0;
+
+                                            // 🔄 Re-render sidebar after /new command
+                                            app.sessions.clear();
+                                            let sessions_root = rt_env.ox_home_dir.join("sessions");
+                                            if sessions_root.exists() {
+                                                if let Ok(project_dirs) = std::fs::read_dir(&sessions_root) {
+                                                    for project_entry in project_dirs.flatten() {
+                                                        let project_path = project_entry.path();
+                                                        if !project_path.is_dir() {
+                                                            continue;
+                                                        }
+                                                        
+                                                        let project_id = project_path
+                                                            .file_name()
+                                                            .map(|n| n.to_string_lossy().to_string())
+                                                            .unwrap_or_else(|| "unknown".to_string());
+                                                        
+                                                        let archived = Session::list_archived(&project_path);
+                                                        for (fname, info) in archived {
+                                                            app.sessions.push(terminal::app::SessionEntry {
+                                                                id: fname,
+                                                                project_id: project_id.clone(),
+                                                                info,
+                                                                is_active: false,
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            app.sessions.insert(
+                                                0,
+                                                terminal::app::SessionEntry {
+                                                    id: "session.jsonl".to_string(),
+                                                    project_id: rt_env.project_id.clone(),
+                                                    info: helpers::session_display_name(&session),
+                                                    is_active: true,
+                                                },
+                                            );
 
                                             // Reinitialize workflow engine for new session
                                             app.init_workflow_engine(&session.meta.id, &session.meta);
@@ -592,34 +662,91 @@ async fn run_app(
                                 }
                             }
                             SessionAction::Resume { filename } => {
-                                let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
-                                if app.agent_running {
-                                    match Session::load_archived(&session_dir, &filename) {
+                                // Find session entry by ID or display name
+                                let target_entry = app.sessions.iter()
+                                    .find(|s| s.id == filename || s.display_name().contains(&filename));
+                                
+                                if let Some(entry) = target_entry {
+                                    let sessions_root = rt_env.ox_home_dir.join("sessions");
+                                    let session_path = entry.full_path(&sessions_root);
+                                    let parent_dir = session_path.parent().unwrap_or(&session_dir);
+                                    
+                                    match Session::load_archived(parent_dir, &entry.id) {
                                         Ok(Some(archived)) => {
-                                            background_session = Some(std::mem::replace(&mut session, archived));
-                                            // Clear UI→Agent channel when switching to background
-                                            app.ui_to_agent_tx = None;
+                                            if app.agent_running {
+                                                background_session = Some(std::mem::replace(&mut session, archived));
+                                                app.ui_to_agent_tx = None;
+                                                compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+                                            } else {
+                                                // ✅ DO NOT archive current session - just replace it
+                                                session = archived;
                                             
-                                            // Load compressed context for resumed session
-                                            compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
-                                        }
-                                        _ => {}
-                                    }
-                                } else {
-                                    match Session::load_archived(&session_dir, &filename) {
-                                        Ok(Some(archived)) => {
-                                            if let Err(e) = session.archive(&session_dir) {
-                                                tracing::warn!("Failed to archive: {e}");
+                                                // ✅ Restore session working directory
+                                                if let Some(ref wd) = session.meta.working_dir {
+                                                    if let Ok(path) = std::path::PathBuf::from(wd).canonicalize() {
+                                                        if let Err(e) = std::env::set_current_dir(&path) {
+                                                            tracing::warn!("Failed to restore working dir: {}", e);
+                                                        } else {
+                                                            rt_env.working_dir = path.clone();
+                                                            // ✅ Update app.working_dir for status bar display (use absolute path)
+                                                            app.working_dir = path.display().to_string();
+                                                            app.output.push_system(&format!(
+                                                                "Restored working directory: {}",
+                                                                path.display()
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                helpers::replay_session_history(&mut app, &session.messages, &rt_env, provider.is_some());
+                                                app.output.push_system(&format!(
+                                                    "Session restored: {} messages from {}",
+                                                    session.messages.len(), filename
+                                                ));
+                                                
+                                                // 🔄 Re-render sidebar after /resume command
+                                                app.sessions.clear();
+                                                let sessions_root = rt_env.ox_home_dir.join("sessions");
+                                                if sessions_root.exists() {
+                                                    if let Ok(project_dirs) = std::fs::read_dir(&sessions_root) {
+                                                        for project_entry in project_dirs.flatten() {
+                                                            let project_path = project_entry.path();
+                                                            if !project_path.is_dir() {
+                                                                continue;
+                                                            }
+                                                                                                        
+                                                            let project_id = project_path
+                                                                .file_name()
+                                                                .map(|n| n.to_string_lossy().to_string())
+                                                                .unwrap_or_else(|| "unknown".to_string());
+                                                                                                        
+                                                            let archived = Session::list_archived(&project_path);
+                                                            for (fname, info) in archived {
+                                                                app.sessions.push(terminal::app::SessionEntry {
+                                                                    id: fname,
+                                                                    project_id: project_id.clone(),
+                                                                    info,
+                                                                    is_active: false,
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                app.sessions.insert(
+                                                    0,
+                                                    terminal::app::SessionEntry {
+                                                        id: "session.jsonl".to_string(),
+                                                        project_id: parent_dir.file_name()
+                                                            .map(|n| n.to_string_lossy().to_string())
+                                                            .unwrap_or_else(|| rt_env.project_id.clone()),
+                                                        info: helpers::session_display_name(&session),
+                                                        is_active: true,
+                                                    },
+                                                );
+                                                
+                                                // Load compressed context for resumed session
+                                                compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
                                             }
-                                            session = archived;
-                                            helpers::replay_session_history(&mut app, &session.messages, &rt_env, provider.is_some());
-                                            app.output.push_system(&format!(
-                                                "Session restored: {} messages from {}",
-                                                session.messages.len(), filename
-                                            ));
-                                            
-                                            // Load compressed context for resumed session
-                                            compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
                                         }
                                         Ok(None) => {
                                             app.output.push_system(&format!("Session '{}' not found.", filename));
@@ -628,6 +755,140 @@ async fn run_app(
                                             app.output.push_system(&format!("Failed to resume: {e}"));
                                         }
                                     }
+                                } else {
+                                    app.output.push_system(&format!("Session '{}' not found in list.", filename));
+                                }
+                            }
+                            SessionAction::SwitchNext => {
+                                // Smart switch: find current session index and switch to next (or previous if at end)
+                                let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
+                                
+                                // Find the index of the current active session
+                                let current_index = app.sessions.iter().position(|s| s.is_active);
+                                
+                                if let Some(idx) = current_index {
+                                    // Determine direction: default forward, reverse if at end
+                                    let total = app.sessions.len();
+                                    let next_idx = if idx + 1 < total {
+                                        idx + 1  // Go forward
+                                    } else {
+                                        idx.saturating_sub(1)  // At end, go backward
+                                    };
+                                    
+                                    // Make sure we're not staying on the same session
+                                    if next_idx != idx {
+                                        // Clone needed data to avoid borrow conflicts
+                                        let (entry_id, entry_project_id) = if let Some(entry) = app.sessions.get(next_idx) {
+                                            (entry.id.clone(), entry.project_id.clone())
+                                        } else {
+                                            continue;
+                                        };
+                                        
+                                        let sessions_root = rt_env.ox_home_dir.join("sessions");
+                                        let session_path = std::path::PathBuf::from(&sessions_root)
+                                            .join(&entry_project_id)
+                                            .join(&entry_id);
+                                        let parent_dir = session_path.parent().unwrap_or(&session_dir);
+                                        
+                                        // Resume the selected session
+                                        if app.agent_running {
+                                            match Session::load_archived(parent_dir, &entry_id) {
+                                                Ok(Some(archived)) => {
+                                                    background_session = Some(std::mem::replace(&mut session, archived));
+                                                    app.ui_to_agent_tx = None;
+                                                    compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+                                                }
+                                                _ => {}
+                                            }
+                                        } else {
+                                            match Session::load_archived(parent_dir, &entry_id) {
+                                                Ok(Some(archived)) => {
+                                                    // ✅ DO NOT archive current session - just replace it
+                                                    // Archive only happens on /new command
+                                                    session = archived;
+                                                    
+                                                    // Restore working directory
+                                                    if let Some(ref wd) = session.meta.working_dir {
+                                                        if let Ok(path) = std::path::PathBuf::from(wd).canonicalize() {
+                                                            if let Err(e) = std::env::set_current_dir(&path) {
+                                                                tracing::warn!("Failed to restore working dir: {}", e);
+                                                            } else {
+                                                                rt_env.working_dir = path.clone();
+                                                                // ✅ Update app.working_dir for status bar display (use absolute path)
+                                                                app.working_dir = path.display().to_string();
+                                                                app.output.push_system(&format!(
+                                                                    "Restored working directory: {}",
+                                                                    path.display()
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    helpers::replay_session_history(&mut app, &session.messages, &rt_env, provider.is_some());
+                                                    app.output.push_system(&format!(
+                                                        "Session switched: {} messages from {}",
+                                                        session.messages.len(), entry_id
+                                                    ));
+                                                    
+                                                    // ✅ Force UI refresh after session switch
+                                                    app.dirty = true;
+                                                    app.scroll_to_bottom();
+                                                    
+                                                    // Re-render sidebar
+                                                    app.sessions.clear();
+                                                    let sessions_root = rt_env.ox_home_dir.join("sessions");
+                                                    if sessions_root.exists() {
+                                                        if let Ok(project_dirs) = std::fs::read_dir(&sessions_root) {
+                                                            for project_entry in project_dirs.flatten() {
+                                                                let project_path = project_entry.path();
+                                                                if !project_path.is_dir() {
+                                                                    continue;
+                                                                }
+                                                                
+                                                                let project_id = project_path
+                                                                    .file_name()
+                                                                    .map(|n| n.to_string_lossy().to_string())
+                                                                    .unwrap_or_else(|| "unknown".to_string());
+                                                                
+                                                                let archived = Session::list_archived(&project_path);
+                                                                for (fname, info) in archived {
+                                                                    app.sessions.push(terminal::app::SessionEntry {
+                                                                        id: fname,
+                                                                        project_id: project_id.clone(),
+                                                                        info,
+                                                                        is_active: false,
+                                                                    });
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    app.sessions.insert(
+                                                        0,
+                                                        terminal::app::SessionEntry {
+                                                            id: "session.jsonl".to_string(),
+                                                            project_id: parent_dir.file_name()
+                                                                .map(|n| n.to_string_lossy().to_string())
+                                                                .unwrap_or_else(|| rt_env.project_id.clone()),
+                                                            info: helpers::session_display_name(&session),
+                                                            is_active: true,
+                                                        },
+                                                    );
+                                                    
+                                                    compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+                                                }
+                                                Ok(None) => {
+                                                    app.output.push_system(&format!("Session '{}' not found.", entry_id));
+                                                }
+                                                Err(e) => {
+                                                    app.output.push_system(&format!("Failed to resume: {e}"));
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        app.output.push_system("Only one session available.");
+                                    }
+                                } else {
+                                    app.output.push_system("No active session found.");
                                 }
                             }
                             SessionAction::None => {}
@@ -820,11 +1081,18 @@ async fn run_app(
                             cost_tracker.record(&model_name, &usage);
                             memory_arc.update_from_turn(&new_messages, &rt_env.project_id, &rt_env.project_language);
 
+                            tracing::info!(
+                                "[AGENT TURN] ✅ Turn completed successfully, {} new messages",
+                                new_messages.len()
+                            );
+
                             // 🆕 Extract keywords from LLM response for semantic learning
+                            let mut keywords_extracted_count = 0;
                             for msg in &new_messages {
                                 if let Message::Assistant { content, .. } = msg {
                                     // Try to extract keywords from the response
                                     if let Some(extracted) = keyword_extraction::extract_keywords_from_response(content) {
+                                        keywords_extracted_count += 1;
                                         // Get the last user query
                                         let last_user_query = target_session.messages.iter()
                                             .rev()
@@ -838,6 +1106,13 @@ async fn run_app(
                                         memory_arc.record_llm_keywords(last_user_query, extracted);
                                     }
                                 }
+                            }
+                            
+                            if keywords_extracted_count == 0 && !new_messages.is_empty() {
+                                tracing::debug!(
+                                    "[KEYWORD EXTRACTION] ⚠️ No keywords extracted from {} assistant messages",
+                                    new_messages.iter().filter(|m| matches!(m, Message::Assistant { .. })).count()
+                                );
                             }
 
                             // === IMPLICIT FEEDBACK: Evaluate satisfaction ===
@@ -1113,6 +1388,12 @@ async fn run_app(
                                     )));
                                     helpers::refresh_header_info(&mut app, &rt_env, provider.is_some());
 
+                                    // ✅ Update session working directory and persist
+                                    let working_dir_str = new_dir.to_string_lossy().to_string();
+                                    if let Err(e) = session.update_working_dir(&working_dir_str) {
+                                        tracing::warn!("Failed to update session working dir: {}", e);
+                                    }
+
                                     // Switch file index to new directory
                                     match file_index_registry.get_or_create(&new_dir) {
                                         Ok(new_file_index) => {
@@ -1186,12 +1467,30 @@ async fn run_app(
                             app.last_compression_msg_count = source_msg_count;
                             app.compression_in_progress = false;
                         }
+                        AgentToUiEvent::WorkflowCompleted { task_description, execution_summary } => {
+                            // Trigger auto-reflection to update Skills
+                            tracing::info!(
+                                "[AUTO-REFLECT] Workflow completed. Task: {}, Summary: {}",
+                                task_description,
+                                execution_summary
+                            );
+                            
+                            // TODO: Implement actual reflection logic here
+                            // For now, just log the event
+                            app.output.push_line(OutputLine::System(
+                                "\n🤖 Auto-reflection triggered (pending implementation)...".to_string()
+                            ));
+                        }
                     }
                 }
             }
         }
 
         if app.should_quit {
+            // ✅ DO NOT archive on exit - keep session.jsonl for auto-restore
+            // Session will be archived only when user explicitly creates a new one (/new)
+            
+            // Flush memory to disk
             memory_arc.flush();
             break;
         }
@@ -1295,6 +1594,104 @@ fn handle_key_event(
                                         "Unknown command: /{}. Type /help for available commands.",
                                         cmd
                                     ));
+                                }
+                                slash_commands::CommandResult::LlmRequest { prompt, description } => {
+                                    // Convert to user message and let main flow handle LLM call
+                                    app.output.push_system(&format!("🤖 {}", description));
+                                    
+                                    // Create a user message with the generated prompt
+                                    let llm_msg = Message::user(&prompt);
+                                    if let Err(e) = session.append_message(llm_msg) {
+                                        tracing::error!("Failed to persist message: {e}");
+                                    }
+                                    
+                                    // Set flag to trigger LLM call in the same iteration
+                                    // Fall through to normal text processing below
+                                    // We'll handle this by setting a temporary text variable
+                                    let temp_text = prompt.clone();
+                                    
+                                    // Continue with normal LLM flow (same as UserInput::Text)
+                                    if let Some(provider) = provider {
+                                        // Build system prompt
+                                        let mut current_system_prompt = context::build_system_prompt(
+                                            &rt_env,
+                                            &tool_registry,
+                                            None,
+                                            Some(&config.behavior_rules),
+                                            None,
+                                        );
+
+                                        let memory_nodes = if let Some(cm) = &compression_manager {
+                                            memory.retrieve_with_rerank(
+                                                &temp_text,
+                                                &Some(rt_env.project_id.as_str()),
+                                                5,
+                                                Some(cm.embedder()),
+                                                None,
+                                            )
+                                        } else {
+                                            memory.retrieve(&temp_text, &Some(rt_env.project_id.as_str()), 5)
+                                        };
+                                        let accessed_ids: Vec<&str> =
+                                            memory_nodes.iter().map(|n| n.id.as_str()).collect();
+                                        memory.reinforce_accessed(&accessed_ids);
+                                        let memory_ctx = memory.format_memory_context(&memory_nodes, false);
+
+                                        let effective_messages =
+                                            if let Some((cached, prev_count)) = compressed_cache {
+                                                let pc = *prev_count;
+                                                let new_msgs = &session.messages[pc.min(session.messages.len())..];
+                                                let mut combined = cached.clone();
+                                                combined.extend_from_slice(new_msgs);
+                                                combined
+                                            } else {
+                                                session.messages.clone()
+                                            };
+
+                                        let turn_messages = context_builder.build(
+                                            &current_system_prompt,
+                                            &memory_ctx,
+                                            &effective_messages,
+                                            context_window,
+                                        );
+
+                                        app.agent_running = true;
+                                        app.status = "Generating skill...".to_string();
+                                        let effort = ox_core::context::estimate_effort(
+                                            &temp_text,
+                                            session.messages.len(),
+                                        );
+                                        let planning = effort == ox_core::context::EffortLevel::High;
+                                        let provider = Arc::clone(provider);
+                                        let tx = agent_tx.clone();
+                                        let registry = Arc::clone(tool_registry);
+                                        let ctx = Arc::clone(tool_ctx);
+                                        let cancel_token = interrupt_ctrl.token();
+                                        let tm = Arc::clone(&trust_manager);
+                                        let ac = Arc::clone(&agent_config);
+                                        let (ui_to_agent_tx, ui_to_agent_rx) =
+                                            mpsc::unbounded_channel::<UiToAgentEvent>();
+                                        app.ui_to_agent_tx = Some(ui_to_agent_tx);
+
+                                        let workflow_engine_clone = app.workflow_engine.clone();
+
+                                        tokio::spawn(async move {
+                                            agent::run_agent_turn(
+                                                provider,
+                                                turn_messages,
+                                                registry,
+                                                ctx,
+                                                tx,
+                                                ui_to_agent_rx,
+                                                cancel_token,
+                                                tm,
+                                                ac,
+                                                planning,
+                                                workflow_engine_clone,
+                                            )
+                                            .await;
+                                        });
+                                    }
                                 }
                                 _ => {}
                             }

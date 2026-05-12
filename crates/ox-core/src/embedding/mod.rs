@@ -31,6 +31,7 @@ pub use reranker::{LlmReranker, RerankerConfig, MemoryJudgment};
 
 use std::sync::Arc;
 
+use crate::context::sanitize_tool_pairs;
 use crate::llm::tokenizer::estimate_tokens;
 use crate::message::Message;
 use anyhow::Result;
@@ -590,6 +591,12 @@ pub fn compress_context_enhanced(
         // Insert notice as first message
         compressed.insert(0, Message::system(&notice));
     }
+
+    // 🚨 CRITICAL FIX: Sanitize tool pairs after compression
+    // Compression may have broken tool_call/ToolResult pairs, causing
+    // "tool result's tool id not found" API errors. This ensures all
+    // ToolResults have matching Assistant tool_calls before returning.
+    sanitize_tool_pairs(&mut compressed);
 
     Ok(Some(compressed))
 }

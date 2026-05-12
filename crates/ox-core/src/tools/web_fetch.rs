@@ -11,7 +11,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch the content of a URL. Returns the response body as text (truncated to 10000 chars)."
+        "Fetch URL content. Returns response body as text (truncated to 10000 chars)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -20,10 +20,14 @@ impl Tool for WebFetchTool {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "The URL to fetch"
+                    "description": "✅ REQUIRED: URL to fetch (must include http:// or https://)"
                 }
             },
-            "required": ["url"]
+            "required": ["url"],
+            "examples": [
+                {"url": "https://example.com/api/docs"},
+                {"url": "https://raw.githubusercontent.com/user/repo/main/README.md"}
+            ]
         })
     }
 

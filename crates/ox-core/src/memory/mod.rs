@@ -170,7 +170,10 @@ pub fn composite_score(node: &MemoryNode, half_life: u64) -> f32 {
 /// # Returns
 /// Vector of chunk strings with overlap
 fn split_with_overlap(text: &str, max_chunk_len: usize, overlap_ratio: f32) -> Vec<String> {
-    if text.len() <= max_chunk_len {
+    let chars: Vec<char> = text.chars().collect();
+    let char_count = chars.len();
+    
+    if char_count <= max_chunk_len {
         return vec![text.to_string()];
     }
     
@@ -178,24 +181,28 @@ fn split_with_overlap(text: &str, max_chunk_len: usize, overlap_ratio: f32) -> V
     let step = (max_chunk_len as f32 * (1.0 - overlap_ratio)) as usize;
     let mut start = 0;
     
-    while start < text.len() {
-        let end = (start + max_chunk_len).min(text.len());
+    while start < char_count {
+        let end = (start + max_chunk_len).min(char_count);
         
         // Try to break at word boundary to avoid cutting words
-        let chunk_end = if end < text.len() {
-            // Find last space before end
-            text[start..end]
-                .rfind(' ')
-                .map(|pos| start + pos)
+        let chunk_end = if end < char_count {
+            // Find last space before end (search in character slice)
+            let chunk_chars = &chars[start..end];
+            chunk_chars
+                .iter()
+                .rposition(|&c| c == ' ')
+                .map(|pos| start + pos + 1)  // +1 to include the space
                 .unwrap_or(end)
         } else {
             end
         };
         
-        chunks.push(text[start..chunk_end].to_string());
+        // Convert character indices back to string
+        let chunk: String = chars[start..chunk_end].iter().collect();
+        chunks.push(chunk);
         
         // Move to next chunk with overlap
-        start = if chunk_end + step > text.len() {
+        start = if chunk_end + step > char_count {
             break;  // Last chunk
         } else {
             chunk_end + step - (max_chunk_len as f32 * overlap_ratio) as usize
@@ -800,9 +807,26 @@ impl MemoryManager {
         extracted: semantic::KeywordExtraction,
     ) {
         if let Some(ref manager) = self.semantic_manager {
-            if let Err(e) = manager.record_llm_keywords(user_query, &extracted) {
-                tracing::warn!("[SEMANTIC LEARNING] Failed to record keywords: {}", e);
+            match manager.record_llm_keywords(user_query, &extracted) {
+                Ok(_) => {
+                    tracing::info!(
+                        "[SEMANTIC LEARNING] ✅ Recorded {} keywords, {} topics for query: '{}'",
+                        extracted.keywords.len(),
+                        extracted.topics.len(),
+                        user_query.chars().take(50).collect::<String>()
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "[SEMANTIC LEARNING] ❌ Failed to record keywords: {}",
+                        e
+                    );
+                }
             }
+        } else {
+            tracing::warn!(
+                "[SEMANTIC LEARNING] ⚠️ Semantic manager not initialized - keywords will not be recorded"
+            );
         }
     }
 
@@ -830,6 +854,13 @@ impl MemoryManager {
         embedder: Option<&crate::embedding::BgeEmbedder>,
         rerank_top_k: Option<usize>,
     ) -> Vec<MemoryNode> {
+        tracing::info!(
+            "[MEMORY RETRIEVAL] Starting retrieval for query: '{}', limit: {}, rerank: {}",
+            query.chars().take(50).collect::<String>(),
+            limit,
+            if embedder.is_some() { "enabled" } else { "disabled" }
+        );
+        
         // Step 1: Multi-path retrieval (get more candidates than needed)
         let retrieve_limit = if embedder.is_some() {
             // If re-ranking is enabled, retrieve more candidates
@@ -839,6 +870,11 @@ impl MemoryManager {
         };
         
         let mut results = self.retrieve(query, project_id, retrieve_limit);
+        
+        tracing::info!(
+            "[MEMORY RETRIEVAL] Initial retrieval returned {} memories",
+            results.len()
+        );
         
         // Step 2: Re-rank if embedder is provided
         if let Some(emb) = embedder {
@@ -862,6 +898,10 @@ impl MemoryManager {
         
         // No re-ranking, just truncate to limit
         results.truncate(limit);
+        tracing::info!(
+            "[MEMORY RETRIEVAL] Final result: {} memories (no re-ranking)",
+            results.len()
+        );
         results
     }
     
@@ -886,14 +926,34 @@ impl MemoryManager {
         // 🆕 Step 1: Query expansion using semantic associations
         let mut expanded_queries = vec![query.to_string()];
         if let Some(ref manager) = self.semantic_manager {
-            if let Ok(related) = manager.get_related_terms(query, 0.6) {
-                expanded_queries.extend(related);
-                tracing::debug!(
-                    "[SEMANTIC EXPANSION] '{}' → {:?}",
-                    query,
-                    expanded_queries
-                );
+            match manager.get_related_terms(query, 0.6) {
+                Ok(related) => {
+                    if !related.is_empty() {
+                        tracing::info!(
+                            "[SEMANTIC EXPANSION] ✅ '{}' → {} related terms: {:?}",
+                            query,
+                            related.len(),
+                            related
+                        );
+                        expanded_queries.extend(related);
+                    } else {
+                        tracing::debug!(
+                            "[SEMANTIC EXPANSION] ⚠️ No related terms found for '{}'",
+                            query
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[SEMANTIC EXPANSION] ❌ Failed to get related terms: {}",
+                        e
+                    );
+                }
             }
+        } else {
+            tracing::debug!(
+                "[SEMANTIC EXPANSION] ⚠️ Semantic manager not initialized - skipping expansion"
+            );
         }
         
         let mut all_results: std::collections::HashMap<String, (MemoryNode, f32)> = std::collections::HashMap::new();
@@ -908,6 +968,13 @@ impl MemoryManager {
                         .unwrap_or_else(|| &self.overall_store)
                         .search(search_term, Some(pid), limit)
                     {
+                        if !mems.is_empty() {
+                            tracing::debug!(
+                                "[MEMORY RETRIEVAL] PATH 1 (query): '{}' → {} results",
+                                search_term,
+                                mems.len()
+                            );
+                        }
                         for m in mems {
                             all_results.entry(m.id.clone())
                                 .or_insert_with(|| (m, 1.0));
@@ -919,6 +986,13 @@ impl MemoryManager {
         
         // 🎯 PATH 2: Entity-based retrieval (weight: 0.8)
         let entities = self.extract_query_entities(query);
+        if !entities.is_empty() {
+            tracing::debug!(
+                "[MEMORY RETRIEVAL] Extracted {} entities: {:?}",
+                entities.len(),
+                entities
+            );
+        }
         for entity in &entities {
             if let Some(pid) = project_id {
                 if let Ok(mems) = self
@@ -927,6 +1001,13 @@ impl MemoryManager {
                     .unwrap_or_else(|| &self.overall_store)
                     .search(entity, Some(pid), 3)  // Limit per entity
                 {
+                    if !mems.is_empty() {
+                        tracing::debug!(
+                            "[MEMORY RETRIEVAL] PATH 2 (entity '{}'): {} results",
+                            entity,
+                            mems.len()
+                        );
+                    }
                     for m in mems {
                         all_results.entry(m.id.clone())
                             .and_modify(|(_, score)| *score = (*score + 0.8).min(2.0))
@@ -948,6 +1029,12 @@ impl MemoryManager {
                     ],
                     limit / 2,  // Reduced limit for type-specific
                 ) {
+                    if !mems.is_empty() {
+                        tracing::debug!(
+                            "[MEMORY RETRIEVAL] PATH 3 (type-specific): {} results",
+                            mems.len()
+                        );
+                    }
                     for m in mems {
                         all_results.entry(m.id.clone())
                             .and_modify(|(_, score)| *score = (*score + 0.6).min(2.0))
@@ -966,6 +1053,12 @@ impl MemoryManager {
             ],
             limit / 2,
         ) {
+            if !mems.is_empty() {
+                tracing::debug!(
+                    "[MEMORY RETRIEVAL] PATH 4 (global): {} results",
+                    mems.len()
+                );
+            }
             for m in mems {
                 all_results.entry(m.id.clone())
                     .and_modify(|(_, score)| *score = (*score + 0.5).min(2.0))
@@ -973,9 +1066,16 @@ impl MemoryManager {
             }
         }
         
+        // Log total candidates before filtering
+        tracing::debug!(
+            "[MEMORY RETRIEVAL] Total candidates before decay filter: {}",
+            all_results.len()
+        );
+        
         // Convert to vector and apply decay filter
         let mut results: Vec<(MemoryNode, f32)> = all_results.into_values().collect();
         
+        let before_filter_count = results.len();
         results.retain(|(n, _)| {
             let decay = if n.project_id.is_some() {
                 calculate_project_decay(n, 30)
@@ -984,6 +1084,20 @@ impl MemoryManager {
             };
             decay > 0.3 || n.is_project_critical
         });
+        
+        let after_filter_count = results.len();
+        if before_filter_count > 0 && after_filter_count < before_filter_count {
+            tracing::info!(
+                "[MEMORY RETRIEVAL] Decay filter: {} → {} memories (removed {})",
+                before_filter_count,
+                after_filter_count,
+                before_filter_count - after_filter_count
+            );
+        } else if before_filter_count == 0 {
+            tracing::info!(
+                "[MEMORY RETRIEVAL] ⚠️ No candidates found - database may be empty or query doesn't match"
+            );
+        }
         
         // Sort by combined score (relevance weight + composite score + LLM feedback boost)
         results.sort_by(|(a, weight_a), (b, weight_b)| {

@@ -42,7 +42,24 @@ impl Tool for ShellExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return stdout/stderr. Use the system's detected shell."
+        "🐚 Execute shell commands in the system shell (bash/cmd/PowerShell).
+         
+         💡 Common use cases:
+         • Git operations: git status, git diff, git commit
+         • Build & run: cargo build, npm run dev, python script.py
+         • System info: ls, pwd, uname, whoami
+         • Package management: pip install, npm install, apt-get
+         
+         ⚠️ Safety:
+         • This is a DANGEROUS tool - requires user confirmation
+         • Avoid destructive commands (rm -rf, del /s, etc.)
+         • Commands timeout after 30 seconds by default
+         
+         📝 Examples:
+         • {\"command\": \"git status\"} - Check git status
+         • {\"command\": \"git diff HEAD~1\"} - View last commit changes
+         • {\"command\": \"git add . && git commit -m 'fix bug'\"} - Commit changes
+         • {\"command\": \"cargo test\", \"timeout_ms\": 60000} - Run tests with 60s timeout"
     }
 
     fn parameters_schema(&self) -> Value {
@@ -83,9 +100,12 @@ impl Tool for ShellExecTool {
                  • Command will run in the system shell (bash on Linux/Mac, cmd on Windows)\n\
                  • Use caution with destructive commands (rm, del, etc.)\n\n\
                  📝 Examples:\n\
-                 {\"command\": \"ls -la\"} - List files\n\
-                 {\"command\": \"cargo build\"} - Build Rust project\n\
-                 {\"command\": \"git status\"} - Check git status",
+                 • {\"command\": \"ls -la\"} - List files\n\
+                 • {\"command\": \"cargo build\"} - Build Rust project\n\
+                 • {\"command\": \"git status\"} - Check git status\n\
+                 • {\"command\": \"git diff\"} - View changes\n\
+                 • {\"command\": \"git add . && git commit -m 'msg'\"} - Commit\n\
+                 • {\"command\": \"python main.py\"} - Run Python script",
                 );
             }
         };

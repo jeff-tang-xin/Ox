@@ -165,9 +165,6 @@ fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
-    // Store chat area bounds for mouse scroll detection
-    app.chat_area = Some((area.x, area.y, area.width, area.height));
-
     let spinner_frame = app.spinner_frame;
     let scroll_offset = app.scroll_offset;
 
@@ -377,9 +374,10 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(TEXT_DIM)
         };
         let icon = if entry.is_active { "▸" } else { " " };
-        let info_short: String = entry.info.chars().take(area.width as usize - 4).collect();
+        // Use display_name() method which includes [ProjectName] prefix
+        let display_short: String = entry.display_name().chars().take(area.width as usize - 4).collect();
         lines.push(Line::from(Span::styled(
-            format!(" {icon} {info_short}"),
+            format!(" {icon} {display_short}"),
             style,
         )));
     }

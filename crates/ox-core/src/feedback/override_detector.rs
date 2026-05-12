@@ -78,7 +78,8 @@ impl CodeOverrideDetector {
                 let current_hash = hash_content(&current_content);
 
                 if current_hash == record.content_hash {
-                    // No changes - accepted
+                    // No changes - accepted, remove from tracking
+                    to_remove.push(path.clone());
                     continue;
                 }
 
@@ -96,10 +97,14 @@ impl CodeOverrideDetector {
                     change_ratio,
                     time_elapsed: record.timestamp.elapsed(),
                 });
+                
+                // ✅ IMPORTANT: Remove from tracking after detecting override
+                // This prevents reporting the same override multiple times
+                to_remove.push(path.clone());
             }
         }
 
-        // Clean up expired records
+        // Clean up processed and expired records
         for path in to_remove {
             self.recent_writes.remove(&path);
         }

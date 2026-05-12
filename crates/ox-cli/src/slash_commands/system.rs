@@ -54,7 +54,7 @@ pub fn handle_exit(app: &mut AppState, _args: &str, _session: &mut Session, _rt_
     CommandResult::Success
 }
 
-pub fn handle_cd(app: &mut AppState, args: &str, _session: &mut Session, rt_env: &mut runtime::RuntimeEnvironment,
+pub fn handle_cd(app: &mut AppState, args: &str, session: &mut Session, rt_env: &mut runtime::RuntimeEnvironment,
     _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     let path = args.trim();
@@ -64,6 +64,13 @@ pub fn handle_cd(app: &mut AppState, args: &str, _session: &mut Session, rt_env:
         match runtime::change_directory(rt_env, &path) {
             DirectoryChangeResult::Success { new_dir, project_changed } => {
                 app.output.push_line(OutputLine::System(format!("Changed to: {}", new_dir.display())));
+                
+                // ✅ Update session working directory and persist
+                let working_dir_str = new_dir.to_string_lossy().to_string();
+                if let Err(e) = session.update_working_dir(&working_dir_str) {
+                    tracing::warn!("Failed to update session working dir: {}", e);
+                }
+                
                 refresh_header_info(app, rt_env);
                 if project_changed {
                     let name = rt_env.project_root.as_ref().and_then(|p| p.file_name())
