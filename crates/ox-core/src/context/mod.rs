@@ -297,8 +297,34 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
         }
     }
 
+    // 🔍 DIAGNOSTIC: Log validation results before sanitization
+    let orphaned_results: Vec<_> = result_call_ids.iter()
+        .filter(|id| !assistant_call_ids.contains(*id))
+        .collect();
+    
+    if !orphaned_results.is_empty() {
+        tracing::warn!(
+            "[TOOL_PAIR_SANITIZATION] Found {} orphaned ToolResult(s) with IDs: {:?}",
+            orphaned_results.len(),
+            orphaned_results
+        );
+    }
+
+    let orphaned_calls: Vec<_> = assistant_call_ids.iter()
+        .filter(|id| !result_call_ids.contains(*id))
+        .collect();
+    
+    if !orphaned_calls.is_empty() {
+        tracing::warn!(
+            "[TOOL_PAIR_SANITIZATION] Found {} orphaned tool_call(s) with IDs: {:?}",
+            orphaned_calls.len(),
+            orphaned_calls
+        );
+    }
+
     // Step 1: Remove orphaned ToolResults (no matching tool_call in any Assistant)
     // This is safe - if there's no tool_call, the result is meaningless
+    let before_count = messages.len();
     messages.retain(|m| {
         if let Message::ToolResult { tool_call_id, .. } = m {
             assistant_call_ids.contains(tool_call_id)
@@ -306,31 +332,74 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
             true
         }
     });
+    let removed_results = before_count - messages.len();
+    if removed_results > 0 {
+        tracing::info!(
+            "[TOOL_PAIR_SANITIZATION] Removed {} orphaned ToolResult(s)",
+            removed_results
+        );
+    }
 
-    // ✅ CRITICAL FIX: Remove orphaned tool_calls (no matching ToolResult)
-    // We MUST remove the entire Assistant message if it has tool_calls but no results,
-    // because sending incomplete tool_call/tool_result pairs will cause API errors.
-    // 
-    // Reason: If we keep an Assistant with tool_calls but remove the ToolResult,
-    // then when we try to send a new ToolResult later, the API will complain
-    // that the tool_call ID doesn't exist (because it was truncated).
-    messages.retain(|m| {
-        if let Message::Assistant { tool_calls, content, .. } = m {
-            // Keep if:
-            // 1. Has text content (even without tool_calls)
-            // 2. OR has tool_calls AND all of them have matching ToolResults
-            if !content.trim().is_empty() {
-                true  // Has content, keep it
-            } else if tool_calls.is_empty() {
-                true  // No tool_calls, keep it (might be pure text response)
-            } else {
-                // Has tool_calls - check if ALL of them have matching ToolResults
-                tool_calls.iter().all(|tc| result_call_ids.contains(&tc.id))
+    // ✅ CRITICAL FIX: Remove orphaned tool_calls from Assistant messages
+    // OpenAI API requires: if an Assistant message has tool_calls, ALL of them must have
+    // corresponding ToolResult messages. If some tool_calls are orphaned (no ToolResult),
+    // we must remove those specific tool_calls from the Assistant message.
+    //
+    // IMPORTANT: We should NOT delete the entire Assistant message if it has text content.
+    // Instead, we only remove the orphaned tool_calls from the tool_calls array.
+    let mut removed_orphaned_calls = 0usize;
+    
+    for msg in messages.iter_mut() {
+        if let Message::Assistant { tool_calls, .. } = msg {
+            // Keep only tool_calls that have matching ToolResults
+            let original_count = tool_calls.len();
+            tool_calls.retain(|tc| result_call_ids.contains(&tc.id));
+            let removed = original_count - tool_calls.len();
+            removed_orphaned_calls += removed;
+            
+            if removed > 0 {
+                tracing::debug!(
+                    "[TOOL_PAIR_SANITIZATION] Removed {} orphaned tool_call(s) from Assistant message",
+                    removed
+                );
             }
-        } else {
-            true  // Not an Assistant message, keep it
         }
-    });
+    }
+    
+    if removed_orphaned_calls > 0 {
+        tracing::info!(
+            "[TOOL_PAIR_SANITIZATION] Total removed {} orphaned tool_call(s) from Assistant messages",
+            removed_orphaned_calls
+        );
+    }
+
+    // 🚨 FINAL VALIDATION: Double-check after sanitization
+    let mut final_assistant_ids = std::collections::HashSet::new();
+    let mut final_result_ids = std::collections::HashSet::new();
+    
+    for msg in messages.iter() {
+        match msg {
+            Message::Assistant { tool_calls, .. } => {
+                for tc in tool_calls {
+                    final_assistant_ids.insert(tc.id.clone());
+                }
+            }
+            Message::ToolResult { tool_call_id, .. } => {
+                final_result_ids.insert(tool_call_id.clone());
+            }
+            _ => {}
+        }
+    }
+    
+    // Check for any remaining mismatches
+    for result_id in &final_result_ids {
+        if !final_assistant_ids.contains(result_id) {
+            tracing::error!(
+                "[TOOL_PAIR_SANITIZATION] ⚠️ CRITICAL: After sanitization, ToolResult ID '{}' still has no matching tool_call!",
+                result_id
+            );
+        }
+    }
 }
 
 /// Estimate tokens for a single message.

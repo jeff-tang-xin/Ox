@@ -60,6 +60,60 @@ impl LlmProvider for OpenAiProvider {
         tools: &[ToolSchema],
         tx: mpsc::UnboundedSender<LlmStreamEvent>,
     ) -> Result<()> {
+        // 🚨 CRITICAL VALIDATION: Verify tool_call/tool_result pairs before sending to API
+        // This catches issues that sanitize_tool_pairs might have missed
+        let mut assistant_call_ids = std::collections::HashSet::new();
+        let mut result_call_ids = std::collections::HashSet::new();
+        
+        for msg in messages {
+            match msg {
+                crate::message::Message::Assistant { tool_calls, .. } => {
+                    for tc in tool_calls {
+                        assistant_call_ids.insert(tc.id.clone());
+                    }
+                }
+                crate::message::Message::ToolResult { tool_call_id, .. } => {
+                    result_call_ids.insert(tool_call_id.clone());
+                }
+                _ => {}
+            }
+        }
+        
+        // Check for orphaned ToolResults (ToolResult without matching tool_call)
+        for result_id in &result_call_ids {
+            if !assistant_call_ids.contains(result_id) {
+                tracing::error!(
+                    "[OPENAI_API_VALIDATION] ⚠️ CRITICAL: ToolResult ID '{}' has no matching tool_call! This will cause API error 400.",
+                    result_id
+                );
+                let _ = tx.send(LlmStreamEvent::Error(
+                    format!("Internal error: ToolResult references non-existent tool call '{}'. Please report this bug.", result_id)
+                ));
+                return Ok(());
+            }
+        }
+        
+        // Check for orphaned tool_calls (tool_call without matching ToolResult)
+        // OpenAI API requires: if Assistant has tool_calls, they MUST be followed by ToolResults
+        for call_id in &assistant_call_ids {
+            if !result_call_ids.contains(call_id) {
+                tracing::error!(
+                    "[OPENAI_API_VALIDATION] ⚠️ CRITICAL: tool_call ID '{}' has no matching ToolResult! This will cause API error 'tool call result does not follow tool call'.",
+                    call_id
+                );
+                let _ = tx.send(LlmStreamEvent::Error(
+                    format!("Internal error: tool_call '{}' has no corresponding ToolResult. This indicates a bug in context sanitization.", call_id)
+                ));
+                return Ok(());
+            }
+        }
+        
+        tracing::info!(
+            "[OPENAI_API_VALIDATION] ✅ Validation passed: {} tool_calls, {} tool_results (all paired correctly)",
+            assistant_call_ids.len(),
+            result_call_ids.len()
+        );
+
         let api_messages = messages.iter().map(message_to_openai).collect::<Vec<_>>();
 
         let mut body = serde_json::json!({

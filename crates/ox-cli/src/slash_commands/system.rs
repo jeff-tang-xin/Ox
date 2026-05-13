@@ -34,7 +34,7 @@ pub const RELOAD_COMMAND: CommandMeta = CommandMeta {
     name: "reload", aliases: &[], description: "Reload session from disk", handler: handle_reload,
 };
 pub const DOWNLOAD_MODEL_COMMAND: CommandMeta = CommandMeta {
-    name: "download_model", aliases: &["dlmodel"], description: "Download embedding model", handler: handle_download_model,
+    name: "download_model", aliases: &["dlmodel", "download-model"], description: "Download embedding model", handler: handle_download_model,
 };
 pub const FREE_COMMAND: CommandMeta = CommandMeta {
     name: "free", aliases: &[], description: "Switch to free mode", handler: handle_free,
