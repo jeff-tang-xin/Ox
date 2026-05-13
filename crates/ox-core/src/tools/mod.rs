@@ -68,6 +68,19 @@ pub struct ToolContext {
     pub memory: Arc<crate::memory::MemoryManager>,
     /// Reference to the file index manager for file lookup
     pub file_index: Arc<crate::file_index::FileIndexManager>,
+    /// Current tool call ID (for progress reporting)
+    pub tool_call_id: String,
+    /// Optional progress callback for real-time updates
+    pub progress_callback: Option<Arc<dyn Fn(ToolProgress) + Send + Sync>>,
+}
+
+/// Progress update from a tool execution
+#[derive(Debug, Clone)]
+pub struct ToolProgress {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub message: String,
+    pub progress_percent: Option<u8>, // 0-100
 }
 
 impl ToolContext {
@@ -85,6 +98,41 @@ impl ToolContext {
             config,
             memory,
             file_index,
+            tool_call_id: String::new(),
+            progress_callback: None,
+        }
+    }
+
+    /// Create a new ToolContext with progress callback support
+    pub fn with_progress_callback(
+        runtime: RuntimeEnvironment,
+        working_dir: std::path::PathBuf,
+        config: Arc<OxConfig>,
+        memory: Arc<crate::memory::MemoryManager>,
+        file_index: Arc<crate::file_index::FileIndexManager>,
+        tool_call_id: String,
+        progress_callback: impl Fn(ToolProgress) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            runtime,
+            working_dir,
+            config,
+            memory,
+            file_index,
+            tool_call_id,
+            progress_callback: Some(Arc::new(progress_callback)),
+        }
+    }
+
+    /// Report progress if callback is available
+    pub fn report_progress(&self, message: String, progress_percent: Option<u8>) {
+        if let Some(callback) = &self.progress_callback {
+            callback(ToolProgress {
+                tool_call_id: self.tool_call_id.clone(),
+                tool_name: "".to_string(), // Will be set by caller
+                message,
+                progress_percent,
+            });
         }
     }
 }

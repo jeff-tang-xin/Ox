@@ -285,7 +285,7 @@ impl Tool for FileWriteTool {
 
         let result = if is_large_file {
             // Automatic chunked write for large files (>1 MB)
-            chunked_write_with_retry(&temp_path, &path, content_bytes, CHUNK_SIZE, 3).await
+            chunked_write_with_retry(&temp_path, &path, content_bytes, CHUNK_SIZE, 3, ctx).await
         } else {
             // Standard atomic write for normal files
             atomic_write_with_retry(&temp_path, &path, content_bytes, 3).await
@@ -441,10 +441,14 @@ async fn chunked_write_with_retry(
     content: &[u8],
     chunk_size: usize,
     max_retries: u32,
+    ctx: &super::ToolContext,
 ) -> Result<usize, String> {
     let total_bytes = content.len();
     let mut bytes_written = 0;
     let mut last_error = String::new();
+    
+    // Calculate total chunks for progress reporting
+    let total_chunks = (total_bytes + chunk_size - 1) / chunk_size;
 
     for attempt in 1..=max_retries {
         // Create temp file
@@ -464,15 +468,30 @@ async fn chunked_write_with_retry(
         // Write in chunks
         let mut offset = 0;
         let mut chunk_success = true;
+        let mut current_chunk = 0;
 
         while offset < total_bytes {
             let end = std::cmp::min(offset + chunk_size, total_bytes);
             let chunk = &content[offset..end];
+            current_chunk += 1;
 
             match file.write_all(chunk) {
                 Ok(_) => {
                     bytes_written = end;
                     offset = end;
+                    
+                    // 🚀 Report progress after each chunk
+                    let percent = ((current_chunk as f64 / total_chunks as f64) * 100.0) as u8;
+                    ctx.report_progress(
+                        format!("Writing chunk {}/{} ({:.1} MB / {:.1} MB)", 
+                            current_chunk, total_chunks,
+                            offset as f64 / 1024.0 / 1024.0,
+                            total_bytes as f64 / 1024.0 / 1024.0),
+                        Some(percent.min(99)), // Cap at 99% until complete
+                    );
+                    
+                    // ⚡ Yield to allow UI to update
+                    tokio::task::yield_now().await;
                 }
                 Err(e) => {
                     chunk_success = false;

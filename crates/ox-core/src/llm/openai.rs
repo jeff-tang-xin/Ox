@@ -52,6 +52,33 @@ impl OpenAiProvider {
     }
 }
 
+/// Determine if a network error is retryable
+fn is_network_retryable_error(error: &reqwest::Error) -> bool {
+    // Retryable errors:
+    // - Connection reset
+    // - Timeout
+    // - Network unreachable
+    // - DNS resolution temporary failure
+    
+    error.is_timeout()
+        || error.is_connect()
+        || error.to_string().contains("connection reset")
+        || error.to_string().contains("broken pipe")
+        || error.to_string().contains("network unreachable")
+        || error.to_string().contains("temporary failure")
+}
+
+/// Calculate exponential backoff delay for retries
+fn calculate_retry_delay(consecutive_errors: u32) -> u64 {
+    // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms...
+    // Cap at 5 seconds to avoid excessive waiting
+    let base_delay = 100u64;
+    let max_delay = 5000u64;
+    
+    let delay = base_delay * (2_u64.pow(consecutive_errors.min(6))); // Cap exponent at 6
+    delay.min(max_delay)
+}
+
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiProvider {
     async fn stream_chat(
@@ -62,6 +89,8 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<()> {
         // 🚨 CRITICAL VALIDATION: Verify tool_call/tool_result pairs before sending to API
         // This catches issues that sanitize_tool_pairs might have missed
+        
+        // Step 1: Collect all IDs (for basic validation)
         let mut assistant_call_ids = std::collections::HashSet::new();
         let mut result_call_ids = std::collections::HashSet::new();
         
@@ -106,6 +135,74 @@ impl LlmProvider for OpenAiProvider {
                 ));
                 return Ok(());
             }
+        }
+        
+        // 🔍 ENHANCED VALIDATION: Check message order and pairing structure
+        // OpenAI API requires strict ordering: Assistant with tool_calls must be immediately followed by ToolResults
+        let mut i = 0;
+        while i < messages.len() {
+            if let crate::message::Message::Assistant { tool_calls, .. } = &messages[i] {
+                if !tool_calls.is_empty() {
+                    // This Assistant has tool_calls - verify the following messages are ToolResults
+                    let expected_tool_count = tool_calls.len();
+                    let mut found_results = Vec::new();
+                    
+                    // Check the next N messages (should all be ToolResults for this Assistant)
+                    for j in 1..=expected_tool_count {
+                        if i + j >= messages.len() {
+                            break;
+                        }
+                        
+                        if let crate::message::Message::ToolResult { tool_call_id, .. } = &messages[i + j] {
+                            found_results.push(tool_call_id.clone());
+                        } else {
+                            // Found a non-ToolResult message where we expected one
+                            tracing::error!(
+                                "[OPENAI_API_VALIDATION] ⚠️ ORDER VIOLATION: Assistant at index {} has {} tool_calls, but message at index {} is not a ToolResult!",
+                                i, expected_tool_count, i + j
+                            );
+                            
+                            // List what tool_calls we have
+                            let call_ids: Vec<_> = tool_calls.iter().map(|tc| tc.id.as_str()).collect();
+                            tracing::error!(
+                                "[OPENAI_API_VALIDATION] Expected ToolResults for: {:?}",
+                                call_ids
+                            );
+                            
+                            let _ = tx.send(LlmStreamEvent::Error(
+                                format!("Internal error: Message ordering violation. Assistant tool_calls are not followed by ToolResults. This is a critical bug in context management.")
+                            ));
+                            return Ok(());
+                        }
+                    }
+                    
+                    // Verify all tool_call IDs match
+                    let call_ids: Vec<_> = tool_calls.iter().map(|tc| tc.id.clone()).collect();
+                    if found_results != call_ids {
+                        tracing::error!(
+                            "[OPENAI_API_VALIDATION] ⚠️ MISMATCH: Assistant tool_call IDs don't match ToolResult order!"
+                        );
+                        tracing::error!(
+                            "[OPENAI_API_VALIDATION] Assistant tool_calls: {:?}",
+                            call_ids
+                        );
+                        tracing::error!(
+                            "[OPENAI_API_VALIDATION] Following ToolResults: {:?}",
+                            found_results
+                        );
+                        
+                        let _ = tx.send(LlmStreamEvent::Error(
+                            format!("Internal error: Tool call/result ID mismatch. The order of ToolResults doesn't match the order of tool_calls.")
+                        ));
+                        return Ok(());
+                    }
+                    
+                    // Skip past the ToolResults we just validated
+                    i += expected_tool_count + 1;
+                    continue;
+                }
+            }
+            i += 1;
         }
         
         tracing::info!(
@@ -211,7 +308,9 @@ impl LlmProvider for OpenAiProvider {
         let mut done_sent = false;
         let mut consecutive_errors = 0u32;
         let mut total_chunks_received = 0u32;
-        const MAX_CONSECUTIVE_ERRORS: u32 = 3;
+        let mut total_errors = 0u32;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;  // Increased from 3 to 10 for better network tolerance
+        const MAX_TOTAL_ERRORS: u32 = 20;         // Total error limit to prevent infinite loops
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
@@ -236,23 +335,56 @@ impl LlmProvider for OpenAiProvider {
                 }
                 Err(e) => {
                     consecutive_errors += 1;
+                    total_errors += 1;
+                    
+                    // Determine if error is retryable
+                    let is_retryable = is_network_retryable_error(&e);
+                    
                     tracing::warn!(
-                        "[LLM STREAM] ⚠️ Chunk error (consecutive: {}/{}): {} - Error type: {:?}",
+                        "[LLM STREAM] ⚠️ Chunk error (consecutive: {}/{}, total: {}): {} - Retryable: {}",
                         consecutive_errors,
                         MAX_CONSECUTIVE_ERRORS,
+                        total_errors,
                         e,
-                        e
+                        is_retryable
                     );
 
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    // Check if we should abort
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS || total_errors >= MAX_TOTAL_ERRORS {
                         tracing::error!(
-                            "Too many consecutive stream errors, aborting. Total chunks received before failure: {}",
+                            "Too many stream errors (consecutive: {}, total: {}), aborting. Received {} chunks before failure.",
+                            consecutive_errors,
+                            total_errors,
                             total_chunks_received
                         );
-                        let _ = tx.send(LlmStreamEvent::Error(
-                            format!("网络不稳定，流式响应中断（已接收 {} 个数据块）。请检查网络连接或稍后重试。", total_chunks_received)
-                        ));
+                        
+                        let error_msg = if total_chunks_received == 0 {
+                            "无法连接到 LLM API，请检查网络连接".to_string()
+                        } else if total_chunks_received < 10 {
+                            format!(
+                                "流式响应过早中断（仅接收 {} 个数据块）。\n\n可能原因：\n• 网络连接不稳定\n• API 服务器超时\n• 防火墙/代理阻止\n\n建议：检查网络后重试", 
+                                total_chunks_received
+                            )
+                        } else {
+                            format!(
+                                "网络不稳定，流式响应中断（已接收 {} 个数据块，失败 {} 次）。\n\n已接收的内容可能不完整，建议：\n• 检查网络连接\n• 稍后重试\n• 尝试使用更小的请求",
+                                total_chunks_received,
+                                total_errors
+                            )
+                        };
+                        
+                        let _ = tx.send(LlmStreamEvent::Error(error_msg));
                         return Ok(());
+                    }
+
+                    // For retryable errors, add delay before continuing
+                    if is_retryable {
+                        let delay_ms = calculate_retry_delay(consecutive_errors);
+                        tracing::info!(
+                            "[LLM STREAM] Waiting {}ms before continuing (retryable error)...",
+                            delay_ms
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
 
                     tracing::debug!("Skipping failed chunk, continuing to receive data...");

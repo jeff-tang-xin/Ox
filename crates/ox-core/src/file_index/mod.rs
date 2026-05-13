@@ -6,6 +6,20 @@ use tracing;
 pub mod registry;
 pub use registry::FileIndexRegistry;
 
+/// 默认需要排除的目录列表
+pub const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
+    "node_modules", ".git", "target", "dist", "build", 
+    "__pycache__", ".venv", "venv", "coverage", ".next", ".nuxt",
+    ".idea", ".vscode", "vendor", "bower_components", ".ox"
+];
+
+/// 检查路径是否应该被排除
+pub fn should_exclude_path(path: &str) -> bool {
+    path.split('/').any(|component| {
+        DEFAULT_EXCLUDE_DIRS.contains(&component)
+    })
+}
+
 /// 文件索引条目
 #[derive(Debug, Clone)]
 pub struct FileIndexEntry {
@@ -197,8 +211,9 @@ impl FileIndexManager {
         };
 
         // 1. Get subdirectories with file counts (using SQL aggregation)
+        // Filter out excluded directories
         let subdir_query = if normalized_dir.is_empty() {
-            // Root level: extract top-level directories
+            // Root level: extract top-level directories, excluding known directories
             "SELECT 
                 CASE 
                     WHEN instr(full_path, '/') > 0 
@@ -208,6 +223,7 @@ impl FileIndexManager {
                 COUNT(*) as count
              FROM file_index
              WHERE full_path LIKE '%/%'
+             AND dirname NOT IN ('node_modules', '.git', 'target', 'dist', 'build', '__pycache__', '.venv', 'venv', 'coverage', '.next', '.nuxt', '.idea', '.vscode', 'vendor', 'bower_components', '.ox')
              GROUP BY dirname
              HAVING dirname != ''
              ORDER BY count DESC"
@@ -224,6 +240,7 @@ impl FileIndexManager {
                  FROM file_index
                  WHERE full_path LIKE '{}%'
                  AND length(full_path) > length('{}')
+                 AND dirname NOT IN ('node_modules', '.git', 'target', 'dist', 'build', '__pycache__', '.venv', 'venv', 'coverage', '.next', '.nuxt', '.idea', '.vscode', 'vendor', 'bower_components', '.ox')
                  GROUP BY dirname
                  HAVING dirname != ''
                  ORDER BY count DESC",
@@ -250,6 +267,7 @@ impl FileIndexManager {
         }
 
         // 2. Get files directly under this directory (LIMIT to prevent overload)
+        // Filter out files from excluded directories
         let file_query = if normalized_dir.is_empty() {
             // Root level: files without '/' in path
             "SELECT id, filename, full_path, file_type 
@@ -258,12 +276,28 @@ impl FileIndexManager {
              ORDER BY filename
              LIMIT 100"
         } else {
-            // Subdirectory: files directly under this dir
+            // Subdirectory: files directly under this dir, excluding known directories
             &format!(
                 "SELECT id, filename, full_path, file_type 
                  FROM file_index 
                  WHERE full_path LIKE '{}%'
                  AND substr(full_path, {}) NOT LIKE '%/%'
+                 AND full_path NOT LIKE '%/node_modules/%'
+                 AND full_path NOT LIKE '%/.git/%'
+                 AND full_path NOT LIKE '%/target/%'
+                 AND full_path NOT LIKE '%/dist/%'
+                 AND full_path NOT LIKE '%/build/%'
+                 AND full_path NOT LIKE '%/__pycache__/%'
+                 AND full_path NOT LIKE '%/.venv/%'
+                 AND full_path NOT LIKE '%/venv/%'
+                 AND full_path NOT LIKE '%/coverage/%'
+                 AND full_path NOT LIKE '%/.next/%'
+                 AND full_path NOT LIKE '%/.nuxt/%'
+                 AND full_path NOT LIKE '%/.idea/%'
+                 AND full_path NOT LIKE '%/.vscode/%'
+                 AND full_path NOT LIKE '%/vendor/%'
+                 AND full_path NOT LIKE '%/bower_components/%'
+                 AND full_path NOT LIKE '%/.ox/%'
                  ORDER BY filename
                  LIMIT 100",
                 normalized_dir,

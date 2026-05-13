@@ -616,8 +616,9 @@ pub async fn run_agent_turn(
 
             // Skip truncated tool calls — return error so LLM can retry.
             if truncated_ids.contains(&tc.id) {
-                // Special handling for file_write with large content
+                // Special handling for different tools
                 let is_file_write = tc.name == "file_write";
+                let is_file_patch = tc.name == "file_patch";
                 let content_length = tc.arguments.len();
 
                 let error_msg = if is_file_write && content_length > 10000 {
@@ -637,6 +638,48 @@ pub async fn run_agent_turn(
                             If modifying existing file, use search/replace instead of rewriting entire file\n\n\
                          📝 Note: Files >1 MB are automatically written in 512 KB chunks",
                         content_length as f64 / 1024.0
+                    )
+                } else if is_file_patch && content_length > 500 {
+                    // Likely file_patch with long search/replace that was truncated
+                    // Try to extract partial info for better error message
+                    let partial_info = if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                        let path = args_val.get("path").and_then(|v| v.as_str()).unwrap_or("<not specified>");
+                        let has_search = args_val.get("search").is_some();
+                        let has_replace = args_val.get("replace").is_some();
+                        format!(
+                            "\n\n📋 Partial arguments received:\n\
+                             • path: {}\n\
+                             • search: {}\n\
+                             • replace: {}",
+                            path,
+                            if has_search { "✅ present (may be truncated)" } else { "❌ missing" },
+                            if has_replace { "✅ present (may be truncated)" } else { "❌ missing" }
+                        )
+                    } else {
+                        "".to_string()
+                    };
+                    
+                    format!(
+                        "❌ Arguments Truncated - file_patch parameters incomplete:\n\
+                         Your search/replace content was too long and got truncated ({:.1} KB).\n\
+                         This usually happens when including too many lines of code context.\n\n\
+                         💡 How to fix:\n\
+                         1️⃣ Use SHORTER search strings:\n\
+                            - Include only 2-3 unique lines that uniquely identify the code\n\
+                            - Use distinctive identifiers (method names, variable names)\n\
+                            - Example: {{\"search\": \"fn process_order() {{\n    let order = validate();\"}}\n\n\
+                         2️⃣ Use file_read first:\n\
+                            - Read the file to see exact line numbers\n\
+                            - Copy the EXACT text including whitespace\n\
+                            - Use line numbers to ensure you have unique context\n\n\
+                         3️⃣ Break into multiple patches:\n\
+                            - Instead of one large patch, make 2-3 smaller file_patch calls\n\
+                            - Each patch should change <50% of the file\n\
+                            - Or use file_write to rewrite the entire file\n{}\n\n\
+                         📝 Example of good search string (2-3 lines):\n\
+                         {{\"path\": \"src/main.rs\", \"search\": \"fn calculate() {{\n    let result = a + b;\", \"replace\": \"fn calculate() {{\n    let result = a * b;\"}}",
+                        content_length as f64 / 1024.0,
+                        partial_info
                     )
                 } else {
                     // General truncation error
@@ -755,6 +798,35 @@ pub async fn run_agent_turn(
                             detail: Some(detail),
                         });
                     }
+                }
+            } else if tc.name == "file_patch" {
+                // For file_patch, show file path and search context
+                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    let path = args_val
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| args_val.get("filename").and_then(|v| v.as_str()))
+                        .unwrap_or("<unknown>");
+
+                    let search_preview = args_val
+                        .get("search")
+                        .and_then(|v| v.as_str())
+                        .map(|s| {
+                            if s.len() > 60 {
+                                format!("{}...", &s[..60])
+                            } else {
+                                s.to_string()
+                            }
+                        })
+                        .unwrap_or("<missing>".to_string());
+
+                    let detail = format!("{} | search: {}", path, search_preview);
+
+                    let _ = ui_tx.send(AgentToUiEvent::ToolStart {
+                        name: tc.name.clone(),
+                        id: tc.id.clone(),
+                        detail: Some(detail),
+                    });
                 }
             }
 
@@ -1047,7 +1119,7 @@ pub async fn run_agent_turn(
                 }
             }
 
-            // Send ToolProgress event to indicate execution starting
+            // Send toolProgress event to indicate execution starting
             let progress_msg = match tc.name.as_str() {
                 "file_write" => "Starting file write...",
                 "file_read" => "Reading file...",
@@ -1062,8 +1134,29 @@ pub async fn run_agent_turn(
                 message: progress_msg.to_string(),
                 progress_percent: Some(0),
             });
-
-            let result = tool.execute(args, &tool_ctx).await;
+            
+            // Create a tool context with progress callback for real-time updates
+            let ui_tx_clone = ui_tx.clone();
+            let tool_call_id_clone = tc.id.clone();
+            let tool_name_clone = tc.name.clone();
+            let tool_ctx_with_progress = Arc::new(crate::tools::ToolContext::with_progress_callback(
+                tool_ctx.runtime.clone(),
+                tool_ctx.working_dir.clone(),
+                tool_ctx.config.clone(),
+                Arc::clone(&tool_ctx.memory),
+                Arc::clone(&tool_ctx.file_index),
+                tc.id.clone(), // Pass tool_call_id
+                move |progress: crate::tools::ToolProgress| {
+                    let _ = ui_tx_clone.send(AgentToUiEvent::ToolProgress {
+                        tool_call_id: progress.tool_call_id,
+                        tool_name: progress.tool_name,
+                        message: progress.message,
+                        progress_percent: progress.progress_percent,
+                    });
+                },
+            ));
+            
+            let result = tool.execute(args, &tool_ctx_with_progress).await;
 
             // Send completion progress event only if tool executed successfully
             if !result.is_error {
