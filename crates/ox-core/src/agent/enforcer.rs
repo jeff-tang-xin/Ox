@@ -104,32 +104,68 @@ impl RuleEnforcer {
             return Ok(());
         }
         
-        let msgs = messages;
-        let has_steps = msgs.iter().rev().take(5).any(|m| {
-            if let Message::Assistant { content, .. } = m {
-                // 使用内置正则表达式进行多语言步骤检测
-                let built_in_match = STEP_PATTERNS.iter().any(|pattern| {
-                    // 对每一行进行检查，提高准确性
+        // 🎯 核心逻辑：只检查最近一次用户消息之后是否有步骤列表
+        let last_user_idx = messages.iter().rev()
+            .position(|m| matches!(m, Message::User { .. }))
+            .map(|pos| messages.len() - 1 - pos);
+        
+        let search_start = last_user_idx.unwrap_or(0);
+        let recent_messages = &messages[search_start..];
+        
+        // 查找最近的任务列表
+        let mut task_list_found = false;
+        let mut has_pending_tasks = false;
+        
+        for msg in recent_messages.iter().rev() {
+            if let Message::Assistant { content, .. } = msg {
+                // 检查是否包含任务列表格式
+                if STEP_PATTERNS.iter().any(|pattern| {
                     content.lines().any(|line| pattern.is_match(line.trim()))
-                });
-                
-                // 检查自定义模式
-                let custom_match = custom_patterns.iter().any(|pattern_str| {
-                    Regex::new(pattern_str)
-                        .map(|pattern| {
-                            content.lines().any(|line| pattern.is_match(line.trim()))
-                        })
-                        .unwrap_or(false)
-                });
-                
-                built_in_match || custom_match
-            } else {
-                false
+                }) {
+                    task_list_found = true;
+                    
+                    // 检查是否有未完成的任务（待办事项标记）
+                    // 支持多种格式：- [ ], ☐, □, TODO, 待完成
+                    let has_unfinished = content.contains("- [ ]") || 
+                                        content.contains("☐") ||
+                                        content.contains("□") ||
+                                        content.to_lowercase().contains("todo") ||
+                                        content.contains("待完成") ||
+                                        content.contains("未完成");
+                    
+                    if has_unfinished {
+                        has_pending_tasks = true;
+                    }
+                    
+                    break; // 找到最近的任务列表即可
+                }
             }
-        });
+        }
+        
+        // 如果内置模式没找到，尝试自定义模式
+        if !task_list_found && !custom_patterns.is_empty() {
+            task_list_found = recent_messages.iter().any(|m| {
+                if let Message::Assistant { content, .. } = m {
+                    custom_patterns.iter().any(|pattern_str| {
+                        Regex::new(pattern_str)
+                            .map(|pattern| content.lines().any(|line| pattern.is_match(line.trim())))
+                            .unwrap_or(false)
+                    })
+                } else {
+                    false
+                }
+            });
+            
+            if task_list_found {
+                has_pending_tasks = true; // 自定义模式默认认为有待办任务
+            }
+        }
 
-        if !has_steps {
-            Err("🛑 RULE VIOLATION (engineering-practices): Complex shell operations require a step-by-step list. Please provide steps like:\n- Step 1: Run git status\n- Step 2: Add changes\n- Step 3: Commit changes\n或者用中文：\n- 第一步：运行 git status\n- 第二步：添加更改\n- 第三步：提交更改".to_string())
+        if !task_list_found {
+            Err("🛑 RULE VIOLATION (engineering-practices): Before executing shell commands, you MUST provide a traceable task list.\n\nExample format:\n```\nTask List:\n- [ ] Step 1: Run git status to check current state\n- [ ] Step 2: Add changed files with git add .\n- [ ] Step 3: Commit changes with git commit\n```\n\nAfter each command execution, update the task list:\n- Mark completed items with ✓ or - [x]\n- Keep the full task list visible for tracking\n\n中文示例：\n```\n任务列表：\n- [ ] 第一步：运行 git status 查看状态\n- [ ] 第二步：使用 git add . 添加文件\n- [ ] 第三步：使用 git commit 提交更改\n```\n执行完每个命令后，更新任务列表标记已完成的项目：✓ 或 - [x]".to_string())
+        } else if !has_pending_tasks {
+            // 有任务列表但所有任务都已完成，提示创建新任务列表
+            Err("⚠️ NOTICE: All tasks in your task list appear to be completed. For a new shell command, please create a new task list with pending items.".to_string())
         } else {
             Ok(())
         }
