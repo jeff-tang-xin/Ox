@@ -1,0 +1,46 @@
+use serde::{Deserialize, Serialize};
+
+/// 强制执行的规则配置 (Enforcement Rules)
+/// 
+/// 这些规则由系统代码直接校验，违反时将直接拦截工具调用并反馈给 LLM。
+/// 它们是从系统级 Skills 中提取的“硬约束”。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnforcementRules {
+    /// 是否启用全局强制校验
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// 规则 1: 编辑前必须有计划 (Extracted from coding-principles)
+    /// 检查 LLM 在调用 file_write/file_patch 前是否在对话中提出了计划。
+    #[serde(default = "default_true")]
+    pub plan_before_edit: bool,
+
+    /// 规则 2: 复杂任务前必须有步骤列表 (Extracted from engineering-practices)
+    /// 检查 LLM 在调用 shell_exec 前是否列出了 Steps。
+    #[serde(default = "default_true")]
+    pub steps_before_shell: bool,
+    
+    /// 自定义计划检测模式（可选）
+    /// 用户可以添加额外的正则表达式模式来检测计划意图
+    #[serde(default)]
+    pub custom_plan_patterns: Vec<String>,
+    
+    /// 自定义步骤检测模式（可选）
+    /// 用户可以添加额外的正则表达式模式来检测步骤列表
+    #[serde(default)]
+    pub custom_step_patterns: Vec<String>,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for EnforcementRules {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            plan_before_edit: true,
+            steps_before_shell: true,
+            custom_plan_patterns: vec![],
+            custom_step_patterns: vec![],
+        }
+    }
+}

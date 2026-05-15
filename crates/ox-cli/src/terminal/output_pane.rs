@@ -108,26 +108,16 @@ impl OutputPane {
     }
 
     pub fn push_system(&mut self, msg: &str) {
-        let msg = if msg.len() > Self::MAX_LINE_LEN {
-            let end = Self::safe_char_boundary(msg, Self::MAX_LINE_LEN);
-            format!("{}…[truncated]", &msg[..end])
-        } else {
-            msg.to_string()
-        };
-        self.lines.push(OutputLine::System(msg));
+        // 🚨 FIX: Do NOT truncate system messages
+        self.lines.push(OutputLine::System(msg.to_string()));
         self.rendered_cache.push(None);
         self.cache_valid = false;
         self.trim_excess();
     }
 
     pub fn push_error(&mut self, msg: &str) {
-        let msg = if msg.len() > Self::MAX_LINE_LEN {
-            let end = Self::safe_char_boundary(msg, Self::MAX_LINE_LEN);
-            format!("{}…[truncated]", &msg[..end])
-        } else {
-            msg.to_string()
-        };
-        self.lines.push(OutputLine::Error(msg));
+        // 🚨 FIX: Do NOT truncate error messages
+        self.lines.push(OutputLine::Error(msg.to_string()));
         self.rendered_cache.push(None);
         self.cache_valid = false;
         self.trim_excess();
@@ -151,11 +141,7 @@ impl OutputPane {
         match self.lines.last_mut() {
             Some(OutputLine::StreamingPartial(s)) => {
                 s.push_str(chunk);
-                if s.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(s, Self::MAX_LINE_LEN);
-                    s.truncate(end);
-                    s.push_str("…[truncated]");
-                }
+                // 🚨 FIX: Do NOT truncate streaming content
                 if let Some(c) = self.rendered_cache.last_mut() {
                     *c = None;
                 }
@@ -259,97 +245,10 @@ impl OutputPane {
     }
 
     fn truncate_line(&self, line: OutputLine) -> OutputLine {
-        match line {
-            OutputLine::User(s) => {
-                if s.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
-                    OutputLine::User(format!("{}…[truncated]", &s[..end]))
-                } else {
-                    OutputLine::User(s)
-                }
-            }
-            OutputLine::Assistant(s) => {
-                if s.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
-                    OutputLine::Assistant(format!("{}…[truncated]", &s[..end]))
-                } else {
-                    OutputLine::Assistant(s)
-                }
-            }
-            OutputLine::Tool { name, detail } => OutputLine::Tool { name, detail },
-            OutputLine::ToolResult {
-                name,
-                summary,
-                is_error,
-            } => {
-                if summary.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(&summary, Self::MAX_LINE_LEN);
-                    OutputLine::ToolResult {
-                        name,
-                        summary: format!("{}…[truncated]", &summary[..end]),
-                        is_error,
-                    }
-                } else {
-                    OutputLine::ToolResult {
-                        name,
-                        summary,
-                        is_error,
-                    }
-                }
-            }
-            OutputLine::System(s) => {
-                if s.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
-                    OutputLine::System(format!("{}…[truncated]", &s[..end]))
-                } else {
-                    OutputLine::System(s)
-                }
-            }
-            OutputLine::Error(s) => {
-                if s.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
-                    OutputLine::Error(format!("{}…[truncated]", &s[..end]))
-                } else {
-                    OutputLine::Error(s)
-                }
-            }
-            OutputLine::StreamingPartial(s) => {
-                if s.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
-                    OutputLine::StreamingPartial(format!("{}…[truncated]", &s[..end]))
-                } else {
-                    OutputLine::StreamingPartial(s)
-                }
-            }
-            OutputLine::Markdown(s) => {
-                if s.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(&s, Self::MAX_LINE_LEN);
-                    OutputLine::Markdown(format!("{}…[truncated]", &s[..end]))
-                } else {
-                    OutputLine::Markdown(s)
-                }
-            }
-            OutputLine::ToolLog {
-                tool_call_id,
-                message,
-                timestamp,
-            } => {
-                if message.len() > Self::MAX_LINE_LEN {
-                    let end = Self::safe_char_boundary(&message, Self::MAX_LINE_LEN);
-                    OutputLine::ToolLog {
-                        tool_call_id,
-                        message: format!("{}…[truncated]", &message[..end]),
-                        timestamp,
-                    }
-                } else {
-                    OutputLine::ToolLog {
-                        tool_call_id,
-                        message,
-                        timestamp,
-                    }
-                }
-            }
-        }
+        // 🚨 FIX: Do NOT truncate any content in UI.
+        // Users need to see full output. Ratatui will handle wrapping and scrolling.
+        // The only limit is MAX_LINES (2000 lines) to prevent memory issues.
+        line
     }
 
     fn safe_char_boundary(s: &str, max_byte: usize) -> usize {

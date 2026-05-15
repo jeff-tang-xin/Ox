@@ -125,8 +125,10 @@ pub fn handle_memory(
         app.output.push_system("Recent memories:");
         for node in &nodes {
             let scope = if node.project_id.is_some() { "project" } else { "global" };
-            let content = if node.content.len() > 100 {
-                format!("{}...", &node.content[..100])
+            // 🚨 FIX: Use char-based truncation to avoid UTF-8 boundary errors
+            let content = if node.content.chars().count() > 100 {
+                let truncated: String = node.content.chars().take(100).collect();
+                format!("{}...", truncated)
             } else {
                 node.content.clone()
             };

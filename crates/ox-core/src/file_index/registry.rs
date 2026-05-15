@@ -27,8 +27,8 @@ impl FileIndexRegistry {
 
     /// 获取或创建指定目录的文件索引管理器
     pub fn get_or_create(&mut self, dir: &Path) -> anyhow::Result<Arc<FileIndexManager>> {
-        // 规范化路径（解析符号链接等）
-        let canonical = dir.canonicalize().unwrap_or(dir.to_path_buf());
+        // 规范化路径（使用 dunce 处理 Windows UNC 路径）
+        let canonical = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
 
         // 如果已有索引，直接返回
         if let Some(manager) = self.indices.get(&canonical) {

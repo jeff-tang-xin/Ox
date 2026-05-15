@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub mod rules;
 use serde::{Deserialize, Serialize};
 
 // ──────────────────────────── Top-level ────────────────────────────
@@ -22,6 +23,7 @@ pub struct OxConfig {
     pub council: CouncilConfig,
     pub memory: MemoryConfig,
     pub behavior_rules: BehaviorRulesConfig,
+    pub enforcement_rules: rules::EnforcementRules,
     pub safety: SafetyConfig,
     pub cost: CostConfig,
     pub spec: SpecConfig,
@@ -215,6 +217,11 @@ enabled = false              # Enable embedding-based compression
 # memory_ratio = 0.02          # Memory budget ratio (2% of context window)
 # system_prompt_ratio = 0.02   # System prompt budget ratio (2%)
 
+# Refined context format: "User: ... Assistant: ... [tools]"
+# Reduces context length by removing <think> tags and intermediate reasoning
+# Recommended for reducing hallucinations and improving instruction following
+use_refined_context = true  # Enable refined context format (default: true)
+
 # ── Tool Execution Settings ──────────────────────────────
 [tools]
 # auto_confirm_safe = true     # Auto-confirm safe tool executions
@@ -251,6 +258,11 @@ enabled = false              # Enable embedding-based compression
 # share_request = true         # Share memories across requests
 # export_format = "json"       # Export format: "json" or "csv"
 # janitor_run_on_startup_prob = 0.2  # Probability of cleanup on startup (0.0-1.0)
+
+# Refined memory storage: Store condensed summaries instead of raw conversations
+# Automatically extracts key insights, tools used, and code changes from each turn
+# Significantly reduces memory bloat and improves retrieval quality
+store_refined_memories = true  # Enable refined memory storage (default: true)
 
 # Project-specific memory decay
 [memory.project_decay]
@@ -313,6 +325,15 @@ enabled = false              # Enable embedding-based compression
 #     "Document public APIs with /// doc comments",
 #     "Run cargo fmt and cargo clippy before committing"
 # ]
+
+# ── Enforcement Rules (Hard Constraints) ─────────────────
+# These rules are enforced by code. If violated, tool calls are blocked immediately.
+# Extracted from system-level Skills (coding-principles, engineering-practices).
+
+[enforcement_rules]
+# enabled = true               # Enable global enforcement
+# plan_before_edit = true      # Require LLM to propose a plan before file_write/file_patch
+# steps_before_shell = true    # Require LLM to list steps before shell_exec
 
 # ── Safety Settings ──────────────────────────────────────
 [safety]
@@ -431,6 +452,9 @@ pub struct ContextConfig {
     /// Token budget ratio for system prompt.
     /// Default: 0.02 (2% of context window).
     pub system_prompt_ratio: f32,
+    /// Use refined context format (User: ... Assistant: ... [tools])
+    /// Removes <think> tags and intermediate steps
+    pub use_refined_context: bool,
 }
 
 impl Default for ContextConfig {
@@ -443,6 +467,7 @@ impl Default for ContextConfig {
             history_ratio: 0.10,
             memory_ratio: 0.02,
             system_prompt_ratio: 0.02,
+            use_refined_context: true, // 🆕 Default: ENABLED to reduce hallucinations and improve instruction following
         }
     }
 }
@@ -521,7 +546,7 @@ impl Default for EmbeddingConfig {
             stop_threshold: 0.5,
             max_segments: 5,
             min_segment_len: 2,
-            keep_recent: 4,
+            keep_recent: 8,  // 🚨 Increased from 4 to 8 to reduce hallucination after compression
             chunk_threshold_tokens: 256,
             max_chunk_tokens: 512,
         }
@@ -648,6 +673,8 @@ pub struct MemoryConfig {
     // 🆕 LLM Judge re-ranking configuration
     pub enable_llm_judge: bool,
     pub llm_judge_threshold: u8,
+    /// Store refined summaries instead of raw conversations
+    pub store_refined_memories: bool,
 }
 
 impl Default for MemoryConfig {
@@ -686,6 +713,7 @@ impl Default for MemoryConfig {
             // 🆕 LLM Judge defaults (enabled by default)
             enable_llm_judge: true,  // Default: ENABLED
             llm_judge_threshold: 7,   // Only keep memories with score >= 7
+            store_refined_memories: true, // Default: ENABLED for better memory quality
         }
     }
 }

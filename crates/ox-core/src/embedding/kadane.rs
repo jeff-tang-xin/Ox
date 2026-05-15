@@ -37,7 +37,7 @@ impl Default for KadaneConfig {
             stop_threshold: 0.1, // Z-scores are typically small,
             max_segments: 5,
             min_segment_len: 2,
-            keep_recent: 4,
+            keep_recent: 8,  // 🚨 Increased from 4 to 8 to reduce hallucination after compression
             chunk_threshold_tokens: 256,
             max_chunk_tokens: 512,
         }

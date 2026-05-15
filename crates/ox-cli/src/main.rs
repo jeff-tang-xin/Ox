@@ -5,6 +5,9 @@ pub mod middleware;
 pub mod helpers;
 pub mod keyword_extraction;  // 🆕 Keyword extraction from LLM responses
 
+use ox_core::tools::intent_classifier;
+use ox_core::context::refinement;
+
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,13 +96,20 @@ fn init_logging() -> anyhow::Result<()> {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ox=info"));
+        // Forcefully set filter to capture all INFO logs from ox_core and ox_cli
+        let filter = tracing_subscriber::EnvFilter::new("ox_core=info,ox_cli=info,tracing=info");
+        
         let file_layer = tracing_subscriber::fmt::layer()
             .with_writer(std::sync::Mutex::new(log_file))
             .with_ansi(false)
             .with_filter(filter);
-        tracing_subscriber::registry().with(file_layer).init();
+            
+        tracing_subscriber::registry()
+            .with(file_layer)
+            .init();
+        
+        // Verify logging is working
+        tracing::info!("✅ Logging initialized successfully. Writing to: {:?}", log_file_path);
     } else {
         use tracing_subscriber::filter::LevelFilter;
         tracing_subscriber::fmt()
@@ -204,17 +214,10 @@ async fn run_app(
     } else {
         Session::new(&session_dir, &rt_env.project_id)?
     };
-    // Truncate old ToolResult content loaded from disk (JSONL retains full content).
-    // All loaded messages are from previous turns — use aggressive threshold.
-    for msg in session.messages.iter_mut() {
-        if let Message::ToolResult { content, .. } = msg {
-            let char_len = content.chars().count();
-            if char_len > 500 {
-                let preview: String = content.chars().take(200).collect();
-                *content = format!("{}...[truncated, {} chars total]", preview, char_len);
-            }
-        }
-    }
+    // 🚨 FIX: Do NOT truncate ToolResult content when loading from disk.
+    // Truncation should only happen when building context for LLM, not in storage.
+    // Users need to see full tool output in the UI.
+    // The old truncation logic permanently destroyed data in session.jsonl.
     // Initialize compression debounce baseline so loaded sessions
     // don't immediately trigger compression on the first new message.
     app.last_compression_msg_count = session.messages.len();
@@ -1059,20 +1062,13 @@ async fn run_app(
                                 }
                                 boundary
                             };
-                            for (i, msg) in target_session.messages[..prev_count].iter_mut().enumerate() {
-                                if let Message::ToolResult { content, .. } = msg {
-                                    let char_len = content.chars().count();
-                                    let (max_len, preview_len) = if i < recent_boundary {
-                                        (500, 200)
-                                    } else {
-                                        (2000, 800)
-                                    };
-                                    if char_len > max_len {
-                                        let preview: String = content.chars().take(preview_len).collect();
-                                        *content = format!("{}...[truncated, {} chars total]", preview, char_len);
-                                    }
-                                }
-                            }
+                            
+                            // 🚨 FIX: Do NOT permanently truncate ToolResult content.
+                            // Truncation should only happen in context building for LLM API calls.
+                            // Users need to see full tool output in the UI for debugging and verification.
+                            // The session.jsonl file should preserve complete data.
+                            
+                            // Save new messages to session
                             for msg in &new_messages {
                                 if let Err(e) = target_session.append_message(msg.clone()) {
                                     tracing::error!("Failed to persist message: {e}");
@@ -1105,6 +1101,59 @@ async fn run_app(
                                         // Record keywords (synchronous, fast operation)
                                         memory_arc.record_llm_keywords(last_user_query, extracted);
                                     }
+                                    
+                                    // 🆕 Extract intent classification from LLM response
+                                    if let Some(intent_info) = intent_classifier::extract_intent_from_llm_response(content) {
+                                        tracing::info!(
+                                            "[INTENT] Detected: {:?} (confidence: {:.2}), tools: {:?}",
+                                            intent_info.intent,
+                                            intent_info.confidence,
+                                            intent_info.suggested_tools
+                                        );
+                                        
+                                        // Use intent info for memory search decision
+                                        if intent_info.should_search_memory {
+                                            if let Some(ref query) = intent_info.memory_query {
+                                                tracing::info!(
+                                                    "[MEMORY SEARCH] Triggered by intent: query='{}', scope={:?}",
+                                                    query,
+                                                    intent_info.memory_scope
+                                                );
+                                                // Note: Memory search is already handled by the system prompt instruction
+                                                // This log confirms the intent was detected
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // 🆕 Store refined memory summaries if enabled
+                            if config.memory.store_refined_memories && !new_messages.is_empty() {
+                                if let Some(summary) = refinement::generate_memory_summary(&new_messages) {
+                                    tracing::info!(
+                                        "[MEMORY REFINEMENT] Generated summary: {} chars, {} tools",
+                                        summary.key_insights.len(),
+                                        summary.tools_used.len()
+                                    );
+                                    
+                                    // Create a memory node from the refined summary
+                                    let mem_content = format!(
+                                        "Topic: {}\n\nKey Insights:\n{}\n\nTools Used: {}",
+                                        summary.topic,
+                                        summary.key_insights,
+                                        summary.tools_used.join(", ")
+                                    );
+                                    
+                                    let mem_node = ox_core::memory::MemoryNode::new(
+                                        mem_content,
+                                        ox_core::memory::MemoryNodeType::BestPractice,
+                                        Some(rt_env.project_id.clone()),
+                                        rt_env.project_language.clone(),
+                                        ox_core::memory::MemorySource::RefinedSummary,
+                                    );
+                                    
+                                    // Store the refined memory
+                                    memory_arc.store(mem_node);
                                 }
                             }
                             
@@ -1188,15 +1237,32 @@ async fn run_app(
                                         let query = msgs.last()
                                             .and_then(|m| match m { Message::User { content } => Some(content.clone()), _ => None })
                                             .unwrap_or_default();
-                                        // Use enhanced compression with memory context
-                                        let compressed_result = if !memory_ctx.is_empty() {
-                                            cm_clone.compress_with_memory(&msgs, &query, Some(&memory_ctx))
-                                        } else {
-                                            cm_clone.compress(&msgs, &query)
+                                        
+                                        // Capture source_count before moving msgs into closure
+                                        let source_count = msgs.len();
+                                        
+                                        // 🚨 CRITICAL FIX: Move CPU-intensive embedding computation to blocking thread pool
+                                        // This prevents blocking the async runtime and allows other tasks (like file_patch) to run
+                                        let memory_ctx_clone = memory_ctx.clone();
+                                        let compressed_result = tokio::task::spawn_blocking(move || {
+                                            // Use enhanced compression with memory context
+                                            if !memory_ctx_clone.is_empty() {
+                                                cm_clone.compress_with_memory(&msgs, &query, Some(&memory_ctx_clone))
+                                            } else {
+                                                cm_clone.compress(&msgs, &query)
+                                            }
+                                        }).await;
+
+                                        // Handle spawn_blocking result
+                                        let compressed_result = match compressed_result {
+                                            Ok(result) => result,
+                                            Err(e) => {
+                                                tracing::error!("[ASYNC COMPRESS] Task panicked: {}", e);
+                                                return;
+                                            }
                                         };
 
                                         if let Ok(Some(compressed)) = compressed_result {
-                                            let source_count = msgs.len();
                                             let compressed_len = compressed.len();
                                             let _ = store.save(&session_id, &compressed, source_count);
                                             let _ = tx_comp.send(AgentToUiEvent::CompressionComplete {
@@ -1260,7 +1326,14 @@ async fn run_app(
                                         } else {
                                             session.messages.clone()
                                         };
-                                        let turn_messages = context_builder.build(&system_prompt, &memory_ctx, &effective_messages, context_window);
+                                        let turn_messages = helpers::build_context_with_option(
+                                            &context_builder,
+                                            &system_prompt,
+                                            &memory_ctx,
+                                            &effective_messages,
+                                            context_window,
+                                            config.context.use_refined_context,
+                                        );
                                         app.agent_running = true;
                                         app.status = "Thinking...".to_string();
                                         let provider = Arc::clone(provider.as_ref().unwrap());
@@ -1648,11 +1721,13 @@ fn handle_key_event(
                                                 session.messages.clone()
                                             };
 
-                                        let turn_messages = context_builder.build(
+                                        let turn_messages = helpers::build_context_with_option(
+                                            &context_builder,
                                             &current_system_prompt,
                                             &memory_ctx,
                                             &effective_messages,
                                             context_window,
+                                            config.context.use_refined_context,
                                         );
 
                                         app.agent_running = true;
@@ -1781,11 +1856,13 @@ fn handle_key_event(
                                         session.messages.clone()
                                     };
 
-                                let turn_messages = context_builder.build(
+                                let turn_messages = helpers::build_context_with_option(
+                                    &context_builder,
                                     &current_system_prompt,
                                     &memory_ctx,
                                     &effective_messages,
                                     context_window,
+                                    config.context.use_refined_context,
                                 );
 
                                 app.agent_running = true;
@@ -1933,11 +2010,13 @@ fn handle_key_event(
                                         session.messages.clone()
                                     };
 
-                                let turn_messages = context_builder.build(
+                                let turn_messages = helpers::build_context_with_option(
+                                    &context_builder,
                                     &current_system_prompt,
                                     &memory_ctx,
                                     &effective_messages,
                                     context_window,
+                                    config.context.use_refined_context,
                                 );
 
                                 app.agent_running = true;
@@ -2212,11 +2291,13 @@ fn handle_key_event(
                                 session.messages.clone()
                             };
 
-                            let turn_messages = context_builder.build(
+                            let turn_messages = helpers::build_context_with_option(
+                                &context_builder,
                                 &current_system_prompt, // Use dynamically built prompt
                                 &memory_ctx,
                                 &effective_messages,
                                 context_window,
+                                config.context.use_refined_context,
                             );
                             app.agent_running = true;
                             app.status = "Thinking...".to_string();

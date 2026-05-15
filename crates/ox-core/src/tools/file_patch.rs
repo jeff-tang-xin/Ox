@@ -214,6 +214,7 @@ impl Tool for FilePatchTool {
         }
 
         // Report progress before blocking I/O
+        tracing::info!("[FILE_PATCH] Starting patch operation for: {:?}", display_path);
         ctx.report_progress("Reading file...".to_string(), Some(10));
         
         // Run blocking file I/O on a dedicated thread to avoid blocking the Tokio runtime.
@@ -228,11 +229,20 @@ impl Tool for FilePatchTool {
         let end_line = args.get("end_line").and_then(|v| v.as_i64());
         let new_content = args.get("new_content").and_then(|v| v.as_str()).map(|s| s.to_string());
         
+        tracing::info!("[FILE_PATCH] Spawning blocking task for: {:?}", display_path_clone);
         let result = tokio::task::spawn_blocking(move || {
+            tracing::info!("[FILE_PATCH] Blocking task started, reading file: {:?}", path_clone);
+            
             // Phase 1: Read file
             let content = match std::fs::read_to_string(&path_clone) {
-                Ok(c) => c,
-                Err(e) => return Err(format!("Failed to read {}: {e}", path_clone.display())),
+                Ok(c) => {
+                    tracing::info!("[FILE_PATCH] File read successfully, size: {} bytes", c.len());
+                    c
+                }
+                Err(e) => {
+                    tracing::error!("[FILE_PATCH] Failed to read file: {:?}, error: {}", path_clone, e);
+                    return Err(format!("Failed to read {}: {e}", path_clone.display()));
+                }
             };
 
             // Phase 2: Apply patch based on mode
@@ -381,8 +391,10 @@ impl Tool for FilePatchTool {
             };
 
             // Phase 3: Write file
+            tracing::info!("[FILE_PATCH] Writing file: {:?}, size: {} bytes", path_clone, new_file_content.len());
             match std::fs::write(&path_clone, &new_file_content) {
                 Ok(()) => {
+                    tracing::info!("[FILE_PATCH] File written successfully: {:?}", path_clone);
                     // Update file index immediately for real-time availability
                     if let Ok(relative_path) = path_clone.strip_prefix(&working_dir) {
                         let rel_str = relative_path.to_string_lossy();

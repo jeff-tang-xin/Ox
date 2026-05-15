@@ -3,11 +3,13 @@ mod effort;
 pub mod skill_prompts;
 mod spec;
 mod system_prompt;
+pub mod refinement;
 
 pub use effort::{EffortLevel, estimate_effort};
 pub use skill_prompts::SKILL_CREATION_PROMPT;
 pub use spec::{TASK_TYPE_PROMPT, load_spec, save_spec, spec_exists};
 pub use system_prompt::build_system_prompt;
+pub use refinement::{RefinedTurn, refine_conversation, build_refined_context, refine_assistant_response, generate_memory_summary, MemorySummary};
 
 use crate::llm::tokenizer::estimate_tokens;
 use crate::message::Message;
@@ -258,6 +260,64 @@ impl ContextBuilder {
         // Sanitize: remove orphaned ToolResults and strip orphaned tool_calls
         // caused by budget truncation breaking tool interaction sequences.
         sanitize_tool_pairs(&mut result);
+        
+        // 🚨 NEW: Filter out noisy intermediate messages to reduce context bloat
+        filter_noisy_messages(&mut result);
+
+        result
+    }
+
+    /// Assemble the final message list using refined context format.
+    ///
+    /// This creates a more compact representation: "User message: Model response (refined) [tools used]"
+    pub fn build_refined(
+        &self,
+        system_prompt: &str,
+        memory_context: &str,
+        history: &[Message],
+        context_window: u32,
+        max_turns: usize,
+    ) -> Vec<Message> {
+        let budgets = self.budgets(context_window);
+
+        let mut result = Vec::new();
+
+        // 1. System prompt + Memory context (merged into ONE system message for MiniMax compatibility).
+        let has_leading_system = matches!(history.first(), Some(Message::System { .. }));
+        
+        let combined_system = if !memory_context.is_empty() {
+            format!(
+                "{}\n\n{}",
+                system_prompt.trim_end_matches('\n'),
+                memory_context.trim_start_matches('\n')
+            )
+        } else {
+            system_prompt.to_string()
+        };
+        
+        // If history already has a system message, merge it with our system prompt
+        if has_leading_system {
+            if let Some(Message::System { content }) = history.first() {
+                // Merge: existing system message + our system prompt
+                let merged = format!("{}\n\n{}", content, combined_system);
+                result.push(Message::system(&merged));
+            } else {
+                result.push(Message::system(&combined_system));
+            }
+        } else {
+            result.push(Message::system(&combined_system));
+        }
+
+        // 2. Build refined context from recent turns
+        let refined_context = build_refined_context(history, max_turns);
+        
+        // Add the refined context as a single user message
+        if !refined_context.is_empty() {
+            result.push(Message::user(format!(
+                "Previous conversation summary:\n\n{}",
+                refined_context
+            )));
+        }
 
         result
     }
@@ -641,5 +701,109 @@ mod tests {
         } else {
             panic!("Expected Assistant message");
         }
+    }
+}
+
+/// 🚨 NEW: Filter out noisy intermediate messages that add little value.
+/// 
+/// This function removes or consolidates messages that:
+/// 1. Contain repeated "Infinite Loop Detected" errors (keep only the last one)
+/// 2. Have multiple consecutive failed tool calls with similar errors
+/// 3. Contain verbose error messages that can be summarized
+/// 
+/// Goal: Reduce context bloat while preserving essential information.
+pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
+    if messages.len() < 5 {
+        return; // Only apply to longer conversations
+    }
+    
+    let original_count = messages.len();
+    let mut filtered = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    
+    while i < messages.len() {
+        let current_msg = &messages[i];
+        
+        // Check if this is a ToolResult with "Infinite Loop Detected"
+        if let Message::ToolResult { content, .. } = current_msg {
+            if content.contains("Infinite Loop Detected") {
+                // Look ahead to see if there are more infinite loop errors
+                let mut consecutive_errors = 1;
+                let mut j = i + 1;
+                
+                while j < messages.len() {
+                    if let Message::ToolResult { content: next_content, .. } = &messages[j] {
+                        if next_content.contains("Infinite Loop Detected") {
+                            consecutive_errors += 1;
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                
+                if consecutive_errors > 1 {
+                    // Keep only the LAST infinite loop error (most relevant)
+                    tracing::info!(
+                        "[NOISE_FILTER] Consolidated {} consecutive 'Infinite Loop' errors into 1",
+                        consecutive_errors
+                    );
+                    filtered.push(messages[j - 1].clone());
+                    i = j;
+                    continue;
+                }
+            }
+            
+            // Check for repeated "File Not Found" errors
+            if content.contains("File Not Found") || content.contains("No file with ID") {
+                // Look ahead for similar errors
+                let mut consecutive_not_found = 1;
+                let mut j = i + 1;
+                
+                while j < messages.len() {
+                    if let Message::ToolResult { content: next_content, .. } = &messages[j] {
+                        if next_content.contains("File Not Found") || next_content.contains("No file with ID") {
+                            consecutive_not_found += 1;
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                
+                if consecutive_not_found > 2 {
+                    // Keep only the first and last "File Not Found" errors
+                    tracing::info!(
+                        "[NOISE_FILTER] Consolidated {} 'File Not Found' errors (kept first and last)",
+                        consecutive_not_found
+                    );
+                    filtered.push(messages[i].clone()); // Keep first
+                    if consecutive_not_found > 1 {
+                        filtered.push(messages[j - 1].clone()); // Keep last
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        
+        // Keep this message as-is
+        filtered.push(current_msg.clone());
+        i += 1;
+    }
+    
+    let removed_count = original_count - filtered.len();
+    if removed_count > 0 {
+        tracing::info!(
+            "[NOISE_FILTER] Removed {} noisy messages ({} → {})",
+            removed_count,
+            original_count,
+            filtered.len()
+        );
+        *messages = filtered;
     }
 }

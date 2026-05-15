@@ -207,6 +207,7 @@ fn format_source(source: &crate::memory::MemorySource) -> String {
         crate::memory::MemorySource::UserExplicit => "👤 User explicitly stated",
         crate::memory::MemorySource::CouncilConclusion => "⚖️ Council conclusion",
         crate::memory::MemorySource::Feedback => "💬 From user feedback",
+        crate::memory::MemorySource::RefinedSummary => "✨ Refined conversation summary",
     }
     .to_string()
 }

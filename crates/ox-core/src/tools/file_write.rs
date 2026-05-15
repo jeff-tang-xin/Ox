@@ -1,7 +1,9 @@
+use encoding_rs::Encoding;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput, content_validation};
@@ -44,6 +46,11 @@ impl Tool for FileWriteTool {
                 "content": {
                     "type": "string",
                     "description": "✅ REQUIRED: The content to write to the file. Large files (>1 MB) will be automatically written in chunks."
+                },
+                "encoding": {
+                    "type": "string",
+                    "description": "File encoding for writing. Options: 'utf-8' (default), 'gbk', 'gb18030', 'utf-16le', 'utf-16be', 'latin1'. Default is UTF-8.",
+                    "enum": ["utf-8", "gbk", "gb18030", "utf-16le", "utf-16be", "latin1"]
                 }
             },
             "required": ["content"],
@@ -55,7 +62,8 @@ impl Tool for FileWriteTool {
             "examples": [
                 {"path": "src/new_file.rs", "content": "// New file with full path"},
                 {"path": "docs/tutorial.md", "content": "# Tutorial"},
-                {"filename": "existing.rs", "content": "// Modifying existing file"}
+                {"filename": "existing.rs", "content": "// Modifying existing file"},
+                {"path": "legacy.txt", "content": "中文内容", "encoding": "gbk"}
             ]
         })
     }
@@ -245,7 +253,32 @@ impl Tool for FileWriteTool {
             }
         };
 
-        let content_bytes = content.as_bytes();
+        // Get encoding parameter and convert content to bytes
+        let encoding = args
+            .get("encoding")
+            .and_then(|e| e.as_str())
+            .map(|e| match e.to_lowercase().as_str() {
+                "gbk" | "gb2312" => encoding_rs::GBK,
+                "gb18030" => encoding_rs::GB18030,
+                "utf-16le" => encoding_rs::UTF_16LE,
+                "utf-16be" => encoding_rs::UTF_16BE,
+                "latin1" | "iso-8859-1" => encoding_rs::WINDOWS_1252,
+                _ => encoding_rs::UTF_8,
+            });
+        
+        let content_bytes = match encoding {
+            Some(enc) => {
+                let (bytes, _encoding_used, had_errors) = enc.encode(content);
+                if had_errors {
+                    tracing::warn!(
+                        "Some characters could not be encoded in {:?}, they will be replaced",
+                        enc.name()
+                    );
+                }
+                bytes.into_owned()
+            }
+            None => content.as_bytes().to_vec(),
+        };
 
         // Auto-detect large files and use chunked writing (>1 MB)
         const AUTO_CHUNK_THRESHOLD: usize = 1 * 1024 * 1024; // 1 MB
@@ -280,18 +313,57 @@ impl Tool for FileWriteTool {
             ));
         }
 
+        // Report progress before blocking I/O
+        tracing::info!("[FILE_WRITE] Starting write operation for: {:?}", display_path);
+        ctx.report_progress("Starting file write...".to_string(), Some(10));
+
         // Write file with automatic strategy selection
         let temp_path = create_temp_path(&path);
-
-        let result = if is_large_file {
-            // Automatic chunked write for large files (>1 MB)
-            chunked_write_with_retry(&temp_path, &path, content_bytes, CHUNK_SIZE, 3, ctx).await
-        } else {
-            // Standard atomic write for normal files
-            atomic_write_with_retry(&temp_path, &path, content_bytes, 3).await
+        
+        // Run blocking file I/O on a dedicated thread to avoid blocking the Tokio runtime.
+        let path_clone = path.clone();
+        let display_path_clone = display_path.clone();
+        let content_bytes_clone = content_bytes.to_vec();
+        let working_dir = ctx.working_dir.clone();
+        let file_index = Arc::clone(&ctx.file_index);
+        let is_large_file_clone = is_large_file;
+        let chunk_size = CHUNK_SIZE;
+        let temp_path_clone = temp_path.clone(); // Clone for spawn_blocking
+        
+        tracing::info!("[FILE_WRITE] Spawning blocking task for: {:?}", display_path_clone);
+        let result = tokio::task::spawn_blocking(move || {
+            tracing::info!("[FILE_WRITE] Blocking task started, writing file: {:?}", path_clone);
+            
+            // Execute the write operation (blocking I/O)
+            let write_result = if is_large_file_clone {
+                // For large files, use chunked write
+                chunked_write_sync(&temp_path_clone, &path_clone, &content_bytes_clone, chunk_size)
+            } else {
+                // For normal files, use atomic write
+                atomic_write_sync(&temp_path_clone, &path_clone, &content_bytes_clone)
+            };
+            
+            // Update file index if successful
+            if write_result.is_ok() {
+                if let Ok(relative_path) = path_clone.strip_prefix(&working_dir) {
+                    let rel_str = relative_path.to_string_lossy();
+                    if let Err(e) = file_index.add_file(&rel_str) {
+                        tracing::warn!("Failed to update file index: {}", e);
+                    }
+                }
+            }
+            
+            write_result
+        }).await;
+        
+        // Handle spawn_blocking result
+        let final_result = match result {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(format!("Write task failed: {e}")),
         };
 
-        match result {
+        match final_result {
             Ok(bytes_written) => {
                 // Update file index immediately for real-time availability
                 if let Ok(relative_path) = path.strip_prefix(&ctx.working_dir) {
@@ -310,14 +382,20 @@ impl Tool for FileWriteTool {
                 } else {
                     String::new()
                 };
+                
+                let encoding_name = match encoding {
+                    Some(enc) => enc.name(),
+                    None => "UTF-8",
+                };
 
                 ToolOutput::success(format!(
                     "✅ Successfully written {} bytes to {}{}\n\
-                     📄 Encoding: UTF-8 (without BOM)\n\
+                     📄 Encoding: {}\n\
                      💡 Tip: Use 'file_read' to verify the content",
                     bytes_written,
                     display_path.display(),
-                    size_info
+                    size_info,
+                    encoding_name
                 ))
             }
             Err(e) => {
@@ -355,9 +433,9 @@ fn create_temp_path(target: &std::path::Path) -> PathBuf {
     temp
 }
 
-/// Atomically write content to a file using temp file + rename strategy
+/// Atomically write content to a file using temp file + rename strategy (synchronous version)
 /// This ensures the target file is never left in a corrupted state
-fn atomic_write(
+fn atomic_write_sync(
     temp_path: &PathBuf,
     target: &std::path::Path,
     content: &[u8],
@@ -397,7 +475,7 @@ async fn atomic_write_with_retry(
     let mut last_error = String::new();
 
     for attempt in 1..=max_retries {
-        match atomic_write(temp_path, target, content) {
+        match atomic_write_sync(temp_path, target, content) {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
                 last_error = e.clone();
@@ -423,6 +501,52 @@ async fn atomic_write_with_retry(
         "Failed after {} attempts: {}",
         max_retries, last_error
     ))
+}
+
+/// Synchronous chunked write (for use inside spawn_blocking)
+fn chunked_write_sync(
+    temp_path: &PathBuf,
+    target: &std::path::Path,
+    content: &[u8],
+    chunk_size: usize,
+) -> Result<usize, String> {
+    let total_bytes = content.len();
+    
+    // Create temp file
+    let mut file = fs::File::create(temp_path)
+        .map_err(|e| format!("Cannot create temporary file: {}", e))?;
+
+    // Write in chunks
+    let mut offset = 0;
+    while offset < total_bytes {
+        let end = std::cmp::min(offset + chunk_size, total_bytes);
+        let chunk = &content[offset..end];
+
+        file.write_all(chunk)
+            .map_err(|e| format!("Failed to write chunk at offset {}: {}", offset, e))?;
+        
+        offset = end;
+    }
+
+    // Flush and sync
+    file.flush()
+        .map_err(|e| format!("Failed to flush data: {}", e))?;
+    file.sync_all()
+        .map_err(|e| format!("Failed to sync to disk: {}", e))?;
+
+    drop(file);
+
+    // Atomic rename
+    fs::rename(temp_path, target)
+        .map_err(|e| format!("Failed to finalize file: {}", e))?;
+
+    tracing::info!(
+        "[FILE_WRITE] Chunked write successful: {} bytes in {} chunks",
+        total_bytes,
+        (total_bytes + chunk_size - 1) / chunk_size
+    );
+    
+    Ok(total_bytes)
 }
 
 /// Determine if an error is transient and worth retrying

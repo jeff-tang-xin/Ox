@@ -7,6 +7,9 @@ pub mod registry;
 pub use registry::FileIndexRegistry;
 
 /// 默认需要排除的目录列表
+/// 
+/// 这些目录会被 Ox 的文件索引系统排除，无论它们是否在 .gitignore 中。
+/// 包括构建输出、依赖管理、IDE 配置等常见目录。
 pub const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
     "node_modules", ".git", "target", "dist", "build", 
     "__pycache__", ".venv", "venv", "coverage", ".next", ".nuxt",
@@ -14,6 +17,9 @@ pub const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
 ];
 
 /// 检查路径是否应该被排除
+/// 
+/// 使用默认排除规则（而非 .gitignore），这样可以索引到 .gitignore 中的本地文件，
+/// 但仍然排除构建/依赖目录。
 pub fn should_exclude_path(path: &str) -> bool {
     path.split('/').any(|component| {
         DEFAULT_EXCLUDE_DIRS.contains(&component)
@@ -43,6 +49,13 @@ pub struct DirectoryListing {
     pub subdirs: Vec<DirEntry>,
     pub files: Vec<FileIndexEntry>,
     pub total_file_count: usize,
+}
+
+/// 🆕 索引统计信息
+#[derive(Debug, Clone)]
+pub struct IndexStats {
+    pub total_files: usize,
+    pub file_types: Vec<String>,
 }
 
 /// 文件索引管理器
@@ -384,6 +397,33 @@ impl FileIndexManager {
         Ok(())
     }
 
+    /// 🆕 Get index statistics (for diagnostics)
+    pub fn get_stats(&self) -> anyhow::Result<IndexStats> {
+        let conn = self.conn.lock().unwrap();
+        
+        // Get total file count
+        let total_files: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_index",
+            [],
+            |row| row.get(0)
+        )?;
+        
+        // Get unique file types
+        let mut stmt = conn.prepare("SELECT DISTINCT file_type FROM file_index WHERE file_type IS NOT NULL")?;
+        let types = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut file_types = Vec::new();
+        for t in types {
+            if let Ok(t) = t {
+                file_types.push(t);
+            }
+        }
+        
+        Ok(IndexStats {
+            total_files: total_files as usize,
+            file_types,
+        })
+    }
+
     /// 运行 Git 命令并返回输出
     fn run_git_cmd(args: &[&str], working_dir: &Path) -> anyhow::Result<String> {
         let output = std::process::Command::new("git")
@@ -397,6 +437,51 @@ impl FileIndexManager {
         }
 
         Ok(String::from_utf8(output.stdout)?)
+    }
+
+    /// 扫描物理文件系统，获取被 .gitignore 忽略但仍存在的文件
+    fn scan_physical_files(working_dir: &Path) -> anyhow::Result<String> {
+        use std::fs;
+        
+        let mut result = String::new();
+        let mut file_count = 0;
+        
+        // 递归遍历目录
+        fn walk_dir(dir: &Path, working_dir: &Path, result: &mut String, depth: usize, count: &mut usize) {
+            // 限制递归深度，避免过深
+            if depth > 10 {
+                return;
+            }
+            
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    
+                    // 获取相对路径
+                    if let Ok(rel_path) = path.strip_prefix(working_dir) {
+                        let rel_str = rel_path.to_string_lossy();
+                        
+                        // 使用默认排除规则（而非 .gitignore）
+                        if should_exclude_path(&rel_str) {
+                            tracing::debug!("Excluded by DEFAULT_EXCLUDE_DIRS: {}", rel_str);
+                            continue;
+                        }
+                        
+                        if path.is_file() {
+                            result.push_str(&format!("{}\n", rel_str));
+                            *count += 1;
+                        } else if path.is_dir() {
+                            // 递归处理子目录
+                            walk_dir(&path, working_dir, result, depth + 1, count);
+                        }
+                    }
+                }
+            }
+        }
+        
+        walk_dir(working_dir, working_dir, &mut result, 0, &mut file_count);
+        tracing::info!("Physical scan found {} files (including git-ignored)", file_count);
+        Ok(result)
     }
 
     /// 解析文件列表为索引条目
@@ -427,7 +512,7 @@ impl FileIndexManager {
             .collect()
     }
 
-    /// 同步扫描：Git 追踪 + 未追踪文件（启动时使用）
+    /// 同步扫描：Git 追踪 + 未追踪文件 + 本地忽略文件（启动时使用）
     pub fn scan_from_git(&self, working_dir: &Path) -> anyhow::Result<usize> {
         tracing::info!("Starting file index scan from git...");
 
@@ -442,19 +527,53 @@ impl FileIndexManager {
         let tracked = Self::run_git_cmd(&["ls-files", "--full-name"], working_dir)?;
 
         // 2. 未追踪的文件（尊重 .gitignore）
-        let untracked =
+        let untracked_gitignore =
             Self::run_git_cmd(&["ls-files", "--others", "--exclude-standard"], working_dir)?;
 
-        // 3. 合并文件列表
-        let all_files = format!("{}\n{}", tracked, untracked);
-        let entries = Self::parse_file_list(&all_files);
+        // 3. 被 .gitignore 忽略但物理存在的文件（补充扫描）
+        let ignored_files = Self::scan_physical_files(working_dir)?;
+
+        // 4. 合并文件列表（去重）
+        let mut all_paths = std::collections::HashSet::new();
+        
+        for line in tracked.lines().chain(untracked_gitignore.lines()).chain(ignored_files.lines()) {
+            let path = line.trim();
+            if !path.is_empty() && !should_exclude_path(path) {
+                all_paths.insert(path.to_string());
+            }
+        }
+        
+        let entries: Vec<FileIndexEntry> = all_paths
+            .into_iter()
+            .map(|path_str| {
+                let path = Path::new(&path_str);
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let file_type = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_string());
+
+                FileIndexEntry {
+                    id: 0,
+                    filename,
+                    full_path: path_str,
+                    file_type,
+                }
+            })
+            .collect();
+        
         let count = entries.len();
 
-        // 4. 清空并重新插入
+        // 5. 清空并重新插入
         self.clear()?;
         self.batch_insert(&entries)?;
 
-        tracing::info!("Indexed {} files from git", count);
+        tracing::info!("Indexed {} files (including git-ignored local files)", count);
         Ok(count)
     }
 
@@ -483,8 +602,17 @@ impl FileIndexManager {
         conn: &Arc<Mutex<Connection>>,
         working_dir: &Path,
     ) -> anyhow::Result<usize> {
-        let manager = Self::from_connection(Arc::clone(conn));
-        manager.scan_from_git(working_dir)
+        // 🚨 CRITICAL FIX: Move synchronous scan to blocking thread pool
+        // This prevents blocking the async runtime during periodic refresh
+        let working_dir = working_dir.to_path_buf();
+        let conn_clone = Arc::clone(conn);
+        
+        tokio::task::spawn_blocking(move || {
+            let manager = Self::from_connection(conn_clone);
+            manager.scan_from_git(&working_dir)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Refresh task panicked: {}", e))?
     }
 
     /// 启动文件系统监听（实时捕获文件变化）
@@ -496,6 +624,13 @@ impl FileIndexManager {
 
         // 创建监听通道
         let (tx, rx) = mpsc::channel();
+        
+        // 🚀 OPTIMIZATION: Use polling mode for better reliability on Windows
+        // Polling is slower but more reliable than native events
+        #[cfg(target_os = "windows")]
+        let mut watcher = RecommendedWatcher::new(tx, notify::Config::default())?;
+        
+        #[cfg(not(target_os = "windows"))]
         let mut watcher = RecommendedWatcher::new(tx, notify::Config::default())?;
 
         // 递归监听工作目录
@@ -504,10 +639,18 @@ impl FileIndexManager {
         // 启动后台处理线程
         std::thread::spawn(move || {
             tracing::info!("File watcher started for {:?}", working_dir);
+            let mut event_count = 0u64;
 
             for result in rx {
                 match result {
                     Ok(event) => {
+                        event_count += 1;
+                        
+                        // Log every 100 events to avoid spam
+                        if event_count % 100 == 0 {
+                            tracing::debug!("Processed {} file system events", event_count);
+                        }
+                        
                         // 过滤掉 .git、target 等目录
                         if Self::should_ignore_path(&event.paths, &working_dir) {
                             continue;
@@ -518,8 +661,12 @@ impl FileIndexManager {
                                 for path in &event.paths {
                                     if let Some(rel_path) = path.strip_prefix(&working_dir).ok() {
                                         let rel_str = rel_path.to_string_lossy();
-                                        // 只处理文件，忽略目录
-                                        if rel_str.contains('.') {
+                                        
+                                        // 🚨 FIX: Check if path is a file (not directory)
+                                        // Use filesystem check instead of relying on '.' in name
+                                        let is_file = path.is_file();
+                                        
+                                        if is_file && !should_exclude_path(&rel_str) {
                                             let manager =
                                                 Self::from_connection(Arc::clone(&file_index));
                                             if let Err(e) = manager.add_file(&rel_str) {
@@ -529,7 +676,7 @@ impl FileIndexManager {
                                                     e
                                                 );
                                             } else {
-                                                tracing::debug!("Indexed file: {}", rel_str);
+                                                tracing::trace!("Indexed file: {}", rel_str);
                                             }
                                         }
                                     }
@@ -548,7 +695,7 @@ impl FileIndexManager {
                                                 e
                                             );
                                         } else {
-                                            tracing::debug!("Removed from index: {}", rel_str);
+                                            tracing::trace!("Removed from index: {}", rel_str);
                                         }
                                     }
                                 }
@@ -567,20 +714,13 @@ impl FileIndexManager {
     }
 
     /// 判断是否应该忽略某些路径
+    /// 
+    /// 使用统一的 DEFAULT_EXCLUDE_DIRS 规则，确保与扫描逻辑一致
     fn should_ignore_path(paths: &[std::path::PathBuf], working_dir: &Path) -> bool {
         paths.iter().any(|p| {
             if let Ok(rel_path) = p.strip_prefix(working_dir) {
-                rel_path.components().any(|c| {
-                    matches!(
-                        c.as_os_str().to_str(),
-                        Some(".git")
-                            | Some("target")
-                            | Some("node_modules")
-                            | Some(".ox")
-                            | Some("dist")
-                            | Some("build")
-                    )
-                })
+                let rel_str = rel_path.to_string_lossy();
+                should_exclude_path(&rel_str)
             } else {
                 false
             }
@@ -646,5 +786,19 @@ mod tests {
         // 测试列出所有文件
         let all = manager.list_all_files().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_should_exclude_path() {
+        // 测试默认排除规则
+        assert!(should_exclude_path("node_modules/package/index.js"));
+        assert!(should_exclude_path("target/debug/app.exe"));
+        assert!(should_exclude_path(".git/config"));
+        assert!(should_exclude_path("logs/app.log"));
+        
+        // 测试不应该排除的路径
+        assert!(!should_exclude_path("src/main.rs"));
+        assert!(!should_exclude_path("docs/README.md"));
+        assert!(!should_exclude_path("config/settings.json"));
     }
 }

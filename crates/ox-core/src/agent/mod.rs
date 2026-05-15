@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod enforcer;
 pub mod interjection;
 pub mod interrupt;
 pub mod intervention;
@@ -120,6 +121,8 @@ pub async fn run_agent_turn(
     let mut new_messages: Vec<Message> = Vec::new();
     let mut total_usage = TokenUsage::default();
 
+    const MAX_SAME_TOOL_CALLS: u32 = 5; // Maximum times the same tool can be called in one turn
+
     let mut iteration = 0u32;
     loop {
         // Check cancellation before each LLM call.
@@ -237,6 +240,58 @@ pub async fn run_agent_turn(
         } else {
             tool_schemas.clone()
         };
+
+        // 📝 LOG REQUEST CONTEXT: Log the complete context sent to LLM for debugging
+        tracing::info!("\n{}", "=".repeat(80));
+        tracing::info!("🤖 LLM REQUEST CONTEXT (Iteration {})", iteration + 1);
+        tracing::info!("{}", "=".repeat(80));
+        tracing::info!("Total messages: {}", msgs.len());
+        
+        // Show system prompt preview
+        if let Some(first_msg) = msgs.first() {
+            if let Message::System { content } = first_msg {
+                let sys_prompt_len = content.chars().count();
+                tracing::info!("📋 SYSTEM PROMPT LENGTH: {} characters", sys_prompt_len);
+                let preview = if sys_prompt_len > 1000 {
+                    format!("{}...[truncated]", content.chars().take(1000).collect::<String>())
+                } else {
+                    content.clone()
+                };
+                tracing::info!("📋 SYSTEM PROMPT PREVIEW:\n{}", preview.replace('\n', "\\n"));
+            }
+        }
+        
+        // Log each message with role and preview
+        for (i, msg) in msgs.iter().enumerate() {
+            let (role, content_preview) = match msg {
+                Message::System { .. } => continue,
+                Message::User { content } => {
+                    ("USER", if content.chars().count() > 150 {
+                        format!("{}...", content.chars().take(150).collect::<String>())
+                    } else { content.clone() })
+                }
+                Message::Assistant { content, tool_calls } => {
+                    let tc_info = if !tool_calls.is_empty() {
+                        format!(" [tool_calls: {}]", tool_calls.len())
+                    } else {
+                        String::new()
+                    };
+                    let preview = if content.chars().count() > 150 {
+                        format!("{}...", content.chars().take(150).collect::<String>())
+                    } else { content.clone() };
+                    ("ASSISTANT", format!("{}{}", preview, tc_info))
+                }
+                Message::ToolResult { tool_call_id, content } => {
+                    let preview = if content.chars().count() > 100 {
+                        format!("{}...", content.chars().take(100).collect::<String>())
+                    } else { content.clone() };
+                    ("TOOL_RESULT", format!("[{}] {}", tool_call_id, preview))
+                }
+            };
+            tracing::info!("  [{}] {}: {}", i, role, content_preview.replace('\n', "\\n"));
+        }
+        tracing::info!("Enabled tools: {}", schemas.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
+        tracing::info!("{}", "=".repeat(80));
         let cancel_clone = cancel_token.clone();
         let llm_tx_err = llm_tx.clone();
         let mut stream_handle = tokio::spawn(async move {
@@ -305,6 +360,40 @@ pub async fn run_agent_turn(
                     total_usage.prompt_tokens += usage.prompt_tokens;
                     total_usage.completion_tokens += usage.completion_tokens;
                     total_usage.total_tokens += usage.total_tokens;
+                    
+                    // 📝 LOG RESPONSE SUMMARY
+                    tracing::info!("\n{}", "-".repeat(80));
+                    tracing::info!("📤 LLM RESPONSE SUMMARY");
+                    tracing::info!("{}", "-".repeat(80));
+                    if !full_text.is_empty() {
+                        // 🚨 FIX: Use char-based truncation
+                        let preview = if full_text.chars().count() > 300 {
+                            format!("{}...", full_text.chars().take(300).collect::<String>())
+                        } else {
+                            full_text.clone()
+                        };
+                        tracing::info!("Text response: {}", preview.replace('\n', "\\n"));
+                    }
+                    if !tool_calls.is_empty() {
+                        tracing::info!("Tool calls: {}", tool_calls.iter().map(|tc| {
+                            format!("{}({})", tc.name, tc.id)
+                        }).collect::<Vec<_>>().join(", "));
+                        
+                        // Log each tool call's arguments (truncated)
+                        for tc in &tool_calls {
+                            // 🚨 FIX: Use char-based truncation
+                            let args_preview = if tc.arguments.chars().count() > 200 {
+                                format!("{}...", tc.arguments.chars().take(200).collect::<String>())
+                            } else {
+                                tc.arguments.clone()
+                            };
+                            tracing::info!("  - {} [{}]: {}", tc.name, tc.id, args_preview.replace('\n', "\\n"));
+                        }
+                    } else {
+                        tracing::info!("No tool calls");
+                    }
+                    tracing::info!("{}", "-".repeat(80));
+                    
                     break;
                 }
                 LlmStreamEvent::Error(err) => {
@@ -590,9 +679,22 @@ pub async fn run_agent_turn(
         // Truncated tool calls have already been handled (error ToolResult added),
         // so they should NOT appear in the Assistant message to avoid confusing
         // the compression logic and causing "tool call result does not follow tool call" errors.
+        
+        // 🚨 Also filter out tool calls that exceeded the infinite loop limit
+        let mut exceeded_loop_limit_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut temp_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        
+        for tc in &tool_calls {
+            let count = temp_counts.entry(tc.name.clone()).or_insert(0);
+            *count += 1;
+            if *count > MAX_SAME_TOOL_CALLS {
+                exceeded_loop_limit_ids.insert(tc.id.clone());
+            }
+        }
+        
         let valid_tool_calls: Vec<_> = tool_calls
             .iter()
-            .filter(|tc| !truncated_ids.contains(&tc.id))
+            .filter(|tc| !truncated_ids.contains(&tc.id) && !exceeded_loop_limit_ids.contains(&tc.id))
             .cloned()
             .collect();
 
@@ -612,6 +714,42 @@ pub async fn run_agent_turn(
                     "Interrupted before tool execution.".to_string(),
                 ));
                 break;
+            }
+
+            // 🚨 Detect infinite loop: same tool called too many times
+            // Note: We already calculated exceeded_loop_limit_ids above, so just check if this ID is in the set
+            if exceeded_loop_limit_ids.contains(&tc.id) {
+                let call_count = temp_counts.get(&tc.name).copied().unwrap_or(0);
+                tracing::error!(
+                    "🚨 INFINITE LOOP DETECTED: Tool '{}' called {} times in one turn. Stopping.",
+                    tc.name,
+                    call_count
+                );
+                
+                let error_msg = format!(
+                    "❌ Infinite Loop Detected:\n\
+                     The tool '{}' has been called {} times in this conversation turn.\n\
+                     This suggests the AI is stuck in a loop.\n\n\
+                     💡 Solutions:\n\
+                     1. Try a different approach to solve the problem\n\
+                     2. Break the task into smaller steps\n\
+                     3. Provide more specific instructions\n\
+                     4. Use /clear to start fresh if needed",
+                    tc.name, call_count
+                );
+                
+                let result_msg = Message::ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: error_msg.clone(),
+                };
+                new_messages.push(result_msg.clone());
+                messages.push(result_msg);
+                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                    name: tc.name.clone(),
+                    output: error_msg,
+                    is_error: true,
+                });
+                continue;
             }
 
             // Skip truncated tool calls — return error so LLM can retry.
@@ -800,6 +938,7 @@ pub async fn run_agent_turn(
                     }
                 }
             } else if tc.name == "file_patch" {
+                tracing::info!("[AGENT] Sending ToolStart for file_patch");
                 // For file_patch, show file path and search context
                 if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                     let path = args_val
@@ -827,11 +966,16 @@ pub async fn run_agent_turn(
                         id: tc.id.clone(),
                         detail: Some(detail),
                     });
+                    tracing::info!("[AGENT] ToolStart event sent for file_patch, proceeding to get tool object");
                 }
             }
 
+            tracing::info!("[AGENT] About to get tool object for: {}", tc.name);
             let tool = match tool_registry.get(&tc.name) {
-                Some(t) => t,
+                Some(t) => {
+                    tracing::info!("[AGENT] Tool object retrieved for: {}", tc.name);
+                    t
+                }
                 None => {
                     let available = tool_registry.names().join(", ");
                     // Find similar tool names (simple string matching)
@@ -882,7 +1026,10 @@ pub async fn run_agent_turn(
             };
 
             // ── Safety check before execution ──
+            tracing::info!("[AGENT] Processing tool call: {} (id: {})", tc.name, tc.id);
+            tracing::info!("[AGENT] About to check safety level for: {}", tc.name);
             let safety_level = tool.safety_level();
+            tracing::info!("[AGENT] Safety level for {}: {:?}", tc.name, safety_level);
 
             // Check if tool args reference a path outside working directory.
             let path_outside =
@@ -897,6 +1044,31 @@ pub async fn run_agent_turn(
                     false
                 };
 
+            // 🆕 NEW: Enforce mandatory rules (e.g., plan_before_edit)
+            if let Err(violation_msg) = crate::agent::enforcer::RuleEnforcer::validate(
+                &tool_ctx.config.enforcement_rules,
+                &tc,
+                &messages,
+            ) {
+                tracing::warn!("🚫 Rule Enforcer blocked tool '{}': {}", tc.name, violation_msg);
+
+                // Send error to LLM as a tool result
+                let error_result = Message::ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: violation_msg.clone(),
+                };
+                new_messages.push(error_result.clone());
+                messages.push(error_result);
+
+                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                    name: tc.name.clone(),
+                    output: violation_msg,
+                    is_error: true,
+                });
+
+                continue; // Skip this tool call and move to the next iteration
+            }
+
             let should_confirm = if path_outside {
                 true // Path outside workdir always requires confirmation.
             } else {
@@ -910,6 +1082,7 @@ pub async fn run_agent_turn(
             };
 
             if should_confirm {
+                tracing::info!("[AGENT] Tool {} requires confirmation", tc.name);
                 // Build args_summary (truncated, sanitized).
                 let args_summary = if tc.arguments.len() > 200 {
                     let end = tc
@@ -986,6 +1159,7 @@ pub async fn run_agent_turn(
 
                 match decision {
                     ui_event::ConfirmationDecision::Deny => {
+                        tracing::info!("[AGENT] User denied tool: {}", tc.name);
                         let error_msg = "User denied tool execution".to_string();
                         let result_msg = Message::ToolResult {
                             tool_call_id: tc.id.clone(),
@@ -1001,10 +1175,13 @@ pub async fn run_agent_turn(
                         continue;
                     }
                     ui_event::ConfirmationDecision::TrustAlways => {
+                        tracing::info!("[AGENT] User trusted all tools");
                         let mut tm = trust_manager.lock().unwrap();
                         tm.trust_all();
                     }
-                    ui_event::ConfirmationDecision::Allow => {}
+                    ui_event::ConfirmationDecision::Allow => {
+                        tracing::info!("[AGENT] User allowed tool: {}", tc.name);
+                    }
                 }
             }
 
@@ -1050,10 +1227,13 @@ pub async fn run_agent_turn(
                             "Tool argument parse error for '{}': {} | Raw: {}",
                             tc.name,
                             parse_err,
-                            if tc.arguments.len() > 100 {
-                                &tc.arguments[..100]
-                            } else {
-                                &tc.arguments
+                            {
+                                let preview = if tc.arguments.chars().count() > 100 {
+                                    tc.arguments.chars().take(100).collect::<String>()
+                                } else {
+                                    tc.arguments.clone()
+                                };
+                                preview
                             }
                         );
 
@@ -1135,6 +1315,7 @@ pub async fn run_agent_turn(
                 progress_percent: Some(0),
             });
             
+            tracing::info!("[AGENT] About to execute tool: {} (id: {})", tc.name, tc.id);
             // Create a tool context with progress callback for real-time updates
             let ui_tx_clone = ui_tx.clone();
             let tool_call_id_clone = tc.id.clone();
@@ -1156,7 +1337,9 @@ pub async fn run_agent_turn(
                 },
             ));
             
+            tracing::info!("[AGENT] Executing tool.execute() for: {}", tc.name);
             let result = tool.execute(args, &tool_ctx_with_progress).await;
+            tracing::info!("[AGENT] Tool execution completed: {}, is_error: {}", tc.name, result.is_error);
 
             // Send completion progress event only if tool executed successfully
             if !result.is_error {

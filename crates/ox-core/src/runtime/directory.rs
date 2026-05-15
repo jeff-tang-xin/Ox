@@ -36,8 +36,8 @@ pub fn change_directory(rt_env: &mut RuntimeEnvironment, target: &str) -> Direct
         }
     };
 
-    // Canonicalize to resolve .. and symlinks.
-    let canonical = match target_path.canonicalize() {
+    // Canonicalize to resolve .. and symlinks (using dunce for Windows compatibility)
+    let canonical = match dunce::canonicalize(&target_path) {
         Ok(p) => p,
         Err(e) => {
             return DirectoryChangeResult::NotFound(format!(

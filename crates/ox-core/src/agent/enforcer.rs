@@ -1,0 +1,137 @@
+use crate::message::{Message, ToolCall};
+use crate::config::rules::EnforcementRules;
+use regex::Regex;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    // 计划意图的正则表达式模式（多语言支持）
+    static ref PLAN_PATTERNS: Vec<Regex> = vec![
+        // 英文模式
+        Regex::new(r"(?i)(?:I plan|I will|I'm going|My plan|intend to|will modify|will change)").unwrap(),
+        Regex::new(r"(?i)(?:plan to|going to|would like to|want to)").unwrap(),
+        // 中文模式
+        Regex::new(r"(我计划|我打算|我将要|我要|准备|想要修改|想要更改)").unwrap(),
+        Regex::new(r"(计划[是:]|打算[是:]|将要[是:])").unwrap(),
+        // 通用模式
+        Regex::new(r"(Step|步骤|第一步|1\.|\*|-).*?(?:to|将|会|要)").unwrap(),
+    ];
+    
+    // 步骤列表的正则表达式模式（多语言支持）
+    static ref STEP_PATTERNS: Vec<Regex> = vec![
+        // 英文步骤标识
+        Regex::new(r"(?i)(?:step|phase|stage)\s*\d+").unwrap(),
+        Regex::new(r"(?i)(?:first|second|third|finally|then|next)").unwrap(),
+        // 中文步骤标识
+        Regex::new(r"(第[一二三四五六七八九十百]+步|首先|然后|接着|最后|接下来)").unwrap(),
+        // 数字列表格式
+        Regex::new(r"^\s*\d+[\.、]\s*").unwrap(),
+        Regex::new(r"^\s*[\*\-\+]\s+").unwrap(),
+        // 冒号分隔的步骤
+        Regex::new(r"(?:步骤|Step|阶段)[：:]\s*\d+").unwrap(),
+    ];
+}
+
+/// Rule Enforcer - 强制执行系统级约束
+/// 
+/// 与 Skill 不同，Rules 是由代码直接校验的。如果违反，工具调用会被立即拦截，
+/// 并将错误信息返回给 LLM，要求其修正行为。
+pub struct RuleEnforcer;
+
+impl RuleEnforcer {
+    /// 执行所有启用的强制规则
+    pub fn validate(
+        rules: &EnforcementRules,
+        tool_call: &ToolCall,
+        messages: &[Message],
+    ) -> Result<(), String> {
+        if !rules.enabled {
+            return Ok(());
+        }
+
+        // 1. 校验: 编辑前必须有计划 (Plan Before Edit)
+        if rules.plan_before_edit {
+            if let Err(e) = Self::check_plan_before_edit(tool_call, messages, &rules.custom_plan_patterns) {
+                return Err(e);
+            }
+        }
+
+        // 2. 校验: Shell 执行前必须有步骤列表 (Steps Before Shell)
+        if rules.steps_before_shell {
+            if let Err(e) = Self::check_steps_before_shell(tool_call, messages, &rules.custom_step_patterns) {
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 检查编辑操作前是否有明确的计划陈述
+    fn check_plan_before_edit(tc: &ToolCall, messages: &[Message], custom_patterns: &[String]) -> Result<(), String> {
+        if !matches!(tc.name.as_str(), "file_write" | "file_patch") {
+            return Ok(());
+        }
+
+        let msgs = messages;
+        // 扫描最近 5 条消息，寻找 LLM 提出的计划
+        let has_plan = msgs.iter().rev().take(5).any(|msg| {
+            if let Message::Assistant { content, .. } = msg {
+                // 使用内置正则表达式进行多语言模式匹配
+                let built_in_match = PLAN_PATTERNS.iter().any(|pattern| pattern.is_match(content));
+                
+                // 检查自定义模式
+                let custom_match = custom_patterns.iter().any(|pattern_str| {
+                    Regex::new(pattern_str)
+                        .map(|pattern| pattern.is_match(content))
+                        .unwrap_or(false)
+                });
+                
+                built_in_match || custom_match
+            } else {
+                false
+            }
+        });
+
+        if !has_plan {
+            Err("🛑 RULE VIOLATION (coding-principles): You must propose a clear plan before editing files.\nExample: 'I plan to modify X to achieve Y.' or '我的计划是修改X以实现Y。'".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 检查 Shell 命令执行前是否有步骤列表
+    fn check_steps_before_shell(tc: &ToolCall, messages: &[Message], custom_patterns: &[String]) -> Result<(), String> {
+        if tc.name != "shell_exec" {
+            return Ok(());
+        }
+        
+        let msgs = messages;
+        let has_steps = msgs.iter().rev().take(5).any(|m| {
+            if let Message::Assistant { content, .. } = m {
+                // 使用内置正则表达式进行多语言步骤检测
+                let built_in_match = STEP_PATTERNS.iter().any(|pattern| {
+                    // 对每一行进行检查，提高准确性
+                    content.lines().any(|line| pattern.is_match(line.trim()))
+                });
+                
+                // 检查自定义模式
+                let custom_match = custom_patterns.iter().any(|pattern_str| {
+                    Regex::new(pattern_str)
+                        .map(|pattern| {
+                            content.lines().any(|line| pattern.is_match(line.trim()))
+                        })
+                        .unwrap_or(false)
+                });
+                
+                built_in_match || custom_match
+            } else {
+                false
+            }
+        });
+
+        if !has_steps {
+            Err("🛑 RULE VIOLATION (engineering-practices): Complex shell operations require a step-by-step list. Please provide steps like:\n- Step 1: Run git status\n- Step 2: Add changes\n- Step 3: Commit changes\n或者用中文：\n- 第一步：运行 git status\n- 第二步：添加更改\n- 第三步：提交更改".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}

@@ -573,20 +573,25 @@ pub fn compress_context_enhanced(
         // Extract semantic summary from removed messages
         let removed_summary = extract_removed_message_summary(messages, &compressed);
         
-        let notice = format!(
-            "⚠️ Context compressed: {} msgs → {} msgs ({} removed).\n\
-             Removed topics: {}\n\
-             \n\
-             💡 ACTION REQUIRED:\n\
-             If your current task relates to any of the removed topics above,\n\
-             you MUST use the `memory_search` tool to retrieve complete information.\n\
-             Example: memory_search(query=\"{}\", scope=\"project\")",
-            messages.len(),
-            compressed.len(),
-            compressed_count,
-            removed_summary,
-            removed_summary.split(':').next().unwrap_or("project architecture").trim()
-        );
+        // 🚨 ULTRA-SIMPLIFIED NOTICE: Minimize token usage
+        // Only include essential info: count + key topics hint
+        let notice = if removed_summary.len() > 100 {
+            // Truncate summary to save tokens
+            let short_summary: String = removed_summary.chars().take(100).collect();
+            format!(
+                "[Context compressed: {} msgs removed. Topics: {}...]\n\
+                 💡 Use `memory_search` if you need details.",
+                compressed_count,
+                short_summary
+            )
+        } else {
+            format!(
+                "[Context compressed: {} msgs removed. Topics: {}]\n\
+                 💡 Use `memory_search` if you need details.",
+                compressed_count,
+                removed_summary
+            )
+        };
         
         // Insert notice as first message
         compressed.insert(0, Message::system(&notice));
@@ -627,6 +632,24 @@ fn identify_protected_context(messages: &[Message]) -> Vec<usize> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // 🚨 PROTECT COMPLETE TOOL INTERACTIONS: Keep tool_call + ToolResult pairs together
+    // If we're keeping a ToolResult, also keep its Assistant message
+    for (i, msg) in messages.iter().enumerate() {
+        if let Message::ToolResult { tool_call_id, .. } = msg {
+            // Find the Assistant message that made this tool call
+            for (j, prev_msg) in messages[..i].iter().enumerate().rev() {
+                if let Message::Assistant { tool_calls, .. } = prev_msg {
+                    if tool_calls.iter().any(|tc| &tc.id == tool_call_id) {
+                        if !protected.contains(&j) {
+                            protected.push(j);
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -728,6 +751,19 @@ fn references_previous_context(current: &str, _previous: &str) -> bool {
     refs.iter().any(|&r| current_lower.contains(r))
 }
 
+/// Filter out <think> tags from content to avoid exposing AI's internal reasoning.
+/// Returns the content with all <think>...</think> blocks removed.
+fn filter_think_tags(content: &str) -> String {
+    use regex::Regex;
+    
+    // Remove <think>...</think> blocks (including newlines)
+    let think_pattern = Regex::new(r"<think>[\s\S]*?</think>").unwrap();
+    let filtered = think_pattern.replace_all(content, "");
+    
+    // Clean up extra whitespace
+    filtered.trim().to_string()
+}
+
 /// Extract semantic summary from removed messages to guide LLM on what to search for.
 /// Instead of just keywords, generates brief topic summaries with context.
 fn extract_removed_message_summary(original: &[Message], compressed: &[Message]) -> String {
@@ -754,8 +790,11 @@ fn extract_removed_message_summary(original: &[Message], compressed: &[Message])
         
         // If this content is not in compressed messages, it was removed
         if !compressed_content.contains(content) {
+            // 🚨 FILTER OUT <think> TAGS: Remove AI's internal reasoning
+            let filtered_content = filter_think_tags(content);
+            
             // Extract key information: file names, technical terms, actions
-            let key_info = extract_key_information(content);
+            let key_info = extract_key_information(&filtered_content);
             
             if !key_info.is_empty() {
                 if topic_messages == 0 {

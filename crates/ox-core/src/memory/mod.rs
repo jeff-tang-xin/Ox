@@ -324,6 +324,7 @@ pub enum MemorySource {
     LlmExtraction,
     CouncilConclusion,
     Feedback,
+    RefinedSummary,  // 🆕 Refined memory summaries from conversation turns
 }
 
 impl MemorySource {
@@ -334,6 +335,7 @@ impl MemorySource {
             Self::LlmExtraction => "llm_extraction",
             Self::CouncilConclusion => "council_conclusion",
             Self::Feedback => "feedback",
+            Self::RefinedSummary => "refined_summary",
         }
     }
 
@@ -344,6 +346,7 @@ impl MemorySource {
             "llm_extraction" => Some(Self::LlmExtraction),
             "council_conclusion" => Some(Self::CouncilConclusion),
             "feedback" => Some(Self::Feedback),
+            "refined_summary" => Some(Self::RefinedSummary),
             _ => None,
         }
     }

@@ -25,6 +25,15 @@ which = { workspace = true }
 dirs = { workspace = true }
 regex = { workspace = true }
 glob = { workspace = true }
+lazy_static = "1.4"
+# Ripgrep ecosystem for high-performance search
+grep = "0.3"        # ripgrep 的核心搜索逻辑
+grep-cli = "0.1"    # 处理文件遍历、.gitignore 等 CLI 相关的功能
+ignore = "0.4"      # .gitignore-aware file walker
+termcolor = "1.4"   # 用于终端的高亮着色
+crossbeam = "0.8"   # 用于高性能无锁并行处理
+encoding_rs = "0.8" # 处理 GBK、GB18030 等非 UTF-8 编码
+dunce = "1.0"       # 规范化 Windows 路径，解决超长路径限制
 rusqlite = { workspace = true }
 rand = { workspace = true }
 candle-core = { workspace = true }
@@ -34,6 +43,7 @@ tokenizers = { workspace = true }
 safetensors = "0.4"
 half = "2"
 notify = "6.1"
+serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

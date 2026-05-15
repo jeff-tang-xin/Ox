@@ -195,14 +195,15 @@ pub fn parse_json_values(
         results.push(serde_json::from_str(current.trim()));
     } else if !current.trim().is_empty() {
         // Log truncated JSON for debugging but don't attempt to parse
+        let preview = if current.chars().count() > 100 {
+            current.chars().take(100).collect::<String>()
+        } else {
+            current.clone()
+        };
         tracing::debug!(
             "Skipping incomplete JSON ({} chars): {}",
             current.len(),
-            if current.len() > 100 {
-                &current[..100]
-            } else {
-                &current
-            }
+            preview
         );
     }
 

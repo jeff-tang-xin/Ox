@@ -5,6 +5,14 @@ use std::path::{Path, PathBuf};
 
 use crate::tools::SafetyLevel;
 
+/// Normalize a path using dunce (Windows-friendly canonicalization)
+/// - On Windows: Removes `\\?\` prefix and normalizes UNC paths
+/// - On Unix: Same as canonicalize()
+/// - Never fails: Falls back to original path if normalization fails
+fn normalize_path(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Session-scoped trust manager for tool confirmation.
 ///
 /// Tracks which tools the user has temporarily trusted (via `/trust`).
@@ -80,28 +88,29 @@ pub fn is_high_risk_command(command: &str) -> bool {
 /// Check whether a resolved path is within the working directory.
 /// Returns true if within, false if outside. Does not error.
 pub fn is_path_within_workdir(path: &Path, working_dir: &Path) -> bool {
-    let Ok(canonical_workdir) = working_dir.canonicalize() else {
-        return false;
-    };
-    if let Ok(canonical_path) = path.canonicalize() {
-        return canonical_path.starts_with(&canonical_workdir);
+    let canonical_workdir = normalize_path(working_dir);
+    let canonical_path = normalize_path(path);
+    
+    if canonical_path.starts_with(&canonical_workdir) {
+        return true;
     }
+    
     // Path doesn't exist yet — check parent.
     if let Some(parent) = path.parent() {
-        if let Ok(canonical_parent) = parent.canonicalize() {
-            return canonical_parent.starts_with(&canonical_workdir);
-        }
+        let canonical_parent = normalize_path(parent);
+        return canonical_parent.starts_with(&canonical_workdir);
     }
+    
     false
 }
 
 /// Resolve a path to an absolute path if it exists.
 /// For non-existent paths (e.g., new files), returns the path as-is.
-/// This is a convenience wrapper around PathBuf::join + canonicalize.
+/// Uses dunce for Windows-friendly path normalization.
 pub fn validate_path_within_workdir(path: &Path, _working_dir: &Path) -> anyhow::Result<PathBuf> {
-    // Try to canonicalize if the path exists
+    // Try to normalize if the path exists
     if path.exists() {
-        return Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        return Ok(normalize_path(path));
     }
 
     // Path doesn't exist yet, return as-is
