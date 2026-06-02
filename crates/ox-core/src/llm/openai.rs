@@ -219,9 +219,8 @@ impl LlmProvider for OpenAiProvider {
             "stream": true,
         });
 
-        if self.stream_usage {
-            body["stream_options"] = serde_json::json!({ "include_usage": true });
-        }
+        // Always request usage in streaming mode (supported by OpenAI + most compatible APIs)
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
 
         if let Some(max_tokens) = self.max_tokens {
             body["max_tokens"] = serde_json::json!(max_tokens);

@@ -319,6 +319,10 @@ impl ContextBuilder {
             )));
         }
 
+        // 🚨 Sanitize tool pairs — same as build() to prevent API errors
+        sanitize_tool_pairs(&mut result);
+        filter_noisy_messages(&mut result);
+
         result
     }
 }
