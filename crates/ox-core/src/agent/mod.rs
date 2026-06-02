@@ -208,6 +208,11 @@ pub async fn run_agent_turn(
             }
         }
 
+        // 🚨 Sanitize tool pairs before EVERY LLM call within the agent turn.
+        // This prevents OpenAI API errors like "ToolResult references non-existent tool call"
+        // when a tool_call was skipped or only partially executed.
+        crate::context::sanitize_tool_pairs(&mut messages);
+
         // Stream LLM response.
         let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmStreamEvent>();
 
@@ -615,10 +620,25 @@ pub async fn run_agent_turn(
                                     let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
                                 }
                             } else {
-                                // Workflow complete
+                                // Workflow complete — trigger auto-reflection for skill generation
                                 let _ = ui_tx.send(AgentToUiEvent::Status(
                                     "🎉 Workflow completed!".to_string(),
                                 ));
+                                // Extract task context for auto-reflection
+                                let task_desc = messages.iter()
+                                    .filter_map(|m| if let Message::User { content } = m { Some(content.as_str()) } else { None })
+                                    .last()
+                                    .unwrap_or("task completed")
+                                    .chars().take(200).collect::<String>();
+                                let exec_summary = new_messages.iter()
+                                    .filter_map(|m| if let Message::Assistant { content, .. } = m { Some(content.as_str()) } else { None })
+                                    .last()
+                                    .unwrap_or("execution finished")
+                                    .chars().take(300).collect::<String>();
+                                let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
+                                    task_description: task_desc,
+                                    execution_summary: exec_summary,
+                                });
                             }
                         }
                         Err(e) => {

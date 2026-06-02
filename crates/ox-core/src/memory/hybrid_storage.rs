@@ -243,10 +243,20 @@ impl HybridStorage {
 
     /// Retrieve L0 conversations from SQLite for a project
     fn retrieve_l0_conversations(&self, project_id: &str) -> anyhow::Result<Vec<RawConversation>> {
-        // In production, query SQLite for L0 nodes
-        // For now, return empty - implementation requires extending MemoryStore
-        tracing::warn!("retrieve_l0_conversations not yet implemented - returning empty");
-        Ok(vec![])
+        // Query all memory nodes for this project using wildcard search
+        let nodes = self.sqlite_store.search("%", Some(project_id), 500)?;
+        let conversations: Vec<RawConversation> = nodes.into_iter().map(|n| RawConversation {
+            id: n.id.clone(),
+            session_id: String::new(),
+            user_message: String::new(),
+            assistant_response: n.content.clone(),
+            timestamp: n.created_at,
+            project_id: n.project_id.clone(),
+            tools_used: vec![],
+            success: true,
+        }).collect();
+        tracing::info!("Retrieved {} L0 conversations for project {}", conversations.len(), project_id);
+        Ok(conversations)
     }
 
     /// Get storage statistics

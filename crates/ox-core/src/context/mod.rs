@@ -461,7 +461,32 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
         }
     }
     
-    // Check for any remaining mismatches
+    // Remove any remaining orphaned ToolResults (safety net)
+    let before_final = messages.len();
+    messages.retain(|m| {
+        if let Message::ToolResult { tool_call_id, .. } = m {
+            final_assistant_ids.contains(tool_call_id)
+        } else {
+            true
+        }
+    });
+    if messages.len() < before_final {
+        tracing::warn!(
+            "[TOOL_PAIR_SANITIZATION] ⚠️ Removed {} additional orphaned ToolResult(s) in final pass",
+            before_final - messages.len()
+        );
+    }
+
+    // Remove empty Assistant messages (no content + no tool_calls after sanitization)
+    messages.retain(|m| {
+        if let Message::Assistant { content, tool_calls } = m {
+            !(content.is_empty() && tool_calls.is_empty())
+        } else {
+            true
+        }
+    });
+
+    // Check for any remaining mismatches (diagnostic only)
     for result_id in &final_result_ids {
         if !final_assistant_ids.contains(result_id) {
             tracing::error!(

@@ -73,6 +73,58 @@ pub fn handle_cd(app: &mut AppState, args: &str, session: &mut Session, rt_env: 
                     let name = rt_env.project_root.as_ref().and_then(|p| p.file_name())
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "(none)".into());
                     app.output.push_system(&format!("Project boundary changed -- {}", name));
+                    
+                    // 🧠 Project onboarding: generate conventions skill if missing
+                    if let Some(ref proj_root) = rt_env.project_root {
+                        let skill_path = proj_root.join(".ox").join("skills").join("project-conventions.md");
+                        if !skill_path.exists() {
+                            let prompt = format!(
+                                "You just entered a new project at `{}`. Generate a project conventions skill.\n\n\
+                                 ## Step 1: Detect\n\
+                                 Run `project_detect`. Note the language, framework, and build system.\n\n\
+                                 ## Step 2: Scan\n\
+                                 Based on detected language, scan these:\n\n\
+                                 | Language | Config files | Code patterns to search |\n\
+                                 |----------|-------------|------------------------|\n\
+                                 | Rust | Cargo.toml | `fn `, `pub fn`, `impl`, `use `, `mod `, `#!` |\n\
+                                 | Python | pyproject.toml, setup.cfg | `def `, `class `, `import `, `from `, `@` |\n\
+                                 | TS/JS | package.json, tsconfig.json, .eslintrc | `function`, `const`, `export`, `interface` |\n\
+                                 | Go | go.mod | `func `, `type `, `package `, `err ` |\n\
+                                 | Java | build.gradle, pom.xml | `public class`, `private`, `@Override` |\n\
+                                 | C/C++ | CMakeLists.txt, Makefile | `void `, `int `, `#include`, `class ` |\n\n\
+                                 ## Step 3: Generate .ox/skills/project-conventions.md\n\
+                                 Use `file_write` to create this file with these sections:\n\n\
+                                 ### Project Overview\n\
+                                 Language, framework, build tool, entry point (1-2 lines).\n\n\
+                                 ### Architecture & Design Rules\n\
+                                 **MUST** rules — patterns that MUST be followed:\n\
+                                 - Module/dependency structure (e.g. \"MUST NOT import from sibling modules directly\")\n\
+                                 - Layer boundaries (e.g. \"MUST keep business logic in services/, not in handlers/\")\n\
+                                 - Error propagation (e.g. \"MUST use Result<T, E>, never panic!/unwrap()\")\n\
+                                 - Testing (e.g. \"MUST write integration tests for public APIs\")\n\n\
+                                 **MUST NOT** rules — anti-patterns to avoid:\n\
+                                 - Forbidden imports/dependencies\n\
+                                 - Forbidden patterns (e.g. \"MUST NOT use global mutable state\")\n\
+                                 - Forbidden shortcuts (e.g. \"MUST NOT commit directly to main\")\n\n\
+                                 Derive these from actual code patterns, linter configs, and project structure.\n\n\
+                                 ### Naming Conventions\n\
+                                 Files, modules, functions, variables — with real examples.\n\n\
+                                 ### Code Style\n\
+                                 Indent, quotes, line length, semicolons — from config/linter files.\n\n\
+                                 ### Commands\n\
+                                 Build, test, lint, run — from Makefile/package.json scripts/Cargo.toml.\n\n\
+                                 Keep it under 400 words. Be specific — cite real files and patterns found.",
+                                proj_root.display()
+                            );
+                            app.output.push_system("🔍 New project detected — generating project conventions...");
+                            return CommandResult::LlmRequest {
+                                prompt,
+                                description: "Generate project conventions".to_string(),
+                            };
+                        } else {
+                            app.output.push_system("📋 Project conventions already exist — loaded from cache.");
+                        }
+                    }
                 }
             }
             DirectoryChangeResult::NotFound(msg) => app.output.push_system(&msg),

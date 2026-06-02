@@ -509,86 +509,67 @@ impl MemoryNode {
                     return None;
                 }
                 
-                // Extract file path from tool args (JSON format)
-                let related_file = serde_json::from_str::<serde_json::Value>(tool_args)
-                    .ok()
+                // Extract file path and content summary
+                let parsed = serde_json::from_str::<serde_json::Value>(tool_args).ok();
+                let related_file = parsed.as_ref()
                     .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()));
                 
-                let content = if tool_args.len() > 400 {
-                    format!(
-                        "{}...",
-                        &tool_args[..tool_args
-                            .char_indices()
-                            .take(400)
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0)]
-                    )
+                // Build richer content: file path + what changed + result summary
+                let path_info = related_file.as_deref().unwrap_or("(unknown file)");
+                let result_summary = tool_result
+                    .map(|r| truncate_str(r, 200))
+                    .unwrap_or("completed");
+                
+                let content = format!(
+                    "[MODIFIED] {} | {} | Result: {}",
+                    path_info,
+                    tool_name,
+                    result_summary
+                );
+                
+                let mut node = if contains_architectural_keywords(tool_args) {
+                    Self::new(content, MemoryNodeType::Architectural, Some(project_id.into()), language.into(), MemorySource::ToolObservation)
+                } else if contains_business_keywords(tool_args) {
+                    Self::new(content, MemoryNodeType::Business, Some(project_id.into()), language.into(), MemorySource::ToolObservation)
                 } else {
-                    tool_args.to_string()
+                    Self::new(content, MemoryNodeType::Fact, Some(project_id.into()), language.into(), MemorySource::ToolObservation)
                 };
                 
-                let mut node = if contains_architectural_keywords(&content) {
-                    Self::new(
-                        content,
-                        MemoryNodeType::Architectural,
-                        Some(project_id.into()),
-                        language.into(),
-                        MemorySource::ToolObservation,
-                    )
-                } else if contains_business_keywords(&content) {
-                    Self::new(
-                        content,
-                        MemoryNodeType::Business,
-                        Some(project_id.into()),
-                        language.into(),
-                        MemorySource::ToolObservation,
-                    )
-                } else {
-                    Self::new(
-                        content,
-                        MemoryNodeType::Fact,
-                        Some(project_id.into()),
-                        language.into(),
-                        MemorySource::ToolObservation,
-                    )
-                };
-                
-                // Attach file path if extracted
-                if let Some(file_path) = related_file {
-                    node = node.with_related_file(&file_path);
+                if let Some(fp) = related_file {
+                    node = node.with_related_file(&fp);
                 }
                 
                 Some(node)
             }
             "shell_exec" => {
-                if tool_args.contains("error")
-                    || tool_args.contains("Error")
-                    || tool_args.contains("failed")
-                {
-                    let content = if tool_args.len() > 400 {
-                        format!(
-                            "{}...",
-                            &tool_args[..tool_args
-                                .char_indices()
-                                .take(400)
-                                .last()
-                                .map(|(i, _)| i)
-                                .unwrap_or(0)]
-                        )
-                    } else {
-                        tool_args.to_string()
-                    };
-                    Some(Self::new(
-                        content,
-                        MemoryNodeType::AntiPattern,
-                        Some(project_id.into()),
-                        language.into(),
-                        MemorySource::ToolObservation,
-                    ))
-                } else {
-                    None
-                }
+                let is_error = tool_args.contains("error") || tool_args.contains("Error") || tool_args.contains("failed");
+                let result_info = tool_result.unwrap_or("");
+                let content = format!(
+                    "[SHELL] {} | {} | {}",
+                    truncate_str(tool_args, 200),
+                    if is_error { "FAILED" } else { "OK" },
+                    truncate_str(result_info, 300)
+                );
+                Some(Self::new(
+                    content,
+                    if is_error { MemoryNodeType::AntiPattern } else { MemoryNodeType::Fact },
+                    Some(project_id.into()),
+                    language.into(),
+                    MemorySource::ToolObservation,
+                ))
+            }
+            "code_search" | "file_search" => {
+                // Remember what was searched for — helps with context
+                let query_info = if tool_args.len() > 300 { &tool_args[..300] } else { tool_args };
+                let result_count = tool_result.map(|r| r.lines().count()).unwrap_or(0);
+                let content = format!("[SEARCH] {} | {} results", query_info, result_count);
+                Some(Self::new(
+                    content,
+                    MemoryNodeType::Fact,
+                    Some(project_id.into()),
+                    language.into(),
+                    MemorySource::ToolObservation,
+                ))
             }
             _ => None,
         }
@@ -685,73 +666,63 @@ impl MemoryNode {
         project_id: &str,
         language: &str,
     ) -> Option<Self> {
+        // Take first 500 chars as summary — capture enough context
+        let summary: String = assistant_content.chars().take(500).collect();
+        
         if contains_architectural_keywords(assistant_content) {
-            let content: String = assistant_content.chars().take(300).collect();
-            Some(Self::new(
-                content,
-                MemoryNodeType::Architectural,
-                Some(project_id.into()),
-                language.into(),
-                MemorySource::LlmExtraction,
-            ))
+            Some(Self::new(summary, MemoryNodeType::Architectural, Some(project_id.into()), language.into(), MemorySource::LlmExtraction))
         } else if contains_user_preference(assistant_content) {
-            let content: String = assistant_content.chars().take(200).collect();
-            Some(Self::new(
-                content,
-                MemoryNodeType::Style,
-                Some(project_id.into()),
-                language.into(),
-                MemorySource::LlmExtraction,
-            ))
+            Some(Self::new(summary, MemoryNodeType::Style, Some(project_id.into()), language.into(), MemorySource::LlmExtraction))
+        } else if contains_business_keywords(assistant_content) {
+            Some(Self::new(summary, MemoryNodeType::Business, Some(project_id.into()), language.into(), MemorySource::LlmExtraction))
+        } else if assistant_content.len() > 100 {
+            // Store any substantial response as a general fact — captures requirements, explanations, etc.
+            Some(Self::new(summary, MemoryNodeType::Fact, Some(project_id.into()), language.into(), MemorySource::LlmExtraction))
         } else {
             None
         }
     }
 }
 
+/// Safe string truncation that respects UTF-8 character boundaries.
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    if s.len() <= max_chars {
+        return s;
+    }
+    let mut end = max_chars;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn contains_architectural_keywords(text: &str) -> bool {
     let keywords = [
-        "module",
-        "struct ",
-        "trait ",
-        "interface",
-        "abstract ",
-        "impl ",
-        "enum ",
-        "protocol",
-        "architecture",
-        "design pattern",
+        "module", "struct ", "trait ", "interface", "abstract ", "impl ",
+        "enum ", "protocol", "architecture", "design pattern",
+        "middleware", "pipeline", "handler", "service", "repository",
+        "dependency", "injection", "factory", "builder", "singleton",
+        "microservice", "monolith", "layer", "component",
     ];
     keywords.iter().any(|k| text.to_lowercase().contains(k))
 }
 
 fn contains_business_keywords(text: &str) -> bool {
     let keywords = [
-        "api",
-        "endpoint",
-        "model",
-        "schema",
-        "service",
-        "handler",
-        "controller",
-        "repository",
-        "entity",
+        "api", "endpoint", "model", "schema", "controller",
+        "entity", "dto", "request", "response", "route",
+        "auth", "login", "register", "user", "role", "permission",
+        "order", "payment", "product", "inventory",
+        "数据库", "表", "查询", "索引", "缓存",
     ];
     keywords.iter().any(|k| text.to_lowercase().contains(k))
 }
 
 fn contains_user_preference(text: &str) -> bool {
     let keywords = [
-        "以后都",
-        "不要用",
-        "always use",
-        "never use",
-        "prefer",
-        "avoid",
-        "习惯",
-        "偏好",
-        "应该用",
-        "选型",
+        "以后都", "不要用", "always use", "never use", "prefer", "avoid",
+        "习惯", "偏好", "应该用", "选型", "用这个", "改成",
+        "convention", "standard", "rule", "must", "should",
     ];
     keywords.iter().any(|k| text.to_lowercase().contains(k))
 }
@@ -939,6 +910,86 @@ impl MemoryManager {
                 successful_tools.len(),
                 successful_tools
             );
+        }
+
+        // 🧠 Requirement-Trace Memory: "user request → files changed → why"
+        self.create_turn_summary(messages, project_id, language);
+    }
+
+    /// Create a structured memory node: what the user asked, what files changed, why.
+    ///
+    /// Format:
+    /// ```
+    /// ## Turn Summary
+    /// **Request**: (user's ask)
+    /// **Files Changed**: path1, path2
+    /// **Why**: (extracted reasoning from assistant)
+    /// ```
+    fn create_turn_summary(&self, messages: &[crate::message::Message], project_id: &str, language: &str) {
+        use crate::message::Message;
+        
+        let user_request = messages.iter()
+            .filter_map(|m| if let Message::User { content } = m { Some(content.as_str()) } else { None })
+            .last()
+            .unwrap_or("(no request)");
+        
+        let mut files_changed: Vec<String> = Vec::new();
+        let mut operations: Vec<String> = Vec::new();
+        let mut assistant_reasoning = String::new();
+        
+        for msg in messages {
+            if let Message::Assistant { content, tool_calls } = msg {
+                // Extract reasoning from assistant's text (first meaningful paragraph)
+                if assistant_reasoning.is_empty() && !content.is_empty() {
+                    assistant_reasoning = content.chars().take(300).collect();
+                }
+                
+                for tc in tool_calls {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                        if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
+                            if !files_changed.contains(&path.to_string()) {
+                                files_changed.push(path.to_string());
+                            }
+                            match tc.name.as_str() {
+                                "file_write" => operations.push(format!("created {}", path)),
+                                "file_patch" => operations.push(format!("patched {}", path)),
+                                _ => {}
+                            }
+                        }
+                        if tc.name == "shell_exec" {
+                            let cmd = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                            operations.push(format!("ran `{}`", if cmd.len() > 60 { &cmd[..60] } else { cmd }));
+                        }
+                    }
+                }
+            }
+        }
+        
+        if !files_changed.is_empty() || !operations.is_empty() {
+            let request = user_request.chars().take(200).collect::<String>();
+            let files = files_changed.join(", ");
+            let ops = operations.join("; ");
+            let why = if assistant_reasoning.is_empty() { "(no explanation)" } else { &assistant_reasoning };
+            
+            let content = format!(
+                "## Turn Summary\n\
+                 **Request**: {request}\n\
+                 **Files Changed**: {files}\n\
+                 **Operations**: {ops}\n\
+                 **Why**: {why}"
+            );
+            
+            let mut node = MemoryNode::new(
+                content,
+                MemoryNodeType::Pattern,  // Higher priority than Fact
+                Some(project_id.to_string()),
+                language.to_string(),
+                MemorySource::RefinedSummary,
+            );
+            node = node
+                .with_related_files(&files_changed)
+                .with_critical();  // Mark as project-critical — never decay
+            self.store(node);
         }
     }
 
@@ -1190,25 +1241,32 @@ impl MemoryManager {
             );
         }
         
-        // Sort by combined score (relevance weight + composite score + LLM feedback boost)
+        // Sort by combined score (relevance + composite + recency + file relevance + LLM feedback)
+        let now = chrono::Utc::now().timestamp();
         results.sort_by(|(a, weight_a), (b, weight_b)| {
             let base_score_a = composite_score(a, 30) * weight_a;
             let base_score_b = composite_score(b, 30) * weight_b;
             
-            // 🆕 Add LLM score boost for high-quality memories
-            let llm_boost_a = if a.avg_llm_score > 0.0 {
-                (a.avg_llm_score / 10.0) * 0.3  // Up to +30% boost
-            } else {
-                0.0
+            // Recency boost: memories accessed in last hour get +20%, last day +10%
+            let recency_a = {
+                let age_hours = (now - a.last_accessed) as f64 / 3600.0;
+                if age_hours < 1.0 { 0.2 } else if age_hours < 24.0 { 0.1 } else { 0.0 }
             };
-            let llm_boost_b = if b.avg_llm_score > 0.0 {
-                (b.avg_llm_score / 10.0) * 0.3
-            } else {
-                0.0
+            let recency_b = {
+                let age_hours = (now - b.last_accessed) as f64 / 3600.0;
+                if age_hours < 1.0 { 0.2 } else if age_hours < 24.0 { 0.1 } else { 0.0 }
             };
             
-            let final_score_a = base_score_a * (1.0 + llm_boost_a);
-            let final_score_b = base_score_b * (1.0 + llm_boost_b);
+            // File relevance boost: memories with related_files get +15%
+            let file_boost_a = if !a.related_files.is_empty() { 0.15 } else { 0.0 };
+            let file_boost_b = if !b.related_files.is_empty() { 0.15 } else { 0.0 };
+            
+            // LLM feedback boost
+            let llm_boost_a = if a.avg_llm_score > 0.0 { (a.avg_llm_score / 10.0) * 0.3 } else { 0.0 };
+            let llm_boost_b = if b.avg_llm_score > 0.0 { (b.avg_llm_score / 10.0) * 0.3 } else { 0.0 };
+            
+            let final_score_a = base_score_a * (1.0 + recency_a + file_boost_a + llm_boost_a);
+            let final_score_b = base_score_b * (1.0 + recency_b + file_boost_b + llm_boost_b);
             
             final_score_b.partial_cmp(&final_score_a).unwrap_or(std::cmp::Ordering::Equal)
         });
