@@ -288,11 +288,18 @@ async fn run_app(
         }
     }
 
+    // Load project persona if available (L3 progressive disclosure)
+    let persona_content = rt_env.project_root.as_ref().and_then(|root| {
+        let layer_mgr = ox_core::memory::layering::LayerManager::new(root);
+        layer_mgr.load_persona_whitebox(&rt_env.project_id).ok().flatten()
+            .map(|p| p.to_markdown())
+    });
+
     // Initial system prompt (not used for agent turns, built dynamically)
     let system_prompt = context::build_system_prompt(
         &rt_env,
         &tool_registry,
-        None,
+        persona_content.as_deref(),
         Some(&config.behavior_rules),
         match &app.workflow_state {
             WorkflowState::Spec { spec_content, .. } if !spec_content.is_empty() => {

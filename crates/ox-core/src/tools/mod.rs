@@ -8,6 +8,7 @@ pub mod file_write;
 pub mod intent_classifier;  // 新增：意图分类器
 pub mod memory_search;
 pub mod project_detect;
+pub mod recall;
 pub mod shell_exec;
 pub mod web_fetch;
 
@@ -187,6 +188,7 @@ impl ToolRegistry {
         registry.register(Box::new(project_detect::ProjectDetectTool));
         registry.register(Box::new(web_fetch::WebFetchTool));
         registry.register(Box::new(memory_search::MemorySearchTool));
+        registry.register(Box::new(recall::RecallTool));
 
         registry
     }

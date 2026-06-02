@@ -701,6 +701,12 @@ pub async fn run_agent_turn(
         new_messages.push(assistant_msg.clone());
         messages.push(assistant_msg);
 
+        // ── Context Offloader: created once and reused across all tools in this iteration ──
+        let mut offloader = context_offloader::ContextOffloader::new(
+            &tool_ctx.working_dir,
+            &format!("session_{}", iteration),
+        );
+
         // Execute each tool call.
         for tc in &tool_calls {
             // Check cancellation before each tool execution.
@@ -1361,16 +1367,11 @@ pub async fn run_agent_turn(
             }
 
             // ── Context Offloading: Save verbose results to external files ──
-            let offloader = context_offloader::ContextOffloader::new(
-                &tool_ctx.working_dir,
-                &format!("session_{}", iteration),
-            );
-            
             let offloaded = offloader.process_result(
                 &tc.name,
                 &result.content,
                 iteration as usize,
-                2000, // threshold: 2000 chars
+                10000, // threshold: 10000 chars — only offload truly enormous outputs
             );
 
             // Send notification about offloading
@@ -1393,6 +1394,33 @@ pub async fn run_agent_turn(
             };
             new_messages.push(result_msg.clone());
             messages.push(result_msg);
+
+            // 🧠 Mid-turn memory refresh: after code-modifying tools, re-retrieve relevant memories
+            // so the LLM has the latest project knowledge for subsequent iterations.
+            if matches!(tc.name.as_str(), "file_write" | "file_patch" | "shell_exec") && !result.is_error {
+                let project_id: Option<&str> = if tool_ctx.runtime.project_id.is_empty() {
+                    None
+                } else {
+                    Some(&tool_ctx.runtime.project_id)
+                };
+                let refreshed = tool_ctx.memory.retrieve(
+                    &format!("Recent change via {}", tc.name),
+                    &project_id,
+                    3,
+                );
+                if !refreshed.is_empty() {
+                    let ctx = tool_ctx.memory.format_memory_context(&refreshed, false);
+                    messages.push(Message::system(&format!(
+                        "📚 Updated project knowledge after {}:\n{}",
+                        tc.name, ctx
+                    )));
+                }
+            }
+        }
+
+        // 🗺️ Inject task canvas if any results were offloaded
+        if let Some(canvas_ctx) = offloader.get_canvas_context() {
+            messages.push(Message::system(&canvas_ctx));
         }
 
         // ── Workflow Step Advancement Logic (after tool execution) ──

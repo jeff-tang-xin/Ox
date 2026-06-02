@@ -190,17 +190,7 @@ impl Tool for ShellExecTool {
             Ok((lines, status)) => {
                 let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
 
-                // Truncate to last 50 lines for LLM context.
-                let truncated = if lines.len() > 50 {
-                    let skipped = lines.len() - 50;
-                    let mut result = vec![format!("... ({skipped} lines omitted)")];
-                    result.extend(lines[lines.len() - 50..].iter().cloned());
-                    result
-                } else {
-                    lines
-                };
-
-                let output = truncated.join("\n");
+                let output = lines.join("\n");
                 let suffix = format!("\n[exit code: {exit_code}]");
                 let mut tool_output = if exit_code == 0 {
                     ToolOutput::success(format!("{output}{suffix}"))

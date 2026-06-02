@@ -38,11 +38,11 @@ impl OffloadedResult {
     /// Format as message content for LLM context
     pub fn to_context_message(&self) -> String {
         if self.is_offloaded {
+            let path = self.ref_path.as_ref().unwrap();
             format!(
-                "✅ Result saved to: {}\n📄 Summary: {}\n💡 Use `recall {}` to view full details",
-                self.ref_path.as_ref().unwrap().display(),
+                "📄 Summary: {}\n💡 Full content saved to `{}` — use `file_read` with this path to retrieve the complete output.",
                 self.summary,
-                self.node_id
+                path.display()
             )
         } else {
             self.summary.clone()
@@ -56,6 +56,8 @@ pub struct ContextOffloader {
     refs_dir: PathBuf,
     /// Current task/session ID for organizing refs
     task_id: String,
+    /// Symbolic task canvas (Mermaid) — accumulates offloaded nodes for a task map
+    canvas: crate::agent::task_canvas::TaskCanvas,
 }
 
 impl ContextOffloader {
@@ -71,6 +73,7 @@ impl ContextOffloader {
         Self {
             refs_dir,
             task_id: task_id.to_string(),
+            canvas: crate::agent::task_canvas::TaskCanvas::new("Task Progress"),
         }
     }
 
@@ -81,7 +84,7 @@ impl ContextOffloader {
     /// - Contains file paths or code blocks
     /// - Is a search/listing operation result
     pub fn process_result(
-        &self,
+        &mut self,
         tool_name: &str,
         content: &str,
         step_index: usize,
@@ -115,12 +118,12 @@ impl ContextOffloader {
                 content.lines().count() > 10
             }
             "shell_exec" => {
-                // Shell output can be very verbose
-                content.len() > 1000 || content.lines().count() > 20
+                // Shell output can be very verbose — only offload truly enormous output
+                content.len() > 8000 || content.lines().count() > 100
             }
             "file_read" => {
-                // Large file reads
-                content.len() > 1500
+                // Large file reads — preserve most file contents for LLM
+                content.len() > 8000
             }
             _ => false,
         }
@@ -128,7 +131,7 @@ impl ContextOffloader {
 
     /// Offload a result to external file
     fn offload_result(
-        &self,
+        &mut self,
         tool_name: &str,
         content: &str,
         step_index: usize,
@@ -182,7 +185,32 @@ impl ContextOffloader {
             file_content.len()
         );
 
+        // Add to task canvas (symbolic memory)
+        let canvas_node = crate::agent::task_canvas::TaskNode::new(&node_id, tool_name)
+            .with_ref(&ref_path.display().to_string())
+            .with_description(&summary);
+        self.canvas.add_node(canvas_node);
+        tracing::debug!("[CANVAS] Added node {} to task canvas ({} total nodes)", node_id, self.canvas.nodes.len());
+
         OffloadedResult::new(summary, node_id, Some(ref_path))
+    }
+
+    /// Get the accumulated task canvas (for injection into context)
+    pub fn get_canvas(&self) -> &crate::agent::task_canvas::TaskCanvas {
+        &self.canvas
+    }
+
+    /// Get compact Mermaid canvas for context injection (only if there are nodes)
+    pub fn get_canvas_context(&self) -> Option<String> {
+        if self.canvas.nodes.is_empty() {
+            return None;
+        }
+        let summary = self.canvas.status_summary();
+        let total: usize = summary.values().sum();
+        let mermaid = self.canvas.to_compact_mermaid();
+        Some(format!(
+            "## 📊 Task Progress ({total} steps offloaded)\n\n{mermaid}\n\n💡 Use `recall <node_id>` to retrieve any step's full content.\n"
+        ))
     }
 
     /// Retrieve full content from an offloaded reference
@@ -259,10 +287,10 @@ mod tests {
     #[test]
     fn test_offload_large_content() {
         let temp_dir = TempDir::new().unwrap();
-        let offloader = ContextOffloader::new(temp_dir.path(), "test_task");
+        let mut offloader = ContextOffloader::new(temp_dir.path(), "test_task");
         
         let large_content = "Line 1\n".repeat(100);
-        let result = offloader.process_result("shell_exec", &large_content, 1, 2000);
+        let result = offloader.process_result("some_tool", &large_content, 1, 500);
         
         assert!(result.is_offloaded);
         assert!(result.ref_path.is_some());
@@ -272,7 +300,7 @@ mod tests {
     #[test]
     fn test_keep_small_content() {
         let temp_dir = TempDir::new().unwrap();
-        let offloader = ContextOffloader::new(temp_dir.path(), "test_task");
+        let mut offloader = ContextOffloader::new(temp_dir.path(), "test_task");
         
         let small_content = "Short result";
         let result = offloader.process_result("file_write", small_content, 1, 2000);
@@ -285,7 +313,7 @@ mod tests {
     #[test]
     fn test_retrieve_content() {
         let temp_dir = TempDir::new().unwrap();
-        let offloader = ContextOffloader::new(temp_dir.path(), "test_task");
+        let mut offloader = ContextOffloader::new(temp_dir.path(), "test_task");
         
         let content = "Test content to retrieve";
         let result = offloader.process_result("file_read", content, 1, 10);
