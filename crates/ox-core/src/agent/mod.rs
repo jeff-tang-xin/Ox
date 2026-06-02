@@ -5,8 +5,13 @@ pub mod interrupt;
 pub mod intervention;
 pub mod progress;
 pub mod session;
+pub mod task_canvas;
 pub mod ui_event;
 pub mod workflow;
+pub mod context_offloader;
+pub mod auto_reflect;  // 🆕 Auto-reflection for skill generation
+
+
 
 pub use engine::StepDisplayInfo;
 
@@ -73,20 +78,10 @@ pub enum AgentToUiEvent {
         total_tokens: u32,
         estimated_cost: String,
     },
-    /// Council debate completed.
-    CouncilDone {
-        session: crate::council::CouncilSession,
-    },
     /// Agent detected a working directory change (e.g. shell cd).
     WorkingDirChanged(std::path::PathBuf),
     /// Agent reached the iteration limit and is asking user to continue.
     IterationLimitReached { iteration: u32 },
-    /// Compression completed — carries compressed messages to persist into SQLite.
-    CompressionComplete {
-        compressed_messages: Vec<Message>,
-        /// Number of original session messages that were compressed.
-        source_msg_count: usize,
-    },
     /// Workflow completed — trigger auto-reflection to update Skills.
     WorkflowCompleted {
         /// Task description (user's original request)
@@ -571,10 +566,10 @@ pub async fn run_agent_turn(
                         engine.set_confirmation_flag();
                         
                         // Notify UI about waiting for confirmation
-                        if let Some(step_info) = get_current_step_info(&engine) {
+                        if let Some(step_name) = get_current_step_name(&engine) {
                             let status_msg = format!(
                                 "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
-                                step_info.step_name
+                                step_name
                             );
                             let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
                         }
@@ -604,16 +599,16 @@ pub async fn run_agent_turn(
                                 }
 
                                 // Notify UI about step transition
-                                if let Some(step_info) = get_current_step_info(&engine) {
+                                if let Some(step_name) = get_current_step_name(&engine) {
                                     let status_msg = if needs_confirmation {
                                         format!(
                                             "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
-                                            step_info.step_name
+                                            step_name
                                         )
                                     } else {
                                         format!(
                                             "✅ Step completed. Moving to: {}",
-                                            step_info.step_name
+                                            step_name
                                         )
                                     };
 
@@ -952,7 +947,7 @@ pub async fn run_agent_turn(
                         .and_then(|v| v.as_str())
                         .map(|s| {
                             if s.len() > 60 {
-                                format!("{}...", &s[..60])
+                                format!("{}...", s.get(..60).unwrap_or(s))
                             } else {
                                 s.to_string()
                             }
@@ -981,8 +976,10 @@ pub async fn run_agent_turn(
                     // Find similar tool names (simple string matching)
                     let mut suggestions: Vec<&str> = Vec::new();
                     for name in tool_registry.names() {
-                        if name.starts_with(&tc.name[..tc.name.len().min(3)])
-                            || tc.name.starts_with(&name[..name.len().min(3)])
+                        let tc_name_prefix = tc.name.get(..tc.name.len().min(3)).unwrap_or(&tc.name);
+                        let name_prefix = name.get(..name.len().min(3)).unwrap_or(name);
+                        if name.starts_with(tc_name_prefix)
+                            || tc.name.starts_with(name_prefix)
                         {
                             suggestions.push(name);
                         }
@@ -1092,7 +1089,7 @@ pub async fn run_agent_turn(
                         .last()
                         .map(|(i, c)| i + c.len_utf8())
                         .unwrap_or(0);
-                    format!("{}...(truncated)", &tc.arguments[..end])
+                    format!("{}...(truncated)", tc.arguments.get(..end).unwrap_or(&tc.arguments))
                 } else {
                     tc.arguments.clone()
                 };
@@ -1363,15 +1360,36 @@ pub async fn run_agent_turn(
                 let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
             }
 
+            // ── Context Offloading: Save verbose results to external files ──
+            let offloader = context_offloader::ContextOffloader::new(
+                &tool_ctx.working_dir,
+                &format!("session_{}", iteration),
+            );
+            
+            let offloaded = offloader.process_result(
+                &tc.name,
+                &result.content,
+                iteration as usize,
+                2000, // threshold: 2000 chars
+            );
+
+            // Send notification about offloading
+            if offloaded.is_offloaded {
+                let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                    "📄 Result offloaded to: {}",
+                    offloaded.ref_path.as_ref().unwrap().display()
+                )));
+            }
+
             let _ = ui_tx.send(AgentToUiEvent::ToolResult {
                 name: tc.name.clone(),
-                output: result.content.clone(),
+                output: offloaded.to_context_message(),
                 is_error: result.is_error,
             });
 
             let result_msg = Message::ToolResult {
                 tool_call_id: tc.id.clone(),
-                content: result.content,
+                content: offloaded.to_context_message(),
             };
             new_messages.push(result_msg.clone());
             messages.push(result_msg);
@@ -1460,10 +1478,10 @@ pub async fn run_agent_turn(
                     
                     engine.set_confirmation_flag();
                     
-                    if let Some(step_info) = get_current_step_info(&engine) {
+                    if let Some(step_name) = get_current_step_name(&engine) {
                         let status_msg = format!(
                             "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
-                            step_info.step_name
+                            step_name
                         );
                         let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
                     }
@@ -1486,14 +1504,14 @@ pub async fn run_agent_turn(
                                 tracing::info!("New step requires user confirmation - setting flag");
                             }
 
-                            if let Some(step_info) = get_current_step_info(&engine) {
+                            if let Some(step_name) = get_current_step_name(&engine) {
                                 let status_msg = if needs_confirmation {
                                     format!(
                                         "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
-                                        step_info.step_name
+                                        step_name
                                     )
                                 } else {
-                                    format!("✅ Step completed. Moving to: {}", step_info.step_name)
+                                    format!("✅ Step completed. Moving to: {}", step_name)
                                 };
 
                                 let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
@@ -1563,29 +1581,9 @@ fn is_likely_json_truncation(json_str: &str, error: &serde_json::Error) -> bool 
     is_eof_error || has_unclosed_structure
 }
 
-/// Helper function to get current step information from workflow engine
-#[derive(Debug, Clone)]
-struct StepInfo {
-    workflow_name: String,
-    step_num: usize,
-    total_steps: usize,
-    step_name: String,
-}
-
-fn get_current_step_info(engine: &crate::agent::engine::WorkflowEngine) -> Option<StepInfo> {
-    if let Some(workflow) = engine.current_workflow() {
-        if let Some((step_num, total_steps)) = engine.get_progress() {
-            if let Some(step) = engine.current_step() {
-                return Some(StepInfo {
-                    workflow_name: workflow.name.clone(),
-                    step_num,
-                    total_steps,
-                    step_name: step.name.clone(),
-                });
-            }
-        }
-    }
-    None
+/// Helper function to get current step name from workflow engine.
+fn get_current_step_name(engine: &crate::agent::engine::WorkflowEngine) -> Option<String> {
+    engine.current_step().map(|step| step.name.clone())
 }
 
 /// Remove think tags (<think>...</think>) from text.

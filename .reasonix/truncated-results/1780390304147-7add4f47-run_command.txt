@@ -1,0 +1,647 @@
+$ cargo test 2>&1
+[exit 101]
+   Compiling ox-core v0.1.0 (F:\rust\Ox\crates\ox-core)
+warning: unused import: `super::*`
+   --> crates\ox-core\src\agent\auto_reflect.rs:219:9
+    |
+219 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary parentheses around assigned value
+    --> crates\ox-core\src\agent\mod.rs:1574:34
+     |
+1574 |       let has_unclosed_structure = (
+     |  __________________________________^
+1575 | |         // Count opening/closing braces
+1576 | |         (trimmed.matches('{').count() > trimmed.matches('}').count()) ||
+     | |________^
+...
+1582 |           (trimmed.matches('"').count() % 2 != 0)
+     |  ________________________________________________^
+1583 | |     );
+     | |_____^
+     |
+     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+     |
+1574 ~     let has_unclosed_structure = (trimmed.matches('{').count() > trimmed.matches('}').count()) ||
+1575 |         (trimmed.matches('[').count() > trimmed.matches(']').count()) ||
+ ...
+1579 |         // Has unclosed quote
+1580 ~         (trimmed.matches('"').count() % 2 != 0) ;
+     |
+
+warning: unused variable: `body`
+   --> crates\ox-core\src\agent\auto_reflect.rs:149:24
+    |
+149 |         let (metadata, body) = self.extract_frontmatter(content)?;
+    |                        ^^^^ help: if this is intentional, prefix it with an underscore: `_body`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `name`
+   --> crates\ox-core\src\agent\auto_reflect.rs:155:13
+    |
+155 |         let name = metadata.get("name")
+    |             ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+
+warning: unused variable: `description`
+   --> crates\ox-core\src\agent\auto_reflect.rs:159:13
+    |
+159 |         let description = metadata.get("description")
+    |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_description`
+
+warning: unused variable: `tool_call_id_clone`
+    --> crates\ox-core\src\agent\mod.rs:1322:17
+     |
+1322 |             let tool_call_id_clone = tc.id.clone();
+     |                 ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_tool_call_id_clone`
+
+warning: unused variable: `tool_name_clone`
+    --> crates\ox-core\src\agent\mod.rs:1323:17
+     |
+1323 |             let tool_name_clone = tc.name.clone();
+     |                 ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_tool_name_clone`
+
+warning: unused variable: `budgets`
+   --> crates\ox-core\src\context\mod.rs:281:13
+    |
+281 |         let budgets = self.budgets(context_window);
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_budgets`
+
+warning: unused variable: `project_id`
+   --> crates\ox-core\src\memory\hybrid_storage.rs:245:41
+    |
+245 |     fn retrieve_l0_conversations(&self, project_id: &str) -> anyhow::Result<Vec<RawConversation>> {
+    |                                         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_project_id`
+
+warning: unused variable: `id`
+   --> crates\ox-core\src\message\session.rs:366:21
+    |
+366 |                 let id = meta.get("id")?.as_str().unwrap_or("?");
+    |                     ^^ help: if this is intentional, prefix it with an underscore: `_id`
+
+warning: unused variable: `count`
+   --> crates\ox-core\src\message\session.rs:367:21
+    |
+367 |                 let count = meta.get("message_count")?.as_u64().unwrap_or(0);
+    |                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_count`
+
+warning: unused variable: `i`
+   --> crates\ox-core\src\skill\generation.rs:393:28
+    |
+393 |                     .map(|(i, tool)| format!("Use `{}` tool", tool))
+    |                            ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: unused variable: `templates`
+   --> crates\ox-core\src\skill\generation.rs:405:9
+    |
+405 |         templates: &[SkillTemplate],
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_templates`
+
+warning: field `ox_home_dir` is never read
+  --> crates\ox-core\src\agent\auto_reflect.rs:20:5
+   |
+17 | pub struct AutoReflector {
+   |            ------------- field in this struct
+...
+20 |     ox_home_dir: std::path::PathBuf,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `parse_file_list` is never used
+   --> crates\ox-core\src\file_index\mod.rs:488:8
+    |
+ 66 | impl FileIndexManager {
+    | --------------------- associated function in this implementation
+...
+488 |     fn parse_file_list(file_list: &str) -> Vec<FileIndexEntry> {
+    |        ^^^^^^^^^^^^^^^
+
+warning: struct `CodeMatch` is never constructed
+   --> crates\ox-core\src\tools\code_search.rs:132:8
+    |
+132 | struct CodeMatch {
+    |        ^^^^^^^^^
+
+warning: `ox-core` (lib) generated 15 warnings (1 duplicate) (run `cargo fix --lib -p ox-core` to apply 11 suggestions)
+   Compiling ox-cli v0.1.0 (F:\rust\Ox\crates\ox-cli)
+warning: unused import: `WorkflowProgress`
+   --> crates\ox-cli\src\spec_helpers.rs:388:55
+    |
+388 |     use ox_core::agent::progress::{scan_all_progress, WorkflowProgress};
+    |                                                       ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ApiKeySource` and `BaseUrlSource`
+  --> crates\ox-cli\src\slash_commands\system.rs:98:24
+   |
+98 |     use ox_core::llm::{ApiKeySource, BaseUrlSource};
+   |                        ^^^^^^^^^^^^  ^^^^^^^^^^^^^
+
+warning: unused import: `CommandResult`
+ --> crates\ox-cli\src\slash_commands\skill.rs:4:29
+  |
+4 | use crate::slash_commands::{CommandResult, CommandMeta};
+  |                             ^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> crates\ox-cli\src\middleware\interjection.rs:5:5
+  |
+5 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `build_refined_context`
+ --> crates\ox-cli\src\helpers\context.rs:3:40
+  |
+3 | use ox_core::context::{ContextBuilder, build_refined_context};
+  |                                        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates\ox-cli\src\main.rs:436:9
+    |
+436 |     let mut session_action: SessionAction = SessionAction::None;
+    |         ----^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated field `terminal::app::App::spec_active`: Use workflow_state instead
+   --> crates\ox-cli\src\terminal\app.rs:450:12
+    |
+450 |         if self.spec_active || session_meta.workflow_mode == "spec" {
+    |            ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated field `terminal::app::App::spec_active`: Use workflow_state instead
+  --> crates\ox-cli\src\spec_helpers.rs:85:13
+   |
+85 |             app.spec_active = true;
+   |             ^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_content`: Use workflow_state instead
+   --> crates\ox-cli\src\spec_helpers.rs:237:5
+    |
+237 |     app.spec_content = content.to_string();
+    |     ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_active`: Use workflow_state instead
+   --> crates\ox-cli\src\spec_helpers.rs:238:5
+    |
+238 |     app.spec_active = true;
+    |     ^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::pending_spec_planning`: Use pending_llm_task instead
+   --> crates\ox-cli\src\spec_helpers.rs:308:5
+    |
+308 |     app.pending_spec_planning = Some(content.to_string());
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates\ox-core\src\file_index\registry.rs:122:13
+    |
+122 |         let mut registry = FileIndexRegistry::new(db_dir.clone());
+    |             ----^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated field `terminal::app::App::spec_active`: Use workflow_state instead
+   --> crates\ox-cli\src\slash_commands\system.rs:183:5
+    |
+183 |     app.spec_active = false;
+    |     ^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_content`: Use workflow_state instead
+   --> crates\ox-cli\src\slash_commands\system.rs:184:5
+    |
+184 |     app.spec_content.clear();
+    |     ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_edit_mode`: Use workflow_state instead
+   --> crates\ox-cli\src\slash_commands\system.rs:185:5
+    |
+185 |     app.spec_edit_mode = false;
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_edit_mode`: Use workflow_state instead
+   --> crates\ox-cli\src\slash_commands\system.rs:197:8
+    |
+197 |     if app.spec_edit_mode { app.spec_edit_mode = false; app.output.push_system("Spec edit cancelled."); }
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_edit_mode`: Use workflow_state instead
+   --> crates\ox-cli\src\slash_commands\system.rs:197:29
+    |
+197 |     if app.spec_edit_mode { app.spec_edit_mode = false; app.output.push_system("Spec edit cancelled."); }
+    |                             ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::pending_spec_planning`: Use pending_llm_task instead
+    --> crates\ox-cli\src\main.rs:1666:53
+     |
+1666 |                         if let Some(spec_content) = app.pending_spec_planning.take() {
+     |                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::pending_smart_naming`: Use pending_llm_task instead
+    --> crates\ox-cli\src\main.rs:1782:48
+     |
+1782 |                         if let Some(pending) = app.pending_smart_naming.take() {
+     |                                                ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::pending_workflow_approval`: Use pending_llm_task instead
+    --> crates\ox-cli\src\main.rs:1808:28
+     |
+1808 |                         if app.pending_workflow_approval {
+     |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::pending_workflow_approval`: Use pending_llm_task instead
+    --> crates\ox-cli\src\main.rs:1809:29
+     |
+1809 | ...                   app.pending_workflow_approval = false;
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_active`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:1818:40
+     |
+1818 | ...                   if app.spec_active && !app.spec_content.is_empty() {
+     |                          ^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_content`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:1818:60
+     |
+1818 | ...                   if app.spec_active && !app.spec_content.is_empty() {
+     |                                              ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_content`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:1819:47
+     |
+1819 | ...                   Some(&app.spec_content)
+     |                             ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_edit_mode`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:1956:28
+     |
+1956 |                         if app.spec_edit_mode {
+     |                            ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_edit_mode`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:1957:29
+     |
+1957 | ...                   app.spec_edit_mode = false;
+     |                       ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_content`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:1958:29
+     |
+1958 | ...                   app.spec_content = text.clone();
+     |                       ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_active`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:1959:29
+     |
+1959 | ...                   app.spec_active = true;
+     |                       ^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_active`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:2025:36
+     |
+2025 | ...                   if app.spec_active && !app.spec_content.is_empty() {
+     |                          ^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_content`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:2025:56
+     |
+2025 | ...                   if app.spec_active && !app.spec_content.is_empty() {
+     |                                              ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `terminal::app::App::spec_content`: Use workflow_state instead
+    --> crates\ox-cli\src\main.rs:2026:43
+     |
+2026 | ...                   Some(&app.spec_content)
+     |                             ^^^^^^^^^^^^^^^^
+
+warning: unused variable: `config`
+  --> crates\ox-cli\src\slash_commands\system.rs:96:5
+   |
+96 |     config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+   |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_config`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `rt_env`
+   --> crates\ox-cli\src\slash_commands\skill.rs:250:45
+    |
+250 | fn handle_skill_reflect(app: &mut AppState, rt_env: &RuntimeEnvironment) {
+    |                                             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_rt_env`
+
+warning: unused variable: `session_action`
+   --> crates\ox-cli\src\main.rs:436:9
+    |
+436 |     let mut session_action: SessionAction = SessionAction::None;
+    |         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_session_action`
+
+warning: unused variable: `recent_boundary`
+   --> crates\ox-cli\src\main.rs:978:33
+    |
+978 | ...                   let recent_boundary = {
+    |                           ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_recent_boundary`
+
+warning: variable does not need to be mutable
+    --> crates\ox-cli\src\main.rs:1576:45
+     |
+1576 | ...                   let mut current_system_prompt = context::build_system_prompt(
+     |                           ----^^^^^^^^^^^^^^^^^^^^^
+     |                           |
+     |                           help: remove this `mut`
+
+warning: unused variable: `model_name`
+    --> crates\ox-cli\src\main.rs:1477:5
+     |
+1477 |     model_name: &str,
+     |     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_model_name`
+
+warning: unused variable: `resolve_info`
+    --> crates\ox-cli\src\main.rs:1481:5
+     |
+1481 |     resolve_info: &Option<ProviderResolveInfo>,
+     |     ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_resolve_info`
+
+warning: associated items `MAX_LINE_LEN` and `safe_char_boundary` are never used
+   --> crates\ox-cli\src\terminal\output_pane.rs:83:11
+    |
+ 81 | impl OutputPane {
+    | --------------- associated items in this implementation
+ 82 |     const MAX_LINES: usize = 2000;
+ 83 |     const MAX_LINE_LEN: usize = 5000;
+    |           ^^^^^^^^^^^^
+...
+254 |     fn safe_char_boundary(s: &str, max_byte: usize) -> usize {
+    |        ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `SmartNameResult` is never constructed
+  --> crates\ox-cli\src\spec_helpers.rs:13:12
+   |
+13 | pub struct SmartNameResult {
+   |            ^^^^^^^^^^^^^^^
+
+warning: enum `SpecMode` is never used
+  --> crates\ox-cli\src\spec_helpers.rs:19:10
+   |
+19 | pub enum SpecMode {
+   |          ^^^^^^^^
+
+warning: function `parse_spec_mode` is never used
+  --> crates\ox-cli\src\spec_helpers.rs:32:8
+   |
+32 | pub fn parse_spec_mode(action: &str) -> SpecMode {
+   |        ^^^^^^^^^^^^^^^
+
+warning: function `activate_existing_spec` is never used
+  --> crates\ox-cli\src\spec_helpers.rs:74:8
+   |
+74 | pub fn activate_existing_spec(
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_new_spec` is never used
+   --> crates\ox-cli\src\spec_helpers.rs:137:8
+    |
+137 | pub fn create_new_spec(
+    |        ^^^^^^^^^^^^^^^
+
+warning: enum `NameExtractionMode` is never used
+   --> crates\ox-cli\src\spec_helpers.rs:148:10
+    |
+148 | pub enum NameExtractionMode {
+    |          ^^^^^^^^^^^^^^^^^^
+
+warning: function `create_new_spec_with_mode` is never used
+   --> crates\ox-cli\src\spec_helpers.rs:158:8
+    |
+158 | pub fn create_new_spec_with_mode(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `finalize_spec_creation` is never used
+   --> crates\ox-cli\src\spec_helpers.rs:186:4
+    |
+186 | fn finalize_spec_creation(
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_requirement_name` is never used
+   --> crates\ox-cli\src\spec_helpers.rs:312:8
+    |
+312 | pub fn extract_requirement_name(content: &str) -> String {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `storage`
+   --> crates\ox-core\src\memory\hybrid_storage.rs:355:13
+    |
+355 |         let storage = HybridStorage::new(temp_dir.path()).unwrap();
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_storage`
+
+warning: `ox-cli` (bin "ox" test) generated 47 warnings (run `cargo fix --bin "ox" -p ox-cli --tests` to apply 13 suggestions)
+warning: `ox-core` (lib test) generated 18 warnings (14 duplicates) (run `cargo fix --lib -p ox-core --tests` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.19s
+     Running unittests src\main.rs (target\debug\deps\ox-2a624dd4201deeef.exe)
+
+running 8 tests
+test keyword_extraction::tests::test_remove_json_block ... ok
+test keyword_extraction::tests::test_extract_keywords ... ok
+test terminal::markdown::tests::paragraph_continuity ... ok
+test terminal::markdown::tests::code_block_integrity ... ok
+test terminal::markdown::tests::heading_rendering ... ok
+test terminal::markdown::tests::bold_italic_rendering ... ok
+test terminal::markdown::tests::inline_code_rendering ... ok
+test terminal::markdown::tests::code_block_rendering ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src\lib.rs (target\debug\deps\ox_core-1ae0ee45a504ce99.exe)
+
+running 148 tests
+test agent::auto_reflect::tests::test_extract_frontmatter ... ok
+test agent::interjection::tests::empty_buffer ... ok
+test agent::interjection::tests::normal_only_no_urgent ... ok
+test agent::interrupt::tests::idle_ctrl_c_triggers_shutdown ... ok
+test agent::interrupt::tests::first_ctrl_c_during_agent_cancels ... ok
+test agent::interrupt::tests::reset_creates_fresh_token ... ok
+test agent::interrupt::tests::double_ctrl_c_during_agent_force_quits ... ok
+test agent::interjection::tests::push_and_drain ... ok
+test agent::task_canvas::tests::test_compact_output ... ok
+test agent::task_canvas::tests::test_basic_canvas ... ok
+test agent::task_canvas::tests::test_node_traceability ... ok
+test agent::task_canvas::tests::test_status_tracking ... ok
+test agent::context_offloader::tests::test_keep_small_content ... ok
+test config::tests::test_provider_config_defaults ... ok
+test context::effort::tests::code_block_is_standard_or_higher ... ok
+test context::effort::tests::refactor_is_high ... ok
+test context::effort::tests::short_request_is_medium ... ok
+test context::effort::tests::simple_question_is_low ... ok
+test config::tests::test_default_config_path_suffix ... ok
+test agent::interrupt::tests::expired_double_click_re_cancels ... ok
+test context::tests::budgets_sum_is_reasonable ... ok
+test context::tests::build_includes_system_and_recent_history ... ok
+test context::tests::build_truncates_old_history_when_budget_exceeded ... ok
+test context::tests::sanitize_keeps_assistant_with_content_even_if_tool_calls_removed ... ok
+test context::tests::sanitize_removes_empty_assistant_messages ... FAILED
+test context::tests::sanitize_removes_orphaned_tool_results ... ok
+test cost::tests::cost_tracker_summary_format ... ok
+test cost::tests::estimate_cost_gpt4o ... ok
+test council::tests::council_session_format_summary ... ok
+test council::tests::council_token_usage_add ... ok
+test council::tests::model_capability_ema_update ... ok
+test council::tests::participant_label ... ok
+test config::tests::test_toml_minimal_parse ... ok
+test config::tests::test_legacy_migration ... ok
+test config::tests::test_legacy_does_not_overwrite_new ... ok
+test council::tests::topic_category_classify ... ok
+test config::tests::test_toml_with_providers ... ok
+test feedback::ema_tracker::tests::test_calculate_accept_rate ... ok
+test feedback::ema_tracker::tests::test_ema_first_update ... ok
+test feedback::ema_tracker::tests::test_ema_initial_state ... ok
+test feedback::ema_tracker::tests::test_ema_manager_multiple_metrics ... ok
+test feedback::ema_tracker::tests::test_ema_subsequent_updates ... ok
+test feedback::ema_tracker::tests::test_trend_direction ... ok
+test feedback::override_detector::tests::test_calculate_diff_ratio_line_change ... ok
+test agent::context_offloader::tests::test_offload_large_content ... ok
+test feedback::override_detector::tests::test_calculate_diff_ratio_no_change ... ok
+test feedback::override_detector::tests::test_hash_content_consistency ... ok
+test feedback::override_detector::tests::test_hash_content_different ... ok
+test feedback::override_detector::tests::test_implicit_feedback_weights ... ok
+test config::tests::test_init_default_config ... ok
+test feedback::override_detector::tests::test_map_override_to_feedback ... ok
+test feedback::rollback::tests::test_calculate_satisfaction_with_explicit ... ok
+test feedback::rollback::tests::test_calculate_satisfaction_without_explicit ... ok
+test feedback::rollback::tests::test_rollback_decision_no_degradation ... ok
+test feedback::rollback::tests::test_rollback_decision_with_degradation ... ok
+test file_index::tests::test_should_exclude_path ... FAILED
+test config::tests::test_config_template_round_trip ... ok
+test llm::sse::tests::test_complete_and_truncated_mixed ... ok
+test llm::sse::tests::test_parse_json_array ... ok
+test llm::sse::tests::test_parse_json_object ... ok
+test file_index::registry::tests::test_registry_creation ... ok
+test context::refinement::tests::test_remove_think_blocks ... ok
+test context::refinement::tests::test_refine_simple_conversation ... ok
+test context::refinement::tests::test_refine_with_tools ... ok
+test llm::sse::tests::test_truncated_json_is_skipped ... ok
+test llm::tests::test_default_base_url ... ok
+test llm::tests::test_resolve_provider_name_anthropic ... ok
+test llm::tests::test_resolve_provider_name_deepseek ... ok
+test llm::tests::test_resolve_provider_name_openai ... ok
+test llm::tests::test_resolve_provider_name_with_config_default_provider ... ok
+test llm::tests::test_resolve_provider_name_with_config_empty_mapping ... ok
+test llm::tests::test_resolve_provider_name_with_config_explicit_mapping ... ok
+test llm::tokenizer::tests::estimate_tokens_basic ... ok
+test llm::universal_adapter::tests::test_adapter_factory ... ok
+test llm::universal_adapter::tests::test_anthropic_text_response ... ok
+test llm::universal_adapter::tests::test_openai_text_response ... ok
+test memory::decay_tests::project_decay_critical_is_one ... ok
+test memory::decay_tests::overall_decay_fresh_is_reasonable ... ok
+test memory::decay_tests::project_decay_fresh_is_high ... ok
+test memory::decay_tests::test_file_read_memory_without_result ... ok
+test memory::decay_tests::test_file_read_memory_extraction_with_result ... FAILED
+test agent::context_offloader::tests::test_retrieve_content ... ok
+test memory::layering::tests::test_layer_conversion ... ok
+test memory::layering::tests::test_persona_markdown_roundtrip ... ok
+test file_index::tests::test_create_index ... ok
+test file_index::tests::test_batch_insert_and_query ... ok
+test llm::sse::tests::test_sse_event_buffer_basic ... ok
+test llm::sse::tests::test_sse_event_buffer_multiline_data ... ok
+test llm::openai_sse::tests::test_simple_text_response ... ok
+test llm::openai_sse::tests::test_json_array_response ... ok
+test llm::openai_sse::tests::test_tool_call_with_finish_reason ... ok
+test message::session::tests::new_session_creates_file ... ok
+test message::session::tests::crash_safety_skips_malformed_last_line ... ok
+test file_index::registry::tests::test_get_or_create_same_dir ... ok
+test runtime::project::tests::compute_project_id_is_deterministic ... ok
+test runtime::project::tests::find_project_root_finds_cargo_toml ... ok
+test message::session::tests::append_and_reload ... ok
+test memory::hybrid_storage::tests::test_hybrid_storage_creation ... ok
+test memory::hybrid_storage::tests::test_store_and_load_l2_scenario ... ok
+test memory::store::tests::insert_and_query ... ok
+test memory::hybrid_storage::tests::test_store_and_load_l3_persona ... ok
+test safety::tests::dangerous_skips_when_trust_all ... ok
+test safety::tests::high_risk_detection ... ok
+test safety::tests::safe_always_skips ... ok
+test safety::tests::trust_all_skips_requires_confirmation ... ok
+test safety::tests::trust_specific_tool ... ok
+test safety::tests::is_path_within_workdir_detects_outside ... ok
+test safety::tests::untrust_revokes ... ok
+test safety::tests::validate_path_allows_within_workdir ... ok
+test safety::tests::validate_path_no_longer_rejects_traversal ... ok
+test skill::generation::tests::test_execution_trace_markdown ... ok
+test skill::generation::tests::test_skill_template_markdown ... ok
+test slash::tests::parse_cancel ... ok
+test slash::tests::parse_help ... ok
+test slash::tests::parse_init ... ok
+test slash::tests::parse_spec_inline_content ... ok
+test slash::tests::parse_spec_show ... ok
+test slash::tests::parse_spec_status ... ok
+test slash::tests::parse_trust_all ... ok
+test slash::tests::parse_trust_specific ... ok
+test slash::tests::parse_unknown ... ok
+test tools::content_validation::tests::test_code_with_special_chars ... ok
+test tools::content_validation::tests::test_control_characters_rejected ... ok
+test tools::content_validation::tests::test_emoji_allowed ... ok
+test tools::content_validation::tests::test_few_fffd_allowed ... ok
+test tools::content_validation::tests::test_many_fffd_warned_but_allowed ... ok
+test tools::content_validation::tests::test_normal_whitespace_allowed ... ok
+test tools::content_validation::tests::test_null_bytes_rejected ... ok
+test tools::content_validation::tests::test_special_unicode_allowed ... ok
+test tools::content_validation::tests::test_valid_text ... ok
+test tools::intent_classifier::tests::test_chinese_code_writing ... ok
+test tools::intent_classifier::tests::test_english_debugging ... ok
+test tools::intent_classifier::tests::test_memory_search_for_debugging ... ok
+test tools::intent_classifier::tests::test_exploration ... ok
+test tools::intent_classifier::tests::test_memory_search_with_architecture_mention ... ok
+test tools::intent_classifier::tests::test_memory_search_with_history_reference ... ok
+test tools::intent_classifier::tests::test_mixed_language ... ok
+test tools::intent_classifier::tests::test_no_memory_search_for_simple_task ... ok
+test memory::store::tests::insert_batch_and_search ... ok
+test memory::store::tests::open_creates_schema ... ok
+test memory::store::tests::overall_memories ... ok
+test runtime::directory::tests::change_to_parent_directory ... ok
+test memory::store::tests::update_depth_and_access ... ok
+test safety::sanitizer::tests::sanitize_preserves_safe_text ... ok
+test safety::sanitizer::tests::sanitize_phone ... ok
+test safety::sanitizer::tests::sanitize_password ... ok
+test safety::sanitizer::tests::sanitize_email ... ok
+test runtime::directory::tests::change_to_nonexistent_directory ... ok
+
+failures:
+
+---- context::tests::sanitize_removes_empty_assistant_messages stdout ----
+
+thread 'context::tests::sanitize_removes_empty_assistant_messages' (42244) panicked at crates\ox-core\src\context\mod.rs:671:9:
+assertion `left == right` failed
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- file_index::tests::test_should_exclude_path stdout ----
+
+thread 'file_index::tests::test_should_exclude_path' (55472) panicked at crates\ox-core\src\file_index\mod.rs:797:9:
+assertion failed: should_exclude_path("logs/app.log")
+
+---- memory::decay_tests::test_file_read_memory_extraction_with_result stdout ----
+
+thread 'memory::decay_tests::test_file_read_memory_extraction_with_result' (58044) panicked at crates\ox-core\src\memory\mod.rs:334:9:
+assertion failed: node.content.contains("Lines:")
+
+
+failures:
+    context::tests::sanitize_removes_empty_assistant_messages
+    file_index::tests::test_should_exclude_path
+    memory::decay_tests::test_file_read_memory_extraction_with_result
+
+test result: FAILED. 145 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+error: test failed, to rerun pass `-p ox-core --lib`

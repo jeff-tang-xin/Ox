@@ -453,19 +453,29 @@ pub fn extract_intent_from_llm_response(response: &str) -> Option<IntentInfo> {
     // 查找最后一个 JSON 代码块
     if let Some(json_start) = response.rfind("```json") {
         if let Some(json_end) = response[json_start..].find("```") {
-            let json_str = &response[json_start + 7..json_start + json_end];
-
-            match serde_json::from_str::<IntentInfo>(json_str.trim()) {
-                Ok(info) => {
-                    tracing::info!(
-                        "Extracted intent from LLM: {:?} (confidence: {:.2})",
-                        info.intent,
-                        info.confidence
-                    );
-                    return Some(info);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse intent JSON: {}", e);
+            // 使用字符边界安全的切片方法
+            let start_byte = json_start + 7; // "```json" 的长度是7
+            let end_byte = json_start + json_end;
+            
+            // 确保字节索引在有效范围内且位于字符边界
+            if start_byte <= end_byte && end_byte <= response.len() {
+                // 使用 get() 方法进行安全切片
+                if let Some(json_str) = response.get(start_byte..end_byte) {
+                    match serde_json::from_str::<IntentInfo>(json_str.trim()) {
+                        Ok(info) => {
+                            tracing::info!(
+                                "Extracted intent from LLM: {:?} (confidence: {:.2})",
+                                info.intent,
+                                info.confidence
+                            );
+                            return Some(info);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse intent JSON: {}", e);
+                        }
+                    }
+                } else {
+                    tracing::warn!("Invalid UTF-8 boundaries in response");
                 }
             }
         }
@@ -480,11 +490,24 @@ pub fn remove_intent_json(response: &str) -> String {
         if let Some(json_end) = response[json_start..].find("```") {
             let json_block_end = json_start + json_end + 3;
 
-            // 移除 JSON 块及其前后的空行
-            let before = response[..json_start].trim_end();
-            let after = response[json_block_end..].trim_start();
+            // 确保字节索引在有效范围内
+            if json_start <= response.len() && json_block_end <= response.len() {
+                // 使用 get() 方法进行安全切片
+                if let (Some(before_part), Some(after_part)) = (
+                    response.get(..json_start),
+                    response.get(json_block_end..)
+                ) {
+                    // 移除 JSON 块及其前后的空行
+                    let before = before_part.trim_end();
+                    let after = after_part.trim_start();
 
-            format!("{}\n{}", before, after)
+                    format!("{}\n{}", before, after)
+                } else {
+                    response.to_string()
+                }
+            } else {
+                response.to_string()
+            }
         } else {
             response.to_string()
         }

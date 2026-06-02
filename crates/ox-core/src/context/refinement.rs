@@ -3,7 +3,7 @@
 /// Transforms raw message history into精炼 format:
 /// "User message: Model response (refined) [tools used]"
 
-use crate::message::{Message, ToolCall};
+use crate::message::Message;
 
 /// A refined conversation turn
 #[derive(Debug, Clone)]

@@ -49,7 +49,8 @@ pub fn handle_skill_command(
             } else {
                 let id = parts[1];
                 let desc = if parts.len() > 2 {
-                    parts[2..].join(" ")
+                    // 使用安全的字符边界检查
+                    parts.get(2..).map(|p| p.join(" ")).unwrap_or_else(|| "Custom skill".to_string())
                 } else {
                     "Custom skill".to_string()
                 };
@@ -63,7 +64,7 @@ pub fn handle_skill_command(
                 app.output.push_system("Example: /skill create-llm Rust error handling best practices");
                 crate::slash_commands::CommandResult::Success
             } else {
-                let desc = parts[1..].join(" ");
+                let desc = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
                 handle_skill_create_llm(app, &desc, rt_env)
             }
         }
@@ -189,7 +190,7 @@ fn handle_skill_create(app: &mut AppState, id: &str, desc: &str, rt_env: &mut Ru
          ```\n",
         id,
         desc,
-        name.chars().next().unwrap_or(' ').to_uppercase().collect::<String>() + &name[1..]
+        name.chars().next().unwrap_or(' ').to_uppercase().collect::<String>() + name.get(1..).unwrap_or("")
     );
     
     // 保存文件

@@ -76,11 +76,16 @@ pub fn summarize_tool_result(name: &str, output: &str) -> String {
 /// Extract file path from file_write output.
 pub fn extract_file_path_from_output(output: &str) -> Option<String> {
     if let Some(pos) = output.find("to ") {
-        let after_to = &output[pos + 3..];
-        if let Some(end_pos) = after_to.find('\n') {
-            Some(after_to[..end_pos].trim().to_string())
+        // 使用安全的字符边界检查
+        if let Some(after_to) = output.get(pos + 3..) {
+            if let Some(end_pos) = after_to.find('\n') {
+                // 安全地获取子字符串
+                after_to.get(..end_pos).map(|s| s.trim().to_string())
+            } else {
+                Some(after_to.trim().to_string())
+            }
         } else {
-            Some(after_to.trim().to_string())
+            None
         }
     } else {
         None

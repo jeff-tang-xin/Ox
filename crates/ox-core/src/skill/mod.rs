@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use chrono;
 
+pub mod generation;  // 🆕 Skill generation layering
+
 /// Skill 的作用域
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkillScope {

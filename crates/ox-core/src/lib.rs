@@ -2,8 +2,6 @@ pub mod agent;
 pub mod config;
 pub mod context;
 pub mod cost;
-pub mod council;
-pub mod embedding;
 pub mod feedback;
 pub mod file_index;
 pub mod llm;

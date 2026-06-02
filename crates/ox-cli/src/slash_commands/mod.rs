@@ -130,7 +130,7 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     registry.register(system::COST_COMMAND);
     registry.register(system::PLAN_COMMAND);
     registry.register(system::RELOAD_COMMAND);
-    registry.register(system::DOWNLOAD_MODEL_COMMAND);
+
     registry.register(system::FREE_COMMAND);
     registry.register(system::CANCEL_COMMAND);
     registry.register(system::CLEAR_COMMAND);

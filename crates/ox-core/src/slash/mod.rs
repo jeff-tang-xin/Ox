@@ -38,18 +38,7 @@ pub enum SlashCommand {
     Feedback {
         category: String,
     },
-    Discuss {
-        question: Option<String>,
-        rounds: Option<u8>,
-        verbose: bool,
-    },
-    Council {
-        action: String,
-    },
     Reload,
-    DownloadModel {
-        model_name: Option<String>,
-    },
     Spec {
         /// Subcommand: status, show, on, off, edit, clear, or inline content
         action: String,
@@ -123,51 +112,7 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
         "feedback" => SlashCommand::Feedback {
             category: args.to_string(),
         },
-        "discuss" => {
-            let mut rounds = None;
-            let mut verbose = false;
-            let mut question_parts = Vec::new();
-            for part in args.split_whitespace() {
-                if part == "--verbose" || part == "-v" {
-                    verbose = true;
-                } else if part == "--rounds" || part == "-r" {
-                    // next part is rounds count, handled below
-                    rounds = None; // placeholder
-                } else if let Some(prev) = question_parts.last() {
-                    if prev == "--rounds" || prev == "-r" {
-                        question_parts.pop();
-                        if let Ok(r) = part.parse::<u8>() {
-                            rounds = Some(r);
-                        }
-                        continue;
-                    }
-                    question_parts.push(part.to_string());
-                } else {
-                    question_parts.push(part.to_string());
-                }
-            }
-            let question = if question_parts.is_empty() {
-                None
-            } else {
-                Some(question_parts.join(" "))
-            };
-            SlashCommand::Discuss {
-                question,
-                rounds,
-                verbose,
-            }
-        }
-        "council" => SlashCommand::Council {
-            action: args.to_string(),
-        },
         "reload" => SlashCommand::Reload,
-        "download-model" => SlashCommand::DownloadModel {
-            model_name: if args.is_empty() {
-                None
-            } else {
-                Some(args.to_string())
-            },
-        },
         "spec" => SlashCommand::Spec {
             action: args.to_string(),
         },
@@ -226,12 +171,10 @@ Commands:
   /cd [path]        Show or change working directory
   /init             Create default config (~/.ox/config.toml)
   /debug            Show debug info
-  /discuss [q]      Start council debate (--rounds N, --verbose)
-  /council [topic]  Start/view council debate (start/status/stop/last/stats)
   /spec <action>    Spec mode (on/off/edit/status) - structured workflow
   /free             Switch to free mode (deactivate any workflow)
   /reload           Reload session from disk (JSONL)
-  /download-model [name] Download embedding model (default: bge-small-zh-v1.5)
+
   /y                Approve and proceed to next phase (workflow confirmation)
   /n                Reject and abort workflow
   /o                Provide feedback for revision"

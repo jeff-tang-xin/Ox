@@ -28,7 +28,7 @@ pub const FORGET_COMMAND: CommandMeta = CommandMeta {
 pub const MEMORY_COMMAND: CommandMeta = CommandMeta {
     name: "memory",
     aliases: &["memories"],
-    description: "Show memory statistics and recent memories",
+    description: "Memory management: /memory [stats|promote]",
     handler: handle_memory,
 };
 
@@ -74,7 +74,7 @@ pub fn handle_forget(
 
 pub fn handle_memory(
     app: &mut AppState,
-    _args: &str,
+    args: &str,
     _session: &mut Session,
     rt_env: &mut RuntimeEnvironment,
     _config: &OxConfig,
@@ -82,6 +82,25 @@ pub fn handle_memory(
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
+    let subcmd = args.trim();
+    
+    // Handle subcommands
+    match subcmd {
+        "promote" | "p" => {
+            return handle_promote(app, rt_env, memory);
+        }
+        "stats" | "s" | "" => {
+            // Show statistics (default behavior)
+        }
+        _ => {
+            app.output.push_system("Usage: /memory [stats|promote]");
+            app.output.push_system("  stats - Show memory statistics (default)");
+            app.output.push_system("  promote - Trigger L0-L3 memory promotion pipeline");
+            return CommandResult::Success;
+        }
+    }
+    
+    // Default: show statistics
     let (project_count, overall_count) = memory.stats(&rt_env.project_id);
     
     // Get detailed learning statistics
@@ -137,5 +156,36 @@ pub fn handle_memory(
             )));
         }
     }
+    CommandResult::Success
+}
+
+/// Handle /memory promote command
+fn handle_promote(
+    app: &mut AppState,
+    rt_env: &mut RuntimeEnvironment,
+    memory: &Arc<MemoryManager>,
+) -> CommandResult {
+    app.output.push_system("🚀 Starting L0-L3 memory promotion pipeline...");
+    
+    let project_name = rt_env.working_dir.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    
+    if let Some(result) = memory.run_promotion_pipeline(&rt_env.project_id, &project_name) {
+        match result {
+            Ok(report) => {
+                app.output.push_system(&format!(
+                    "\n✅ Memory Promotion Complete:\n{}",
+                    report
+                ));
+            }
+            Err(e) => {
+                app.output.push_error(&format!("❌ Promotion failed: {}", e));
+            }
+        }
+    } else {
+        app.output.push_system("⚠️ Hybrid storage not enabled. Promotion pipeline unavailable.");
+    }
+    
     CommandResult::Success
 }

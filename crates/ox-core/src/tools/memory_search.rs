@@ -177,7 +177,6 @@ fn calculate_confidence(node: &crate::memory::MemoryNode) -> f32 {
         crate::memory::MemoryNodeType::Architectural => 0.9,
         crate::memory::MemoryNodeType::BestPractice => 0.85,
         crate::memory::MemoryNodeType::Style => 0.8,
-        crate::memory::MemoryNodeType::Council => 0.9,
         crate::memory::MemoryNodeType::MetaSkill => 0.85,
         crate::memory::MemoryNodeType::AntiPattern => 0.8,
         crate::memory::MemoryNodeType::Business => 0.75,
@@ -205,7 +204,6 @@ fn format_source(source: &crate::memory::MemorySource) -> String {
         crate::memory::MemorySource::ToolObservation => "🔧 Observed from tool output",
         crate::memory::MemorySource::LlmExtraction => "🤖 Extracted by LLM",
         crate::memory::MemorySource::UserExplicit => "👤 User explicitly stated",
-        crate::memory::MemorySource::CouncilConclusion => "⚖️ Council conclusion",
         crate::memory::MemorySource::Feedback => "💬 From user feedback",
         crate::memory::MemorySource::RefinedSummary => "✨ Refined conversation summary",
     }

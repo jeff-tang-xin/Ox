@@ -1,0 +1,403 @@
+$ findstr /n "let compression_manager\|compression_manager =" "F:\rust\Ox\crates\ox-cli\src\main.rs"
+[exit 0]
+51:    let config = OxConfig::load(None)?;
+54:    let rt_env = runtime::detect_runtime();
+57:    let (provider, resolve_info) = create_provider(&config)?;
+61:    let mut stdout = io::stdout();
+63:    let backend = CrosstermBackend::new(stdout);
+64:    let mut terminal = Terminal::new(backend)?;
+68:    let result = run_app(&mut terminal, &config, rt_env, provider, resolve_info).await;
+78:// ============================================================================
+80:// ============================================================================
+84:    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+85:    let log_dir = home.join(".ox").join("logs");
+86:    let _ = std::fs::create_dir_all(&log_dir);
+87:    let log_file_path = log_dir.join("ox.log");
+89:    if let Ok(log_file) = std::fs::OpenOptions::new()
+99:        let filter = tracing_subscriber::EnvFilter::new("ox_core=info,ox_cli=info,tracing=info");
+101:        let file_layer = tracing_subscriber::fmt::layer()
+127:    let default_panic = std::panic::take_hook();
+129:        let _ = disable_raw_mode();
+130:        let _ = io::stdout().execute(LeaveAlternateScreen);
+140:        Ok((p, info)) => Ok((Some(Arc::from(p)), Some(info))),
+141:        Err(e) => {
+157:        let ox = &rt_env.ox_home_dir;
+158:        let _ = std::fs::create_dir_all(ox.join("sessions"));
+159:        let _ = std::fs::create_dir_all(ox.join("db"));
+160:        let _ = std::fs::create_dir_all(ox.join("logs"));
+161:        let _ = std::fs::create_dir_all(ox.join("skills"));
+162:        let _ = std::fs::create_dir_all(ox.join("memory"));
+165:    if let Some(ref proj_ox) = rt_env.project_ox_dir {
+166:        let _ = std::fs::create_dir_all(proj_ox.join("skills"));
+167:        let _ = std::fs::create_dir_all(proj_ox.join("memory"));
+170:    let mut app = App::new();
+173:    app.model_name = provider
+177:    app.working_dir = rt_env.working_dir.display().to_string();
+178:    app.message_count = 0;
+199:    let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
+200:    let mut session = if config.session.auto_restore {
+202:            Some(s) => {
+211:            None => Session::new(&session_dir, &rt_env.project_id)?,
+222:    app.last_compression_msg_count = session.messages.len();
+224:    // 🚨 Display incomplete spec tasks on startup
+225:    let project_root_for_display = rt_env.project_root.as_ref().map(|p| p.as_path());
+226:    spec_helpers::display_incomplete_tasks(&mut app, project_root_for_display);
+230:        let sessions_root = rt_env.ox_home_dir.join("sessions");
+233:            if let Ok(project_dirs) = std::fs::read_dir(&sessions_root) {
+235:                    let project_path = project_entry.path();
+241:                    let project_id = project_path
+247:                    let archived = Session::list_archived(&project_path);
+273:    let mut tool_registry = ToolRegistry::new();
+276:    if let Err(e) = tool_registry.load_skills(&rt_env) {
+280:    let tool_registry = Arc::new(tool_registry);
+283:    let command_registry = slash_commands::CommandRegistry::new();
+287:        if let Some(ref project_root) = rt_env.project_root {
+289:                Ok(content) if !content.is_empty() => {
+293:                Ok(_) => {}
+294:                Err(e) => {
+302:    let system_prompt = context::build_system_prompt(
+308:            WorkflowState::Spec { spec_content, .. } if !spec_content.is_empty() => {
+311:            _ => None,
+317:    let context_builder = ContextBuilder::from_config(&config.context);
+318:    let context_window = provider
+324:    let db_dir = rt_env.ox_home_dir.join("db");
+325:    let mut cost_tracker = CostTracker::load_or_create(&db_dir).unwrap_or_else(|e| {
+331:    let memory = MemoryManager::init(&rt_env.ox_home_dir, &rt_env.project_id, &config.memory)
+334:            let temp = std::env::temp_dir();
+340:    let memory_arc = Arc::new(memory);
+343:    if let Err(e) = app
+351:    let _baseline_satisfaction = 0.75; // Default baseline, can be made configurable
+359:    let file_index_db_dir = db_dir.join("file_indices");
+360:    let mut file_index_registry = ox_core::file_index::FileIndexRegistry::new(file_index_db_dir);
+363:    let mut file_index_manager = file_index_registry
+377:    if let Err(e) = file_index_manager.start_file_watcher(rt_env.working_dir.clone()) {
+386:    let mut tool_ctx = Arc::new(ToolContext::new(
+395:    let mut model_name = provider
+401:    let trust_manager = Arc::new(std::sync::Mutex::new(TrustManager::new()));
+404:    let mut interrupt_ctrl = InterruptController::new();
+407:    let mut interjection_buf = InterjectionBuffer::new();
+410:    let mut events = EventHandler::new(Duration::from_millis(33));
+413:    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<AgentToUiEvent>();
+416:    let agent_config = Arc::new(config.agent.clone());
+419:    let compressed_ctx_store = Arc::new(
+433:    let mut tick_count: u64 = 0;
+436:    // source_msg_count = number of JSONL messages absorbed into the compressed context.
+437:    let mut compressed_cache: Option<(Vec<Message>, usize)> =
+441:    let mut session_action: SessionAction = SessionAction::None;
+444:    let mut background_session: Option<Session> = None;
+450:        // === IMPLICIT FEEDBACK: Detect overrides before user input ===
+451:        let override_signals = app.override_detector.detect_overrides();
+458:        // === END IMPLICIT FEEDBACK DETECTION ===
+463:            app.dirty = false;
+471:            ev = events.recv() => {
+473:                    Some(Event::Key(key)) => {
+500:                            SessionAction::New => {
+502:                                let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
+505:                                    let project_id = rt_env.project_id.clone();
+506:                                    let new_s = Session::new(&session_dir, &project_id)
+508:                                    background_session = Some(std::mem::replace(&mut session, new_s));
+510:                                    app.ui_to_agent_tx = None;
+516:                                    compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+518:                                    let project_id = rt_env.project_id.clone();
+520:                                        Ok(mut s) => {
+522:                                            if session.messages.len() >= 10 {  // Only promote meaningful sessions
+524:                                                if let Some(result) = memory_arc.run_promotion_pipeline(
+531:                                                        Ok(report) => {
+533:                                                                "\n🧠 Memory Promotion Complete:\n{}",
+537:                                                        Err(e) => {
+545:                                            if let Err(e) = session.archive(&session_dir) {
+550:                                            let default_wd = rt_env.working_dir.to_string_lossy().to_string();
+551:                                            if let Err(e) = s.update_working_dir(&default_wd) {
+555:                                            session = s;
+559:                                            app.message_count = 0;
+563:                                            let sessions_root = rt_env.ox_home_dir.join("sessions");
+565:                                                if let Ok(project_dirs) = std::fs::read_dir(&sessions_root) {
+567:                                                        let project_path = project_entry.path();
+572:                                                        let project_id = project_path
+577:                                                        let archived = Session::list_archived(&project_path);
+603:                                            compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+605:                                        Err(e) => {
+611:                            SessionAction::Resume { filename } => {
+613:                                let target_entry = app.sessions.iter()
+614:                                    .find(|s| s.id == filename || s.display_name().contains(&filename));
+616:                                if let Some(entry) = target_entry {
+617:                                    let sessions_root = rt_env.ox_home_dir.join("sessions");
+618:                                    let session_path = entry.full_path(&sessions_root);
+619:                                    let parent_dir = session_path.parent().unwrap_or(&session_dir);
+622:                                        Ok(Some(archived)) => {
+624:                                                background_session = Some(std::mem::replace(&mut session, archived));
+625:                                                app.ui_to_agent_tx = None;
+626:                                                compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+629:                                                session = archived;
+632:                                                if let Some(ref wd) = session.meta.working_dir {
+633:                                                    if let Ok(path) = std::path::PathBuf::from(wd).canonicalize() {
+634:                                                        if let Err(e) = std::env::set_current_dir(&path) {
+637:                                                            rt_env.working_dir = path.clone();
+639:                                                            app.working_dir = path.display().to_string();
+656:                                                let sessions_root = rt_env.ox_home_dir.join("sessions");
+658:                                                    if let Ok(project_dirs) = std::fs::read_dir(&sessions_root) {
+660:                                                            let project_path = project_entry.path();
+665:                                                            let project_id = project_path
+670:                                                            let archived = Session::list_archived(&project_path);
+695:                                                compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+698:                                        Ok(None) => {
+701:                                        Err(e) => {
+709:                            SessionAction::SwitchNext => {
+711:                                let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
+714:                                let current_index = app.sessions.iter().position(|s| s.is_active);
+716:                                if let Some(idx) = current_index {
+718:                                    let total = app.sessions.len();
+719:                                    let next_idx = if idx + 1 < total {
+726:                                    if next_idx != idx {
+728:                                        let (entry_id, entry_project_id) = if let Some(entry) = app.sessions.get(next_idx) {
+734:                                        let sessions_root = rt_env.ox_home_dir.join("sessions");
+735:                                        let session_path = std::path::PathBuf::from(&sessions_root)
+738:                                        let parent_dir = session_path.parent().unwrap_or(&session_dir);
+743:                                                Ok(Some(archived)) => {
+744:                                                    background_session = Some(std::mem::replace(&mut session, archived));
+745:                                                    app.ui_to_agent_tx = None;
+746:                                                    compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+748:                                                _ => {}
+752:                                                Ok(Some(archived)) => {
+755:                                                    session = archived;
+758:                                                    if let Some(ref wd) = session.meta.working_dir {
+759:                                                        if let Ok(path) = std::path::PathBuf::from(wd).canonicalize() {
+760:                                                            if let Err(e) = std::env::set_current_dir(&path) {
+763:                                                                rt_env.working_dir = path.clone();
+765:                                                                app.working_dir = path.display().to_string();
+781:                                                    app.dirty = true;
+786:                                                    let sessions_root = rt_env.ox_home_dir.join("sessions");
+788:                                                        if let Ok(project_dirs) = std::fs::read_dir(&sessions_root) {
+790:                                                                let project_path = project_entry.path();
+795:                                                                let project_id = project_path
+800:                                                                let archived = Session::list_archived(&project_path);
+824:                                                    compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+826:                                                Ok(None) => {
+829:                                                Err(e) => {
+841:                            SessionAction::None => {}
+846:                            app.pending_compressed_cache_clear = false;
+847:                            if let Err(e) = compressed_ctx_store.delete(&session.meta.id) {
+848:                                tracing::warn!("Failed to delete compressed context: {}", e);
+852:                            compressed_cache = None;
+855:                        if let Some(new_model_name) = app.pending_model_switch.take() {
+857:                                Ok((new_provider, new_info)) => {
+858:                                    provider = Some(Arc::from(new_provider));
+859:                                    resolve_info = Some(new_info);
+860:                                    model_name = provider
+864:                                    app.model_name = model_name.clone();
+866:                                Err(e) => {
+875:                    Some(Event::Resize(_, _)) => {
+876:                        app.dirty = true;
+878:                    Some(Event::Tick) | None => {
+879:                        tick_count = tick_count.wrapping_add(1);
+880:                        app.spinner_frame = tick_count;
+887:                        if app.agent_running && app.spinner_frame != app.last_spinner_frame {
+888:                            app.dirty = true;
+893:            agent_ev = agent_rx.recv() => {
+894:                if let Some(ev) = agent_ev {
+896:                    let target_session = background_session.as_mut().unwrap_or(&mut session);
+898:                        AgentToUiEvent::TextChunk(text) => {
+901:                            app.dirty = true;
+903:                        AgentToUiEvent::ToolStart { name, id: _, detail } => {
+906:                                let mut updated = false;
+908:                                    if let OutputLine::Tool { name: n, detail: d } = line {
+909:                                        if *n == name {
+910:                                            *d = detail.clone();
+911:                                            updated = true;
+924:                            app.dirty = true;
+926:                        AgentToUiEvent::ToolResult { name, output, is_error } => {
+927:                            let summary = helpers::summarize_tool_result(&name, &output);
+935:                            if name == "file_write" && !is_error {
+936:                                if let Some(path_str) = helpers::extract_file_path_from_output(&output) {
+937:                                    if let Ok(path) = std::path::PathBuf::from(path_str).canonicalize() {
+938:                                        if let Some(content) = helpers::extract_last_file_write_content(&target_session.messages) {
+940:                                            app.total_file_writes += 1;
+953:                            app.dirty = true;
+955:                        AgentToUiEvent::ToolProgress { tool_call_id, tool_name, message, progress_percent } => {
+957:                            let progress_display = if let Some(percent) = progress_percent {
+964:                            app.dirty = true;
+966:                        AgentToUiEvent::TurnDone { new_messages, usage } => {
+970:                            let total_tokens = usage.prompt_tokens + usage.completion_tokens;
+971:                            let cost_this_turn = cost::estimate_cost(&model_name, &usage);
+974:                            let context_info = if let Some((ref compressed_msgs, source_count)) = compressed_cache {
+975:                                let current_total = target_session.messages.len();
+976:                                let recent_msgs = current_total.saturating_sub(source_count);
+977:                                format!(" | Context: {} compressed + {} recent = {} total msgs",
+980:                                let current_total = target_session.messages.len();
+985:                                "\n💰 Token Usage: {} prompt + {} completion = {} total | Cost: ${:.4}{}",
+987:                                usage.completion_tokens,
+994:                            let prev_count = target_session.messages.len();
+995:                            let recent_boundary = {
+996:                                let mut user_count = 0usize;
+997:                                let mut boundary = prev_count;
+1000:                                    if i >= prev_count {
+1004:                                        user_count += 1;
+1005:                                        if user_count >= 2 {
+1006:                                            boundary = i;
+1017:                            // The session.jsonl file should preserve complete data.
+1021:                                if let Err(e) = target_session.append_message(msg.clone()) {
+1029:                                "[AGENT TURN] ✅ Turn completed successfully, {} new messages",
+1034:                            let mut keywords_extracted_count = 0;
+1036:                                if let Message::Assistant { content, .. } = msg {
+1038:                                    if let Some(extracted) = keyword_extraction::extract_keywords_from_response(content) {
+1039:                                        keywords_extracted_count += 1;
+1041:                                        let last_user_query = target_session.messages.iter()
+1044:                                                Message::User { content } => Some(content.as_str()),
+1045:                                                _ => None,
+1054:                                    if let Some(intent_info) = intent_classifier::extract_intent_from_llm_response(content) {
+1064:                                            if let Some(ref query) = intent_info.memory_query {
+1066:                                                    "[MEMORY SEARCH] Triggered by intent: query='{}', scope={:?}",
+1080:                                if let Some(summary) = refinement::generate_memory_summary(&new_messages) {
+1088:                                    let mem_content = format!(
+1095:                                    let mem_node = ox_core::memory::MemoryNode::new(
+1108:                            if keywords_extracted_count == 0 && !new_messages.is_empty() {
+1115:                            // === IMPLICIT FEEDBACK: Evaluate satisfaction ===
+1117:                            let explicit_rate = if app.explicit_feedback_count > 0 {
+1124:                            let tool_success_rate = helpers::calculate_tool_success_rate(&target_session.messages);
+1127:                            let code_accept_rate = app.ema_manager.get_value("code_accept_rate")
+1130:                            let has_explicit = app.explicit_feedback_count >= 5;
+1132:                            let satisfaction_score = app.rollback_manager.calculate_satisfaction_score(
+1140:                                "[SATISFACTION] explicit={:.2}, tool={:.2}, code_accept={:.2}, overall={:.2}",
+1147:                            // === END IMPLICIT FEEDBACK ===
+1150:                            if let Some(ref cm) = compression_manager {
+1151:                                let session_id = target_session.meta.id.clone();
+1152:                                let msgs = target_session.messages.clone();
+1153:                                let store = Arc::clone(&compressed_ctx_store);
+1154:                                let tx_comp = agent_tx.clone();
+1155:                                let last_count = app.last_compression_msg_count;
+1156:                                let cw = context_window;
+1157:                                let cm_clone = cm.clone();
+1160:                                let last_user_query = msgs.last()
+1161:                                    .and_then(|m| match m { Message::User { content } => Some(content.clone()), _ => None })
+1165:                                let memory_nodes = if let Some(cm) = &compression_manager {
+1176:                                let memory_ctx = memory_arc.format_memory_context(&memory_nodes, false);
+1179:                                    let current_tokens = cm_clone.calculate_context_tokens(&msgs);
+1182:                                    let should_compress = cm_clone.should_compress_smart(&msgs, cw);
+1185:                                        let query = msgs.last()
+1186:                                            .and_then(|m| match m { Message::User { content } => Some(content.clone()), _ => None })
+1190:                                        let source_count = msgs.len();
+1194:                                        let memory_ctx_clone = memory_ctx.clone();
+1195:                                        let compressed_result = tokio::task::spawn_blocking(move || {
+1205:                                        let compressed_result = match compressed_result {
+1206:                                            Ok(result) => result,
+1207:                                            Err(e) => {
+1213:                                        if let Ok(Some(compressed)) = compressed_result {
+1214:                                            let compressed_len = compressed.len();
+1215:                                            let _ = store.save(&session_id, &compressed, source_count);
+1216:                                            let _ = tx_comp.send(AgentToUiEvent::CompressionComplete {
+1227:                                background_session = None;
+1228:                                app.output.push_system("Background session completed and saved.");
+1230:                                app.agent_running = false;
+1231:                                app.status = String::new();
+1232:                                app.pending_confirmation = None;
+1233:                                app.message_count = session.messages.len();
+1236:                                if app.message_count > 0 && app.message_count % 50 == 0 {
+1238:                                    if let Some(result) = memory_arc.run_promotion_pipeline(
+1245:                                            Ok(report) => {
+1251:                                            Err(e) => {
+1258:                                app.cost_summary = cost_tracker.summary_short();
+1260:                                // Clear the UI→Agent channel after turn completes
+1261:                                app.ui_to_agent_tx = None;
+1263:                                // Process interjections after turn completion
+1264:                                let interjections_vec: Vec<String> = interjection_buf.drain();
+1269:                                    if let Some(last) = interjections_vec.last() {
+1271:                                        let user_msg = Message::user(last);
+1272:                                        if let Err(e) = session.append_message(user_msg) {
+1276:                                        let text = last.clone();
+1279:                                        let memory_nodes = memory_arc.retrieve(&text, &Some(rt_env.project_id.as_str()), 5);
+1280:                                        let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
+1282:                                        let memory_ctx = memory_arc.format_memory_context(&memory_nodes, false);
+1283:                                        let turn_messages = helpers::build_context_with_option(
+1291:                                        app.agent_running = true;
+1292:                                        app.status = "Thinking...".to_string();
+1293:                                        let provider = Arc::clone(provider.as_ref().unwrap());
+1294:                                        let tx = agent_tx.clone();
+1295:                                        let registry = Arc::clone(&tool_registry);
+1296:                                        let ctx = Arc::clone(&tool_ctx);
+1297:                                        let cancel_token = interrupt_ctrl.token();
+1298:                                        let tm = Arc::clone(&trust_manager);
+1299:                                        let ac = Arc::clone(&agent_config);
+1300:                                        let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
+1301:                                        app.ui_to_agent_tx = Some(ui_to_agent_tx);
+1304:                                        let workflow_engine_clone = app.workflow_engine.clone();
+1310:                                        app.dirty = true;
+1311:                                        app.message_count = session.messages.len();
+1312:                                        app.cost_summary = cost_tracker.summary_short();
+1319:                            app.dirty = true;
+1321:                        AgentToUiEvent::Error(err) => {
+1325:                                background_session = None;
+1327:                                app.agent_running = false;
+1328:                                app.status = String::new();
+1330:                                app.ui_to_agent_tx = None;
+1333:                            app.dirty = true;
+1335:                        AgentToUiEvent::Status(status) => {
+1336:                            app.status = status;
+1337:                            app.dirty = true;
+1345:                        } => {
+1347:                            let warning_str = high_risk_warning
+1356:                            app.pending_confirmation = Some(PendingConfirmation {
+1361:                            app.dirty = true;
+1363:                        AgentToUiEvent::ToolOutputChunk { tool_call_id: _, chunk } => {
+1366:                            app.dirty = true;
+1368:                        AgentToUiEvent::BudgetExceeded { total_tokens, estimated_cost } => {
+1373:                            app.pending_confirmation = Some(PendingConfirmation {
+1378:                            app.dirty = true;
+1380:                        AgentToUiEvent::CouncilDone { session: council_session } => {
+1381:                            let summary = council_session.format_summary();
+1386:                            if let Some(ref arb) = council_session.arbitration {
+1387:                                let mem_node = ox_core::memory::MemoryNode::new(
+1396:                            app.last_council_session = Some(council_session);
+1398:                                background_session = None;
+1400:                                app.agent_running = false;
+1401:                                app.status = "Ox".to_string();
+1402:                                // Clear the UI→Agent channel after council completes
+1403:                                app.ui_to_agent_tx = None;
+1406:                            app.dirty = true;
+1408:                        AgentToUiEvent::WorkingDirChanged(new_dir) => {
+1409:                            let target = new_dir.display().to_string();
+1411:                                runtime::DirectoryChangeResult::Success { new_dir, project_changed } => {
+1419:                                    let working_dir_str = new_dir.to_string_lossy().to_string();
+1420:                                    if let Err(e) = session.update_working_dir(&working_dir_str) {
+1426:                                        Ok(new_file_index) => {
+1427:                                            file_index_manager = new_file_index;
+1431:                                            if let Err(e) = file_index_manager.start_file_watcher(new_dir.clone()) {
+1437:                                        Err(e) => {
+1443:                                    tool_ctx = Arc::new(ToolContext::new(
+1457:                                _ => {} // Agent already resolved; unlikely to fail here.
+1459:                            app.dirty = true;
+1461:                        AgentToUiEvent::IterationLimitReached { iteration } => {
+1466:                            app.pending_confirmation = Some(PendingConfirmation {
+1471:                            app.dirty = true;
+1473:                        AgentToUiEvent::CompressionComplete { compressed_messages, source_msg_count } => {
+1474:                            let target_session = background_session.as_ref().unwrap_or(&session);
+1475:                            let sid = target_session.meta.id.clone();
+1476:                            if let Err(e) = compressed_ctx_store.save(&sid, &compressed_messages, source_msg_count) {
+1480:                                    "[COMPRESSION] Saved to SQLite: source_msgs={}, compressed={}",
+1493:                            compressed_cache = Some((compressed_messages, source_msg_count));
+1494:                            app.last_compression_msg_count = source_msg_count;
+1495:                            app.compression_in_progress = false;
+1497:                        AgentToUiEvent::WorkflowCompleted { task_description, execution_summary } => {
+1500:                                "[AUTO-REFLECT] Workflow completed. Task: {}, Summary: {}",
+1506:                            if let Some(ref llm_provider) = provider {
+1507:                                let project_root = rt_env.working_dir.clone();
+1508:                                let ox_home = rt_env.ox_home_dir.clone();
+1515:                                    Ok(reflector) => {
+1521:                                        let conversation_history = session.messages.clone();
+1522:                                        let tx_clone = agent_tx.clone();
+1523:                                        let task_desc = task_description.clone();
+1524:                                        let exec_summary = execution_summary.clone();
+1532:                                                Ok(Some(skill_id)) => {
+1533:                                                    let _ = tx_clone.send(AgentToUiEvent::Status(
+1537:                                                Ok(None) => {
+1540:                                                Err(e) => {
+1542:                                                    let _ = tx_clone.send(AgentToUiEvent::Error(
+1549:                                    Err(e) => {
+1608:        (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
+1611:                app.dirty = true;
+1614:        (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Char('N'), KeyModifiers::NONE) => {
+1617:                app.dirty = true;
+1620:        (KeyCode::Char('t'), KeyModifiers::NONE) | (KeyCode::Char('T'), KeyModifiers::NONE) => {
+1623:                app.dirty = true;
+1626:        (KeyCode::Char('a'), KeyModifiers::CO
+
+[… truncated 16808 chars …]

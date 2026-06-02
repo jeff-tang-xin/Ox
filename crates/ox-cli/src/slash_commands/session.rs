@@ -145,7 +145,6 @@ pub fn handle_clean(
         app.output.clear();
         app.message_count = 0;
         app.cost_summary = String::new();
-        app.pending_compressed_cache_clear = true;
         app.output.push_system("Session cleared. All messages removed.");
     }
     CommandResult::Success
@@ -161,12 +160,7 @@ pub fn handle_clear_cache(
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
-    // Mark compressed cache for clearing
-    app.pending_compressed_cache_clear = true;
-    app.output.push_system("
-🗑️ Compressed context cache will be cleared on next iteration.
-💡 This fixes 'tool call result does not follow tool call' errors.
-🔄 The cache will be regenerated automatically during next compression.");
+    app.output.push_system("\n🗑️ Session cache cleared.");
     CommandResult::Success
 }
 

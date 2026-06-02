@@ -1,5 +1,4 @@
 mod terminal;
-mod spec_helpers;
 pub mod slash_commands;
 pub mod middleware;
 pub mod helpers;
@@ -28,7 +27,6 @@ use ox_core::agent::ui_event::UiToAgentEvent;
 use ox_core::config::{AgentConfig, OxConfig};
 use ox_core::context::{self, ContextBuilder};
 use ox_core::cost::{self, CostTracker};
-use ox_core::embedding::{CompressionManager, KadaneConfig};
 use ox_core::llm::{self, LlmProvider, ProviderResolveInfo};
 use ox_core::memory::MemoryManager;
 use ox_core::message::{Message, Session};
@@ -217,15 +215,6 @@ async fn run_app(
     // 🚨 FIX: Do NOT truncate ToolResult content when loading from disk.
     // Truncation should only happen when building context for LLM, not in storage.
     // Users need to see full tool output in the UI.
-    // The old truncation logic permanently destroyed data in session.jsonl.
-    // Initialize compression debounce baseline so loaded sessions
-    // don't immediately trigger compression on the first new message.
-    app.last_compression_msg_count = session.messages.len();
-
-    // 🚨 Display incomplete spec tasks on startup
-    let project_root_for_display = rt_env.project_root.as_ref().map(|p| p.as_path());
-    spec_helpers::display_incomplete_tasks(&mut app, project_root_for_display);
-
     // Populate sidebar with archived sessions from ALL projects.
     {
         let sessions_root = rt_env.ox_home_dir.join("sessions");
@@ -430,64 +419,6 @@ async fn run_app(
         }),
     );
 
-    // Compression manager for context compression (KadaneDial).
-    // Uses history_ratio from ContextBuilder for consistent configuration.
-    let compression_manager: Option<CompressionManager> =
-        if let Some(ref emb_config) = config.models.embedding {
-            if emb_config.enabled {
-                let model_path = emb_config
-                    .model_path
-                    .as_ref()
-                    .map(|p| {
-                        let p = p.replace(
-                            '~',
-                            &dirs::home_dir()
-                                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                .to_string_lossy(),
-                        );
-                        std::path::PathBuf::from(p)
-                    })
-                    .unwrap_or_else(|| {
-                        dirs::home_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
-                            .join(".ox/models/bge-small-zh-v1.5")
-                    });
-
-                let kadane_config = KadaneConfig {
-                    threshold: emb_config.threshold,
-                    stop_threshold: emb_config.stop_threshold,
-                    max_segments: emb_config.max_segments,
-                    min_segment_len: emb_config.min_segment_len,
-                    keep_recent: emb_config.keep_recent,
-                    chunk_threshold_tokens: emb_config.chunk_threshold_tokens,
-                    max_chunk_tokens: emb_config.max_chunk_tokens,
-                };
-
-                match ox_core::embedding::BgeEmbedder::load(&model_path) {
-                    Ok(emb) => {
-                        tracing::info!("Embedding model loaded: {:?}", model_path);
-                        // Use history_ratio from ContextBuilder for consistent configuration
-                        Some(CompressionManager::new(
-                            emb,
-                            kadane_config,
-                            context_builder.history_ratio(),
-                        ))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load embedding model: {}. Compression disabled.",
-                            e
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
     // Tick counter for spinner animation.
     let mut tick_count: u64 = 0;
 
@@ -523,26 +454,6 @@ async fn run_app(
             app.mark_spinner_rendered();
         }
 
-        // Handle deferred compression using middleware
-        if app.pending_compression.is_some() {
-            middleware::compression::handle_pending_compression(
-                &mut app,
-                &mut session,
-                &provider,
-                &compression_manager,
-                &compressed_cache,
-                &system_prompt,
-                &context_builder,
-                context_window,
-                &agent_tx,
-                &tool_registry,
-                &tool_ctx,
-                &mut interrupt_ctrl,
-                &trust_manager,
-                &agent_config,
-            ).await;
-        }
-
         // Async event loop: wait for crossterm event OR agent event.
         // Use biased to prioritize user input over agent events.
         tokio::select! {
@@ -570,7 +481,6 @@ async fn run_app(
                             &resolve_info,
                             &config,
                             &agent_config,
-                            &compression_manager,
                             &compressed_cache,
                             &command_registry,
                         );
@@ -597,6 +507,29 @@ async fn run_app(
                                     let project_id = rt_env.project_id.clone();
                                     match Session::new(&session_dir, &project_id) {
                                         Ok(mut s) => {
+                                            // 🧠 Run memory promotion pipeline before archiving
+                                            if session.messages.len() >= 10 {  // Only promote meaningful sessions
+                                                tracing::info!("🚀 Triggering memory promotion for session with {} messages", session.messages.len());
+                                                if let Some(result) = memory_arc.run_promotion_pipeline(
+                                                    &rt_env.project_id,
+                                                    &rt_env.working_dir.file_name()
+                                                        .map(|n| n.to_string_lossy().to_string())
+                                                        .unwrap_or_else(|| "unknown".to_string()),
+                                                ) {
+                                                    match result {
+                                                        Ok(report) => {
+                                                            app.output.push_system(&format!(
+                                                                "\n🧠 Memory Promotion Complete:\n{}",
+                                                                report
+                                                            ));
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!("Memory promotion failed: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
                                             // ✅ Archive current session before creating new one
                                             if let Err(e) = session.archive(&session_dir) {
                                                 tracing::warn!("Failed to archive current session: {e}");
@@ -897,17 +830,6 @@ async fn run_app(
                             SessionAction::None => {}
                         }
 
-                        // Handle compressed cache clear when session is cleaned
-                        if app.pending_compressed_cache_clear {
-                            app.pending_compressed_cache_clear = false;
-                            if let Err(e) = compressed_ctx_store.delete(&session.meta.id) {
-                                tracing::warn!("Failed to delete compressed context: {}", e);
-                            } else {
-                                tracing::info!("Compressed context cleared for session {}", session.meta.id);
-                            }
-                            compressed_cache = None;
-                        }
-
                         if let Some(new_model_name) = app.pending_model_switch.take() {
                             match llm::create_provider_with_info(&new_model_name, &config.models) {
                                 Ok((new_provider, new_info)) => {
@@ -1051,7 +973,11 @@ async fn run_app(
                             let recent_boundary = {
                                 let mut user_count = 0usize;
                                 let mut boundary = prev_count;
-                                for (i, m) in target_session.messages[..prev_count].iter().enumerate().rev() {
+                                // 使用安全的切片方法
+                                for (i, m) in target_session.messages.iter().enumerate().rev() {
+                                    if i >= prev_count {
+                                        continue;
+                                    }
                                     if matches!(m, Message::User { .. }) {
                                         user_count += 1;
                                         if user_count >= 2 {
@@ -1198,83 +1124,6 @@ async fn run_app(
 
                             // === END IMPLICIT FEEDBACK ===
 
-                            // Post-turn asynchronous compression trigger
-                            if let Some(ref cm) = compression_manager {
-                                let session_id = target_session.meta.id.clone();
-                                let msgs = target_session.messages.clone();
-                                let store = Arc::clone(&compressed_ctx_store);
-                                let tx_comp = agent_tx.clone();
-                                let last_count = app.last_compression_msg_count;
-                                let cw = context_window;
-                                let cm_clone = cm.clone();
-
-                                // Get memory context for better compression
-                                let last_user_query = msgs.last()
-                                    .and_then(|m| match m { Message::User { content } => Some(content.clone()), _ => None })
-                                    .unwrap_or_default();
-                                
-                                // 🆕 Use retrieve_with_rerank if embedder is available
-                                let memory_nodes = if let Some(cm) = &compression_manager {
-                                    memory_arc.retrieve_with_rerank(
-                                        &last_user_query,
-                                        &Some(rt_env.project_id.as_str()),
-                                        5,
-                                        Some(cm.embedder()),
-                                        None,
-                                    )
-                                } else {
-                                    memory_arc.retrieve(&last_user_query, &Some(rt_env.project_id.as_str()), 5)
-                                };
-                                let memory_ctx = memory_arc.format_memory_context(&memory_nodes, false);
-
-                                tokio::spawn(async move {
-                                    let current_tokens = cm_clone.calculate_context_tokens(&msgs);
-
-                                    // Use smart compression trigger
-                                    let should_compress = cm_clone.should_compress_smart(&msgs, cw);
-
-                                    if should_compress && msgs.len() > last_count {
-                                        let query = msgs.last()
-                                            .and_then(|m| match m { Message::User { content } => Some(content.clone()), _ => None })
-                                            .unwrap_or_default();
-                                        
-                                        // Capture source_count before moving msgs into closure
-                                        let source_count = msgs.len();
-                                        
-                                        // 🚨 CRITICAL FIX: Move CPU-intensive embedding computation to blocking thread pool
-                                        // This prevents blocking the async runtime and allows other tasks (like file_patch) to run
-                                        let memory_ctx_clone = memory_ctx.clone();
-                                        let compressed_result = tokio::task::spawn_blocking(move || {
-                                            // Use enhanced compression with memory context
-                                            if !memory_ctx_clone.is_empty() {
-                                                cm_clone.compress_with_memory(&msgs, &query, Some(&memory_ctx_clone))
-                                            } else {
-                                                cm_clone.compress(&msgs, &query)
-                                            }
-                                        }).await;
-
-                                        // Handle spawn_blocking result
-                                        let compressed_result = match compressed_result {
-                                            Ok(result) => result,
-                                            Err(e) => {
-                                                tracing::error!("[ASYNC COMPRESS] Task panicked: {}", e);
-                                                return;
-                                            }
-                                        };
-
-                                        if let Ok(Some(compressed)) = compressed_result {
-                                            let compressed_len = compressed.len();
-                                            let _ = store.save(&session_id, &compressed, source_count);
-                                            let _ = tx_comp.send(AgentToUiEvent::CompressionComplete {
-                                                compressed_messages: compressed,
-                                                source_msg_count: source_count,
-                                            });
-                                            tracing::info!("[ASYNC COMPRESS] Done: {} -> {} msgs (tokens: {})", source_count, compressed_len, current_tokens);
-                                        }
-                                    }
-                                });
-                            }
-
                             if background_session.is_some() {
                                 background_session = None;
                                 app.output.push_system("Background session completed and saved.");
@@ -1283,6 +1132,30 @@ async fn run_app(
                                 app.status = String::new();
                                 app.pending_confirmation = None;
                                 app.message_count = session.messages.len();
+                                
+                                // 🧠 Periodic memory promotion (every 50 messages)
+                                if app.message_count > 0 && app.message_count % 50 == 0 {
+                                    tracing::info!("🚀 Periodic memory promotion triggered at message {}", app.message_count);
+                                    if let Some(result) = memory_arc.run_promotion_pipeline(
+                                        &rt_env.project_id,
+                                        &rt_env.working_dir.file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| "unknown".to_string()),
+                                    ) {
+                                        match result {
+                                            Ok(report) => {
+                                                app.output.push_system(&format!(
+                                                    "\n🧠 Periodic Memory Promotion:\n{}",
+                                                    report
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Periodic memory promotion failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                
                                 app.cost_summary = cost_tracker.summary_short();
                                 interrupt_ctrl.reset();
                                 // Clear the UI→Agent channel after turn completes
@@ -1303,34 +1176,16 @@ async fn run_app(
                                         // Trigger new run for interjection
                                         let text = last.clone();
                                         
-                                        // 🆕 Use retrieve_with_rerank if embedder is available
-                                        let memory_nodes = if let Some(cm) = &compression_manager {
-                                            memory_arc.retrieve_with_rerank(
-                                                &text,
-                                                &Some(rt_env.project_id.as_str()),
-                                                5,
-                                                Some(cm.embedder()),
-                                                None,
-                                            )
-                                        } else {
-                                            memory_arc.retrieve(&text, &Some(rt_env.project_id.as_str()), 5)
-                                        };
+                                        // Retrieve memories for the interjection
+                                        let memory_nodes = memory_arc.retrieve(&text, &Some(rt_env.project_id.as_str()), 5);
                                         let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
                                         memory_arc.reinforce_accessed(&accessed_ids);
                                         let memory_ctx = memory_arc.format_memory_context(&memory_nodes, false);
-                                        let effective_messages = if let Some((ref cached, prev_count)) = compressed_cache {
-                                            let new_msgs = &session.messages[prev_count.min(session.messages.len())..];
-                                            let mut combined = cached.clone();
-                                            combined.extend_from_slice(new_msgs);
-                                            combined
-                                        } else {
-                                            session.messages.clone()
-                                        };
                                         let turn_messages = helpers::build_context_with_option(
                                             &context_builder,
                                             &system_prompt,
                                             &memory_ctx,
-                                            &effective_messages,
+                                            &session.messages,
                                             context_window,
                                             config.context.use_refined_context,
                                         );
@@ -1423,34 +1278,6 @@ async fn run_app(
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
-                        AgentToUiEvent::CouncilDone { session: council_session } => {
-                            let summary = council_session.format_summary();
-                            for line in summary.lines() {
-                                app.output.push_line(OutputLine::System(line.to_string()));
-                            }
-                            // Store council conclusion to memory
-                            if let Some(ref arb) = council_session.arbitration {
-                                let mem_node = ox_core::memory::MemoryNode::new(
-                                    arb.final_recommendation.clone(),
-                                    ox_core::memory::MemoryNodeType::Architectural,
-                                    Some(rt_env.project_id.clone()),
-                                    "multi".into(),
-                                    ox_core::memory::MemorySource::CouncilConclusion,
-                                );
-                                memory_arc.store(mem_node);
-                            }
-                            app.last_council_session = Some(council_session);
-                            if background_session.is_some() {
-                                background_session = None;
-                            } else {
-                                app.agent_running = false;
-                                app.status = "Ox".to_string();
-                                // Clear the UI→Agent channel after council completes
-                                app.ui_to_agent_tx = None;
-                            }
-                            if !app.user_scrolled { app.scroll_to_bottom(); }
-                            app.dirty = true;
-                        }
                         AgentToUiEvent::WorkingDirChanged(new_dir) => {
                             let target = new_dir.display().to_string();
                             match runtime::change_directory(&mut rt_env, &target) {
@@ -1516,30 +1343,6 @@ async fn run_app(
                             if !app.user_scrolled { app.scroll_to_bottom(); }
                             app.dirty = true;
                         }
-                        AgentToUiEvent::CompressionComplete { compressed_messages, source_msg_count } => {
-                            let target_session = background_session.as_ref().unwrap_or(&session);
-                            let sid = target_session.meta.id.clone();
-                            if let Err(e) = compressed_ctx_store.save(&sid, &compressed_messages, source_msg_count) {
-                                tracing::error!("Failed to save compressed context to SQLite: {e}");
-                            } else {
-                                tracing::info!(
-                                    "[COMPRESSION] Saved to SQLite: source_msgs={}, compressed={}",
-                                    source_msg_count,
-                                    compressed_messages.len()
-                                );
-
-                                // Display compression notification to user
-                                app.output.push_line(OutputLine::System(format!(
-                                    "\n🗜️ Context Compressed: {} messages → {} messages (saved ~{} msgs)",
-                                    source_msg_count,
-                                    compressed_messages.len(),
-                                    source_msg_count.saturating_sub(compressed_messages.len())
-                                )));
-                            }
-                            compressed_cache = Some((compressed_messages, source_msg_count));
-                            app.last_compression_msg_count = source_msg_count;
-                            app.compression_in_progress = false;
-                        }
                         AgentToUiEvent::WorkflowCompleted { task_description, execution_summary } => {
                             // Trigger auto-reflection to update Skills
                             tracing::info!(
@@ -1548,11 +1351,63 @@ async fn run_app(
                                 execution_summary
                             );
                             
-                            // TODO: Implement actual reflection logic here
-                            // For now, just log the event
-                            app.output.push_line(OutputLine::System(
-                                "\n🤖 Auto-reflection triggered (pending implementation)...".to_string()
-                            ));
+                            // 🧠 Implement actual reflection logic
+                            if let Some(ref llm_provider) = provider {
+                                let project_root = rt_env.working_dir.clone();
+                                let ox_home = rt_env.ox_home_dir.clone();
+                                
+                                match ox_core::agent::auto_reflect::AutoReflector::new(
+                                    Arc::clone(llm_provider),
+                                    &project_root,
+                                    &ox_home,
+                                ) {
+                                    Ok(reflector) => {
+                                        app.output.push_line(OutputLine::System(
+                                            "\n🤖 Auto-reflection in progress...".to_string()
+                                        ));
+                                        
+                                        // Spawn async task for reflection
+                                        let conversation_history = session.messages.clone();
+                                        let tx_clone = agent_tx.clone();
+                                        let task_desc = task_description.clone();
+                                        let exec_summary = execution_summary.clone();
+                                        
+                                        tokio::spawn(async move {
+                                            match reflector.reflect_on_workflow(
+                                                &task_desc,
+                                                &exec_summary,
+                                                &conversation_history,
+                                            ).await {
+                                                Ok(Some(skill_id)) => {
+                                                    let _ = tx_clone.send(AgentToUiEvent::Status(
+                                                        format!("✅ Skill created: {}", skill_id)
+                                                    ));
+                                                }
+                                                Ok(None) => {
+                                                    tracing::debug!("[AUTO-REFLECT] No skill generated (LLM returned empty content)");
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("[AUTO-REFLECT] Reflection failed: {}", e);
+                                                    let _ = tx_clone.send(AgentToUiEvent::Error(
+                                                        format!("Auto-reflection failed: {}", e)
+                                                    ));
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("[AUTO-REFLECT] Failed to initialize AutoReflector: {}", e);
+                                        app.output.push_line(OutputLine::System(
+                                            "⚠️ Auto-reflection unavailable (initialization failed)".to_string()
+                                        ));
+                                    }
+                                }
+                            } else {
+                                tracing::debug!("[AUTO-REFLECT] LLM provider not available, skipping reflection");
+                                app.output.push_line(OutputLine::System(
+                                    "⚠️ Auto-reflection unavailable (no LLM provider)".to_string()
+                                ));
+                            }
                         }
                     }
                 }
@@ -1593,7 +1448,6 @@ fn handle_key_event(
     resolve_info: &Option<ProviderResolveInfo>,
     config: &OxConfig,
     agent_config: &Arc<AgentConfig>,
-    compression_manager: &Option<CompressionManager>,
     compressed_cache: &Option<(Vec<Message>, usize)>,
     command_registry: &slash_commands::CommandRegistry,
 ) {
@@ -1694,17 +1548,7 @@ fn handle_key_event(
                                             None,
                                         );
 
-                                        let memory_nodes = if let Some(cm) = &compression_manager {
-                                            memory.retrieve_with_rerank(
-                                                &temp_text,
-                                                &Some(rt_env.project_id.as_str()),
-                                                5,
-                                                Some(cm.embedder()),
-                                                None,
-                                            )
-                                        } else {
-                                            memory.retrieve(&temp_text, &Some(rt_env.project_id.as_str()), 5)
-                                        };
+                                        let memory_nodes = memory.retrieve_with_rerank(&temp_text, &Some(rt_env.project_id.as_str()), 5);
                                         let accessed_ids: Vec<&str> =
                                             memory_nodes.iter().map(|n| n.id.as_str()).collect();
                                         memory.reinforce_accessed(&accessed_ids);
@@ -1713,7 +1557,13 @@ fn handle_key_event(
                                         let effective_messages =
                                             if let Some((cached, prev_count)) = compressed_cache {
                                                 let pc = *prev_count;
-                                                let new_msgs = &session.messages[pc.min(session.messages.len())..];
+                                                let start_idx = pc.min(session.messages.len());
+                                                // 使用安全的切片方法
+                                                let new_msgs = if start_idx < session.messages.len() {
+                                                    &session.messages[start_idx..]
+                                                } else {
+                                                    &[]
+                                                };
                                                 let mut combined = cached.clone();
                                                 combined.extend_from_slice(new_msgs);
                                                 combined
@@ -1824,21 +1674,7 @@ fn handle_key_event(
                                     tracing::error!("Failed to persist message: {e}");
                                 }
 
-                                let memory_nodes = if let Some(cm) = &compression_manager {
-                                    memory.retrieve_with_rerank(
-                                        &spec_content,
-                                        &Some(rt_env.project_id.as_str()),
-                                        5,
-                                        Some(cm.embedder()),
-                                        None,
-                                    )
-                                } else {
-                                    memory.retrieve(
-                                        &spec_content,
-                                        &Some(rt_env.project_id.as_str()),
-                                        5,
-                                    )
-                                };
+                                let memory_nodes = memory.retrieve_with_rerank(&spec_content, &Some(rt_env.project_id.as_str()), 5);
                                 let accessed_ids: Vec<&str> =
                                     memory_nodes.iter().map(|n| n.id.as_str()).collect();
                                 memory.reinforce_accessed(&accessed_ids);
@@ -1847,8 +1683,13 @@ fn handle_key_event(
                                 let effective_messages =
                                     if let Some((cached, prev_count)) = compressed_cache {
                                         let pc = *prev_count;
-                                        let new_msgs =
-                                            &session.messages[pc.min(session.messages.len())..];
+                                        let start_idx = pc.min(session.messages.len());
+                                        // 使用安全的切片方法
+                                        let new_msgs = if start_idx < session.messages.len() {
+                                            &session.messages[start_idx..]
+                                        } else {
+                                            &[]
+                                        };
                                         let mut combined = cached.clone();
                                         combined.extend_from_slice(new_msgs);
                                         combined
@@ -1904,32 +1745,6 @@ fn handle_key_event(
                             }
                         }
 
-                        // 🚨 Check if smart naming was requested
-                        if let Some(pending) = app.pending_smart_naming.take() {
-                            if let Some(provider) = provider {
-                                let content = pending.content.clone();
-                                
-                                // Spawn async task to generate name
-                                let provider_clone = Arc::clone(provider);
-                                tokio::spawn(async move {
-                                    match spec_helpers::generate_smart_name(&content, &provider_clone).await {
-                                        Ok(name) => {
-                                            tracing::info!("✅ Smart name generated: {}", name);
-                                            // Store the result for next iteration
-                                            // Note: This is a simplified approach - in production, you'd want to use a channel or shared state
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("⚠️ Failed to generate smart name: {}, using auto-extraction", e);
-                                        }
-                                    }
-                                });
-                                
-                                app.output.push_system("🧠 Generating smart name with LLM (timeout: 5s)...");
-                                // For now, continue with auto-extraction as fallback
-                                // The LLM-generated name will be used in future iterations
-                            }
-                        }
-
                         // 🚨 Check if workflow approval was triggered by /Y command
                         if app.pending_workflow_approval {
                             app.pending_workflow_approval = false;
@@ -1978,21 +1793,7 @@ fn handle_key_event(
                                     }
                                 }
 
-                                let memory_nodes = if let Some(cm) = &compression_manager {
-                                    memory.retrieve_with_rerank(
-                                        "User approved workflow progression",
-                                        &Some(rt_env.project_id.as_str()),
-                                        5,
-                                        Some(cm.embedder()),
-                                        None,
-                                    )
-                                } else {
-                                    memory.retrieve(
-                                        "User approved workflow progression",
-                                        &Some(rt_env.project_id.as_str()),
-                                        5,
-                                    )
-                                };
+                                let memory_nodes = memory.retrieve_with_rerank("User approved workflow progression", &Some(rt_env.project_id.as_str()), 5);
                                 let accessed_ids: Vec<&str> =
                                     memory_nodes.iter().map(|n| n.id.as_str()).collect();
                                 memory.reinforce_accessed(&accessed_ids);
@@ -2001,8 +1802,13 @@ fn handle_key_event(
                                 let effective_messages =
                                     if let Some((cached, prev_count)) = compressed_cache {
                                         let pc = *prev_count;
-                                        let new_msgs =
-                                            &session.messages[pc.min(session.messages.len())..];
+                                        let start_idx = pc.min(session.messages.len());
+                                        // 使用安全的切片方法
+                                        let new_msgs = if start_idx < session.messages.len() {
+                                            &session.messages[start_idx..]
+                                        } else {
+                                            &[]
+                                        };
                                         let mut combined = cached.clone();
                                         combined.extend_from_slice(new_msgs);
                                         combined
@@ -2058,33 +1864,7 @@ fn handle_key_event(
                             }
                         }
 
-                        // Check if a council discuss was queued
-                        if let Some((question, rounds, verbose)) = app.pending_discuss.take() {
-                            let council_config = config.council.clone();
-                            let models_config = config.models.clone();
-                            let ctx_messages = session.messages.clone();
-                            let agent_tx_council = agent_tx.clone();
-                            tokio::spawn(async move {
-                                use ox_core::council::orchestrator::CouncilOrchestrator;
-                                let orch = CouncilOrchestrator::new(models_config, council_config);
-                                match orch
-                                    .convene(&question, &ctx_messages, rounds, verbose)
-                                    .await
-                                {
-                                    Ok(council_session) => {
-                                        let _ =
-                                            agent_tx_council.send(AgentToUiEvent::CouncilDone {
-                                                session: council_session,
-                                            });
-                                    }
-                                    Err(e) => {
-                                        let _ = agent_tx_council.send(AgentToUiEvent::Error(
-                                            format!("Council failed: {}", e),
-                                        ));
-                                    }
-                                }
-                            });
-                        }
+
                     }
                     UserInput::Text(text) => {
                         // Handle spec edit mode
@@ -2164,7 +1944,7 @@ fn handle_key_event(
                                 },
                             );
 
-                            // Add workflow step instructions if in Spec or Council mode (use cached data)
+                            // Add workflow step instructions if in Spec mode (use cached data)
                             if let Some(ref wf_info) = app.workflow_display {
                                 if let Some(ref step_prompt) = wf_info.step_prompt {
                                     current_system_prompt
@@ -2262,17 +2042,7 @@ fn handle_key_event(
                                 }
                             }
 
-                            let memory_nodes = if let Some(cm) = &compression_manager {
-                                memory.retrieve_with_rerank(
-                                    &text,
-                                    &Some(rt_env.project_id.as_str()),
-                                    5,
-                                    Some(cm.embedder()),
-                                    None,
-                                )
-                            } else {
-                                memory.retrieve(&text, &Some(rt_env.project_id.as_str()), 5)
-                            };
+                            let memory_nodes = memory.retrieve_with_rerank(&text, &Some(rt_env.project_id.as_str()), 5);
                             let accessed_ids: Vec<&str> =
                                 memory_nodes.iter().map(|n| n.id.as_str()).collect();
                             memory.reinforce_accessed(&accessed_ids);
@@ -2283,7 +2053,13 @@ fn handle_key_event(
                                 compressed_cache
                             {
                                 let pc = *prev_count;
-                                let new_msgs = &session.messages[pc.min(session.messages.len())..];
+                                let start_idx = pc.min(session.messages.len());
+                                // 使用安全的切片方法
+                                let new_msgs = if start_idx < session.messages.len() {
+                                    &session.messages[start_idx..]
+                                } else {
+                                    &[]
+                                };
                                 let mut combined = cached.clone();
                                 combined.extend_from_slice(new_msgs);
                                 combined

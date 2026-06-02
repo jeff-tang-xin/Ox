@@ -1,4 +1,4 @@
-use crate::agent::intervention::{InterventionManager, InterventionRequest};
+use crate::agent::intervention::InterventionRequest;
 use crate::agent::session::SessionState;
 use crate::agent::workflow::{Workflow, WorkflowStep};
 use std::sync::Arc;
@@ -11,8 +11,7 @@ pub struct WorkflowEngine {
     current_workflow: Option<Workflow>,
     /// Session state tracker
     session_state: Arc<tokio::sync::Mutex<SessionState>>,
-    /// Intervention manager for user interaction points
-    intervention_manager: Arc<tokio::sync::Mutex<InterventionManager>>,
+
 }
 
 impl WorkflowEngine {
@@ -21,13 +20,10 @@ impl WorkflowEngine {
             workflows: std::collections::HashMap::new(),
             current_workflow: None,
             session_state,
-            intervention_manager: Arc::new(tokio::sync::Mutex::new(InterventionManager::new())),
         };
 
         // Register default workflows
         engine.register_workflow(crate::agent::workflow::create_free_workflow());
-        engine.register_workflow(crate::agent::workflow::create_spec_workflow());
-        engine.register_workflow(crate::agent::workflow::create_council_workflow());
 
         engine
     }

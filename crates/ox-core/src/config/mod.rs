@@ -20,7 +20,6 @@ pub struct OxConfig {
     pub tools: ToolsConfig,
     pub models: ModelsConfig,
     pub agent: AgentConfig,
-    pub council: CouncilConfig,
     pub memory: MemoryConfig,
     pub behavior_rules: BehaviorRulesConfig,
     pub enforcement_rules: rules::EnforcementRules,
@@ -160,32 +159,6 @@ api_key = ""                   # Your DeepSeek API key
 # [models.model_providers]
 # "deepseek-v4-pro" = "openai"
 # "custom-model" = "anthropic"
-
-# ── Embedding Compression (KadaneDial) ───────────────────
-# Uses BGE embedding model for semantic context compression.
-# Automatically triggers when conversation history exceeds budget.
-# History budget = context_window × history_ratio (default 10%).
-#
-# To download a BGE model, use the /download-model command:
-#   /download-model                    # Downloads bge-small-zh-v1.5 (default)
-#   /download-model bge-base-zh-v1.5   # Downloads base model
-#   /download-model bge-large-zh-v1.5  # Downloads large model
-#
-# Available models from ModelScope:
-#   - bge-small-zh-v1.5  (~130MB, fast, good for most cases)
-#   - bge-base-zh-v1.5   (~420MB, balanced performance)
-#   - bge-large-zh-v1.5  (~1.2GB, best quality, slower)
-
-[models.embedding]
-enabled = false              # Enable embedding-based compression
-# model_path = "~/.ox/models/bge-small-zh-v1.5"  # Path to BGE model
-# threshold = 0.0            # Z-score threshold (higher = stricter filtering)
-# stop_threshold = 0.5       # Stop selecting when gain drops below this
-# max_segments = 5           # Maximum conversation segments to keep
-# min_segment_len = 2        # Minimum messages per segment
-# keep_recent = 4            # Always keep N most recent messages
-# chunk_threshold_tokens = 256  # Split messages longer than this
-# max_chunk_tokens = 512     # Maximum tokens per chunk
 
 # ── REPL Settings ────────────────────────────────────────
 [repl]
@@ -513,46 +486,6 @@ pub struct ProviderConfig {
     pub disable_tools: Option<bool>,
 }
 
-/// Configuration for embedding-based context compression (KadaneDial).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct EmbeddingConfig {
-    /// Enable embedding-based compression.
-    pub enabled: bool,
-    /// Path to BGE model directory (ModelScope format with safetensors).
-    pub model_path: Option<String>,
-    /// Z-score threshold for relevance filtering (higher = stricter).
-    pub threshold: f32,
-    /// Stop when cumulative gain drops below this threshold.
-    pub stop_threshold: f32,
-    /// Maximum number of segments to select.
-    pub max_segments: usize,
-    /// Minimum length of each segment (in message pairs).
-    pub min_segment_len: usize,
-    /// Always keep this many recent messages.
-    pub keep_recent: usize,
-    /// Token threshold for chunking: messages shorter than this are kept as single chunk.
-    pub chunk_threshold_tokens: usize,
-    /// Maximum tokens per chunk when splitting long messages.
-    pub max_chunk_tokens: usize,
-}
-
-impl Default for EmbeddingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,  // 🆕 Default: ENABLED for better retrieval accuracy
-            model_path: None,  // Will use ~/.ox/models/bge-small-zh-v1.5 if not specified
-            threshold: 0.0,
-            stop_threshold: 0.5,
-            max_segments: 5,
-            min_segment_len: 2,
-            keep_recent: 8,  // 🚨 Increased from 4 to 8 to reduce hallucination after compression
-            chunk_threshold_tokens: 256,
-            max_chunk_tokens: 512,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
@@ -570,9 +503,6 @@ pub struct ModelsConfig {
     /// Takes priority over `resolve_provider_name()` prefix inference and `default_provider`.
     #[serde(default)]
     pub model_providers: HashMap<String, String>,
-    /// Embedding-based compression configuration (KadaneDial).
-    #[serde(default)]
-    pub embedding: Option<EmbeddingConfig>,
 }
 
 impl Default for ModelsConfig {
@@ -585,8 +515,6 @@ impl Default for ModelsConfig {
             providers: HashMap::new(),
             default_provider: String::new(),
             model_providers: HashMap::new(),
-            // 🆕 Default: Enable embedding for memory re-ranking
-            embedding: Some(EmbeddingConfig::default()),
         }
     }
 }
@@ -615,40 +543,6 @@ impl ModelsConfig {
                     );
                 }
             }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CouncilConfig {
-    pub default_rounds: u32,
-    pub max_rounds: u32,
-    pub max_participants: u32,
-    pub participants: Vec<String>,
-    pub arbiter_model: String,
-    pub early_convergence_threshold: f64,
-    pub verbose_by_default: bool,
-    pub budget_warning: bool,
-    pub council_memory_decay_factor: f64,
-}
-
-impl Default for CouncilConfig {
-    fn default() -> Self {
-        Self {
-            default_rounds: 2,
-            max_rounds: 3,
-            max_participants: 4,
-            participants: vec![
-                "gpt-4o".into(),
-                "claude-sonnet-4-20250514".into(),
-                "deepseek-coder".into(),
-            ],
-            arbiter_model: "default".into(),
-            early_convergence_threshold: 0.8,
-            verbose_by_default: false,
-            budget_warning: true,
-            council_memory_decay_factor: 0.7,
         }
     }
 }

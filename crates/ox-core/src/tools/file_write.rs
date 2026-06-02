@@ -1,11 +1,8 @@
-use encoding_rs::Encoding;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
-
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput, content_validation};
 
 pub struct FileWriteTool;
@@ -465,45 +462,8 @@ fn atomic_write_sync(
     Ok(bytes_written)
 }
 
-/// Atomically write with retry mechanism for transient failures
-async fn atomic_write_with_retry(
-    temp_path: &PathBuf,
-    target: &std::path::Path,
-    content: &[u8],
-    max_retries: u32,
-) -> Result<usize, String> {
-    let mut last_error = String::new();
-
-    for attempt in 1..=max_retries {
-        match atomic_write_sync(temp_path, target, content) {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => {
-                last_error = e.clone();
-
-                // Check if error is retryable
-                if is_retryable_error(&e) && attempt < max_retries {
-                    let delay = Duration::from_millis(100 * attempt as u64); // Exponential backoff
-                    tracing::warn!(
-                        "[FILE_WRITE] Attempt {} failed, retrying in {:?}: {}",
-                        attempt,
-                        delay,
-                        e
-                    );
-                    tokio::time::sleep(delay).await;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    Err(format!(
-        "Failed after {} attempts: {}",
-        max_retries, last_error
-    ))
-}
-
-/// Synchronous chunked write (for use inside spawn_blocking)
+/// Synchronous chunked write (for use inside spawn_blocking).
+/// Writes large files in chunks to avoid memory pressure.
 fn chunked_write_sync(
     temp_path: &PathBuf,
     target: &std::path::Path,
@@ -511,180 +471,27 @@ fn chunked_write_sync(
     chunk_size: usize,
 ) -> Result<usize, String> {
     let total_bytes = content.len();
-    
-    // Create temp file
     let mut file = fs::File::create(temp_path)
         .map_err(|e| format!("Cannot create temporary file: {}", e))?;
 
-    // Write in chunks
     let mut offset = 0;
     while offset < total_bytes {
         let end = std::cmp::min(offset + chunk_size, total_bytes);
         let chunk = &content[offset..end];
-
         file.write_all(chunk)
             .map_err(|e| format!("Failed to write chunk at offset {}: {}", offset, e))?;
-        
         offset = end;
     }
 
-    // Flush and sync
     file.flush()
         .map_err(|e| format!("Failed to flush data: {}", e))?;
     file.sync_all()
         .map_err(|e| format!("Failed to sync to disk: {}", e))?;
-
     drop(file);
 
-    // Atomic rename
     fs::rename(temp_path, target)
         .map_err(|e| format!("Failed to finalize file: {}", e))?;
 
-    tracing::info!(
-        "[FILE_WRITE] Chunked write successful: {} bytes in {} chunks",
-        total_bytes,
-        (total_bytes + chunk_size - 1) / chunk_size
-    );
-    
     Ok(total_bytes)
 }
 
-/// Determine if an error is transient and worth retrying
-fn is_retryable_error(error: &str) -> bool {
-    error.contains("being used by another process") ||  // Windows file lock
-    error.contains("resource busy") ||                   // Unix file lock
-    error.contains("disk I/O error") ||                  // Temporary disk issue
-    error.contains("device or resource busy") ||
-    error.contains("too many open files") // File descriptor exhaustion
-}
-
-/// Write content in chunks with progress tracking
-async fn chunked_write_with_retry(
-    temp_path: &PathBuf,
-    target: &std::path::Path,
-    content: &[u8],
-    chunk_size: usize,
-    max_retries: u32,
-    ctx: &super::ToolContext,
-) -> Result<usize, String> {
-    let total_bytes = content.len();
-    let mut bytes_written = 0;
-    let mut last_error = String::new();
-    
-    // Calculate total chunks for progress reporting
-    let total_chunks = (total_bytes + chunk_size - 1) / chunk_size;
-
-    for attempt in 1..=max_retries {
-        // Create temp file
-        let mut file = match fs::File::create(temp_path) {
-            Ok(f) => f,
-            Err(e) => {
-                last_error = format!("Cannot create temporary file: {}", e);
-                if attempt < max_retries {
-                    tracing::warn!("[FILE_WRITE] Attempt {} failed: {}", attempt, last_error);
-                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                    continue;
-                }
-                return Err(last_error);
-            }
-        };
-
-        // Write in chunks
-        let mut offset = 0;
-        let mut chunk_success = true;
-        let mut current_chunk = 0;
-
-        while offset < total_bytes {
-            let end = std::cmp::min(offset + chunk_size, total_bytes);
-            let chunk = &content[offset..end];
-            current_chunk += 1;
-
-            match file.write_all(chunk) {
-                Ok(_) => {
-                    bytes_written = end;
-                    offset = end;
-                    
-                    // 🚀 Report progress after each chunk
-                    let percent = ((current_chunk as f64 / total_chunks as f64) * 100.0) as u8;
-                    ctx.report_progress(
-                        format!("Writing chunk {}/{} ({:.1} MB / {:.1} MB)", 
-                            current_chunk, total_chunks,
-                            offset as f64 / 1024.0 / 1024.0,
-                            total_bytes as f64 / 1024.0 / 1024.0),
-                        Some(percent.min(99)), // Cap at 99% until complete
-                    );
-                    
-                    // ⚡ Yield to allow UI to update
-                    tokio::task::yield_now().await;
-                }
-                Err(e) => {
-                    chunk_success = false;
-                    last_error = format!("Failed to write chunk at offset {}: {}", offset, e);
-                    tracing::warn!("[FILE_WRITE] Chunk write failed: {}", last_error);
-                    break;
-                }
-            }
-        }
-
-        if !chunk_success {
-            drop(file);
-            let _ = fs::remove_file(temp_path);
-
-            if attempt < max_retries {
-                tracing::warn!("[FILE_WRITE] Attempt {} failed, retrying...", attempt);
-                tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                continue;
-            }
-            return Err(format!(
-                "Failed after {} attempts: {}",
-                max_retries, last_error
-            ));
-        }
-
-        // Flush and sync
-        if let Err(e) = file.flush() {
-            drop(file);
-            let _ = fs::remove_file(temp_path);
-            return Err(format!("Failed to flush data: {}", e));
-        }
-
-        if let Err(e) = file.sync_all() {
-            drop(file);
-            let _ = fs::remove_file(temp_path);
-            return Err(format!("Failed to sync to disk: {}", e));
-        }
-
-        drop(file);
-
-        // Atomic rename
-        match fs::rename(temp_path, target) {
-            Ok(_) => {
-                tracing::info!(
-                    "[FILE_WRITE] Chunked write successful: {} bytes in {} chunks",
-                    total_bytes,
-                    (total_bytes + chunk_size - 1) / chunk_size
-                );
-                return Ok(total_bytes);
-            }
-            Err(e) => {
-                last_error = format!("Failed to finalize file: {}", e);
-                let _ = fs::remove_file(temp_path);
-
-                if attempt < max_retries {
-                    tracing::warn!("[FILE_WRITE] Rename failed, retrying...",);
-                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                    continue;
-                }
-                return Err(format!(
-                    "Failed after {} attempts: {}",
-                    max_retries, last_error
-                ));
-            }
-        }
-    }
-
-    Err(format!(
-        "Failed after {} attempts: {}",
-        max_retries, last_error
-    ))
-}

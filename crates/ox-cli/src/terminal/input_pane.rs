@@ -43,10 +43,8 @@ impl InputPane {
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             // Find the previous char boundary.
-            let prev = self.buffer[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
+            let prev = self.buffer.get(..self.cursor)
+                .and_then(|s| s.char_indices().next_back().map(|(i, _)| i))
                 .unwrap_or(0);
             self.buffer.drain(prev..self.cursor);
             self.cursor = prev;
@@ -56,12 +54,10 @@ impl InputPane {
     /// Delete the character at the cursor (delete key).
     pub fn delete(&mut self) {
         if self.cursor < self.buffer.len() {
-            let next = self.cursor
-                + self.buffer[self.cursor..]
-                    .chars()
-                    .next()
-                    .map(|c| c.len_utf8())
-                    .unwrap_or(0);
+            let next_char_len = self.buffer.get(self.cursor..)
+                .and_then(|s| s.chars().next().map(|c| c.len_utf8()))
+                .unwrap_or(0);
+            let next = self.cursor + next_char_len;
             self.buffer.drain(self.cursor..next);
         }
     }
@@ -69,10 +65,8 @@ impl InputPane {
     /// Move cursor left by one character.
     pub fn move_left(&mut self) {
         if self.cursor > 0 {
-            self.cursor = self.buffer[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
+            self.cursor = self.buffer.get(..self.cursor)
+                .and_then(|s| s.char_indices().next_back().map(|(i, _)| i))
                 .unwrap_or(0);
         }
     }
@@ -80,11 +74,10 @@ impl InputPane {
     /// Move cursor right by one character.
     pub fn move_right(&mut self) {
         if self.cursor < self.buffer.len() {
-            self.cursor += self.buffer[self.cursor..]
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
+            let next_char_len = self.buffer.get(self.cursor..)
+                .and_then(|s| s.chars().next().map(|c| c.len_utf8()))
                 .unwrap_or(0);
+            self.cursor += next_char_len;
         }
     }
 
@@ -111,7 +104,7 @@ impl InputPane {
         if !text.is_empty() {
             // Truncate if too long.
             let entry = if text.len() > Self::MAX_ENTRY_LEN {
-                text[..Self::MAX_ENTRY_LEN].to_string()
+                text.get(..Self::MAX_ENTRY_LEN).unwrap_or(&text).to_string()
             } else {
                 text.clone()
             };
@@ -196,7 +189,9 @@ impl InputPane {
 
         // Content doesn't fit - need to scroll
         // Strategy: keep cursor visible with some padding
-        let cursor_visual_pos = Self::visual_width(&self.buffer[..self.cursor]);
+        let cursor_visual_pos = self.buffer.get(..self.cursor)
+            .map(|s| Self::visual_width(s))
+            .unwrap_or(0);
 
         // Calculate optimal scroll position to keep cursor visible
         // Try to center cursor with ~20% padding on each side
@@ -215,7 +210,7 @@ impl InputPane {
         }
 
         // Extract visible portion
-        let remaining = &self.buffer[scroll_chars..];
+        let remaining = self.buffer.get(scroll_chars..).unwrap_or("");
         let mut visible = String::new();
         let mut visible_width = 0;
 
@@ -248,7 +243,7 @@ impl InputPane {
             return;
         }
         // Find the start of the current word by scanning backwards.
-        let before_cursor = &self.buffer[..self.cursor];
+        let before_cursor = self.buffer.get(..self.cursor).unwrap_or("");
         let chars: Vec<(usize, char)> = before_cursor.char_indices().collect();
         let mut idx = chars.len();
 

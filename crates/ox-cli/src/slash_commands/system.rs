@@ -1,4 +1,4 @@
-/// System commands: /exit, /cd, /init, /debug, /cost, /plan, /reload, /download_model, /free, /cancel, /clear
+/// System commands: /exit, /cd, /init, /debug, /cost, /plan, /reload, /free, /cancel, /clear
 
 use crate::terminal::app::App as AppState;
 use crate::slash_commands::{CommandMeta, CommandResult};
@@ -32,9 +32,6 @@ pub const PLAN_COMMAND: CommandMeta = CommandMeta {
 };
 pub const RELOAD_COMMAND: CommandMeta = CommandMeta {
     name: "reload", aliases: &[], description: "Reload session from disk", handler: handle_reload,
-};
-pub const DOWNLOAD_MODEL_COMMAND: CommandMeta = CommandMeta {
-    name: "download_model", aliases: &["dlmodel", "download-model"], description: "Download embedding model", handler: handle_download_model,
 };
 pub const FREE_COMMAND: CommandMeta = CommandMeta {
     name: "free", aliases: &[], description: "Switch to free mode", handler: handle_free,
@@ -105,11 +102,6 @@ pub fn handle_debug(app: &mut AppState, _args: &str, session: &mut Session, rt_e
     }
     let config_path = OxConfig::default_config_path();
     app.output.push_line(OutputLine::System(format!("Config file: {}", config_path.display())));
-    if app.compression_manager.is_some() {
-        app.output.push_line(OutputLine::System("Embedding: loaded".to_string()));
-    } else {
-        app.output.push_line(OutputLine::System("Embedding: disabled".to_string()));
-    }
     app.output.push_line(OutputLine::System(format!("OS: {} ({})", rt_env.os, rt_env.arch)));
     app.output.push_line(OutputLine::System(format!("Shell: {}", rt_env.shell.name)));
     app.output.push_line(OutputLine::System(format!("Working dir: {}", rt_env.working_dir.display())));
@@ -153,26 +145,11 @@ pub fn handle_reload(app: &mut AppState, _args: &str, session: &mut Session, _rt
     CommandResult::Success
 }
 
-pub fn handle_download_model(app: &mut AppState, args: &str, _session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
-    _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
-    let model = if args.trim().is_empty() { "bge-small-zh-v1.5".to_string() } else { args.trim().to_string() };
-    let target_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(format!(".ox/models/{}", model));
-    app.output.push_system(&format!("Downloading embedding model '{}'...", model));
-    app.output.push_line(OutputLine::System(format!("Target: {}", target_dir.display())));
-    match ox_core::embedding::download_model(&model, &target_dir) {
-        Ok(()) => app.output.push_system(&format!("Model '{}' downloaded successfully", model)),
-        Err(e) => app.output.push_error(&format!("Failed to download model: {}", e)),
-    }
-    CommandResult::Success
-}
-
 pub fn handle_free(app: &mut AppState, _args: &str, session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
     _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     let prev = match app.workflow_state {
         WorkflowState::Spec { .. } => "Spec",
-        WorkflowState::Council { .. } => "Council",
         WorkflowState::Free => { app.output.push_system("Already in Free mode."); return CommandResult::Success; }
     };
     

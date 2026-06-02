@@ -1,5 +1,7 @@
 pub mod store;
 pub mod semantic;  // 🆕 Semantic association manager
+pub mod layering;  // 🆕 L0-L3 memory layering
+pub mod hybrid_storage;  // 🆕 Hybrid SQLite + Markdown storage
 
 use std::fmt;
 use std::sync::Mutex;
@@ -54,7 +56,6 @@ pub enum MemoryNodeType {
     BestPractice,
     Pattern,
     MetaSkill,
-    Council,
 }
 
 impl MemoryNodeType {
@@ -68,7 +69,6 @@ impl MemoryNodeType {
             Self::BestPractice => "best_practice",
             Self::Pattern => "pattern",
             Self::MetaSkill => "meta_skill",
-            Self::Council => "council",
         }
     }
 
@@ -82,7 +82,6 @@ impl MemoryNodeType {
             "best_practice" => Some(Self::BestPractice),
             "pattern" => Some(Self::Pattern),
             "meta_skill" => Some(Self::MetaSkill),
-            "council" => Some(Self::Council),
             _ => None,
         }
     }
@@ -97,14 +96,13 @@ impl MemoryNodeType {
             Self::BestPractice => 2,
             Self::Pattern => 2,
             Self::MetaSkill => 3,
-            Self::Council => 3,
         }
     }
 
     pub fn is_immediate_write(&self) -> bool {
         matches!(
             self,
-            Self::Style | Self::Architectural | Self::AntiPattern | Self::MetaSkill | Self::Council
+            Self::Style | Self::Architectural | Self::AntiPattern | Self::MetaSkill
         )
     }
 
@@ -309,6 +307,55 @@ mod decay_tests {
         let decay = calculate_overall_decay(&node, &[0.1, 0.2, 0.3, 0.4, 0.5]);
         assert!(decay > 0.0);
     }
+    
+    // 🆕 Test for enhanced file_read memory extraction
+    #[test]
+    fn test_file_read_memory_extraction_with_result() {
+        let tool_args = r#"{"path": "src/main.rs"}"#;
+        let tool_result = "     1\tfn main() {\n     2\t    println!(\"Hello, world!\");\n     3\t}\n     4\t\n     5\tstruct User {\n     6\t    name: String,\n     7\t}\n     8\t\n     9\timpl User {\n    10\t    fn new(name: String) -> Self {\n    11\t        Self { name }\n    12\t    }\n    13\t}";
+        
+        let node = MemoryNode::extract_from_tool_call_with_result(
+            "file_read",
+            tool_args,
+            Some(tool_result),
+            "test-project",
+            "rust",
+        );
+        
+        assert!(node.is_some());
+        let node = node.unwrap();
+        
+        // Verify the memory contains rich information
+        assert!(node.content.contains("src/main.rs"));
+        assert!(node.content.contains("Lines:"));
+        assert!(node.content.contains("Preview:"));
+        assert!(node.content.contains("functions"));
+        assert!(node.content.contains("structs/classes"));
+        assert_eq!(node.related_files.len(), 1);
+        assert_eq!(node.related_files[0], "src/main.rs");
+        
+        tracing::info!("Generated memory content:\n{}", node.content);
+    }
+    
+    #[test]
+    fn test_file_read_memory_without_result() {
+        let tool_args = r#"{"path": "config.toml"}"#;
+        
+        let node = MemoryNode::extract_from_tool_call_with_result(
+            "file_read",
+            tool_args,
+            None,  // No result available
+            "test-project",
+            "toml",
+        );
+        
+        assert!(node.is_some());
+        let node = node.unwrap();
+        
+        // Should have basic information
+        assert!(node.content.contains("config.toml"));
+        assert_eq!(node.related_files.len(), 1);
+    }
 }
 
 impl fmt::Display for MemoryNodeType {
@@ -322,7 +369,6 @@ pub enum MemorySource {
     UserExplicit,
     ToolObservation,
     LlmExtraction,
-    CouncilConclusion,
     Feedback,
     RefinedSummary,  // 🆕 Refined memory summaries from conversation turns
 }
@@ -333,7 +379,6 @@ impl MemorySource {
             Self::UserExplicit => "user_explicit",
             Self::ToolObservation => "tool_observation",
             Self::LlmExtraction => "llm_extraction",
-            Self::CouncilConclusion => "council_conclusion",
             Self::Feedback => "feedback",
             Self::RefinedSummary => "refined_summary",
         }
@@ -344,7 +389,6 @@ impl MemorySource {
             "user_explicit" => Some(Self::UserExplicit),
             "tool_observation" => Some(Self::ToolObservation),
             "llm_extraction" => Some(Self::LlmExtraction),
-            "council_conclusion" => Some(Self::CouncilConclusion),
             "feedback" => Some(Self::Feedback),
             "refined_summary" => Some(Self::RefinedSummary),
             _ => None,
@@ -450,13 +494,16 @@ impl WriteBuffer {
 // ── Extractor (启发式记忆提取) ──
 
 impl MemoryNode {
-    pub fn extract_from_tool_call(
+    /// 🆕 Enhanced extraction with access to tool execution results
+    pub fn extract_from_tool_call_with_result(
         tool_name: &str,
         tool_args: &str,
+        tool_result: Option<&str>,
         project_id: &str,
         language: &str,
     ) -> Option<Self> {
         match tool_name {
+            "file_read" => Self::extract_file_read_memory(tool_args, tool_result, project_id, language),
             "file_write" | "file_patch" => {
                 if tool_args.len() < 20 {
                     return None;
@@ -514,28 +561,6 @@ impl MemoryNode {
                 
                 Some(node)
             }
-            "file_read" => {
-                // Extract file path for read operations too
-                let related_file = serde_json::from_str::<serde_json::Value>(tool_args)
-                    .ok()
-                    .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()));
-                
-                if let Some(file_path) = related_file {
-                    let content = format!("Read file: {}", file_path);
-                    Some(
-                        Self::new(
-                            content,
-                            MemoryNodeType::Fact,
-                            Some(project_id.into()),
-                            language.into(),
-                            MemorySource::ToolObservation,
-                        )
-                        .with_related_file(&file_path)
-                    )
-                } else {
-                    None
-                }
-            }
             "shell_exec" => {
                 if tool_args.contains("error")
                     || tool_args.contains("Error")
@@ -567,6 +592,92 @@ impl MemoryNode {
             }
             _ => None,
         }
+    }
+
+    /// Legacy extraction without result access (kept for compatibility)
+    pub fn extract_from_tool_call(
+        tool_name: &str,
+        tool_args: &str,
+        project_id: &str,
+        language: &str,
+    ) -> Option<Self> {
+        Self::extract_from_tool_call_with_result(tool_name, tool_args, None, project_id, language)
+    }
+
+    /// 🆕 Specialized memory extraction for file_read operations
+    fn extract_file_read_memory(
+        tool_args: &str,
+        tool_result: Option<&str>,
+        project_id: &str,
+        language: &str,
+    ) -> Option<Self> {
+        // Extract file path from arguments
+        let file_path = serde_json::from_str::<serde_json::Value>(tool_args)
+            .ok()
+            .and_then(|v| {
+                v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string())
+            })?;
+        
+        // Create rich memory content based on tool result
+        let content = if let Some(result) = tool_result {
+            // If we have the actual file content, create a meaningful summary
+            let result_lines: Vec<&str> = result.lines().collect();
+            let line_count = result_lines.len();
+            
+            // Extract key information from the file content (first 10 lines)
+            let preview_lines: Vec<&str> = result_lines.iter().take(10).cloned().collect();
+            let preview = preview_lines.join("\n");
+            
+            // Check for important patterns in the file
+            let has_functions = result.contains("fn ") || result.contains("def ") || result.contains("function");
+            let has_structs = result.contains("struct ") || result.contains("class ") || result.contains("type");
+            let has_imports = result.contains("use ") || result.contains("import ") || result.contains("#include");
+            
+            let mut features = Vec::new();
+            if has_functions { features.push("functions"); }
+            if has_structs { features.push("structs/classes"); }
+            if has_imports { features.push("imports/dependencies"); }
+            
+            let features_str = if features.is_empty() {
+                String::new()
+            } else {
+                format!(" Contains: {}.", features.join(", "))
+            };
+            
+            // 🚨 FIX: Use char-based truncation to avoid UTF-8 boundary errors
+            let preview_truncated: String = preview.chars().take(300).collect();
+            let preview_final = if preview.chars().count() > 300 {
+                format!("{}...", preview_truncated)
+            } else {
+                preview
+            };
+            
+            // 🆕 Enhanced format with searchable keywords at the beginning
+            // This improves retrieval by putting key terms first
+            let filename_only = file_path.split('/').last().unwrap_or(&file_path);
+            format!(
+                "[FILE] {} | Read src file with {} lines.{}\nFull path: {}\nPreview:\n{}",
+                filename_only,  // Put filename first for better search matching
+                line_count,
+                features_str,
+                file_path,
+                preview_final
+            )
+        } else {
+            // Fallback: just record that the file was read
+            format!("Read file: {}", file_path)
+        };
+        
+        Some(
+            Self::new(
+                content,
+                MemoryNodeType::Fact,
+                Some(project_id.into()),
+                language.into(),
+                MemorySource::ToolObservation,
+            )
+            .with_related_file(&file_path)
+        )
     }
 
     pub fn extract_from_conversation(
@@ -660,6 +771,8 @@ pub struct MemoryManager {
     query_cache: Mutex<HashMap<String, (Vec<MemoryNode>, chrono::DateTime<chrono::Utc>)>>,
     // 🆕 Semantic association manager for dynamic query expansion
     semantic_manager: Option<semantic::SemanticAssociationManager>,
+    // 🆕 Hybrid storage for L0-L3 architecture (optional)
+    hybrid_storage: Option<hybrid_storage::HybridStorage>,
 }
 
 impl Clone for MemoryManager {
@@ -670,6 +783,7 @@ impl Clone for MemoryManager {
             write_buffer: Mutex::new(WriteBuffer::new()),
             query_cache: Mutex::new(HashMap::new()),  // Don't clone cache
             semantic_manager: self.semantic_manager.clone(),
+            hybrid_storage: None,  // Don't clone hybrid storage (expensive)
         }
     }
 }
@@ -708,12 +822,25 @@ impl MemoryManager {
             None
         };
 
+        // 🆕 Initialize hybrid storage for L0-L3 architecture
+        let hybrid_storage = match hybrid_storage::HybridStorage::new(runtime_ox_home) {
+            Ok(storage) => {
+                tracing::info!("✅ Hybrid storage initialized (L0-L3 architecture enabled)");
+                Some(storage)
+            }
+            Err(e) => {
+                tracing::warn!("⚠️ Failed to initialize hybrid storage: {}. Using legacy store only.", e);
+                None
+            }
+        };
+
         Ok(Self {
             project_store,
             overall_store,
             write_buffer: Mutex::new(WriteBuffer::new()),
             query_cache: Mutex::new(HashMap::new()),  // Initialize empty cache
             semantic_manager,
+            hybrid_storage,
         })
     }
 
@@ -765,17 +892,29 @@ impl MemoryManager {
         // Track successful tool calls for learning
         let mut successful_tools = Vec::new();
         
+        // 🆕 Build a map of tool_call_id -> tool_result_content for accessing results
+        let mut tool_results_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for msg in messages {
+            if let crate::message::Message::ToolResult { tool_call_id, content } = msg {
+                tool_results_map.insert(tool_call_id.clone(), content.clone());
+            }
+        }
+        
         for msg in messages {
             if let crate::message::Message::Assistant {
                 content,
                 tool_calls,
             } = msg
             {
-                // Extract knowledge from tool calls
+                // Extract knowledge from tool calls (with access to results)
                 for tc in tool_calls {
-                    if let Some(node) = MemoryNode::extract_from_tool_call(
+                    // Get the corresponding tool result if available
+                    let tool_result = tool_results_map.get(&tc.id).cloned();
+                    
+                    if let Some(node) = MemoryNode::extract_from_tool_call_with_result(
                         &tc.name,
                         &tc.arguments,
+                        tool_result.as_deref(),
                         project_id,
                         language,
                     ) {
@@ -846,66 +985,15 @@ impl MemoryManager {
     /// # Arguments
     /// * `query` - Search query
     /// * `project_id` - Optional project ID for scoped search
-    /// * `limit` - Maximum number of results to return
-    /// * `embedder` - Optional BGE embedder for re-ranking (if None, skips re-ranking)
-    /// * `rerank_top_k` - Number of results after re-ranking (default: same as limit)
+    /// Retrieve memories with optional re-ranking.
+    /// Delegates to `retrieve()` — LLM Judge re-ranking is handled at config level.
     pub fn retrieve_with_rerank(
         &self,
         query: &str,
         project_id: &Option<&str>,
         limit: usize,
-        embedder: Option<&crate::embedding::BgeEmbedder>,
-        rerank_top_k: Option<usize>,
     ) -> Vec<MemoryNode> {
-        tracing::info!(
-            "[MEMORY RETRIEVAL] Starting retrieval for query: '{}', limit: {}, rerank: {}",
-            query.chars().take(50).collect::<String>(),
-            limit,
-            if embedder.is_some() { "enabled" } else { "disabled" }
-        );
-        
-        // Step 1: Multi-path retrieval (get more candidates than needed)
-        let retrieve_limit = if embedder.is_some() {
-            // If re-ranking is enabled, retrieve more candidates
-            (limit * 2).max(limit + 5)
-        } else {
-            limit
-        };
-        
-        let mut results = self.retrieve(query, project_id, retrieve_limit);
-        
-        tracing::info!(
-            "[MEMORY RETRIEVAL] Initial retrieval returned {} memories",
-            results.len()
-        );
-        
-        // Step 2: Re-rank if embedder is provided
-        if let Some(emb) = embedder {
-            let top_k = rerank_top_k.unwrap_or(limit);
-            
-            tracing::info!("[MEMORY] Re-ranking {} memories (target: {})", results.len(), top_k);
-            
-            match crate::embedding::rerank_memories(emb, query, results.clone(), top_k) {
-                Ok(reranked) => {
-                    tracing::info!("[MEMORY] Re-ranking complete, returned {} memories", reranked.len());
-                    return reranked;
-                }
-                Err(e) => {
-                    tracing::warn!("[MEMORY] Re-ranking failed: {}, falling back to original ranking", e);
-                    // Fall back to original ranking
-                    results.truncate(limit);
-                    return results;
-                }
-            }
-        }
-        
-        // No re-ranking, just truncate to limit
-        results.truncate(limit);
-        tracing::info!(
-            "[MEMORY RETRIEVAL] Final result: {} memories (no re-ranking)",
-            results.len()
-        );
-        results
+        self.retrieve(query, project_id, limit)
     }
     
     /// Legacy retrieve method (without re-ranking).
@@ -1196,13 +1284,12 @@ impl MemoryManager {
         results.into_iter().map(|(node, _)| node).collect()
     }
     
-    /// Extract key entities from query for multi-path retrieval.
-    /// Focuses on: file names, function names, technical terms.
+    /// 🆕 Enhanced entity extraction for better file_read memory retrieval
     fn extract_query_entities(&self, query: &str) -> Vec<String> {
         let mut entities = Vec::new();
         
-        // 1. Extract file paths and names
-        if let Ok(file_pattern) = regex::Regex::new(r"[\w.-]+\.(rs|toml|json|md|py|js|ts|go)") {
+        // 1. Extract file paths and names (enhanced pattern)
+        if let Ok(file_pattern) = regex::Regex::new(r"[\w./-]+\.(rs|toml|json|md|py|js|ts|go|jsx|tsx|java|cpp|c|h)") {
             for mat in file_pattern.find_iter(query) {
                 let file_name = mat.as_str().to_string();
                 if !entities.contains(&file_name) {
@@ -1221,11 +1308,13 @@ impl MemoryManager {
             }
         }
         
-        // 3. Extract technical terms
+        // 3. Extract technical terms (expanded list)
         let tech_terms = [
             "authentication", "authorization", "database", "api", "http",
             "async", "await", "error handling", "testing", "deployment",
-            "refactor", "optimize", "performance", "security"
+            "refactor", "optimize", "performance", "security",
+            "function", "method", "class", "struct", "interface",
+            "module", "component", "service", "controller"
         ];
         let query_lower = query.to_lowercase();
         for term in &tech_terms {
@@ -1263,79 +1352,121 @@ impl MemoryManager {
             return String::new();
         }
 
-        if use_xml {
-            // XML format for compatible APIs
-            let mut out = String::from("<relevant_memories>\n");
-            for n in nodes.iter().take(8) {
-                // 🆕 Dynamic truncation based on LLM score with chunking
-                let max_len = if n.avg_llm_score >= 8.0 {
-                    350  // High-score memory: preserve more context
-                } else if n.avg_llm_score >= 6.0 {
-                    250  // Medium-score memory: normal length
-                } else if n.avg_llm_score > 0.0 {
-                    180  // Low-score memory: concise
-                } else {
-                    250  // Unrated memory: default length
-                };
-                
-                // 🆕 Use sliding window chunking for long memories
-                let content = if n.content.len() > max_len * 2 {
-                    // For very long memories, use first chunk with overlap
-                    let chunks = split_with_overlap(&n.content, max_len, 0.15);
-                    format!("{}...", chunks[0])
-                } else if n.content.len() > max_len {
-                    // 🚨 FIX: Use char boundary to avoid slicing in the middle of UTF-8 characters
-                    let char_boundary = n.content
-                        .char_indices()
-                        .nth(max_len)
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(n.content.len());
-                    format!("{}...", &n.content[..char_boundary])
-                } else {
-                    n.content.clone()
-                };
-                out.push_str(&format!(
-                    "  <memory depth=\"{}\" type=\"{}\">{}</memory>\n",
-                    n.depth, n.node_type, content
-                ));
+        // 🆕 Separate file_read memories from other memories
+        let mut file_memories = Vec::new();
+        let mut other_memories = Vec::new();
+        
+        for node in nodes {
+            if node.content.starts_with("[FILE]") || node.content.starts_with("Read file:") {
+                file_memories.push(node);
+            } else {
+                other_memories.push(node);
             }
-            out.push_str("</relevant_memories>");
-            out
-        } else {
-            // Plain text format for MiniMax and similar APIs
-            let mut out = String::from("Relevant context:\n");
-            for n in nodes.iter().take(5) {
-                // 🆕 Dynamic truncation based on LLM score with chunking
-                let max_len = if n.avg_llm_score >= 8.0 {
-                    400  // High-score memory: preserve more context
-                } else if n.avg_llm_score >= 6.0 {
-                    280  // Medium-score memory: normal length
-                } else if n.avg_llm_score > 0.0 {
-                    200  // Low-score memory: concise
-                } else {
-                    280  // Unrated memory: default length
-                };
-                
-                // 🆕 Use sliding window chunking for long memories
-                let content = if n.content.len() > max_len * 2 {
-                    // For very long memories, use first chunk with overlap
-                    let chunks = split_with_overlap(&n.content, max_len, 0.15);
-                    format!("{}...", chunks[0])
-                } else if n.content.len() > max_len {
-                    // 🚨 FIX: Use char boundary to avoid slicing in the middle of UTF-8 characters
-                    let char_boundary = n.content
-                        .char_indices()
-                        .nth(max_len)
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(n.content.len());
-                    format!("{}...", &n.content[..char_boundary])
-                } else {
-                    n.content.clone()
-                };
-                out.push_str(&format!("- {}\n", content));
-            }
-            out
         }
+        
+        let mut out = String::new();
+        
+        // 🆕 Format file memories with special warning header
+        if !file_memories.is_empty() {
+            out.push_str("\n## ⚠️ IMPORTANT: Files You've Already Read\n\n");
+            out.push_str("You have recently read the following files. **DO NOT re-read them unless explicitly requested by the user.**\n");
+            out.push_str("Use your memory of these files to answer questions directly.\n\n");
+            
+            for n in file_memories.iter().take(5) {
+                // Extract filename and brief info
+                let summary_line = if n.content.starts_with("[FILE]") {
+                    // New format: "[FILE] main.rs | Read src file with 150 lines..."
+                    n.content.lines().next().unwrap_or(&n.content).to_string()
+                } else {
+                    // Old format: "Read file: src/main.rs"
+                    n.content.clone()
+                };
+                
+                out.push_str(&format!("- {}\n", summary_line));
+            }
+            
+            out.push_str("\n**Rule**: If the user asks about a file listed above, assume you already know its content. Only re-read if:\n");
+            out.push_str("- The user explicitly says \"read the file again\"\n");
+            out.push_str("- You suspect the file has been modified since you last read it\n");
+            out.push_str("- You need to see a different part of the file (use offset/limit parameters)\n\n");
+        }
+        
+        // Format other memories
+        if !other_memories.is_empty() {
+            if use_xml {
+                // XML format for compatible APIs
+                out.push_str("<relevant_memories>\n");
+                for n in other_memories.iter().take(8) {
+                    // 🆕 Dynamic truncation based on LLM score with chunking
+                    let max_len = if n.avg_llm_score >= 8.0 {
+                        350  // High-score memory: preserve more context
+                    } else if n.avg_llm_score >= 6.0 {
+                        250  // Medium-score memory: normal length
+                    } else if n.avg_llm_score > 0.0 {
+                        180  // Low-score memory: concise
+                    } else {
+                        250  // Unrated memory: default length
+                    };
+                    
+                    // 🆕 Use sliding window chunking for long memories
+                    let content = if n.content.len() > max_len * 2 {
+                        // For very long memories, use first chunk with overlap
+                        let chunks = split_with_overlap(&n.content, max_len, 0.15);
+                        format!("{}...", chunks[0])
+                    } else if n.content.len() > max_len {
+                        // 🚨 FIX: Use char boundary to avoid slicing in the middle of UTF-8 characters
+                        let char_boundary = n.content
+                            .char_indices()
+                            .nth(max_len)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(n.content.len());
+                        format!("{}...", &n.content[..char_boundary])
+                    } else {
+                        n.content.clone()
+                    };
+                    out.push_str(&format!(
+                        "  <memory depth=\"{}\" type=\"{}\">{}</memory>\n",
+                        n.depth, n.node_type, content
+                    ));
+                }
+                out.push_str("</relevant_memories>");
+            } else {
+                // Plain text format for MiniMax and similar APIs
+                out.push_str("Relevant context:\n");
+                for n in other_memories.iter().take(5) {
+                    // 🆕 Dynamic truncation based on LLM score with chunking
+                    let max_len = if n.avg_llm_score >= 8.0 {
+                        400  // High-score memory: preserve more context
+                    } else if n.avg_llm_score >= 6.0 {
+                        280  // Medium-score memory: normal length
+                    } else if n.avg_llm_score > 0.0 {
+                        200  // Low-score memory: concise
+                    } else {
+                        280  // Unrated memory: default length
+                    };
+                    
+                    // 🆕 Use sliding window chunking for long memories
+                    let content = if n.content.len() > max_len * 2 {
+                        // For very long memories, use first chunk with overlap
+                        let chunks = split_with_overlap(&n.content, max_len, 0.15);
+                        format!("{}...", chunks[0])
+                    } else if n.content.len() > max_len {
+                        // 🚨 FIX: Use char boundary to avoid slicing in the middle of UTF-8 characters
+                        let char_boundary = n.content
+                            .char_indices()
+                            .nth(max_len)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(n.content.len());
+                        format!("{}...", &n.content[..char_boundary])
+                    } else {
+                        n.content.clone()
+                    };
+                    out.push_str(&format!("- {}\n", content));
+                }
+            }
+        }
+        
+        out
     }
 
     pub fn forget(&self, keyword: &str, project_id: &str) -> usize {
@@ -1360,6 +1491,83 @@ impl MemoryManager {
             .unwrap_or(0);
         let overall_count = self.overall_store.count_overall().unwrap_or(0);
         (project_count, overall_count)
+    }
+
+    /// 🆕 Get summary of recently read files from memory.
+    /// 
+    /// This is used to remind the LLM which files it has already read,
+    /// preventing redundant file_read operations.
+    /// 
+    /// # Arguments
+    /// * `limit` - Maximum number of recent files to return
+    /// 
+    /// # Returns
+    /// A formatted string listing recently read files with brief descriptions
+    pub fn get_recent_files_summary(&self, limit: usize) -> String {
+        // Query recent file_read memories
+        if let Some(ref store) = self.project_store {
+            if let Ok(mems) = store.query_by_project(
+                "",
+                &[MemoryNodeType::Fact],
+                limit + 10,  // Get extra to filter
+            ) {
+                // Filter for file_read memories and extract unique files
+                let mut seen_files = std::collections::HashSet::new();
+                let mut recent_files: Vec<(String, String)> = Vec::new();  // (file_path, summary)
+                
+                for mem in mems {
+                    // Check if this is a file_read memory
+                    if mem.content.starts_with("[FILE]") || mem.content.starts_with("Read file:") {
+                        // Extract file path
+                        let file_path = if mem.content.starts_with("[FILE]") {
+                            // New format: "[FILE] main.rs | Read src file with 150 lines..."
+                            mem.content.split('|').next()
+                                .map(|s| s.replace("[FILE]", "").trim().to_string())
+                                .unwrap_or_default()
+                        } else {
+                            // Old format: "Read file: src/main.rs"
+                            mem.content.replace("Read file:", "").trim().to_string()
+                        };
+                        
+                        if !file_path.is_empty() && !seen_files.contains(&file_path) {
+                            seen_files.insert(file_path.clone());
+                            
+                            // Create a brief summary
+                            let summary = if mem.content.len() > 200 {
+                                format!("{}...", &mem.content[..200])
+                            } else {
+                                mem.content.clone()
+                            };
+                            
+                            recent_files.push((file_path, summary));
+                            
+                            if recent_files.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Format as a list
+                if recent_files.is_empty() {
+                    return String::new();
+                }
+                
+                let mut output = String::from("You have recently read these files:\n\n");
+                for (i, (path, summary)) in recent_files.iter().enumerate() {
+                    output.push_str(&format!(
+                        "{}. **{}**\n   {}\n\n",
+                        i + 1,
+                        path,
+                        summary.lines().next().unwrap_or("")
+                    ));
+                }
+                
+                return output;
+            }
+        }
+        
+        String::new()
     }
 
     pub fn reinforce_accessed(&self, ids: &[&str]) {
@@ -1612,6 +1820,52 @@ impl MemoryManager {
             project_memories: project_count,
             overall_memories: overall_count,
             memories_by_type: type_counts,
+        }
+    }
+
+    /// 🆕 Run memory promotion pipeline (L0 → L1 → L2 → L3)
+    /// 
+    /// This triggers the four-tier architecture to distill raw conversations
+    /// into high-level project personas.
+    /// 
+    /// # Arguments
+    /// * `project_name` - Human-readable project name for persona generation
+    /// 
+    /// # Returns
+    /// Promotion report or None if hybrid storage is not enabled
+    pub fn run_promotion_pipeline(
+        &self,
+        project_id: &str,
+        project_name: &str,
+    ) -> Option<anyhow::Result<hybrid_storage::PromotionReport>> {
+        if let Some(ref hybrid) = self.hybrid_storage {
+            tracing::info!(
+                "🚀 Starting memory promotion pipeline for project: {} ({})",
+                project_name,
+                project_id
+            );
+            
+            let result = hybrid.promote_full_pipeline(project_id, project_name);
+            
+            if let Ok(ref report) = result {
+                tracing::info!("✅ Promotion complete:\n{}", report);
+            } else if let Err(ref e) = result {
+                tracing::error!("❌ Promotion failed: {}", e);
+            }
+            
+            Some(result)
+        } else {
+            tracing::debug!("Hybrid storage not enabled - skipping promotion pipeline");
+            None
+        }
+    }
+
+    /// 🆕 Get hybrid storage statistics
+    pub fn get_hybrid_stats(&self) -> Option<String> {
+        if let Some(ref hybrid) = self.hybrid_storage {
+            hybrid.get_stats().ok().map(|stats| format!("{}", stats))
+        } else {
+            None
         }
     }
 }

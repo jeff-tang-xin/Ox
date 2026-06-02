@@ -42,7 +42,12 @@ pub fn replay_session_history(
     app.output.clear();
 
     let start = messages.len().saturating_sub(REPLAY_HISTORY_DEPTH);
-    let slice = &messages[start..];
+    // 使用安全的切片方法
+    let slice = if start < messages.len() {
+        &messages[start..]
+    } else {
+        &[]
+    };
     if slice.is_empty() {
         refresh_header_info(app, rt_env, has_provider);
         app.message_count = messages.len();

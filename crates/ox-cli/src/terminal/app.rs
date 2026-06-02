@@ -18,7 +18,7 @@ pub enum SessionAction {
     SwitchNext,
 }
 
-/// Workflow state machine for Spec and Council modes
+/// Workflow state machine for Spec mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkflowState {
     /// Free exploration mode (default)
@@ -28,12 +28,6 @@ pub enum WorkflowState {
     Spec {
         step: SpecWorkflowStep,
         spec_content: String,
-    },
-
-    /// Council mode workflow states
-    Council {
-        step: CouncilWorkflowStep,
-        topic: Option<String>,
     },
 }
 
@@ -54,22 +48,6 @@ pub enum SpecWorkflowStep {
     Executing,
 }
 
-/// Council workflow steps (enforced by code)
-#[derive(Debug, Clone, PartialEq)]
-pub enum CouncilWorkflowStep {
-    /// Step 1: Define discussion topic
-    TopicDefinition,
-    /// Step 2: Proposal phase (agents submit proposals)
-    ProposalPhase,
-    /// Step 3: Review phase (critique proposals)
-    ReviewPhase,
-    /// Step 4: Rebuttal phase (defend proposals)
-    RebuttalPhase,
-    /// Step 5: Arbitration (final decision)
-    Arbitration,
-    /// Step 6: Conclusion and summary
-    Conclusion,
-}
 
 /// Cached workflow display information (to avoid locking in render loop)
 #[derive(Debug, Clone)]
@@ -95,6 +73,12 @@ pub enum PendingLlmTask {
     WorkflowApproval { context: String },
     /// Smart naming for requirement
     SmartNaming { content: String },
+}
+
+/// Pending smart naming request data
+#[derive(Debug, Clone)]
+pub struct PendingSmartNaming {
+    pub content: String,
 }
 
 #[derive(Debug)]
@@ -134,12 +118,6 @@ impl SessionEntry {
     }
 }
 
-/// Deferred compression: set by handle_key_event, processed by main loop after render.
-pub struct PendingCompression {
-    pub text: String,
-    pub memory_ctx: String,
-}
-
 pub struct App {
     pub output: OutputPane,
     pub input: InputPane,
@@ -158,10 +136,7 @@ pub struct App {
     pub pending_confirmation: Option<PendingConfirmation>,
     pub ui_to_agent_tx:
         Option<tokio::sync::mpsc::UnboundedSender<ox_core::agent::ui_event::UiToAgentEvent>>,
-    pub pending_discuss: Option<(String, Option<u8>, bool)>,
-    pub last_council_session: Option<ox_core::council::CouncilSession>,
     pub pending_model_switch: Option<String>,
-    pub pending_compression: Option<PendingCompression>,
     /// 🆕 Unified pending LLM task (replaces multiple flags)
     pub pending_llm_task: Option<PendingLlmTask>,
     /// Deprecated: use pending_llm_task instead
@@ -170,19 +145,13 @@ pub struct App {
     /// 🚨 Pending smart naming request (LLM-based name generation)
     /// Deprecated: use pending_llm_task instead
     #[deprecated(note = "Use pending_llm_task instead")]
-    pub pending_smart_naming: Option<crate::spec_helpers::PendingSmartNaming>,
+    pub pending_smart_naming: Option<PendingSmartNaming>,
     /// Flag indicating user requested revision feedback via /O command
     pub pending_revision_feedback: bool,
     /// Flag indicating user approved workflow progression via /Y command
     /// Deprecated: use pending_llm_task instead
     #[deprecated(note = "Use pending_llm_task instead")]
     pub pending_workflow_approval: bool,
-    /// Message count at last compression. Used to avoid re-compressing
-    /// when no new messages have been added since last compression.
-    pub last_compression_msg_count: usize,
-    /// Whether compression is currently in progress. Used to prevent
-    /// re-entrant compression while an async compression is running.
-    pub compression_in_progress: bool,
     pub trusted_all: bool,
     pub header_info: Vec<String>,
     pub sessions: Vec<SessionEntry>,
@@ -201,7 +170,7 @@ pub struct App {
     pub explicit_feedback_count: u32,
     pub good_feedback_count: u32,
 
-    // Workflow state machine for Spec and Council modes
+    // Workflow state machine for Spec mode
     pub workflow_state: WorkflowState,
 
     // Cached workflow display info (updated each tick to avoid locking in render)
@@ -221,12 +190,8 @@ pub struct App {
     // Fields needed by slash command handlers
     /// Session action signaled by slash commands, processed in the main event loop.
     pub session_action: SessionAction,
-    /// Compression manager reference for debugging commands.
-    pub compression_manager: Option<ox_core::embedding::CompressionManager>,
     /// Provider resolution info for debugging commands.
     pub resolve_info: Option<ox_core::llm::ProviderResolveInfo>,
-    /// Flag to clear compressed cache when session is cleaned.
-    pub pending_compressed_cache_clear: bool,
 }
 
 impl App {
@@ -248,10 +213,7 @@ impl App {
             user_scrolled: false,
             pending_confirmation: None,
             ui_to_agent_tx: None,
-            pending_discuss: None,
-            last_council_session: None,
             pending_model_switch: None,
-            pending_compression: None,
             pending_llm_task: None,  // 🆕 Unified LLM task
             #[allow(deprecated)]
             pending_spec_planning: None,
@@ -260,8 +222,6 @@ impl App {
             pending_revision_feedback: false,
             #[allow(deprecated)]
             pending_workflow_approval: false,
-            last_compression_msg_count: 0,
-            compression_in_progress: false,
             trusted_all: false,
             header_info: Vec::new(),
             sessions: Vec::new(),
@@ -294,9 +254,7 @@ impl App {
 
             // Slash command context fields
             session_action: SessionAction::None,
-            compression_manager: None,
             resolve_info: None,
-            pending_compressed_cache_clear: false,
         }
     }
 
@@ -406,37 +364,6 @@ impl App {
 
     /// Deactivate Spec mode and return to Free mode
     pub fn deactivate_spec_mode(&mut self) {
-        self.workflow_state = WorkflowState::Free;
-    }
-
-    /// Activate Council mode with topic
-    pub fn activate_council_mode(&mut self, topic: Option<String>) {
-        self.workflow_state = WorkflowState::Council {
-            step: CouncilWorkflowStep::TopicDefinition,
-            topic,
-        };
-    }
-
-    /// Transition to next Council workflow step
-    pub fn advance_council_step(&mut self) {
-        if let WorkflowState::Council { step, topic } = &self.workflow_state {
-            let next_step = match step {
-                CouncilWorkflowStep::TopicDefinition => CouncilWorkflowStep::ProposalPhase,
-                CouncilWorkflowStep::ProposalPhase => CouncilWorkflowStep::ReviewPhase,
-                CouncilWorkflowStep::ReviewPhase => CouncilWorkflowStep::RebuttalPhase,
-                CouncilWorkflowStep::RebuttalPhase => CouncilWorkflowStep::Arbitration,
-                CouncilWorkflowStep::Arbitration => CouncilWorkflowStep::Conclusion,
-                CouncilWorkflowStep::Conclusion => return, // Stay in conclusion
-            };
-            self.workflow_state = WorkflowState::Council {
-                step: next_step,
-                topic: topic.clone(),
-            };
-        }
-    }
-
-    /// Deactivate Council mode and return to Free mode
-    pub fn deactivate_council_mode(&mut self) {
         self.workflow_state = WorkflowState::Free;
     }
 

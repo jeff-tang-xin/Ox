@@ -69,19 +69,9 @@ impl SseEventBuffer {
         data
     }
 
-    /// Get a reference to the accumulated data without consuming it.
-    pub fn data(&self) -> &str {
-        &self.data
-    }
-
     /// Get the current event type.
     pub fn event_type(&self) -> &str {
         &self.event_type
-    }
-
-    /// Check if there's pending data that hasn't been consumed.
-    pub fn has_pending_data(&self) -> bool {
-        self.has_content && !self.data.is_empty()
     }
 
     /// Reset the buffer to initial state.
@@ -221,7 +211,7 @@ mod tests {
         assert!(!buf.push_line("event: message"));
         assert!(!buf.push_line("data: {\"foo\": \"bar\"}"));
         assert!(buf.push_line("")); // Event boundary
-        assert_eq!(buf.data(), "{\"foo\": \"bar\"}");
+        assert_eq!(buf.data, "{\"foo\": \"bar\"}");
     }
 
     #[test]
@@ -232,7 +222,7 @@ mod tests {
         buf.push_line("data:   \"foo\": \"bar\"");
         buf.push_line("data: }");
         assert!(buf.push_line(""));
-        assert_eq!(buf.data().trim(), "{\n  \"foo\": \"bar\"\n}");
+        assert_eq!(buf.data.trim(), "{\n  \"foo\": \"bar\"\n}");
     }
 
     #[test]

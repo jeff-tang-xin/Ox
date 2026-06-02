@@ -502,7 +502,7 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
 
     // Calculate cursor position using visual width of visible portion before cursor
     let visible_before_cursor = if scroll_offset <= app.input.cursor {
-        &app.input.buffer[scroll_offset..app.input.cursor]
+        app.input.buffer.get(scroll_offset..app.input.cursor).unwrap_or("")
     } else {
         ""
     };

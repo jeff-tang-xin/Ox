@@ -110,7 +110,12 @@ impl RuleEnforcer {
             .map(|pos| messages.len() - 1 - pos);
         
         let search_start = last_user_idx.unwrap_or(0);
-        let recent_messages = &messages[search_start..];
+        // 使用安全的切片方法
+        let recent_messages = if search_start < messages.len() {
+            &messages[search_start..]
+        } else {
+            &[]
+        };
         
         // 查找最近的任务列表
         let mut task_list_found = false;
