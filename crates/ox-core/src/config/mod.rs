@@ -137,7 +137,6 @@ default = "gpt-4o"             # Default model to use
 api_key = ""                   # Your OpenAI API key (sk-...)
 # base_url = "https://api.openai.com/v1"       # Custom API endpoint
 # max_tokens = 4096            # Maximum response tokens
-# stream_usage = true          # Enable usage tracking (official OpenAI only)
 
 [models.providers.anthropic]
 api_key = ""                   # Your Anthropic API key (sk-ant-...)
@@ -208,18 +207,6 @@ use_refined_context = true  # Enable refined context format (default: true)
 [agent]
 # max_iterations = 25          # Maximum agent loop iterations per turn
 # max_per_turn_tokens = 500000  # Max tokens per turn before user confirmation
-
-# ── Council Mode (Multi-LLM Discussion) ──────────────────
-[council]
-# default_rounds = 2           # Default discussion rounds
-# max_rounds = 3               # Maximum discussion rounds
-# max_participants = 4         # Maximum participating LLMs
-# participants = ["gpt-4o", "claude-sonnet-4", "deepseek-coder"]
-# arbiter_model = "default"    # Model to arbitrate discussions
-# early_convergence_threshold = 0.8  # Early stop if agreement > 80%
-# verbose_by_default = false   # Show detailed council discussions
-# budget_warning = true        # Warn about high token costs
-# council_memory_decay_factor = 0.7  # Memory decay between rounds
 
 # ── Memory System ────────────────────────────────────────
 [memory]
@@ -478,9 +465,6 @@ pub struct ProviderConfig {
     pub base_url: String,
     /// Max tokens for response. None = use provider's built-in default.
     pub max_tokens: Option<u32>,
-    /// Whether to send stream_options for usage tracking.
-    /// Default false. Set true only for official OpenAI API if you need usage stats.
-    pub stream_usage: Option<bool>,
     /// Disable tools/function calling for this provider.
     /// Set true for providers like MiniMax that don't support tools.
     pub disable_tools: Option<bool>,
