@@ -109,14 +109,29 @@ pub fn replay_session_history(
 
 /// Refresh header_info from current runtime state.
 pub fn refresh_header_info(app: &mut App, rt_env: &RuntimeEnvironment, has_provider: bool) {
+    use crate::terminal::app::PlanItemStatus;
     app.header_info.clear();
     app.header_info.push(rt_env.banner_summary());
     if has_provider {
-        app.header_info
-            .push("Type a message or /help. /exit to quit.".into());
+        app.header_info.push("Type a message or /help. /exit to quit.".into());
     } else {
-        app.header_info
-            .push("No API key. Running in echo mode.".into());
+        app.header_info.push("No API key. Running in echo mode.".into());
+    }
+    // Show active plan items
+    if !app.plan_items.is_empty() {
+        let pending: Vec<_> = app.plan_items.iter().filter(|p| p.status == PlanItemStatus::Pending).collect();
+        let done: Vec<_> = app.plan_items.iter().filter(|p| p.status == PlanItemStatus::Done).collect();
+        if !pending.is_empty() {
+            let files: Vec<_> = pending.iter().map(|p| p.file.as_str()).collect();
+            app.header_info.push(format!("📋 Plan: {}", files.join(", ")));
+        }
+        if !done.is_empty() {
+            let files: Vec<_> = done.iter().map(|p| p.file.as_str()).collect();
+            app.header_info.push(format!("✅ Done: {}", files.join(", ")));
+        }
+        if pending.is_empty() && !done.is_empty() {
+            app.header_info.push("✅ All planned tasks complete.".into());
+        }
     }
     app.working_dir = rt_env
         .working_dir

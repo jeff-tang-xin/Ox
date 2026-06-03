@@ -916,79 +916,69 @@ pub async fn run_agent_turn(
                 }
             }
 
-            // For shell_exec, send an updated ToolStart with the command detail.
-            if tc.name == "shell_exec" {
-                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                    if let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
-                        let _ = ui_tx.send(AgentToUiEvent::ToolStart {
-                            name: tc.name.clone(),
-                            id: tc.id.clone(),
-                            detail: Some(cmd.to_string()),
-                        });
-                    }
+            // Send detailed ToolStart for UI display
+            let tool_detail = match tc.name.as_str() {
+                "shell_exec" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_string()))
                 }
-            } else if tc.name == "file_write" {
-                // For file_write, analyze arguments to show file size and write strategy
-                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                    if let Some(content) = args_val.get("content").and_then(|v| v.as_str()) {
-                        let content_len = content.len();
-                        let path = args_val
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("<unknown>");
-
-                        // Determine write strategy based on content size
-                        let strategy_detail = if content_len > 1024 * 1024 {
-                            // > 1MB
-                            let chunk_count = (content_len + 512 * 1024 - 1) / (512 * 1024); // 512KB chunks
-                            format!(
-                                "Large file ({} bytes) - will use chunked write ({} chunks of 512KB)",
-                                content_len, chunk_count
-                            )
-                        } else {
-                            format!("Small file ({} bytes) - will use atomic write", content_len)
-                        };
-
-                        let detail = format!("{} | {}", path, strategy_detail);
-
-                        let _ = ui_tx.send(AgentToUiEvent::ToolStart {
-                            name: tc.name.clone(),
-                            id: tc.id.clone(),
-                            detail: Some(detail),
-                        });
-                    }
-                }
-            } else if tc.name == "file_patch" {
-                tracing::info!("[AGENT] Sending ToolStart for file_patch");
-                // For file_patch, show file path and search context
-                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                    let path = args_val
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| args_val.get("filename").and_then(|v| v.as_str()))
-                        .unwrap_or("<unknown>");
-
-                    let search_preview = args_val
-                        .get("search")
-                        .and_then(|v| v.as_str())
-                        .map(|s| {
-                            if s.len() > 60 {
-                                format!("{}...", s.get(..60).unwrap_or(s))
-                            } else {
-                                s.to_string()
-                            }
+                "file_read" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| {
+                            let path = v.get("path").or(v.get("filename")).and_then(|p| p.as_str()).unwrap_or("?");
+                            let limit = v.get("limit").and_then(|l| l.as_u64()).map(|l| format!(" (limit:{})", l)).unwrap_or_default();
+                            Some(format!("{} {}", path, limit))
                         })
-                        .unwrap_or("<missing>".to_string());
-
-                    let detail = format!("{} | search: {}", path, search_preview);
-
-                    let _ = ui_tx.send(AgentToUiEvent::ToolStart {
-                        name: tc.name.clone(),
-                        id: tc.id.clone(),
-                        detail: Some(detail),
-                    });
-                    tracing::info!("[AGENT] ToolStart event sent for file_patch, proceeding to get tool object");
                 }
+                "file_write" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| {
+                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                            let size = v.get("content").and_then(|c| c.as_str()).map(|c| c.len()).unwrap_or(0);
+                            Some(format!("{} ({} bytes)", path, size))
+                        })
+                }
+                "file_patch" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| {
+                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                            let search = v.get("search").and_then(|s| s.as_str()).map(|s| if s.len()>50 {&s[..50]} else {s}).unwrap_or("");
+                            Some(format!("{} | {}", path, search))
+                        })
+                }
+                "code_search" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| v.get("pattern").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                }
+                "file_search" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| v.get("pattern").and_then(|p| p.as_str()).map(|s| format!("glob: {}", s)))
+                }
+                "file_list" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                        .or_else(|| Some("(root)".to_string()))
+                }
+                "memory_search" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| v.get("query").and_then(|q| q.as_str()).map(|s| s.to_string()))
+                }
+                "recall" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| v.get("node_id").or(v.get("query")).and_then(|q| q.as_str()).map(|s| s.to_string()))
+                }
+                "web_fetch" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
+                }
+                _ => None,
+            };
+            if let Some(detail) = tool_detail {
+                let _ = ui_tx.send(AgentToUiEvent::ToolStart {
+                    name: tc.name.clone(),
+                    id: tc.id.clone(),
+                    detail: Some(detail),
+                });
             }
 
             tracing::info!("[AGENT] About to get tool object for: {}", tc.name);
@@ -1341,8 +1331,8 @@ pub async fn run_agent_turn(
             tracing::info!("[AGENT] About to execute tool: {} (id: {})", tc.name, tc.id);
             // Create a tool context with progress callback for real-time updates
             let ui_tx_clone = ui_tx.clone();
-            let tool_call_id_clone = tc.id.clone();
-            let tool_name_clone = tc.name.clone();
+            let _tool_call_id_clone = tc.id.clone();
+            let _tool_name_clone = tc.name.clone();
             let tool_ctx_with_progress = Arc::new(crate::tools::ToolContext::with_progress_callback(
                 tool_ctx.runtime.clone(),
                 tool_ctx.working_dir.clone(),
@@ -1361,7 +1351,13 @@ pub async fn run_agent_turn(
             ));
             
             tracing::info!("[AGENT] Executing tool.execute() for: {}", tc.name);
-            let result = tool.execute(args, &tool_ctx_with_progress).await;
+            let mut result = tool.execute(args.clone(), &tool_ctx_with_progress).await;
+            // Retry once for transient failures on write/network tools
+            if result.is_error && matches!(tc.name.as_str(), "file_write" | "shell_exec" | "web_fetch") {
+                tracing::warn!("[AGENT] Tool {} failed, retrying once: {}", tc.name, result.content);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                result = tool.execute(args.clone(), &tool_ctx_with_progress).await;
+            }
             tracing::info!("[AGENT] Tool execution completed: {}, is_error: {}", tc.name, result.is_error);
 
             // Send completion progress event only if tool executed successfully
@@ -1441,6 +1437,58 @@ pub async fn run_agent_turn(
         // 🗺️ Inject task canvas if any results were offloaded
         if let Some(canvas_ctx) = offloader.get_canvas_context() {
             messages.push(Message::system(&canvas_ctx));
+        }
+
+        // 🚨 Done reminder: prompt LLM to summarize using structured format
+        if !tool_calls.is_empty() {
+            let has_write = tool_calls.iter().any(|tc| matches!(tc.name.as_str(), "file_write" | "file_patch"));
+            if has_write {
+                messages.push(Message::system(
+                    "Files were modified. Output ## Done: list what was created/modified and the verify result. 3 lines max. No extra text."
+                ));
+            }
+
+            // 🔄 Auto-fix: if build/test failed, inject error for self-repair
+            for tc in tool_calls {
+                if tc.name == "shell_exec" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                        let cmd = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        let is_build_or_test = cmd.contains("cargo build") || cmd.contains("cargo test")
+                            || cmd.contains("npm test") || cmd.contains("pytest") || cmd.contains("go test")
+                            || cmd.contains("cargo clippy") || cmd.contains("npm run lint");
+                        if is_build_or_test {
+                            // Find the tool result for this shell_exec
+                            for msg in new_messages.iter().rev() {
+                                if let Message::ToolResult { tool_call_id, content, .. } = msg {
+                                    if tool_call_id == &tc.id && content.contains("[exit code:") {
+                                        let exit_code = content.lines()
+                                            .filter(|l| l.contains("exit code:"))
+                                            .last()
+                                            .unwrap_or("");
+                                        if !exit_code.contains("exit code: 0") {
+                                            messages.push(Message::system(&format!(
+                                                "Build/Test FAILED. Read the error above, fix the issue, and retry.\n\
+                                                 Error summary: {}",
+                                                content.lines().take(5).collect::<Vec<_>>().join("\n")
+                                            )));
+                                            // Track fix attempts in this turn (count existing failure messages)
+                                            let fix_attempts = messages.iter()
+                                                .filter(|m| matches!(m, Message::System { content } if content.contains("Build/Test FAILED")))
+                                                .count() + 1;
+                                            if fix_attempts >= 3 {
+                                                messages.push(Message::system(
+                                                    "3 fix attempts exhausted. Report the remaining error to the user and ask for guidance."
+                                                ));
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // ── Workflow Step Advancement Logic (after tool execution) ──
@@ -1615,16 +1663,13 @@ fn is_likely_json_truncation(json_str: &str, error: &serde_json::Error) -> bool 
 
     // Additional heuristic: check if the JSON looks incomplete
     let trimmed = json_str.trim();
-    let has_unclosed_structure = (
-        // Count opening/closing braces
-        (trimmed.matches('{').count() > trimmed.matches('}').count()) ||
+    let has_unclosed_structure = (trimmed.matches('{').count() > trimmed.matches('}').count()) ||
         (trimmed.matches('[').count() > trimmed.matches(']').count()) ||
         // Ends with incomplete syntax
         trimmed.ends_with(',') ||
         trimmed.ends_with(':') ||
         // Has unclosed quote
-        (trimmed.matches('"').count() % 2 != 0)
-    );
+        (trimmed.matches('"').count() % 2 != 0) ;
 
     is_eof_error || has_unclosed_structure
 }

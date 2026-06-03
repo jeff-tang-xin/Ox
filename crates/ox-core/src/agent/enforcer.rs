@@ -2,6 +2,18 @@ use crate::message::{Message, ToolCall};
 use crate::config::rules::EnforcementRules;
 use regex::Regex;
 use lazy_static::lazy_static;
+use serde_json;
+
+/// Check if a file path is source code (needs Plan before editing).
+fn is_source_file(path: &str) -> bool {
+    let src_extensions = [
+        ".rs", ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".java", ".kt",
+        ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".scala",
+        ".r", ".m", ".mm", ".vue", ".svelte", ".sql", ".sh", ".bash", ".fish",
+    ];
+    let lower = path.to_lowercase();
+    src_extensions.iter().any(|ext| lower.ends_with(ext))
+}
 
 lazy_static! {
     // 计划意图的正则表达式模式（多语言支持）
@@ -69,6 +81,15 @@ impl RuleEnforcer {
     fn check_plan_before_edit(tc: &ToolCall, messages: &[Message], custom_patterns: &[String]) -> Result<(), String> {
         if !matches!(tc.name.as_str(), "file_write" | "file_patch") {
             return Ok(());
+        }
+
+        // Exception: Plan only needed for source code, not docs/config/system files
+        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+            if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
+                if !is_source_file(path) {
+                    return Ok(());
+                }
+            }
         }
 
         let msgs = messages;

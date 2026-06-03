@@ -327,7 +327,7 @@ mod decay_tests {
         
         // Verify the memory contains rich information
         assert!(node.content.contains("src/main.rs"));
-        assert!(node.content.contains("Lines:"));
+        assert!(node.content.contains("lines."));
         assert!(node.content.contains("Preview:"));
         assert!(node.content.contains("functions"));
         assert!(node.content.contains("structs/classes"));
@@ -649,16 +649,16 @@ impl MemoryNode {
             format!("Read file: {}", file_path)
         };
         
-        Some(
-            Self::new(
-                content,
-                MemoryNodeType::Fact,
-                Some(project_id.into()),
-                language.into(),
-                MemorySource::ToolObservation,
-            )
-            .with_related_file(&file_path)
-        )
+        let mut node = Self::new(
+            content,
+            MemoryNodeType::Fact,
+            Some(project_id.into()),
+            language.into(),
+            MemorySource::ToolObservation,
+        );
+        node.depth = 3;  // Higher depth for better retrieval ranking
+        node = node.with_related_file(&file_path);
+        Some(node)
     }
 
     pub fn extract_from_conversation(
@@ -682,6 +682,19 @@ impl MemoryNode {
             None
         }
     }
+}
+
+/// Calculate word overlap score between query and memory content.
+/// Returns 0.0–0.3 based on shared terms (simple semantic relevance).
+fn calculate_word_overlap(query: &str, content: &str) -> f32 {
+    let query_lower = query.to_lowercase();
+    let content_lower = content.to_lowercase();
+    let query_words: std::collections::HashSet<&str> = query_lower.split_whitespace().collect();
+    if query_words.is_empty() { return 0.0; }
+    let content_words: std::collections::HashSet<&str> = content_lower.split_whitespace().collect();
+    let overlap = query_words.intersection(&content_words).count() as f32;
+    let score = overlap / query_words.len() as f32;
+    (score * 0.3).min(0.3) // Cap at 30%
 }
 
 /// Safe string truncation that respects UTF-8 character boundaries.
@@ -919,7 +932,7 @@ impl MemoryManager {
     /// Create a structured memory node: what the user asked, what files changed, why.
     ///
     /// Format:
-    /// ```
+    /// ```text
     /// ## Turn Summary
     /// **Request**: (user's ask)
     /// **Files Changed**: path1, path2
@@ -933,17 +946,105 @@ impl MemoryManager {
             .last()
             .unwrap_or("(no request)");
         
+        // 🆕 Parse structured LLM output: ## Plan and ## Done blocks
+        let mut plan_files: Vec<String> = Vec::new();
+        let mut plan_reason = String::new();
+        let mut done_created: Vec<String> = Vec::new();
+        let mut done_modified: Vec<String> = Vec::new();
+        let mut done_verified: String = String::new();
+        
+        for msg in messages {
+            if let Message::Assistant { content, .. } = msg {
+                // Parse ## Plan block
+                if let Some(plan_start) = content.find("## Plan") {
+                    let plan_text = &content[plan_start..];
+                    let plan_end = plan_text.find("## Done").unwrap_or(plan_text.len());
+                    let plan_block = &plan_text[..plan_end];
+                    for line in plan_block.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("- File:") || trimmed.starts_with("- **File:**") {
+                            let file = trimmed.trim_start_matches("- File:").trim_start_matches("- **File:**").trim();
+                            let file = file.trim_matches('`').trim_matches('*');
+                            if !file.is_empty() { plan_files.push(file.to_string()); }
+                        }
+                        if trimmed.starts_with("- Reason:") {
+                            plan_reason = trimmed.trim_start_matches("- Reason:").trim().to_string();
+                        }
+                    }
+                }
+                // Parse ## Done block
+                if let Some(done_start) = content.find("## Done") {
+                    let done_block = &content[done_start..];
+                    for line in done_block.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("- Created:") {
+                            let entry = trimmed.trim_start_matches("- Created:").trim();
+                            done_created.push(entry.to_string());
+                        }
+                        if trimmed.starts_with("- Modified:") {
+                            let entry = trimmed.trim_start_matches("- Modified:").trim();
+                            done_modified.push(entry.to_string());
+                        }
+                        if trimmed.starts_with("- Verified:") {
+                            done_verified = trimmed.trim_start_matches("- Verified:").trim().to_string();
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Use Done block as primary source, fall back to heuristic
+        if !done_created.is_empty() || !done_modified.is_empty() {
+            let created = done_created.join("; ");
+            let modified = done_modified.join("; ");
+            let request = user_request.chars().take(200).collect::<String>();
+            let why = if plan_reason.is_empty() { "(no reason given)" } else { &plan_reason };
+            
+            let content = format!(
+                "## Turn Summary\n\
+                 **Request**: {request}\n\
+                 **Created**: {created}\n\
+                 **Modified**: {modified}\n\
+                 **Verified**: {done_verified}\n\
+                 **Why**: {why}"
+            );
+            
+            // Collect file paths from Done blocks
+            let all_files: Vec<String> = done_created.iter()
+                .chain(done_modified.iter())
+                .filter_map(|e| {
+                    // Extract path from format like "`src/auth.rs` — purpose"
+                    let path = e.trim_matches('`').split('`').next().unwrap_or(e);
+                    let path = path.split(" — ").next().unwrap_or(path).trim();
+                    if path.is_empty() { None } else { Some(path.to_string()) }
+                })
+                .collect();
+            
+            let mut node = MemoryNode::new(
+                content,
+                MemoryNodeType::Pattern,
+                Some(project_id.to_string()),
+                language.to_string(),
+                MemorySource::RefinedSummary,
+            );
+            if !all_files.is_empty() {
+                node = node.with_related_files(&all_files);
+            }
+            node = node.with_critical();
+            self.store(node);
+            return;
+        }
+        
+        // Fallback: heuristic extraction (legacy)
         let mut files_changed: Vec<String> = Vec::new();
         let mut operations: Vec<String> = Vec::new();
         let mut assistant_reasoning = String::new();
         
         for msg in messages {
             if let Message::Assistant { content, tool_calls } = msg {
-                // Extract reasoning from assistant's text (first meaningful paragraph)
                 if assistant_reasoning.is_empty() && !content.is_empty() {
                     assistant_reasoning = content.chars().take(300).collect();
                 }
-                
                 for tc in tool_calls {
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                         if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
@@ -981,16 +1082,29 @@ impl MemoryManager {
             
             let mut node = MemoryNode::new(
                 content,
-                MemoryNodeType::Pattern,  // Higher priority than Fact
+                MemoryNodeType::Pattern,
                 Some(project_id.to_string()),
                 language.to_string(),
                 MemorySource::RefinedSummary,
             );
-            node = node
-                .with_related_files(&files_changed)
-                .with_critical();  // Mark as project-critical — never decay
+            node = node.with_related_files(&files_changed).with_critical();
             self.store(node);
         }
+
+        // 🆕 Always create a lightweight Turn Summary, even for read-only turns.
+        // This ensures code reading sessions are also remembered.
+        let request = user_request.chars().take(150).collect::<String>();
+        let content = format!("[TURN] Request: {request}");
+        let mut node = MemoryNode::new(
+            content,
+            MemoryNodeType::Fact,
+            Some(project_id.to_string()),
+            language.to_string(),
+            MemorySource::RefinedSummary,
+        );
+        // Boost depth so it ranks higher in retrieval
+        node.depth = 2;
+        self.store(node);
     }
 
     /// 🆕 Record LLM-extracted keywords for semantic learning (synchronous, fast)
@@ -1241,8 +1355,9 @@ impl MemoryManager {
             );
         }
         
-        // Sort by combined score (relevance + composite + recency + file relevance + LLM feedback)
+        // Sort by combined score (relevance + composite + recency + word overlap + LLM feedback)
         let now = chrono::Utc::now().timestamp();
+        let query_for_sort = query.to_string();
         results.sort_by(|(a, weight_a), (b, weight_b)| {
             let base_score_a = composite_score(a, 30) * weight_a;
             let base_score_b = composite_score(b, 30) * weight_b;
@@ -1261,12 +1376,16 @@ impl MemoryManager {
             let file_boost_a = if !a.related_files.is_empty() { 0.15 } else { 0.0 };
             let file_boost_b = if !b.related_files.is_empty() { 0.15 } else { 0.0 };
             
+            // Word overlap boost: simple semantic relevance via term overlap
+            let word_overlap_a = calculate_word_overlap(&query_for_sort, &a.content);
+            let word_overlap_b = calculate_word_overlap(&query_for_sort, &b.content);
+            
             // LLM feedback boost
             let llm_boost_a = if a.avg_llm_score > 0.0 { (a.avg_llm_score / 10.0) * 0.3 } else { 0.0 };
             let llm_boost_b = if b.avg_llm_score > 0.0 { (b.avg_llm_score / 10.0) * 0.3 } else { 0.0 };
             
-            let final_score_a = base_score_a * (1.0 + recency_a + file_boost_a + llm_boost_a);
-            let final_score_b = base_score_b * (1.0 + recency_b + file_boost_b + llm_boost_b);
+            let final_score_a = base_score_a * (1.0 + recency_a + file_boost_a + word_overlap_a + llm_boost_a);
+            let final_score_b = base_score_b * (1.0 + recency_b + file_boost_b + word_overlap_b + llm_boost_b);
             
             final_score_b.partial_cmp(&final_score_a).unwrap_or(std::cmp::Ordering::Equal)
         });

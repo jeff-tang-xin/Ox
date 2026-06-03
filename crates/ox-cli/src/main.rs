@@ -33,7 +33,7 @@ use ox_core::message::{Message, Session};
 use ox_core::runtime;
 use ox_core::safety::TrustManager;
 use ox_core::tools::{ToolContext, ToolRegistry};
-use terminal::app::{App, PendingConfirmation, SessionAction, UserInput, WorkflowState};
+use terminal::app::{App, PendingConfirmation, PlanItem, PlanItemStatus, SessionAction, UserInput, WorkflowState};
 use terminal::event::{Event, EventHandler};
 use terminal::output_pane::OutputLine;
 use terminal::render;
@@ -78,12 +78,25 @@ async fn main() -> anyhow::Result<()> {
 // Helper Functions
 // ============================================================================
 
-/// Initialize logging to file (~/.ox/logs/ox.log)
+/// Initialize logging to file (~/.ox/logs/ox.log) with rotation (max 10MB, keep 3 backups).
 fn init_logging() -> anyhow::Result<()> {
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let log_dir = home.join(".ox").join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
     let log_file_path = log_dir.join("ox.log");
+
+    // Rotate: if log > 10MB, shift ox.log → ox.log.1 → ox.log.2 → ox.log.3 (delete oldest)
+    const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+    if let Ok(meta) = std::fs::metadata(&log_file_path) {
+        if meta.len() > MAX_LOG_SIZE {
+            for i in (1..3).rev() {
+                let old = log_dir.join(format!("ox.log.{}", i));
+                let new = log_dir.join(format!("ox.log.{}", i + 1));
+                if old.exists() { let _ = std::fs::rename(&old, &new); }
+            }
+            let _ = std::fs::rename(&log_file_path, log_dir.join("ox.log.1"));
+        }
+    }
 
     if let Ok(log_file) = std::fs::OpenOptions::new()
         .create(true)
@@ -203,6 +216,23 @@ async fn run_app(
                     "Session restored ({} messages)",
                     s.user_message_count()
                 )));
+                // Restore plan items from session metadata
+                if !s.meta.plan_json.is_empty() {
+                    if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&s.meta.plan_json) {
+                        for item in items {
+                            if let (Some(file), Some(status)) = (item["file"].as_str(), item["status"].as_str()) {
+                                app.plan_items.push(PlanItem {
+                                    file: file.to_string(),
+                                    status: match status {
+                                        "done" => PlanItemStatus::Done,
+                                        "cancelled" => PlanItemStatus::Cancelled,
+                                        _ => PlanItemStatus::Pending,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
                 // Replay session history into output pane.
                 helpers::replay_session_history(&mut app, &s.messages, &rt_env, provider.is_some());
                 s
@@ -435,7 +465,7 @@ async fn run_app(
         compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
 
     // Session action signaled from slash commands.
-    let mut session_action: SessionAction = SessionAction::None;
+    let _session_action: SessionAction = SessionAction::None;
 
     // Holds the old session when switching during agent run.
     let mut background_session: Option<Session> = None;
@@ -443,7 +473,84 @@ async fn run_app(
     // Initialize Workflow Engine in App
     app.init_workflow_engine(&session.meta.id, &session.meta);
 
+    // 🧠 Project onboarding: queue if conventions skill is missing
+    let mut needs_onboarding = false;
+    let mut onboarding_prompt_text = String::new();
+    if let Some(ref root) = rt_env.project_root {
+        let conventions = root.join(".ox").join("skills").join("project-conventions.md");
+        let architecture = root.join(".ox").join("skills").join("project-architecture.md");
+        if !conventions.exists() || !architecture.exists() {
+            needs_onboarding = true;
+            onboarding_prompt_text = format!(
+                "You just opened a new project at `{}`. This is the FIRST time Ox has seen this project.\n\n\
+                 Generate TWO skill files by analyzing the codebase:\n\n\
+                 ## File 1: .ox/skills/project-conventions.md\n\
+                 - Language, framework, build tool (from project_detect + config files)\n\
+                 - Naming conventions (scan source files for patterns)\n\
+                 - Code style (indent, quotes, line length from linter config)\n\
+                 - Import ordering and grouping conventions\n\n\
+                 ## File 2: .ox/skills/project-architecture.md\n\
+                 - Directory structure and module layout\n\
+                 - Layer boundaries (handlers → services → repositories?)\n\
+                 - MUST rules (patterns that must be followed, from existing code)\n\
+                 - MUST NOT rules (anti-patterns to avoid, from linter rules)\n\
+                 - Error handling patterns (Result/Option/exception style)\n\
+                 - Key dependencies and their roles\n\n\
+                 **Process**:\n\
+                 1. Run `project_detect` first to identify language/framework.\n\
+                 2. Read config files (Cargo.toml, package.json, pyproject.toml, etc.).\n\
+                 3. Scan source directories for naming patterns, error handling, module structure.\n\
+                 4. Create BOTH files using `file_write`.\n\
+                 5. Keep each file 200-400 words. Use real examples from the codebase.\n\n\
+                 After creating both files, respond with a brief summary of what you found.",
+                root.display()
+            );
+        }
+    }
+
     loop {
+        // 🧠 Trigger onboarding on first tick if needed
+        if needs_onboarding {
+            needs_onboarding = false;
+            if let Some(ref provider) = provider {
+                tracing::info!("[ONBOARDING] Starting project scan...");
+                app.output.push_system("🔍 First time in this project. I will now scan the codebase to learn its conventions and architecture.");
+                app.output.push_system("   This generates two files in .ox/skills/: project-conventions.md + project-architecture.md");
+                let llm_msg = Message::user(&onboarding_prompt_text);
+                let _ = session.append_message(llm_msg);
+                let memory_nodes = memory_arc.retrieve_with_rerank(&onboarding_prompt_text, &Some(rt_env.project_id.as_str()), 5);
+                memory_arc.reinforce_accessed(&memory_nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>());
+                let memory_ctx = memory_arc.format_memory_context(&memory_nodes, false);
+                let turn_messages = helpers::build_context_with_option(
+                    &context_builder,
+                    &system_prompt,
+                    &memory_ctx,
+                    &session.messages,
+                    context_window,
+                    config.context.use_refined_context,
+                );
+                app.agent_running = true;
+                app.status = "Scanning project...".to_string();
+                let p = Arc::clone(provider);
+                let tx = agent_tx.clone();
+                let reg = Arc::clone(&tool_registry);
+                let ctx = Arc::clone(&tool_ctx);
+                let cancel = interrupt_ctrl.token();
+                let tm = Arc::clone(&trust_manager);
+                let ac = Arc::clone(&agent_config);
+                let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+                app.ui_to_agent_tx = Some(ui_tx);
+                let wf = app.workflow_engine.clone();
+                tokio::spawn(async move {
+                    agent::run_agent_turn(p, turn_messages, reg, ctx, tx, ui_rx, cancel, tm, ac, false, wf).await;
+                });
+            } else {
+                tracing::warn!("[ONBOARDING] Skipped — no LLM provider available");
+                app.output.push_system("💡 Tip: Set your API key to enable automatic project scanning on first open.");
+            }
+        }
+
+        // === IMPLICIT FEEDBACK: Detect overrides before user input ===
         // === IMPLICIT FEEDBACK: Detect overrides before user input ===
         let override_signals = app.override_detector.detect_overrides();
         
@@ -467,30 +574,54 @@ async fn run_app(
             biased;
             ev = events.recv() => {
                 match ev {
-                    Some(Event::Key(key)) => {
-                        handle_key_event(
-                            &mut app,
-                            key,
-                            &provider,
-                            &agent_tx,
-                            &mut session,
-                            &memory_arc,
-                            &tool_registry,
-                            &tool_ctx,
-                            &context_builder,
-                            context_window,
-                            &mut cost_tracker,
-                            &trust_manager,
-                            &model_name,
-                            &mut rt_env,
-                            &mut interrupt_ctrl,
-                            &mut interjection_buf,
-                            &resolve_info,
-                            &config,
-                            &agent_config,
-                            &compressed_cache,
-                            &command_registry,
-                        );
+                    Some(Event::Key(first_key)) => {
+                        // 🆕 Paste detection: batch rapid keystrokes into a single input
+                        let mut keys = vec![first_key];
+                        while let Some(ev) = events.try_recv() {
+                            match ev {
+                                Event::Key(k) => keys.push(k),
+                                _ => {} // skip non-key events
+                            }
+                        }
+                        if keys.len() > 3 {
+                            // Likely a paste — batch all printable chars as one input
+                            let pasted: String = keys.iter()
+                                .filter_map(|k| {
+                                    if let KeyCode::Char(c) = k.code { Some(c) } else { None }
+                                })
+                                .collect();
+                            if pasted.len() > 1 {
+                                app.input.insert_str(&pasted);
+                                app.dirty = true;
+                                continue;
+                            }
+                        }
+                        // Single key or small batch — process normally
+                        for key in keys {
+                            handle_key_event(
+                                &mut app,
+                                key,
+                                &provider,
+                                &agent_tx,
+                                &mut session,
+                                &memory_arc,
+                                &tool_registry,
+                                &tool_ctx,
+                                &context_builder,
+                                context_window,
+                                &mut cost_tracker,
+                                &trust_manager,
+                                &model_name,
+                                &mut rt_env,
+                                &mut interrupt_ctrl,
+                                &mut interjection_buf,
+                                &resolve_info,
+                                &config,
+                                &agent_config,
+                                &compressed_cache,
+                                &command_registry,
+                            );
+                        }
                         // Process session switch action from app.
                         match std::mem::replace(&mut app.session_action, SessionAction::None) {
                             SessionAction::New => {
@@ -951,6 +1082,97 @@ async fn run_app(
                         AgentToUiEvent::TurnDone { new_messages, usage } => {
                             app.output.finalize_streaming();
 
+                            // 🆕 Parse structured LLM output (Plan/Done blocks) + completion tracking
+                            let mut plan_files: Vec<String> = Vec::new();
+                            let mut plan_lines = String::new();
+                            let mut done_files: Vec<String> = Vec::new();
+                            let mut done_lines = String::new();
+                            for msg in &new_messages {
+                                if let Message::Assistant { content, .. } = msg {
+                                    // Match ## Plan at start of line only (not inside code blocks)
+                                    if let Some(plan_start) = content.find("\n## Plan").or_else(|| {
+                                        if content.starts_with("## Plan") { Some(0) } else { None }
+                                    }) {
+                                        let plan_start = if content.starts_with("## Plan") { 0 } else { plan_start + 1 };
+                                        let plan_text = &content[plan_start..];
+                                        let plan_end = plan_text.find("\n## Done").unwrap_or(plan_text.len());
+                                        for line in plan_text[..plan_end].lines().skip(1) {
+                                            let t = line.trim();
+                                            if t.starts_with("- File:") || t.starts_with("- **File:**") {
+                                                let f = t.trim_start_matches("- File:").trim_start_matches("- **File:**").trim().trim_matches('`');
+                                                plan_files.push(f.to_string());
+                                            }
+                                            if t.starts_with("- ") && plan_lines.len() < 200 {
+                                                plan_lines.push_str(&format!("  {}\n", t));
+                                            }
+                                        }
+                                    }
+                                    // Match ## Done at start of line only
+                                    if let Some(done_start) = content.find("\n## Done").or_else(|| {
+                                        if content.starts_with("## Done") { Some(0) } else { None }
+                                    }) {
+                                        let done_start = if content.starts_with("## Done") { 0 } else { done_start + 1 };
+                                        let done_text = &content[done_start..];
+                                        for line in done_text.lines().skip(1).take(6) {
+                                            let t = line.trim();
+                                            if t.starts_with("- Created:") || t.starts_with("- Modified:") {
+                                                let entry = t.trim_start_matches("- Created:").trim_start_matches("- Modified:").trim();
+                                                if let Some(path) = entry.trim_matches('`').split('`').next() {
+                                                    let path = path.split(" — ").next().unwrap_or(path).trim();
+                                                    if !path.is_empty() { done_files.push(path.to_string()); }
+                                                }
+                                            }
+                                            if t.starts_with("- ") && done_lines.len() < 200 {
+                                                done_lines.push_str(&format!("  {}\n", t));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Show Plan (compact: file names only)
+                            if !plan_files.is_empty() {
+                                let names: Vec<_> = plan_files.iter().map(|f| {
+                                    f.rsplit('/').next().unwrap_or(f)
+                                }).collect();
+                                app.output.push_line(OutputLine::System(format!("📋 Plan: {}", names.join(", "))));
+                            }
+                            // Show Done with completion status
+                            // 🆕 Update plan tracking state
+                            app.plan_items = plan_files.iter().map(|f| PlanItem {
+                                file: f.clone(),
+                                status: if done_files.contains(f) { PlanItemStatus::Done } else { PlanItemStatus::Pending },
+                            }).collect();
+                            for item in &mut app.plan_items {
+                                if !plan_files.contains(&item.file) && item.status == PlanItemStatus::Pending {
+                                    item.status = PlanItemStatus::Cancelled;
+                                }
+                            }
+                            // Persist plan to session metadata
+                            let plan_data: Vec<serde_json::Value> = app.plan_items.iter().map(|p| {
+                                serde_json::json!({
+                                    "file": p.file,
+                                    "status": match p.status { PlanItemStatus::Done => "done", PlanItemStatus::Pending => "pending", PlanItemStatus::Cancelled => "cancelled" }
+                                })
+                            }).collect();
+                            if let Ok(json) = serde_json::to_string(&plan_data) {
+                                target_session.meta.plan_json = json;
+                            }
+                            // Refresh header to show plan status
+                            helpers::refresh_header_info(&mut app, &rt_env, provider.is_some());
+
+                            if !done_files.is_empty() {
+                                let status = if !plan_files.is_empty() {
+                                    let planned: std::collections::HashSet<_> = plan_files.iter().collect();
+                                    let done: std::collections::HashSet<_> = done_files.iter().collect();
+                                    let missing: Vec<_> = planned.difference(&done).collect();
+                                    if missing.is_empty() { "✅" } else { "⚠️" }
+                                } else { "" };
+                                let names: Vec<_> = done_files.iter().map(|f| f.rsplit('/').next().unwrap_or(f)).collect();
+                                app.output.push_line(OutputLine::System(format!("{status} Done: {}", names.join(", "))));
+                            } else if !plan_files.is_empty() {
+                                app.output.push_line(OutputLine::System("⏳ Awaiting verification...".to_string()));
+                            }
+
                             // Display token usage summary for this turn
                             let total_tokens = usage.prompt_tokens + usage.completion_tokens;
                             let cost_this_turn = cost::estimate_cost(&model_name, &usage);
@@ -977,7 +1199,7 @@ async fn run_app(
 
                             // Two-tier ToolResult truncation (in-memory only; JSONL keeps full content).
                             let prev_count = target_session.messages.len();
-                            let recent_boundary = {
+                            let _recent_boundary = {
                                 let mut user_count = 0usize;
                                 let mut boundary = prev_count;
                                 // 使用安全的切片方法
@@ -1361,12 +1583,10 @@ async fn run_app(
                             // 🧠 Implement actual reflection logic
                             if let Some(ref llm_provider) = provider {
                                 let project_root = rt_env.working_dir.clone();
-                                let ox_home = rt_env.ox_home_dir.clone();
                                 
                                 match ox_core::agent::auto_reflect::AutoReflector::new(
                                     Arc::clone(llm_provider),
                                     &project_root,
-                                    &ox_home,
                                 ) {
                                     Ok(reflector) => {
                                         app.output.push_line(OutputLine::System(
@@ -1448,16 +1668,27 @@ fn handle_key_event(
     context_window: u32,
     cost_tracker: &mut CostTracker,
     trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
-    model_name: &str,
+    _model_name: &str,
     rt_env: &mut runtime::RuntimeEnvironment,
     interrupt_ctrl: &mut InterruptController,
     interjection_buf: &mut InterjectionBuffer,
-    resolve_info: &Option<ProviderResolveInfo>,
+    _resolve_info: &Option<ProviderResolveInfo>,
     config: &OxConfig,
     agent_config: &Arc<AgentConfig>,
     compressed_cache: &Option<(Vec<Message>, usize)>,
     command_registry: &slash_commands::CommandRegistry,
 ) {
+    // Fast path: simple printable characters go straight to input buffer
+    if let KeyCode::Char(ch) = key.code {
+        if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
+            if ch != 'y' && ch != 'Y' && ch != 'n' && ch != 'N' && ch != 't' && ch != 'T' {
+                app.input.insert_char(ch);
+                app.dirty = true;
+                return;
+            }
+        }
+    }
+
     match (key.code, key.modifiers) {
         // Confirmation key handling (Y/N/T when pending)
         (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
@@ -1547,7 +1778,7 @@ fn handle_key_event(
                                     // Continue with normal LLM flow (same as UserInput::Text)
                                     if let Some(provider) = provider {
                                         // Build system prompt
-                                        let mut current_system_prompt = context::build_system_prompt(
+                                        let current_system_prompt = context::build_system_prompt(
                                             &rt_env,
                                             &tool_registry,
                                             None,
@@ -1636,281 +1867,12 @@ fn handle_key_event(
                         // Mark dirty to trigger UI refresh after slash command processing
                         app.dirty = true;
 
-                        // Check if spec planning was triggered by /spec command
-                        if let Some(spec_content) = app.pending_spec_planning.take() {
-                            if let Some(provider) = provider {
-                                // Build system prompt with spec content
-                                let mut current_system_prompt = context::build_system_prompt(
-                                    &rt_env,
-                                    &tool_registry,
-                                    None,
-                                    Some(&config.behavior_rules),
-                                    Some(&spec_content),
-                                );
-
-                                // Add workflow step instructions
-                                if let Some(ref wf_info) = app.workflow_display {
-                                    if let Some(ref step_prompt) = wf_info.step_prompt {
-                                        current_system_prompt
-                                            .push_str("\n\n## Current Workflow Step\n\n");
-
-                                        // Replace {project_ox_dir} placeholder with actual path
-                                        let project_ox_dir = rt_env
-                                            .project_ox_dir
-                                            .as_ref()
-                                            .map(|p| p.to_string_lossy().to_string())
-                                            .unwrap_or_else(|| ".ox".to_string());
-                                        let processed_prompt = step_prompt
-                                            .replace("{project_ox_dir}", &project_ox_dir);
-
-                                        current_system_prompt.push_str(&processed_prompt);
-
-                                        if !wf_info.allows_code_modification {
-                                            current_system_prompt.push_str("\n\n⚠️ IMPORTANT: You CAN use tools (file_read, file_search, etc.) but you CANNOT modify source code files (.rs, .py, .js, etc.) in this step. You can only create/modify documentation files (.md, .txt, etc.).");
-                                        }
-                                    }
-                                }
-
-                                // Create a user message to trigger planning
-                                let planning_msg = Message::user(&format!(
-                                    "Based on the following requirement, please analyze and create a detailed spec document (.ox/spec.md):\n\n{}",
-                                    spec_content
-                                ));
-
-                                if let Err(e) = session.append_message(planning_msg) {
-                                    tracing::error!("Failed to persist message: {e}");
-                                }
-
-                                let memory_nodes = memory.retrieve_with_rerank(&spec_content, &Some(rt_env.project_id.as_str()), 5);
-                                let accessed_ids: Vec<&str> =
-                                    memory_nodes.iter().map(|n| n.id.as_str()).collect();
-                                memory.reinforce_accessed(&accessed_ids);
-                                let memory_ctx = memory.format_memory_context(&memory_nodes, false);
-
-                                let effective_messages =
-                                    if let Some((cached, prev_count)) = compressed_cache {
-                                        let pc = *prev_count;
-                                        let start_idx = pc.min(session.messages.len());
-                                        // 使用安全的切片方法
-                                        let new_msgs = if start_idx < session.messages.len() {
-                                            &session.messages[start_idx..]
-                                        } else {
-                                            &[]
-                                        };
-                                        let mut combined = cached.clone();
-                                        combined.extend_from_slice(new_msgs);
-                                        combined
-                                    } else {
-                                        session.messages.clone()
-                                    };
-
-                                let turn_messages = helpers::build_context_with_option(
-                                    &context_builder,
-                                    &current_system_prompt,
-                                    &memory_ctx,
-                                    &effective_messages,
-                                    context_window,
-                                    config.context.use_refined_context,
-                                );
-
-                                app.agent_running = true;
-                                app.status = "Planning...".to_string();
-                                let effort = ox_core::context::estimate_effort(
-                                    &spec_content,
-                                    session.messages.len(),
-                                );
-                                let planning = effort == ox_core::context::EffortLevel::High;
-                                let provider = Arc::clone(provider);
-                                let tx = agent_tx.clone();
-                                let registry = Arc::clone(tool_registry);
-                                let ctx = Arc::clone(tool_ctx);
-                                let cancel_token = interrupt_ctrl.token();
-                                let tm = Arc::clone(&trust_manager);
-                                let ac = Arc::clone(&agent_config);
-                                let (ui_to_agent_tx, ui_to_agent_rx) =
-                                    mpsc::unbounded_channel::<UiToAgentEvent>();
-                                app.ui_to_agent_tx = Some(ui_to_agent_tx);
-
-                                let workflow_engine_clone = app.workflow_engine.clone();
-
-                                tokio::spawn(async move {
-                                    agent::run_agent_turn(
-                                        provider,
-                                        turn_messages,
-                                        registry,
-                                        ctx,
-                                        tx,
-                                        ui_to_agent_rx,
-                                        cancel_token,
-                                        tm,
-                                        ac,
-                                        planning,
-                                        workflow_engine_clone,
-                                    )
-                                    .await;
-                                });
-                            }
-                        }
-
-                        // 🚨 Check if workflow approval was triggered by /Y command
-                        if app.pending_workflow_approval {
-                            app.pending_workflow_approval = false;
-                            
-                            if let Some(provider) = provider {
-                                // Build system prompt dynamically
-                                let mut current_system_prompt = context::build_system_prompt(
-                                    &rt_env,
-                                    &tool_registry,
-                                    None,
-                                    Some(&config.behavior_rules),
-                                    if app.spec_active && !app.spec_content.is_empty() {
-                                        Some(&app.spec_content)
-                                    } else {
-                                        None
-                                    },
-                                );
-
-                                // Add workflow step instructions
-                                if let Some(ref wf_info) = app.workflow_display {
-                                    if let Some(ref step_prompt) = wf_info.step_prompt {
-                                        current_system_prompt
-                                            .push_str("\n\n## Current Workflow Step\n\n");
-
-                                        let project_ox_dir = rt_env
-                                            .project_ox_dir
-                                            .as_ref()
-                                            .map(|p| p.to_string_lossy().to_string())
-                                            .unwrap_or_else(|| ".ox".to_string());
-                                        let mut processed_prompt = step_prompt
-                                            .replace("{project_ox_dir}", &project_ox_dir);
-                                        
-                                        // 🚨 Replace {REQUIREMENT_NAME} placeholder with actual requirement name
-                                        if let Some(ref req_name) = wf_info.requirement_name {
-                                            processed_prompt = processed_prompt.replace("{REQUIREMENT_NAME}", req_name);
-                                            processed_prompt = processed_prompt.replace("{YOUR_NAME}", req_name);
-                                            processed_prompt = processed_prompt.replace("{IDENTIFIED_NAME}", req_name);
-                                            processed_prompt = processed_prompt.replace("{requirement_name}", req_name);
-                                        }
-
-                                        current_system_prompt.push_str(&processed_prompt);
-
-                                        if !wf_info.allows_code_modification {
-                                            current_system_prompt.push_str("\n\n⚠️ IMPORTANT: You CAN use tools (file_read, file_search, etc.) but you CANNOT modify source code files (.rs, .py, .js, etc.) in this step. You can only create/modify documentation files (.md, .txt, etc.).");
-                                        }
-                                    }
-                                }
-
-                                let memory_nodes = memory.retrieve_with_rerank("User approved workflow progression", &Some(rt_env.project_id.as_str()), 5);
-                                let accessed_ids: Vec<&str> =
-                                    memory_nodes.iter().map(|n| n.id.as_str()).collect();
-                                memory.reinforce_accessed(&accessed_ids);
-                                let memory_ctx = memory.format_memory_context(&memory_nodes, false);
-
-                                let effective_messages =
-                                    if let Some((cached, prev_count)) = compressed_cache {
-                                        let pc = *prev_count;
-                                        let start_idx = pc.min(session.messages.len());
-                                        // 使用安全的切片方法
-                                        let new_msgs = if start_idx < session.messages.len() {
-                                            &session.messages[start_idx..]
-                                        } else {
-                                            &[]
-                                        };
-                                        let mut combined = cached.clone();
-                                        combined.extend_from_slice(new_msgs);
-                                        combined
-                                    } else {
-                                        session.messages.clone()
-                                    };
-
-                                let turn_messages = helpers::build_context_with_option(
-                                    &context_builder,
-                                    &current_system_prompt,
-                                    &memory_ctx,
-                                    &effective_messages,
-                                    context_window,
-                                    config.context.use_refined_context,
-                                );
-
-                                app.agent_running = true;
-                                app.status = "Thinking...".to_string();
-                                let effort = ox_core::context::estimate_effort(
-                                    "User approved",
-                                    session.messages.len(),
-                                );
-                                let planning = effort == ox_core::context::EffortLevel::High;
-                                let provider = Arc::clone(provider);
-                                let tx = agent_tx.clone();
-                                let registry = Arc::clone(tool_registry);
-                                let ctx = Arc::clone(tool_ctx);
-                                let cancel_token = interrupt_ctrl.token();
-                                let tm = Arc::clone(&trust_manager);
-                                let ac = Arc::clone(&agent_config);
-                                let (ui_to_agent_tx, ui_to_agent_rx) =
-                                    mpsc::unbounded_channel::<UiToAgentEvent>();
-                                app.ui_to_agent_tx = Some(ui_to_agent_tx);
-
-                                let workflow_engine_clone = app.workflow_engine.clone();
-
-                                tokio::spawn(async move {
-                                    agent::run_agent_turn(
-                                        provider,
-                                        turn_messages,
-                                        registry,
-                                        ctx,
-                                        tx,
-                                        ui_to_agent_rx,
-                                        cancel_token,
-                                        tm,
-                                        ac,
-                                        planning,
-                                        workflow_engine_clone,
-                                    )
-                                    .await;
-                                });
-                            }
-                        }
-
+                        // Workflow approval is no longer supported in unified mode.
+                        // The LLM decides autonomously whether to plan before acting.
 
                     }
                     UserInput::Text(text) => {
-                        // Handle spec edit mode
-                        if app.spec_edit_mode {
-                            app.spec_edit_mode = false;
-                            app.spec_content = text.clone();
-                            app.spec_active = true;
-
-                            // Save to file
-                            if let Some(ref project_root) = rt_env.project_root {
-                                match context::save_spec(
-                                    project_root,
-                                    &config.spec.file_path,
-                                    &text,
-                                ) {
-                                    Ok(path) => {
-                                        app.output.push_system(&format!(
-                                            "✅ Spec saved to {} ({} chars)",
-                                            path,
-                                            text.len()
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        app.output
-                                            .push_error(&format!("Failed to save spec: {}", e));
-                                    }
-                                }
-                            } else {
-                                app.output.push_system(&format!(
-                                    "✅ Spec set ({} chars, not persisted - no project root)",
-                                    text.len()
-                                ));
-                            }
-
-                            app.output.push_system(
-                                "Spec mode activated. AI will use this spec for task planning.",
-                            );
-                            app.dirty = true;
-                        } else if app.agent_running {
+                        if app.agent_running {
                             // Handle interjection during agent execution
                             let priority = if text.starts_with('!') {
                                 InterjectionPriority::Urgent
@@ -1938,17 +1900,20 @@ fn handle_key_event(
                             app.scroll_to_bottom();
                             app.dirty = true;
                         } else if let Some(provider) = provider {
-                            // Build system prompt dynamically to include latest spec content AND workflow step instructions
-                            let mut current_system_prompt = context::build_system_prompt(
+                            // Build system prompt with dynamic context (git log, diff stat)
+                            let turn_ctx = context::TurnContext {
+                                git_log: context::gather_git_context(&rt_env.working_dir),
+                                git_diff_stat: context::gather_diff_context(&rt_env.working_dir),
+                                dir_structure: None,
+                                recent_summary: None,
+                            };
+                            let mut current_system_prompt = context::build_system_prompt_with_context(
                                 &rt_env,
                                 &tool_registry,
                                 None,
                                 Some(&config.behavior_rules),
-                                if app.spec_active && !app.spec_content.is_empty() {
-                                    Some(&app.spec_content)
-                                } else {
-                                    None
-                                },
+                                None,
+                                &turn_ctx,
                             );
 
                             // Add workflow step instructions if in Spec mode (use cached data)

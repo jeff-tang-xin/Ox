@@ -148,10 +148,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
-    let sidebar_w = if app.sessions.is_empty() {
-        0
-    } else {
+    let has_sidebar_content = !app.sessions.is_empty() || !app.plan_items.is_empty();
+    let sidebar_w = if has_sidebar_content {
         app.sidebar_width.min(area.width / 4)
+    } else {
+        0
     };
 
     let main_chunks =
@@ -362,24 +363,50 @@ fn render_single_line(
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    lines.push(Line::from(Span::styled(
-        " Sessions ".to_string(),
-        Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
-    )));
-
-    for entry in &app.sessions {
-        let style = if entry.is_active {
-            Style::default().fg(USER_COLOR).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(TEXT_DIM)
-        };
-        let icon = if entry.is_active { "▸" } else { " " };
-        // Use display_name() method which includes [ProjectName] prefix
-        let display_short: String = entry.display_name().chars().take(area.width as usize - 4).collect();
+    // ── Tasks Section ──
+    if !app.plan_items.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!(" {icon} {display_short}"),
-            style,
+            " Tasks ".to_string(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )));
+        for item in &app.plan_items {
+            let (icon, style) = match item.status {
+                super::app::PlanItemStatus::Done => ("✅", Style::default().fg(TOOL_OK)),
+                super::app::PlanItemStatus::Pending => ("⏳", Style::default().fg(Color::Yellow)),
+                super::app::PlanItemStatus::Cancelled => ("❌", Style::default().fg(TEXT_DIM)),
+            };
+            let display: String = item.file.chars().take(area.width.saturating_sub(6) as usize).collect();
+            lines.push(Line::from(Span::styled(
+                format!(" {icon} {display}"),
+                style,
+            )));
+        }
+        lines.push(Line::from("")); // separator
+    }
+
+    // ── Sessions Section ──
+    if !app.sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " Sessions ".to_string(),
+            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+        )));
+        for entry in &app.sessions {
+            let style = if entry.is_active {
+                Style::default().fg(USER_COLOR).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT_DIM)
+            };
+            let icon = if entry.is_active { "▸" } else { " " };
+            let display_short: String = entry.display_name().chars().take(area.width as usize - 4).collect();
+            lines.push(Line::from(Span::styled(
+                format!(" {icon} {display_short}"),
+                style,
+            )));
+        }
+    }
+
+    if lines.is_empty() {
+        return;
     }
 
     let block = Block::default()

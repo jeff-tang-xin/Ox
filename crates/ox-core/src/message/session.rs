@@ -35,6 +35,11 @@ pub struct SessionMeta {
     /// Working directory for this session (relative to project root or absolute path)
     #[serde(default)]
     pub working_dir: Option<String>,
+
+    // 📋 Plan/task tracking — persisted across sessions
+    /// JSON-encoded plan items from LLM ## Plan / ## Done blocks
+    #[serde(default)]
+    pub plan_json: String,
 }
 
 /// A persistent conversation session.
@@ -65,6 +70,7 @@ impl Session {
             workflow_step_index: 0,
             requirement_name: None,
             working_dir: None,
+            plan_json: String::new(),
         };
 
         // Write meta as first line and keep file handle open.
@@ -133,7 +139,7 @@ impl Session {
             return Ok(None);
         }
 
-        let meta = meta.unwrap_or_else(|| SessionMeta {
+        let mut meta = meta.unwrap_or_else(|| SessionMeta {
             id: Uuid::new_v4().to_string(),
             project_id: String::new(),
             created_at: Utc::now().to_rfc3339(),
@@ -144,13 +150,27 @@ impl Session {
             workflow_step_index: 0,
             requirement_name: None,
             working_dir: None,
+            plan_json: String::new(),
         });
+
+        // Auto-truncate old sessions (>7 days) to prevent unbounded disk growth
+        let mut messages = messages;
+        if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&meta.created_at) {
+            let age_days = (Utc::now().timestamp() - created.timestamp()) / 86400;
+            if age_days > 7 && messages.len() > 500 {
+                let trim = messages.len() - 500;
+                messages.drain(..trim);
+                tracing::info!("Session {} ({} days old): trimmed {} messages → {} retained",
+                    meta.id, age_days, trim, messages.len());
+                meta.message_count = messages.len();
+            }
+        }
 
         Ok(Some(Self {
             meta,
             messages,
             file_path,
-            file_handle: None, // Will be opened on first append.
+            file_handle: None,
         }))
     }
 
@@ -363,8 +383,8 @@ impl Session {
                 let first_line = &lines[0];
                 let val: serde_json::Value = serde_json::from_str(first_line).ok()?;
                 let meta = val.get("_meta")?;
-                let id = meta.get("id")?.as_str().unwrap_or("?");
-                let count = meta.get("message_count")?.as_u64().unwrap_or(0);
+                let _id = meta.get("id")?.as_str().unwrap_or("?");
+                let _count = meta.get("message_count")?.as_u64().unwrap_or(0);
                 let created = meta.get("created_at")?.as_str().unwrap_or("?");
                 
                 // Extract session name from first user message
@@ -453,6 +473,7 @@ impl Session {
             workflow_step_index: 0,
             requirement_name: None,
             working_dir: None,
+            plan_json: String::new(),
         });
 
         Ok(Some(Self {

@@ -2,7 +2,6 @@
 //!
 //! Manages the interjection buffer and processes user input during agent execution.
 
-use std::sync::Arc;
 use ox_core::agent::interjection::{InterjectionBuffer, InterjectionPriority};
 use ox_core::agent::ui_event::UiToAgentEvent;
 use crate::terminal::app::App;

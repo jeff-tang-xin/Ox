@@ -39,6 +39,12 @@ impl InputPane {
         self.cursor += ch.len_utf8();
     }
 
+    /// Insert a string at the cursor position (used for paste).
+    pub fn insert_str(&mut self, s: &str) {
+        self.buffer.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
     /// Delete the character before the cursor (backspace).
     pub fn backspace(&mut self) {
         if self.cursor > 0 {

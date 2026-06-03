@@ -39,7 +39,7 @@ impl Tool for FileReadTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max lines to read. Default: unlimited. Recommended: 100-500 for large files."
+                    "description": "Max lines to read. Default: 200. Set higher for full file reads."
                 },
                 "encoding": {
                     "type": "string",
@@ -161,7 +161,8 @@ impl Tool for FileReadTool {
         let limit = args
             .get("limit")
             .and_then(|l| l.as_u64())
-            .map(|l| l as usize);
+            .map(|l| l as usize)
+            .or(Some(200)); // Default: 200 lines
         
         // Get encoding parameter
         let encoding = args

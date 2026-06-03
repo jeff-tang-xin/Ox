@@ -75,10 +75,18 @@ pub enum PendingLlmTask {
     SmartNaming { content: String },
 }
 
-/// Pending smart naming request data
+/// Plan item — parsed from LLM ## Plan block, tracked against ## Done
 #[derive(Debug, Clone)]
-pub struct PendingSmartNaming {
-    pub content: String,
+pub struct PlanItem {
+    pub file: String,
+    pub status: PlanItemStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanItemStatus {
+    Pending,
+    Done,
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -139,19 +147,8 @@ pub struct App {
     pub pending_model_switch: Option<String>,
     /// 🆕 Unified pending LLM task (replaces multiple flags)
     pub pending_llm_task: Option<PendingLlmTask>,
-    /// Deprecated: use pending_llm_task instead
-    #[deprecated(note = "Use pending_llm_task instead")]
-    pub pending_spec_planning: Option<String>,
-    /// 🚨 Pending smart naming request (LLM-based name generation)
-    /// Deprecated: use pending_llm_task instead
-    #[deprecated(note = "Use pending_llm_task instead")]
-    pub pending_smart_naming: Option<PendingSmartNaming>,
     /// Flag indicating user requested revision feedback via /O command
     pub pending_revision_feedback: bool,
-    /// Flag indicating user approved workflow progression via /Y command
-    /// Deprecated: use pending_llm_task instead
-    #[deprecated(note = "Use pending_llm_task instead")]
-    pub pending_workflow_approval: bool,
     pub trusted_all: bool,
     pub header_info: Vec<String>,
     pub sessions: Vec<SessionEntry>,
@@ -176,16 +173,11 @@ pub struct App {
     // Cached workflow display info (updated each tick to avoid locking in render)
     pub workflow_display: Option<WorkflowDisplayInfo>,
 
-    // Backward compatibility fields (deprecated, use workflow_state instead)
-    #[deprecated(note = "Use workflow_state instead")]
-    pub spec_content: String,
-    #[deprecated(note = "Use workflow_state instead")]
-    pub spec_active: bool,
-    #[deprecated(note = "Use workflow_state instead")]
-    pub spec_edit_mode: bool,
-
-    // Workflow engine for Spec and Council modes (wrapped in Arc for sharing)
+    // Workflow engine (wrapped in Arc for sharing)
     pub workflow_engine: Option<Arc<tokio::sync::Mutex<WorkflowEngine>>>,
+
+    // 🆕 Plan tracking: parsed from LLM ## Plan / ## Done blocks
+    pub plan_items: Vec<PlanItem>,
 
     // Fields needed by slash command handlers
     /// Session action signaled by slash commands, processed in the main event loop.
@@ -215,13 +207,7 @@ impl App {
             ui_to_agent_tx: None,
             pending_model_switch: None,
             pending_llm_task: None,  // 🆕 Unified LLM task
-            #[allow(deprecated)]
-            pending_spec_planning: None,
-            #[allow(deprecated)]
-            pending_smart_naming: None,
             pending_revision_feedback: false,
-            #[allow(deprecated)]
-            pending_workflow_approval: false,
             trusted_all: false,
             header_info: Vec::new(),
             sessions: Vec::new(),
@@ -241,16 +227,11 @@ impl App {
             workflow_state: WorkflowState::Free,
             workflow_display: None,
 
-            // Backward compatibility fields (deprecated)
-            #[allow(deprecated)]
-            spec_content: String::new(),
-            #[allow(deprecated)]
-            spec_active: false,
-            #[allow(deprecated)]
-            spec_edit_mode: false,
-
             // Workflow engine (initialized later with session ID)
             workflow_engine: None,
+
+            // Plan tracking
+            plan_items: Vec::new(),
 
             // Slash command context fields
             session_action: SessionAction::None,
@@ -396,7 +377,7 @@ impl App {
         let mut engine = WorkflowEngine::new(session_state_arc);
 
         // Activate initial workflow based on current mode
-        if self.spec_active || session_meta.workflow_mode == "spec" {
+        if session_meta.workflow_mode == "spec" {
             if let Err(e) = engine.activate_workflow("spec_workflow") {
                 tracing::warn!("Failed to activate spec workflow: {}", e);
             } else {

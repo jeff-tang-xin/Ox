@@ -390,7 +390,7 @@ impl SkillGenerator {
                 trigger_conditions: pattern.applicable_scenarios.clone(),
                 step_by_step_guide: pattern.common_tool_sequence.iter()
                     .enumerate()
-                    .map(|(i, tool)| format!("Use `{}` tool", tool))
+                    .map(|(_i, tool)| format!("Use `{}` tool", tool))
                     .collect(),
                 example_tool_calls: vec![], // Would need to extract from traces
                 pitfalls: vec![],
@@ -402,7 +402,7 @@ impl SkillGenerator {
     /// Abstract meta-skills from multiple skill templates (L2 → L3)
     pub fn distill_meta_skills(
         &self,
-        templates: &[SkillTemplate],
+        _templates: &[SkillTemplate],
     ) -> Vec<MetaSkill> {
         // Group similar skills and extract common principles
         // This is a simplified version - in production, would use LLM

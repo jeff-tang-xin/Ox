@@ -74,55 +74,39 @@ pub fn handle_cd(app: &mut AppState, args: &str, session: &mut Session, rt_env: 
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "(none)".into());
                     app.output.push_system(&format!("Project boundary changed -- {}", name));
                     
-                    // 🧠 Project onboarding: generate conventions skill if missing
+                    // 🧠 Project onboarding: generate TWO skill files if missing
                     if let Some(ref proj_root) = rt_env.project_root {
-                        let skill_path = proj_root.join(".ox").join("skills").join("project-conventions.md");
-                        if !skill_path.exists() {
+                        let conventions = proj_root.join(".ox").join("skills").join("project-conventions.md");
+                        let architecture = proj_root.join(".ox").join("skills").join("project-architecture.md");
+                        if !conventions.exists() || !architecture.exists() {
                             let prompt = format!(
-                                "You just entered a new project at `{}`. Generate a project conventions skill.\n\n\
-                                 ## Step 1: Detect\n\
-                                 Run `project_detect`. Note the language, framework, and build system.\n\n\
-                                 ## Step 2: Scan\n\
-                                 Based on detected language, scan these:\n\n\
-                                 | Language | Config files | Code patterns to search |\n\
-                                 |----------|-------------|------------------------|\n\
-                                 | Rust | Cargo.toml | `fn `, `pub fn`, `impl`, `use `, `mod `, `#!` |\n\
-                                 | Python | pyproject.toml, setup.cfg | `def `, `class `, `import `, `from `, `@` |\n\
-                                 | TS/JS | package.json, tsconfig.json, .eslintrc | `function`, `const`, `export`, `interface` |\n\
-                                 | Go | go.mod | `func `, `type `, `package `, `err ` |\n\
-                                 | Java | build.gradle, pom.xml | `public class`, `private`, `@Override` |\n\
-                                 | C/C++ | CMakeLists.txt, Makefile | `void `, `int `, `#include`, `class ` |\n\n\
-                                 ## Step 3: Generate .ox/skills/project-conventions.md\n\
-                                 Use `file_write` to create this file with these sections:\n\n\
-                                 ### Project Overview\n\
-                                 Language, framework, build tool, entry point (1-2 lines).\n\n\
-                                 ### Architecture & Design Rules\n\
-                                 **MUST** rules — patterns that MUST be followed:\n\
-                                 - Module/dependency structure (e.g. \"MUST NOT import from sibling modules directly\")\n\
-                                 - Layer boundaries (e.g. \"MUST keep business logic in services/, not in handlers/\")\n\
-                                 - Error propagation (e.g. \"MUST use Result<T, E>, never panic!/unwrap()\")\n\
-                                 - Testing (e.g. \"MUST write integration tests for public APIs\")\n\n\
-                                 **MUST NOT** rules — anti-patterns to avoid:\n\
-                                 - Forbidden imports/dependencies\n\
-                                 - Forbidden patterns (e.g. \"MUST NOT use global mutable state\")\n\
-                                 - Forbidden shortcuts (e.g. \"MUST NOT commit directly to main\")\n\n\
-                                 Derive these from actual code patterns, linter configs, and project structure.\n\n\
-                                 ### Naming Conventions\n\
-                                 Files, modules, functions, variables — with real examples.\n\n\
-                                 ### Code Style\n\
-                                 Indent, quotes, line length, semicolons — from config/linter files.\n\n\
-                                 ### Commands\n\
-                                 Build, test, lint, run — from Makefile/package.json scripts/Cargo.toml.\n\n\
-                                 Keep it under 400 words. Be specific — cite real files and patterns found.",
+                                "You just entered a new project at `{}`. Generate TWO skill files.\n\n\
+                                 ## File 1: .ox/skills/project-conventions.md\n\
+                                 Run `project_detect` first. Then scan config files and source patterns:\n\
+                                 - Language, framework, build tool (1-2 lines)\n\
+                                 - Naming conventions (files, modules, functions — with real examples)\n\
+                                 - Code style (indent, quotes, line length from linter config)\n\
+                                 - Import ordering and grouping\n\
+                                 - Build/test/lint/run commands\n\n\
+                                 ## File 2: .ox/skills/project-architecture.md\n\
+                                 Scan directory structure and module layout:\n\
+                                 - Directory tree and layer boundaries (handlers/services/repos?)\n\
+                                 - MUST rules (from existing code patterns and linter config)\n\
+                                 - MUST NOT rules (anti-patterns to avoid)\n\
+                                 - Error handling patterns (Result/Option/exception style)\n\
+                                 - Key dependencies and their roles\n\
+                                 - Data flow patterns (request → handler → service → db?)\n\n\
+                                 Keep each file 200-400 words. Use real file names and examples.",
                                 proj_root.display()
                             );
-                            app.output.push_system("🔍 New project detected — generating project conventions...");
+                            app.output.push_system("🔍 First time in this project. Scanning codebase to learn conventions and architecture...");
+                            app.output.push_system("   Will generate .ox/skills/project-conventions.md + project-architecture.md");
                             return CommandResult::LlmRequest {
                                 prompt,
-                                description: "Generate project conventions".to_string(),
+                                description: "Generate project conventions and architecture".to_string(),
                             };
                         } else {
-                            app.output.push_system("📋 Project conventions already exist — loaded from cache.");
+                            app.output.push_system("📋 Project skills already exist — loaded from cache.");
                         }
                     }
                 }
@@ -145,9 +129,9 @@ pub fn handle_init(app: &mut AppState, _args: &str, _session: &mut Session, _rt_
 }
 
 pub fn handle_debug(app: &mut AppState, _args: &str, session: &mut Session, rt_env: &mut runtime::RuntimeEnvironment,
-    config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
     trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
-    use ox_core::llm::{ApiKeySource, BaseUrlSource};
+    
     app.output.push_line(OutputLine::System(format!("Model: {}", app.model_name)));
     if let Some(info) = &app.resolve_info {
         app.output.push_line(OutputLine::System(format!("Provider: {}", info.provider_name)));
@@ -230,11 +214,6 @@ pub fn handle_free(app: &mut AppState, _args: &str, session: &mut Session, _rt_e
         }
     }
     
-    // Clear spec state
-    app.spec_active = false;
-    app.spec_content.clear();
-    app.spec_edit_mode = false;
-    
     // Force UI refresh to update header immediately
     app.dirty = true;
     
@@ -245,8 +224,7 @@ pub fn handle_free(app: &mut AppState, _args: &str, session: &mut Session, _rt_e
 pub fn handle_cancel(app: &mut AppState, _args: &str, _session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
     _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
-    if app.spec_edit_mode { app.spec_edit_mode = false; app.output.push_system("Spec edit cancelled."); }
-    else { app.output.push_system("Nothing to cancel."); }
+    app.output.push_system("Nothing to cancel.");
     CommandResult::Success
 }
 

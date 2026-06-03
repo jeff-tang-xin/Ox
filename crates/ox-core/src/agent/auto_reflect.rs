@@ -17,7 +17,6 @@ use crate::context::SKILL_CREATION_PROMPT;
 pub struct AutoReflector {
     llm_provider: Arc<dyn LlmProvider>,
     project_root: std::path::PathBuf,
-    ox_home_dir: std::path::PathBuf,
 }
 
 impl AutoReflector {
@@ -25,12 +24,10 @@ impl AutoReflector {
     pub fn new(
         llm_provider: Arc<dyn LlmProvider>,
         project_root: &Path,
-        ox_home_dir: &Path,
     ) -> Result<Self> {
         Ok(Self {
             llm_provider,
             project_root: project_root.to_path_buf(),
-            ox_home_dir: ox_home_dir.to_path_buf(),
         })
     }
 
@@ -146,17 +143,17 @@ impl AutoReflector {
     /// Parse the LLM-generated markdown and save as a skill
     fn parse_and_save_skill(&self, content: &str) -> Result<String> {
         // Extract skill metadata from YAML frontmatter
-        let (metadata, body) = self.extract_frontmatter(content)?;
+        let (metadata, _body) = self.extract_frontmatter(content)?;
         
         let skill_id = metadata.get("id")
             .ok_or_else(|| anyhow::anyhow!("Missing 'id' in skill frontmatter"))?
             .clone();
         
-        let name = metadata.get("name")
+        let _name = metadata.get("name")
             .ok_or_else(|| anyhow::anyhow!("Missing 'name' in skill frontmatter"))?
             .clone();
         
-        let description = metadata.get("description")
+        let _description = metadata.get("description")
             .ok_or_else(|| anyhow::anyhow!("Missing 'description' in skill frontmatter"))?
             .clone();
 

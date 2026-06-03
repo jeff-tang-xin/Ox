@@ -11,7 +11,6 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     max_tokens: Option<u32>,
-    stream_usage: bool,
     disable_tools: bool,
     client: reqwest::Client,
 }
@@ -22,7 +21,6 @@ impl OpenAiProvider {
         api_key: String,
         base_url: String,
         max_tokens: Option<u32>,
-        stream_usage: bool,
         disable_tools: bool,
     ) -> Self {
         let client = reqwest::Client::builder()
@@ -45,7 +43,6 @@ impl OpenAiProvider {
                 base_url
             },
             max_tokens,
-            stream_usage,
             disable_tools,
             client,
         }
@@ -246,51 +243,44 @@ impl LlmProvider for OpenAiProvider {
         // Debug: Log the request body for troubleshooting
         tracing::debug!("OpenAI request body: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
 
-        let resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await;
+        // Retry loop with exponential backoff for transient failures
+        const MAX_RETRIES: u32 = 3;
+        let mut attempt = 0u32;
+        let resp = loop {
+            attempt += 1;
+            let result = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await;
 
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed to send request to {}: {}", self.base_url, e);
-
-                let error_msg = if e.is_timeout() {
-                    format!(
-                        "请求超时：无法连接到 {}\n\n可能原因：\n• 网络连接不稳定\n• API 服务器响应过慢\n• 防火墙阻止连接",
-                        self.base_url
-                    )
-                } else if e.is_connect() {
-                    format!(
-                        "连接失败：无法连接到 {}\n\n可能原因：\n• 网络连接中断\n• DNS 解析失败\n• 防火墙/代理阻止\n• API 服务不可用",
-                        self.base_url
-                    )
-                } else if e.is_request() {
-                    format!(
-                        "请求错误：{}\n\n请检查：\n• API 密钥是否正确\n• base_url 是否配置正确\n• 模型名称是否有效",
-                        e
-                    )
-                } else {
-                    format!(
-                        "网络错误：{}\n\nURL: {}\n\n请检查网络连接或稍后重试。",
-                        e, self.base_url
-                    )
-                };
-
-                let _ = tx.send(LlmStreamEvent::Error(error_msg));
-                return Ok(());
+            match result {
+                Ok(r) if r.status().is_server_error() && attempt < MAX_RETRIES => {
+                    let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                    tracing::warn!("[API RETRY] 5xx, retry {}/{} in {:?}", attempt, MAX_RETRIES, delay);
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(r) => break r,
+                Err(e) if attempt < MAX_RETRIES && (e.is_timeout() || e.is_connect()) => {
+                    let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                    tracing::warn!("[API RETRY] Network error, retry {}/{} in {:?}: {}", attempt, MAX_RETRIES, delay, e);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    let err_msg = format!("API unreachable: {}", e);
+                    let _ = tx.send(LlmStreamEvent::Error(err_msg));
+                    return Ok(());
+                }
             }
         };
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
-            let err_msg = format!("OpenAI API error {status}: {body_text}");
+            let err_msg = format!("API error {status}: {body_text}");
             tracing::error!("{}", err_msg);
             let _ = tx.send(LlmStreamEvent::Error(err_msg));
             return Ok(());

@@ -60,4 +60,9 @@ impl EventHandler {
     pub async fn recv(&mut self) -> Option<Event> {
         self.rx.recv().await
     }
+
+    /// Non-blocking receive — returns None if queue is empty.
+    pub fn try_recv(&mut self) -> Option<Event> {
+        self.rx.try_recv().ok()
+    }
 }

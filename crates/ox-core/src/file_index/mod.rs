@@ -13,7 +13,8 @@ pub use registry::FileIndexRegistry;
 pub const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
     "node_modules", ".git", "target", "dist", "build", 
     "__pycache__", ".venv", "venv", "coverage", ".next", ".nuxt",
-    ".idea", ".vscode", "vendor", "bower_components", ".ox"
+    ".idea", ".vscode", "vendor", "bower_components", ".ox",
+    "logs", ".cache", "tmp",
 ];
 
 /// 检查路径是否应该被排除
@@ -482,34 +483,6 @@ impl FileIndexManager {
         walk_dir(working_dir, working_dir, &mut result, 0, &mut file_count);
         tracing::info!("Physical scan found {} files (including git-ignored)", file_count);
         Ok(result)
-    }
-
-    /// 解析文件列表为索引条目
-    fn parse_file_list(file_list: &str) -> Vec<FileIndexEntry> {
-        file_list
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|path_str| {
-                let path = Path::new(path_str);
-                let filename = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let file_type = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|s| s.to_string());
-
-                FileIndexEntry {
-                    id: 0, // Will be auto-assigned by SQLite
-                    filename,
-                    full_path: path_str.to_string(),
-                    file_type,
-                }
-            })
-            .collect()
     }
 
     /// 同步扫描：Git 追踪 + 未追踪文件 + 本地忽略文件（启动时使用）

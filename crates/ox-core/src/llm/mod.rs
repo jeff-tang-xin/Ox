@@ -200,8 +200,6 @@ pub fn create_provider_with_info(
         api_key_source,
         base_url_source,
     };
-    // Use stream_usage from config. Default true for token tracking.
-    let stream_usage = provider_cfg.stream_usage.unwrap_or(true);
     // Check if tools should be disabled for this provider (e.g. MiniMax).
     let disable_tools = provider_cfg.disable_tools.unwrap_or(false);
 
@@ -218,7 +216,6 @@ pub fn create_provider_with_info(
             api_key,
             base_url,
             provider_cfg.max_tokens,
-            stream_usage,
             disable_tools,
         )),
     };

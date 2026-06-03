@@ -127,14 +127,6 @@ impl Tool for CodeSearchTool {
     }
 }
 
-/// Represents a single match result
-#[derive(Debug, Clone)]
-struct CodeMatch {
-    path: String,
-    line_number: u64,
-    line: String,
-}
-
 fn search_with_ripgrep(
     pattern: &str,
     base: &Path,

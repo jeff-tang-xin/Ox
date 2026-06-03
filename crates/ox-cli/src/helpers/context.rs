@@ -1,6 +1,6 @@
 //! Context building helpers with optional refinement support.
 
-use ox_core::context::{ContextBuilder, build_refined_context};
+use ox_core::context::ContextBuilder;
 use ox_core::message::Message;
 
 /// Build context with optional refinement based on configuration.

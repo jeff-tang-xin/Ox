@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use crate::terminal::app::App as AppState;
 use ox_core::runtime::RuntimeEnvironment;
-use crate::slash_commands::{CommandResult, CommandMeta};
+use crate::slash_commands::CommandMeta;
 use ox_core::message::Session;
 
 /// /skill 命令元数据
@@ -247,7 +247,7 @@ fn handle_skill_create_llm(app: &mut AppState, description: &str, _rt_env: &Runt
 }
 
 /// 反思最近的任务并创建 Skill
-fn handle_skill_reflect(app: &mut AppState, rt_env: &RuntimeEnvironment) {
+fn handle_skill_reflect(app: &mut AppState, _rt_env: &RuntimeEnvironment) {
     use ox_core::context::SKILL_CREATION_PROMPT;
     
     app.output.push_system("🤔 Analyzing conversation context for reusable patterns...");

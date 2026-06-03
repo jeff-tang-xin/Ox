@@ -8,7 +8,7 @@ pub mod refinement;
 pub use effort::{EffortLevel, estimate_effort};
 pub use skill_prompts::SKILL_CREATION_PROMPT;
 pub use spec::{TASK_TYPE_PROMPT, load_spec, save_spec, spec_exists};
-pub use system_prompt::build_system_prompt;
+pub use system_prompt::{build_system_prompt, build_system_prompt_with_context, TurnContext, gather_git_context, gather_diff_context, gather_dir_context};
 pub use refinement::{RefinedTurn, refine_conversation, build_refined_context, refine_assistant_response, generate_memory_summary, MemorySummary};
 
 use crate::llm::tokenizer::estimate_tokens;
@@ -161,32 +161,48 @@ impl ContextBuilder {
         }
     }
 
-    /// Adjust budgets based on user intent for smarter context allocation.
-    pub fn budgets_for_intent(&self, context_window: u32, intent: UserIntent) -> TokenBudgets {
+    /// Adjust budgets based on user intent and conversation length.
+    pub fn budgets_for_intent(&self, context_window: u32, intent: UserIntent, msg_count: usize) -> TokenBudgets {
+        // Dynamic adjustment based on conversation length
+        let (mem_r, hist_r) = if msg_count < 20 {
+            // Short: give more to history, reply reserve is still large
+            (0.02, 0.20)
+        } else if msg_count < 100 {
+            // Medium: default ratios
+            (self.memory_ratio, self.history_ratio)
+        } else {
+            // Long: more memory, less history to avoid context bloat
+            (0.05, 0.08)
+        };
+        let reply = (1.0 - self.system_prompt_ratio - mem_r - hist_r).max(0.5);
+
         match intent {
             UserIntent::Exploration => {
-                // Exploration mode: more history for context, less memory
                 TokenBudgets {
                     system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
-                    memory: (context_window as f32 * 0.01) as u32,  // Reduce to 1%
-                    history: (context_window as f32 * 0.15) as u32,  // Increase to 15%
+                    memory: (context_window as f32 * 0.01) as u32,
+                    history: (context_window as f32 * 0.15) as u32,
                     reply_reserve: (context_window as f32 * 0.83) as u32,
                     total: context_window,
                 }
             }
             UserIntent::CodeUnderstanding | UserIntent::CodeModification => {
-                // Development mode: more memory for relevant code knowledge
                 TokenBudgets {
                     system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
-                    memory: (context_window as f32 * 0.05) as u32,  // Increase to 5%
-                    history: (context_window as f32 * 0.08) as u32,  // Slightly reduce to 8%
-                    reply_reserve: (context_window as f32 * 0.86) as u32,
+                    memory: (context_window as f32 * mem_r) as u32,
+                    history: (context_window as f32 * hist_r) as u32,
+                    reply_reserve: (context_window as f32 * reply) as u32,
                     total: context_window,
                 }
             }
             UserIntent::General => {
-                // General mode: use default ratios
-                self.budgets(context_window)
+                TokenBudgets {
+                    system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
+                    memory: (context_window as f32 * mem_r) as u32,
+                    history: (context_window as f32 * hist_r) as u32,
+                    reply_reserve: (context_window as f32 * reply) as u32,
+                    total: context_window,
+                }
             }
         }
     }
@@ -278,7 +294,7 @@ impl ContextBuilder {
         context_window: u32,
         max_turns: usize,
     ) -> Vec<Message> {
-        let budgets = self.budgets(context_window);
+        let _budgets = self.budgets(context_window);
 
         let mut result = Vec::new();
 

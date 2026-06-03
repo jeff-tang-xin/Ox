@@ -80,7 +80,6 @@ pub struct OutputPane {
 
 impl OutputPane {
     const MAX_LINES: usize = 2000;
-    const MAX_LINE_LEN: usize = 5000;
 
     pub fn new() -> Self {
         Self {
@@ -249,14 +248,6 @@ impl OutputPane {
         // Users need to see full output. Ratatui will handle wrapping and scrolling.
         // The only limit is MAX_LINES (2000 lines) to prevent memory issues.
         line
-    }
-
-    fn safe_char_boundary(s: &str, max_byte: usize) -> usize {
-        s.char_indices()
-            .take_while(|(i, _)| *i < max_byte)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0)
     }
 
     #[allow(dead_code)]
