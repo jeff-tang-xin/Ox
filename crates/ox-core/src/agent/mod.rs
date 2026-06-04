@@ -1385,6 +1385,7 @@ pub async fn run_agent_turn(
             // ── Context Offloading: Save verbose results to external files ──
             let offloaded = offloader.process_result(
                 &tc.name,
+                &tc.arguments,
                 &result.content,
                 iteration as usize,
                 10000, // threshold: 10000 chars — only offload truly enormous outputs
@@ -1623,6 +1624,11 @@ pub async fn run_agent_turn(
                     }
                 }
             }
+        }
+
+        // Clean up old offloaded refs, keeping at most the 50 most recent ones.
+        if let Err(e) = offloader.cleanup_old_refs(50) {
+            tracing::warn!("Failed to clean up old refs: {}", e);
         }
 
         // Loop back to call LLM again with tool results.

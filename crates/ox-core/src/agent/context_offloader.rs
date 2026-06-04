@@ -86,11 +86,12 @@ impl ContextOffloader {
     pub fn process_result(
         &mut self,
         tool_name: &str,
+        tool_args: &str,
         content: &str,
         step_index: usize,
         threshold: usize,
     ) -> OffloadedResult {
-        let should_offload = self.should_offload(tool_name, content, threshold);
+        let should_offload = self.should_offload(tool_name, tool_args, content, threshold);
         
         if should_offload {
             self.offload_result(tool_name, content, step_index)
@@ -105,7 +106,18 @@ impl ContextOffloader {
     }
 
     /// Determine if a result should be offloaded
-    fn should_offload(&self, tool_name: &str, content: &str, threshold: usize) -> bool {
+    fn should_offload(&self, tool_name: &str, tool_args: &str, content: &str, threshold: usize) -> bool {
+        // Never offload recall results — they're already retrieving offloaded content,
+        // offloading them again would create a pointless feedback loop.
+        if tool_name == "recall" {
+            return false;
+        }
+
+        // Never offload file_read when it's reading a refs file — same feedback loop.
+        if tool_name == "file_read" && tool_args.contains(".ox/refs/") {
+            return false;
+        }
+
         // Always offload if content exceeds threshold
         if content.len() > threshold {
             return true;
@@ -114,8 +126,8 @@ impl ContextOffloader {
         // Offload specific tool types that tend to produce verbose output
         match tool_name {
             "code_search" | "file_list" | "grep" => {
-                // Search results often contain many file paths
-                content.lines().count() > 10
+                // Search results — only offload when there are many results
+                content.lines().count() > 50
             }
             "shell_exec" => {
                 // Shell output can be very verbose — only offload truly enormous output
@@ -290,7 +302,7 @@ mod tests {
         let mut offloader = ContextOffloader::new(temp_dir.path(), "test_task");
         
         let large_content = "Line 1\n".repeat(100);
-        let result = offloader.process_result("some_tool", &large_content, 1, 500);
+        let result = offloader.process_result("some_tool", "", &large_content, 1, 500);
         
         assert!(result.is_offloaded);
         assert!(result.ref_path.is_some());
@@ -303,7 +315,7 @@ mod tests {
         let mut offloader = ContextOffloader::new(temp_dir.path(), "test_task");
         
         let small_content = "Short result";
-        let result = offloader.process_result("file_write", small_content, 1, 2000);
+        let result = offloader.process_result("file_write", "", small_content, 1, 2000);
         
         assert!(!result.is_offloaded);
         assert!(result.ref_path.is_none());
@@ -316,7 +328,7 @@ mod tests {
         let mut offloader = ContextOffloader::new(temp_dir.path(), "test_task");
         
         let content = "Test content to retrieve";
-        let result = offloader.process_result("file_read", content, 1, 10);
+        let result = offloader.process_result("file_read", "", content, 1, 10);
         
         if result.is_offloaded {
             let retrieved = offloader.retrieve_full_content(&result.node_id);

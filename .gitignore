@@ -23,3 +23,6 @@ target
 /.qoder/
 /target/
 /.ox/
+reasonix.toml
+.env
+.codegraph
