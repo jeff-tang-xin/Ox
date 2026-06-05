@@ -100,7 +100,7 @@ fn default_base_url(provider: &str) -> &'static str {
 }
 
 /// Resolve provider name from model string, using explicit mapping first.
-/// Priority: config.model_providers exact match > prefix inference > config.default_provider.
+/// Priority: config.model_providers exact match > config.default_provider > prefix inference.
 pub fn resolve_provider_name_with_config<'a>(
     model: &str,
     config: &'a crate::config::ModelsConfig,
@@ -109,20 +109,12 @@ pub fn resolve_provider_name_with_config<'a>(
     if let Some(provider) = config.model_providers.get(model) {
         return provider.as_str();
     }
-    // Priority 2: prefix inference
-    let inferred = resolve_provider_name(model);
-    // If prefix inference returned "openai" as default (no match), try default_provider.
-    if inferred == "openai" && !config.default_provider.is_empty() {
-        // Check if the model name actually matches a known prefix; if not, use default_provider.
-        let known_prefixes = [
-            "gpt", "o1", "chatgpt", "claude", "deepseek", "gemini", "qwen", "glm",
-        ];
-        let lower = model.to_lowercase();
-        if !known_prefixes.iter().any(|p| lower.starts_with(p)) {
-            return config.default_provider.as_str();
-        }
+    // Priority 2: explicit default_provider overrides prefix inference
+    if !config.default_provider.is_empty() {
+        return config.default_provider.as_str();
     }
-    inferred
+    // Priority 3: prefix inference (claude*/deepseek*/gpt*…)
+    resolve_provider_name(model)
 }
 
 /// Source of the API key, for diagnostics.
@@ -301,23 +293,22 @@ mod tests {
         let mut config = ModelsConfig::default();
         config.default_provider = "openai".to_string();
 
-        // Unknown model prefix falls back to default_provider.
+        // default_provider overrides prefix inference for ALL models.
         assert_eq!(
             resolve_provider_name_with_config("my-custom-model", &config),
             "openai"
         );
-        // Known prefix still uses prefix inference.
         assert_eq!(
             resolve_provider_name_with_config("gpt-4o", &config),
             "openai"
         );
         assert_eq!(
             resolve_provider_name_with_config("claude-sonnet-4", &config),
-            "anthropic"
+            "openai"
         );
         assert_eq!(
             resolve_provider_name_with_config("deepseek-coder", &config),
-            "deepseek"
+            "openai"
         );
     }
 }

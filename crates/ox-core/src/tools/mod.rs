@@ -1,5 +1,6 @@
 pub mod code_search;
 pub mod content_validation;
+pub mod edit_file;
 pub mod file_list;
 pub mod file_patch;
 pub mod file_read;
@@ -181,6 +182,7 @@ impl ToolRegistry {
 
         registry.register(Box::new(file_read::FileReadTool));
         registry.register(Box::new(file_write::FileWriteTool));
+        registry.register(Box::new(edit_file::EditFileTool));
         registry.register(Box::new(file_patch::FilePatchTool));
         registry.register(Box::new(file_list::FileListTool));
         registry.register(Box::new(file_search::FileSearchTool));
@@ -205,7 +207,17 @@ impl ToolRegistry {
             rt_env.working_dir.join(".ox").join("skills")
         );
         
-        self.skills = loader.load_enabled_skills()?;
+        // ⚠️ Cap at 10 skills to prevent context bloat
+        // Keep the most recent skills (sorted by modification time)
+        let mut skills = loader.load_enabled_skills()?;
+        const MAX_SKILLS: usize = 10;
+        if skills.len() > MAX_SKILLS {
+            // Sort by creation time (newest first) and keep top N
+            skills.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            skills.truncate(MAX_SKILLS);
+            tracing::info!("Capped skills at {} (oldest trimmed)", MAX_SKILLS);
+        }
+        self.skills = skills;
         
         tracing::info!("Loaded {} skills", self.skills.len());
         
@@ -235,9 +247,9 @@ impl ToolRegistry {
         // Add Skills as special composite tools
         for skill in &self.skills {
             schemas.push(crate::llm::ToolSchema {
-                name: format!("skill:{}", skill.id),
+                name: format!("skill_{}", skill.id),
                 description: format!(
-                    "Skill: {} - {}\n\n{}",
+                    "[SKILL] {} - {}\n\n{}",
                     skill.name,
                     skill.description,
                     skill.content

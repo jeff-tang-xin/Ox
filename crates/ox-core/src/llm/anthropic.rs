@@ -79,9 +79,12 @@ impl LlmProvider for AnthropicProvider {
             body["tools"] = serde_json::Value::Array(tool_defs);
         }
 
+        let base = self.base_url.trim_end_matches('/');
+        let request_url = format!("{}/messages", base);
+
         let resp = self
             .client
-            .post(format!("{}/messages", self.base_url))
+            .post(&request_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
@@ -92,8 +95,8 @@ impl LlmProvider for AnthropicProvider {
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("Failed to send request to {}: {}", self.base_url, e);
-                let error_msg = format!("Request failed: {}", e);
+                tracing::error!("Failed to send request to {}: {}", request_url, e);
+                let error_msg = format!("Request failed to {}: {}", request_url, e);
                 let _ = tx.send(LlmStreamEvent::Error(error_msg));
                 return Ok(());
             }
@@ -121,7 +124,7 @@ impl LlmProvider for AnthropicProvider {
                 format!("Anthropic API error [{status}]: {body_text}")
             };
 
-            tracing::error!("{}", err_msg);
+            tracing::error!("[LLM ERROR] {} | URL: {} | Model: {}", err_msg, request_url, self.model);
             let _ = tx.send(LlmStreamEvent::Error(err_msg));
             return Ok(());
         }

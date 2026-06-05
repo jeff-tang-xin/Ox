@@ -31,6 +31,7 @@ use ox_core::llm::{self, LlmProvider, ProviderResolveInfo};
 use ox_core::memory::MemoryManager;
 use ox_core::message::{Message, Session};
 use ox_core::runtime;
+use ox_core::safety::injection;
 use ox_core::safety::TrustManager;
 use ox_core::tools::{ToolContext, ToolRegistry};
 use terminal::app::{App, PendingConfirmation, PlanItem, PlanItemStatus, SessionAction, UserInput, WorkflowState};
@@ -53,7 +54,10 @@ async fn main() -> anyhow::Result<()> {
     let rt_env = runtime::detect_runtime();
 
     // Try to create LLM provider (may fail if no API key)
-    let (provider, resolve_info) = create_provider(&config)?;
+    let (provider, resolve_info, provider_error) = create_provider(&config);
+    if let Some(ref err) = provider_error {
+        tracing::warn!("Provider init failed (will retry on /model): {}", err);
+    }
 
     // Setup terminal
     enable_raw_mode()?;
@@ -64,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     terminal.clear()?;
 
     // Run the application
-    let result = run_app(&mut terminal, &config, rt_env, provider, resolve_info).await;
+    let result = run_app(&mut terminal, &config, rt_env, provider, resolve_info, provider_error).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -144,15 +148,16 @@ fn install_panic_hook() {
     }));
 }
 
-/// Create LLM provider from config
+/// Create LLM provider from config, returning provider and error details.
 fn create_provider(
     config: &OxConfig,
-) -> anyhow::Result<(Option<Arc<dyn LlmProvider>>, Option<ProviderResolveInfo>)> {
+) -> (Option<Arc<dyn LlmProvider>>, Option<ProviderResolveInfo>, Option<String>) {
     match llm::create_provider_with_info(&config.models.default, &config.models) {
-        Ok((p, info)) => Ok((Some(Arc::from(p)), Some(info))),
+        Ok((p, info)) => (Some(Arc::from(p)), Some(info), None),
         Err(e) => {
-            tracing::warn!("No LLM provider: {e}. Running in echo mode.");
-            Ok((None, None))
+            let msg = format!("{}", e);
+            tracing::warn!("No LLM provider: {}. Running in echo mode.", msg);
+            (None, None, Some(msg))
         }
     }
 }
@@ -163,6 +168,7 @@ async fn run_app(
     mut rt_env: runtime::RuntimeEnvironment,
     mut provider: Option<Arc<dyn LlmProvider>>,
     mut resolve_info: Option<ProviderResolveInfo>,
+    provider_error: Option<String>,
 ) -> anyhow::Result<()> {
     // Ensure system-level directory structure: ~/.ox/{sessions,db,logs,skills,memory}
     {
@@ -292,7 +298,7 @@ async fn run_app(
     // Create tool registry (tool context will be created after memory initialization)
     let mut tool_registry = ToolRegistry::new();
     
-    // Load Skills from filesystem
+    // Load Skills from filesystem (includes the auto-generated project-info if created)
     if let Err(e) = tool_registry.load_skills(&rt_env) {
         tracing::warn!("Failed to load skills: {}", e);
     }
@@ -473,13 +479,14 @@ async fn run_app(
     // Initialize Workflow Engine in App
     app.init_workflow_engine(&session.meta.id, &session.meta);
 
-    // 🧠 Project onboarding: queue if conventions skill is missing
+    // 🧠 Project onboarding: queue if either conventions or architecture skill is missing
     let mut needs_onboarding = false;
     let mut onboarding_prompt_text = String::new();
     if let Some(ref root) = rt_env.project_root {
         let conventions = root.join(".ox").join("skills").join("project-conventions.md");
         let architecture = root.join(".ox").join("skills").join("project-architecture.md");
         if !conventions.exists() || !architecture.exists() {
+            needs_onboarding = true;
             needs_onboarding = true;
             onboarding_prompt_text = format!(
                 "You just opened a new project at `{}`. This is the FIRST time Ox has seen this project.\n\n\
@@ -546,7 +553,20 @@ async fn run_app(
                 });
             } else {
                 tracing::warn!("[ONBOARDING] Skipped — no LLM provider available");
-                app.output.push_system("💡 Tip: Set your API key to enable automatic project scanning on first open.");
+                let err_detail = provider_error.as_ref()
+                    .map(|e| format!("\n   🔍 Reason: {e}"))
+                    .unwrap_or_default();
+                app.output.push_system(&format!(
+                    "⚠️ LLM provider not available.{}\n\
+                     To fix:\n\
+                     • Set env var: OX_OPENAI_API_KEY=your-key\n\
+                     • Or in ~/.ox/config.toml:\n\
+                       [models.providers.openai]\n\
+                       api_key = \"your-key\"\n\
+                       base_url = \"https://api.openai.com/v1\"  # or your compatible endpoint\n\
+                     📝 Full details: ~/.ox/logs/ox.log",
+                    err_detail
+                ));
             }
         }
 
@@ -1900,88 +1920,60 @@ fn handle_key_event(
                             app.scroll_to_bottom();
                             app.dirty = true;
                         } else if let Some(provider) = provider {
-                            // Build system prompt with dynamic context (git log, diff stat)
-                            let turn_ctx = context::TurnContext {
-                                git_log: context::gather_git_context(&rt_env.working_dir),
-                                git_diff_stat: context::gather_diff_context(&rt_env.working_dir),
-                                dir_structure: None,
-                                recent_summary: None,
+                            // ⚡ Show "Thinking..." immediately — UI renders this on the next tick
+                            app.status = "Thinking...".to_string();
+                            app.dirty = true;
+
+                            // 🛡️ Scan user input for prompt injection before it reaches the LLM
+                            let user_text = if injection::is_suspicious(&text) {
+                                let result = injection::detect(&text);
+                                let categories: Vec<String> = result.matches.iter()
+                                    .map(|m| format!("{:?}", m.category))
+                                    .collect();
+                                tracing::warn!(
+                                    "🛡️ Prompt injection detected in user input: categories={:?}",
+                                    categories
+                                );
+                                app.output.push_line(OutputLine::System(format!(
+                                    "⚠️ Prompt injection detected and sanitized: {}",
+                                    categories.join(", ")
+                                )));
+                                injection::sanitize(&text)
+                            } else {
+                                text.clone()
                             };
-                            let mut current_system_prompt = context::build_system_prompt_with_context(
-                                &rt_env,
-                                &tool_registry,
-                                None,
-                                Some(&config.behavior_rules),
-                                None,
-                                &turn_ctx,
-                            );
 
-                            // Add workflow step instructions if in Spec mode (use cached data)
-                            if let Some(ref wf_info) = app.workflow_display {
-                                if let Some(ref step_prompt) = wf_info.step_prompt {
-                                    current_system_prompt
-                                        .push_str("\n\n## Current Workflow Step\n\n");
-
-                                    // Replace {project_ox_dir} placeholder with actual path
-                                    let project_ox_dir = rt_env
-                                        .project_ox_dir
-                                        .as_ref()
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| ".ox".to_string());
-                                    let mut processed_prompt =
-                                        step_prompt.replace("{project_ox_dir}", &project_ox_dir);
-                                    
-                                    // 🚨 Replace {REQUIREMENT_NAME} placeholder with actual requirement name
-                                    if let Some(ref req_name) = wf_info.requirement_name {
-                                        processed_prompt = processed_prompt.replace("{REQUIREMENT_NAME}", req_name);
-                                        processed_prompt = processed_prompt.replace("{YOUR_NAME}", req_name);
-                                        processed_prompt = processed_prompt.replace("{IDENTIFIED_NAME}", req_name);
-                                        processed_prompt = processed_prompt.replace("{requirement_name}", req_name);
-                                    }
-
-                                    current_system_prompt.push_str(&processed_prompt);
-
-                                    // Add tool restriction warnings
-                                    if !wf_info.allows_code_modification {
-                                        current_system_prompt.push_str("\n\n⚠️ IMPORTANT: You CAN use tools (file_read, file_search, etc.) but you CANNOT modify source code files (.rs, .py, .js, etc.) in this step. You can only create/modify documentation files (.md, .txt, etc.).");
-                                    }
-                                }
-                            }
-
-                            let user_msg = Message::user(&text);
+                            // Save user message (fast disk write)
+                            let user_msg = Message::user(&user_text);
                             if let Err(e) = session.append_message(user_msg) {
                                 tracing::error!("Failed to persist user message: {e}");
                             }
 
-                            // Check if this is feedback during a confirmation step
+                            // Check and handle workflow feedback (fast string matching)
                             let mut should_rewind = false;
                             let mut rewind_to_step = None;
 
                             if let Some(ref wf_info) = app.workflow_display {
-                                // Detect if user is providing feedback instead of confirmation
-                                let is_feedback = text.contains("修改")
-                                    || text.contains("改")
-                                    || text.contains("调整")
-                                    || text.contains("优化")
-                                    || text.contains("不对")
-                                    || text.contains("错误")
-                                    || text.to_lowercase().contains("revise")
-                                    || text.to_lowercase().contains("modify")
-                                    || text.to_lowercase().contains("change")
-                                    || text.to_lowercase().contains("update");
-
+                                let is_feedback = user_text.contains("修改")
+                                    || user_text.contains("改")
+                                    || user_text.contains("调整")
+                                    || user_text.contains("优化")
+                                    || user_text.contains("不对")
+                                    || user_text.contains("错误")
+                                    || user_text.to_lowercase().contains("revise")
+                                    || user_text.to_lowercase().contains("modify")
+                                    || user_text.to_lowercase().contains("change")
+                                    || user_text.to_lowercase().contains("update");
                                 if is_feedback {
                                     match wf_info.step_name.as_str() {
                                         "Await Spec Confirmation" => {
-                                            // User is giving feedback on spec.md, go back to Step 2 (generate_spec)
                                             should_rewind = true;
-                                            rewind_to_step = Some(1); // index 1 = generate_spec
+                                            rewind_to_step = Some(1);
                                             app.output.push_system("📝 Detected feedback on spec. Returning to Step 2 for revision...");
                                         }
                                         "Await Task Confirmation" => {
-                                            // User is giving feedback on task.md, go back to Step 4 (generate_task)
                                             should_rewind = true;
-                                            rewind_to_step = Some(3); // index 3 = generate_task
+                                            rewind_to_step = Some(3);
                                             app.output.push_system("📝 Detected feedback on task plan. Returning to Step 4 for revision...");
                                         }
                                         _ => {}
@@ -1989,99 +1981,175 @@ fn handle_key_event(
                                 }
                             }
 
-                            // Rewind workflow if needed
                             if should_rewind {
                                 if let Some(step_idx) = rewind_to_step {
                                     if let Some(ref mut engine_arc) = app.workflow_engine {
                                         if let Ok(mut engine) = engine_arc.try_lock() {
                                             if let Err(e) = engine.go_to_step(step_idx) {
-                                                app.output.push_error(&format!(
-                                                    "Failed to rewind workflow: {}",
-                                                    e
-                                                ));
+                                                app.output.push_error(&format!("Failed to rewind workflow: {}", e));
                                             }
                                         }
                                     }
                                 }
-                                
-                                // 🚨 CRITICAL: Add system message to inform LLM about user feedback
                                 let feedback_msg = Message::system(&format!(
                                     "📝 User provided revision feedback:\n{}\n\nPlease revise your work based on this feedback.",
-                                    text
+                                    user_text
                                 ));
                                 if let Err(e) = session.append_message(feedback_msg) {
                                     tracing::error!("Failed to persist feedback message: {e}");
                                 }
                             }
 
-                            let memory_nodes = memory.retrieve_with_rerank(&text, &Some(rt_env.project_id.as_str()), 5);
-                            let accessed_ids: Vec<&str> =
-                                memory_nodes.iter().map(|n| n.id.as_str()).collect();
-                            memory.reinforce_accessed(&accessed_ids);
-                            let memory_ctx = memory.format_memory_context(&memory_nodes, false);
-
-                            // Build effective messages using the latest compressed cache from SQLite
-                            let effective_messages = if let Some((cached, prev_count)) =
-                                compressed_cache
-                            {
-                                let pc = *prev_count;
-                                let start_idx = pc.min(session.messages.len());
-                                // 使用安全的切片方法
-                                let new_msgs = if start_idx < session.messages.len() {
-                                    &session.messages[start_idx..]
-                                } else {
-                                    &[]
-                                };
-                                let mut combined = cached.clone();
-                                combined.extend_from_slice(new_msgs);
-                                combined
-                            } else {
-                                session.messages.clone()
-                            };
-
-                            let turn_messages = helpers::build_context_with_option(
-                                &context_builder,
-                                &current_system_prompt, // Use dynamically built prompt
-                                &memory_ctx,
-                                &effective_messages,
-                                context_window,
-                                config.context.use_refined_context,
-                            );
-                            app.agent_running = true;
-                            app.status = "Thinking...".to_string();
-                            let effort =
-                                ox_core::context::estimate_effort(&text, session.messages.len());
-                            let planning = effort == ox_core::context::EffortLevel::High;
+                            // ── Capture all state for the background task ──
                             let provider = Arc::clone(provider);
-                            let tx = agent_tx.clone();
-                            let registry = Arc::clone(tool_registry);
-                            let ctx = Arc::clone(tool_ctx);
-                            let cancel_token = interrupt_ctrl.token();
-                            let tm = Arc::clone(&trust_manager);
-                            let ac = Arc::clone(&agent_config);
+                            let memory = memory.clone();
+                            let context_builder = context_builder.clone();
+                            let tool_registry = Arc::clone(&tool_registry);
+                            let tool_ctx = Arc::clone(&tool_ctx);
+                            let trust_manager = Arc::clone(&trust_manager);
+                            let agent_config = Arc::clone(&agent_config);
+                            let rt_env = rt_env.clone();
+                            let session_messages = session.messages.clone();
+                            let compressed_cache_data = compressed_cache.clone();
+                            let behavior_rules = config.behavior_rules.clone();
+                            let use_refined = config.context.use_refined_context;
+                            let workflow_display = app.workflow_display.clone();
+                            let workflow_engine = app.workflow_engine.clone();
                             let (ui_to_agent_tx, ui_to_agent_rx) =
                                 mpsc::unbounded_channel::<UiToAgentEvent>();
                             app.ui_to_agent_tx = Some(ui_to_agent_tx);
+                            let tx = agent_tx.clone();
+                            let cancel_token = interrupt_ctrl.token();
+                            app.agent_running = true;
 
-                            // Clone workflow engine Arc for the async task
-                            let workflow_engine_clone = app.workflow_engine.clone();
-
+                            // ⭐ Defer heavy work to a background thread so the event loop
+                            // stays responsive and "Thinking..." renders immediately.
                             tokio::spawn(async move {
+                                // ── All heavy synchronous work runs on a blocking thread ──
+                                let tr = tool_registry.clone();
+                                let blocking_result = tokio::task::spawn_blocking(move || {
+                                    let working_dir = &rt_env.working_dir;
+
+                                    // 1. Git context (subprocess calls)
+                                    let turn_ctx = context::TurnContext {
+                                        git_log: context::gather_git_context(working_dir),
+                                        git_diff_stat: context::gather_diff_context(working_dir),
+                                        dir_structure: None,
+                                        recent_summary: None,
+                                    };
+
+                                    // 2. Build system prompt
+                                    let mut system_prompt = context::build_system_prompt_with_context(
+                                        &rt_env,
+                                        &tr,
+                                        None,
+                                        Some(&behavior_rules),
+                                        None,
+                                        &turn_ctx,
+                                    );
+
+                                    // 3. Workflow step instructions (if any)
+                                    if let Some(ref wf_info) = workflow_display {
+                                        if let Some(ref step_prompt) = wf_info.step_prompt {
+                                            system_prompt.push_str("\n\n## Current Workflow Step\n\n");
+                                            let project_ox_dir = rt_env.project_ox_dir
+                                                .as_ref()
+                                                .map(|p| p.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| ".ox".to_string());
+                                            let mut processed = step_prompt.replace("{project_ox_dir}", &project_ox_dir);
+                                            if let Some(ref req_name) = wf_info.requirement_name {
+                                                for pat in &["{REQUIREMENT_NAME}", "{YOUR_NAME}", "{IDENTIFIED_NAME}", "{requirement_name}"] {
+                                                    processed = processed.replace(pat, req_name);
+                                                }
+                                            }
+                                            system_prompt.push_str(&processed);
+                                            if !wf_info.allows_code_modification {
+                                                system_prompt.push_str("\n\n⚠️ IMPORTANT: You CAN use tools (file_read, file_search, etc.) but you CANNOT modify source code files (.rs, .py, .js, etc.) in this step. You can only create/modify documentation files (.md, .txt, etc.).");
+                                            }
+                                        }
+                                    }
+
+                                    // 4. Memory retrieval (SQLite queries)
+                                    let project_id: Option<&str> = if rt_env.project_id.is_empty() {
+                                        None
+                                    } else {
+                                        Some(rt_env.project_id.as_str())
+                                    };
+                                    let memory_nodes = memory.retrieve_with_rerank(&user_text, &project_id, 5);
+                                    let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
+                                    memory.reinforce_accessed(&accessed_ids);
+                                    let memory_ctx = memory.format_memory_context(&memory_nodes, false);
+
+                                    // 5. Build effective messages with compressed cache
+                                    let effective_messages = if let Some((cached, prev_count)) = compressed_cache_data {
+                                        let start_idx = prev_count.min(session_messages.len());
+                                        let new_msgs = if start_idx < session_messages.len() {
+                                            &session_messages[start_idx..]
+                                        } else {
+                                            &[]
+                                        };
+                                        let mut combined = cached;
+                                        combined.extend_from_slice(new_msgs);
+                                        combined
+                                    } else {
+                                        session_messages
+                                    };
+
+                                    // 6. Token-aware context building
+                                    let turn_messages = helpers::build_context_with_option(
+                                        &context_builder,
+                                        &system_prompt,
+                                        &memory_ctx,
+                                        &effective_messages,
+                                        context_window,
+                                        use_refined,
+                                    );
+
+                                    // 7. Effort estimate
+                                    let effort = ox_core::context::estimate_effort(&user_text, effective_messages.len());
+                                    let planning = effort == ox_core::context::EffortLevel::High;
+
+                                    Ok::<_, String>((turn_messages, planning))
+                                }).await;
+
+                                // Handle spawn_blocking errors — send error to UI so user sees it
+                                let (turn_messages, planning) = match blocking_result {
+                                    Ok(Ok(result)) => result,
+                                    Ok(Err(e)) => {
+                                        tracing::error!("[BACKGROUND] Blocking task failed: {}", e);
+                                        let _ = tx.send(AgentToUiEvent::Error(format!(
+                                            "Preparing context failed: {}", e
+                                        )));
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("[BACKGROUND] Blocking task panicked: {}", e);
+                                        let _ = tx.send(AgentToUiEvent::Error(format!(
+                                            "Background task crashed: {}", e
+                                        )));
+                                        return;
+                                    }
+                                };
+
+                                // ── Now spawn the agent task with the prepared context ──
                                 agent::run_agent_turn(
                                     provider,
                                     turn_messages,
-                                    registry,
-                                    ctx,
+                                    tool_registry,
+                                    tool_ctx,
                                     tx,
                                     ui_to_agent_rx,
                                     cancel_token,
-                                    tm,
-                                    ac,
+                                    trust_manager,
+                                    agent_config,
                                     planning,
-                                    workflow_engine_clone,
+                                    workflow_engine,
                                 )
                                 .await;
                             });
+
+                            app.scroll_to_bottom();
+                            app.user_scrolled = false;
                         } else {
                             app.output
                                 .push_line(OutputLine::System(format!("[echo] {}", text.trim())));

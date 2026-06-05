@@ -149,8 +149,8 @@ api_key = ""                   # Your DeepSeek API key
 # max_tokens = 4096            # Maximum response tokens
 
 # ── Advanced Model Configuration ─────────────────────────
-# Fallback provider when model name doesn't match any known prefix.
-# Example: default_provider = "openai"  (for OpenAI-compatible APIs like DashScope)
+# Default provider — overrides automatic model-name prefix detection.
+# Example: default_provider = "openai"  (all models route through openai provider)
 # default_provider = "openai"
 
 # Explicit model→provider mapping (overrides automatic detection).
@@ -479,12 +479,12 @@ pub struct ModelsConfig {
     pub effort_level: String,
     /// Per-provider configuration, keyed by provider name ("openai", "anthropic", "deepseek").
     pub providers: HashMap<String, ProviderConfig>,
-    /// Fallback provider when prefix inference fails. Example: "openai".
-    /// Set via `[models] default_provider = "openai"`.
+    /// Default provider that overrides prefix inference. Set via `[models] default_provider = "openai"`.
+    /// When set, all models route to this provider unless overridden by `model_providers`.
     #[serde(default)]
     pub default_provider: String,
     /// Explicit model→provider mapping. Key = model name, Value = provider name.
-    /// Takes priority over `resolve_provider_name()` prefix inference and `default_provider`.
+    /// Takes priority over `default_provider` and prefix inference.
     #[serde(default)]
     pub model_providers: HashMap<String, String>,
 }

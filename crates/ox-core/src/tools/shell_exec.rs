@@ -169,7 +169,7 @@ impl Tool for ShellExecTool {
                     let reader = BufReader::new(stderr);
                     let mut lines_reader = reader.lines();
                     while let Ok(Some(line)) = lines_reader.next_line().await {
-                        lines.push(format!("[stderr] {line}"));
+                        lines.push(line);
                     }
                 }
                 lines
@@ -178,24 +178,97 @@ impl Tool for ShellExecTool {
             let out = stdout_lines.await.unwrap_or_default();
             let err = stderr_lines.await.unwrap_or_default();
 
-            let mut output_lines = out;
-            output_lines.extend(err);
-
             let status = child.wait().await;
-            (output_lines, status)
+            (out, err, status)
         })
         .await;
 
         match result {
-            Ok((lines, status)) => {
+            Ok((stdout_lines, stderr_lines, status)) => {
                 let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
 
-                let output = lines.join("\n");
-                let suffix = format!("\n[exit code: {exit_code}]");
-                let mut tool_output = if exit_code == 0 {
-                    ToolOutput::success(format!("{output}{suffix}"))
+                // Build a structured output with stdout, stderr, and analysis
+                let mut parts = Vec::new();
+
+                // Stdout section (only if non-empty)
+                if !stdout_lines.is_empty() {
+                    parts.push(format!("── stdout ──\n{}", stdout_lines.join("\n")));
+                }
+
+                let stderr_text = stderr_lines.join("\n");
+
+                if exit_code != 0 {
+                    // ── Error analysis for non-zero exits ──
+                    // Count error/warning keywords in combined output
+                    let combined = format!("{}\n{}", stdout_lines.join("\n"), stderr_text);
+                    let line_count = combined.lines().count();
+                    let error_count = combined.matches("error[").count()
+                        + combined.matches("error:").count()
+                        + combined.matches("Error:").count()
+                        + combined.matches("ERROR").count()
+                        + combined.matches("❌").count()
+                        + combined.matches("failed").count();
+                    let warning_count = combined.matches("warning[").count()
+                        + combined.matches("warning:").count()
+                        + combined.matches("Warning:").count()
+                        + combined.matches("WARNING").count()
+                        + combined.matches("⚠️").count()
+                        + combined.matches("WARN").count()
+                        + combined.matches("\x1b[33m").count(); // yellow ANSI
+
+                    // stderr section
+                    if !stderr_text.is_empty() {
+                        parts.push(format!("── stderr ({n} lines) ──\n{stderr_text}", n = stderr_lines.len()));
+                    }
+
+                    // Extract first relevant error line for quick diagnosis
+                    let first_error = combined.lines()
+                        .find(|l| {
+                            l.contains("error[") || l.contains("error:") ||
+                            l.contains("Error:") || l.contains("❌") ||
+                            l.contains("fatal") || l.contains("cannot find")
+                        })
+                        .map(|l| l.trim().to_string());
+
+                    // Build concise analysis block
+                    let mut analysis = format!("\n── Analysis ──\n📊 {} lines | {} errors | {} warnings\n💥 Exit code: {exit_code}",
+                        line_count, error_count, warning_count);
+
+                    if let Some(ref first) = first_error {
+                        analysis.push_str(&format!("\n🔍 First error: {}", first));
+                    }
+
+                    // Common error hints
+                    if combined.contains("not found") || combined.contains("No such file") {
+                        analysis.push_str("\n💡 Hint: A file or command was not found. Check the path and name.");
+                    }
+                    if combined.contains("syntax error") || combined.contains("parse error") || combined.contains("unexpected") {
+                        analysis.push_str("\n💡 Hint: There may be a syntax error. Check the command syntax.");
+                    }
+                    if combined.contains("permission denied") || combined.contains("Permission denied") || combined.contains("EACCES") {
+                        analysis.push_str("\n💡 Hint: Permission denied. Try with appropriate permissions or check file ownership.");
+                    }
+                    if combined.contains("does not exist") || combined.contains("No such file or directory") {
+                        analysis.push_str("\n💡 Hint: Path not found. Use `ls` to verify the file/directory exists.");
+                    }
+                    if combined.contains("connection refused") || combined.contains("Connection refused") || combined.contains("timed out") {
+                        analysis.push_str("\n💡 Hint: Network issue. Check if the service is running and reachable.");
+                    }
+
+                    parts.push(analysis);
                 } else {
-                    ToolOutput::error(format!("{output}{suffix}"))
+                    // Success — just include stderr if present (warnings, etc.)
+                    if !stderr_text.is_empty() {
+                        parts.push(format!("── stderr ──\n{stderr_text}"));
+                    }
+                    parts.push(format!("\n✅ Exit code: 0"));
+                }
+
+                let output = parts.join("\n\n");
+                let mut tool_output = if exit_code == 0 {
+                    ToolOutput::success(output)
+                } else {
+                    ToolOutput::error(output)
                 };
                 // Detect cd: if command succeeded and contains a cd target, carry the new dir.
                 if exit_code == 0 {

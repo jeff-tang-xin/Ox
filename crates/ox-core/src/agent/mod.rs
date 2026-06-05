@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::AgentConfig;
 use crate::llm::{LlmProvider, LlmStreamEvent};
 use crate::message::{Message, TokenUsage, ToolCall};
+use crate::safety::injection;
 use crate::safety::TrustManager;
 use crate::tools::{SafetyLevel, ToolContext, ToolRegistry};
 
@@ -119,6 +120,17 @@ pub async fn run_agent_turn(
     const MAX_SAME_TOOL_CALLS: u32 = 5; // Maximum times the same tool can be called in one turn
 
     let mut iteration = 0u32;
+
+    // 🎯 Capture the first user message for task anchoring
+    let user_task = messages.iter()
+        .find_map(|m| {
+            if let Message::User { content } = m {
+                Some(content.clone())
+            } else {
+                None
+            }
+        });
+
     loop {
         // Check cancellation before each LLM call.
         if cancel_token.is_cancelled() {
@@ -179,7 +191,24 @@ pub async fn run_agent_turn(
         // Check for queued interjections before LLM call.
         while let Ok(ev) = ui_rx.try_recv() {
             if let ui_event::UiToAgentEvent::Interjection(text) = ev {
-                messages.push(Message::user(&text));
+                // 🛡️ Scan interjection for prompt injection patterns
+                if injection::is_suspicious(&text) {
+                    let result = injection::detect(&text);
+                    let categories: Vec<String> = result.matches.iter()
+                        .map(|m| format!("{:?}", m.category))
+                        .collect();
+                    tracing::warn!(
+                        "🛡️ Prompt injection detected in interjection: categories={:?}, text={:?}",
+                        categories, &text[..text.len().min(100)]
+                    );
+                    let sanitized = injection::sanitize(&text);
+                    messages.push(Message::system(
+                        "⚠️ The following user input was sanitized for potential prompt injection:\n"
+                    ));
+                    messages.push(Message::user(&sanitized));
+                } else {
+                    messages.push(Message::user(&text));
+                }
                 let _ = ui_tx.send(AgentToUiEvent::Status(format!("💬 User: {}", text.trim())));
             }
         }
@@ -205,6 +234,23 @@ pub async fn run_agent_turn(
                     usage: total_usage,
                 });
                 return;
+            }
+        }
+
+        // 🎯 Task anchoring: remind LLM of the user's original request
+        // Prevents divergence in long multi-turn conversations.
+        if iteration > 0 {
+            if let Some(ref task) = user_task {
+                let anchor = if task.chars().count() > 200 {
+                    format!("{}...", task.chars().take(200).collect::<String>())
+                } else {
+                    task.clone()
+                };
+                messages.push(Message::system(&format!(
+                    "📋 **Current task** (reminder): {}\n\n\
+                     Stay focused on this task. Do NOT deviate to unrelated changes.",
+                    anchor
+                )));
             }
         }
 
@@ -925,7 +971,7 @@ pub async fn run_agent_turn(
                 "file_read" => {
                     serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
                         .and_then(|v| {
-                            let path = v.get("path").or(v.get("filename")).and_then(|p| p.as_str()).unwrap_or("?");
+                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
                             let limit = v.get("limit").and_then(|l| l.as_u64()).map(|l| format!(" (limit:{})", l)).unwrap_or_default();
                             Some(format!("{} {}", path, limit))
                         })
@@ -944,6 +990,17 @@ pub async fn run_agent_turn(
                             let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
                             let search = v.get("search").and_then(|s| s.as_str()).map(|s| if s.len()>50 {&s[..50]} else {s}).unwrap_or("");
                             Some(format!("{} | {}", path, search))
+                        })
+                }
+                "edit_file" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| {
+                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                            let old = v.get("old_string").and_then(|s| s.as_str()).map(|s| {
+                                let one_line = s.lines().next().unwrap_or(s);
+                                if one_line.len() > 60 { &one_line[..60] } else { one_line }
+                            }).unwrap_or("");
+                            Some(format!("{} | {}", path, old))
                         })
                 }
                 "code_search" => {
@@ -965,7 +1022,7 @@ pub async fn run_agent_turn(
                 }
                 "recall" => {
                     serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| v.get("node_id").or(v.get("query")).and_then(|q| q.as_str()).map(|s| s.to_string()))
+                        .and_then(|v| v.get("node_id").and_then(|q| q.as_str()).map(|s| s.to_string()))
                 }
                 "web_fetch" => {
                     serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
@@ -1382,11 +1439,32 @@ pub async fn run_agent_turn(
                 let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
             }
 
+            // 🛡️ Scan web_fetch and file_read results for prompt injection before
+            // they reach the LLM context. Untrusted external content may contain
+            // injection attacks like "ignore previous instructions".
+            let sanitized_content = if matches!(tc.name.as_str(), "web_fetch" | "file_read") && !result.is_error {
+                let injection_result = injection::detect(&result.content);
+                if injection_result.has_injection {
+                    let categories: Vec<String> = injection_result.matches.iter()
+                        .map(|m| format!("{:?}", m.category))
+                        .collect();
+                    tracing::warn!(
+                        "🛡️ Prompt injection detected in {} output: categories={:?}",
+                        tc.name, categories
+                    );
+                    injection::sanitize(&result.content)
+                } else {
+                    result.content.clone()
+                }
+            } else {
+                result.content.clone()
+            };
+
             // ── Context Offloading: Save verbose results to external files ──
             let offloaded = offloader.process_result(
                 &tc.name,
                 &tc.arguments,
-                &result.content,
+                &sanitized_content,
                 iteration as usize,
                 10000, // threshold: 10000 chars — only offload truly enormous outputs
             );
@@ -1405,9 +1483,14 @@ pub async fn run_agent_turn(
                 is_error: result.is_error,
             });
 
+            let result_content = format!(
+                "── DATA ({}) ──\n{}\n── END DATA ──",
+                tc.name,
+                offloaded.to_context_message()
+            );
             let result_msg = Message::ToolResult {
                 tool_call_id: tc.id.clone(),
-                content: offloaded.to_context_message(),
+                content: result_content,
             };
             new_messages.push(result_msg.clone());
             messages.push(result_msg);
@@ -1432,6 +1515,25 @@ pub async fn run_agent_turn(
                         tc.name, ctx
                     )));
                 }
+            }
+
+            // 📖 Verify-after-edit: prompt LLM to verify changes
+            if matches!(tc.name.as_str(), "file_patch" | "file_write") && !result.is_error {
+                // Extract the file path from tool arguments
+                let file_path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("path")
+                            .and_then(|p| p.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| "the file".to_string());
+                messages.push(Message::system(&format!(
+                    "📖 You modified `{path}`. Please verify by reading the file:\n\
+                     file_read(path=\"{path}\")\n\n\
+                     Then check if the result matches your plan. If not, fix it.",
+                    path = file_path
+                )));
             }
         }
 
@@ -1467,15 +1569,65 @@ pub async fn run_agent_turn(
                                             .last()
                                             .unwrap_or("");
                                         if !exit_code.contains("exit code: 0") {
-                                            messages.push(Message::system(&format!(
-                                                "Build/Test FAILED. Read the error above, fix the issue, and retry.\n\
-                                                 Error summary: {}",
+                                            // Structured error recovery protocol
+                                            // Extract more context for better diagnosis
+                                            let error_lines: Vec<&str> = content.lines()
+                                                .filter(|l| {
+                                                    l.contains("error[") || l.contains("error:") ||
+                                                    l.contains("Error:") || l.contains("❌") ||
+                                                    l.contains("fatal") || l.contains("cannot find") ||
+                                                    l.contains("expected") || l.contains("unexpected") ||
+                                                    l.contains("not found") || l.contains("undefined")
+                                                })
+                                                .collect();
+                                            let error_summary = if error_lines.is_empty() {
                                                 content.lines().take(5).collect::<Vec<_>>().join("\n")
-                                            )));
-                                            // Track fix attempts in this turn (count existing failure messages)
+                                            } else {
+                                                error_lines.iter().take(5).map(|l| l.trim()).collect::<Vec<_>>().join("\n")
+                                            };
+
                                             let fix_attempts = messages.iter()
-                                                .filter(|m| matches!(m, Message::System { content } if content.contains("Build/Test FAILED")))
+                                                .filter(|m| matches!(m, Message::System { content } if content.contains("BUILD/TOOL FAILED")))
                                                 .count() + 1;
+
+                                            let recovery_msg = if fix_attempts == 1 {
+                                                format!(
+"🔧 BUILD/TOOL FAILED (attempt 1/3)
+
+Error summary:
+```
+{error_summary}
+```
+
+Recovery protocol — follow these steps IN ORDER:
+1. **Read the error** — the relevant lines are shown above
+2. **Read the affected source code** — use `file_read` on the files mentioned in the error
+3. **Diagnose root cause** — understand WHY the error occurred (wrong type? missing import? syntax error?)
+4. **Fix the issue** — use `file_patch` to apply the correction
+5. **Verify** — re-run the build/test command to confirm
+
+DO NOT guess. Read the source code first, then fix."
+                                                )
+                                            } else {
+                                                format!(
+"🔧 BUILD/TOOL FAILED (attempt {attempts}/3)
+
+Error summary:
+```
+{error_summary}
+```
+
+Previous fix did NOT resolve the issue. Try a different approach:
+1. **Re-read the error** — you may have misread it
+2. **Re-read the source code** — the actual code may differ from what you expect
+3. **Change your approach** — the fix you tried was incorrect, try something else
+4. **Verify** — re-run and check if the error changes",
+                                                    attempts = fix_attempts
+                                                )
+                                            };
+
+                                            messages.push(Message::system(&recovery_msg));
+
                                             if fix_attempts >= 3 {
                                                 messages.push(Message::system(
                                                     "3 fix attempts exhausted. Report the remaining error to the user and ask for guidance."

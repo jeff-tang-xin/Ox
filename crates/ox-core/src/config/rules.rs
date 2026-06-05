@@ -19,6 +19,18 @@ pub struct EnforcementRules {
     /// 检查 LLM 在调用 shell_exec 前是否列出了 Steps。
     #[serde(default = "default_true")]
     pub steps_before_shell: bool,
+
+    /// 规则 3: 编辑前必须先读取文件 (Read Before Edit)
+    /// 检查 LLM 在调用 file_write/file_patch 前是否通过 file_read 读取过目标文件。
+    /// 防止 LLM 在没有阅读的情况下猜测文件内容。
+    #[serde(default = "default_true")]
+    pub read_before_edit: bool,
+
+    /// 规则 4: 修改前检查调用方 (Impact Analysis)
+    /// 编辑已存在的源码文件时，检查是否通过 code_search 搜索了依赖/调用方。
+    /// 防止修改后忘记更新调用处。
+    #[serde(default = "default_true")]
+    pub impact_analysis: bool,
     
     /// 自定义计划检测模式（可选）
     /// 用户可以添加额外的正则表达式模式来检测计划意图
@@ -39,6 +51,8 @@ impl Default for EnforcementRules {
             enabled: true,
             plan_before_edit: true,
             steps_before_shell: true,
+            read_before_edit: true,
+            impact_analysis: true,
             custom_plan_patterns: vec![],
             custom_step_patterns: vec![],
         }

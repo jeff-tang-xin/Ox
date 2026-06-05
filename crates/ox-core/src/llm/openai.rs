@@ -246,11 +246,16 @@ impl LlmProvider for OpenAiProvider {
         // Retry loop with exponential backoff for transient failures
         const MAX_RETRIES: u32 = 3;
         let mut attempt = 0u32;
+
+        // Normalize base_url: strip trailing slash to avoid double-slash in path
+        let base = self.base_url.trim_end_matches('/');
+        let request_url = format!("{}/chat/completions", base);
+
         let resp = loop {
             attempt += 1;
             let result = self
                 .client
-                .post(format!("{}/chat/completions", self.base_url))
+                .post(&request_url)
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .header("Content-Type", "application/json")
                 .json(&body)
@@ -270,7 +275,8 @@ impl LlmProvider for OpenAiProvider {
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
-                    let err_msg = format!("API unreachable: {}", e);
+                    let err_msg = format!("API request failed to {}: {}", request_url, e);
+                    tracing::error!("{}", err_msg);
                     let _ = tx.send(LlmStreamEvent::Error(err_msg));
                     return Ok(());
                 }
@@ -281,7 +287,10 @@ impl LlmProvider for OpenAiProvider {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
             let err_msg = format!("API error {status}: {body_text}");
-            tracing::error!("{}", err_msg);
+            tracing::error!(
+                "[LLM ERROR] {} | URL: {} | Model: {}",
+                err_msg, request_url, self.model
+            );
             let _ = tx.send(LlmStreamEvent::Error(err_msg));
             return Ok(());
         }

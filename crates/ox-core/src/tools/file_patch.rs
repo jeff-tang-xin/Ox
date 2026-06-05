@@ -12,11 +12,11 @@ impl Tool for FilePatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply small edits to existing files (<50% changed). For new files or large rewrites, use file_write.\n\n\
-         💡 Two modes:\n\
-         1. Text-based: Provide 'search' + 'replace' for search/replace\n\
-         2. Line-based: Provide 'start_line' + 'end_line' + 'new_content' to replace specific lines\n\n\
-         ⚠️ For text-based mode: search must match exactly once. Use file_read first to get exact content."
+        "Apply small edits to existing files via search/replace. For simple exact-string replacement, prefer edit_file.\n\n\
+         Two modes:\n\
+         1. Text-based: Provide 'search' + 'replace' for fuzzy search/replace (handles whitespace differences)\n\
+         2. Line-based: Provide 'start_line' + 'end_line' + 'new_content' to replace by line numbers\n\n\
+         After using file_read to inspect line numbers, line-based mode is the most reliable."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -25,53 +25,33 @@ impl Tool for FilePatchTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path (relative). Required unless using file_id or filename."
-                },
-                "filename": {
-                    "type": "string",
-                    "description": "Filename to search in index. Must be unique."
-                },
-                "file_id": {
-                    "type": "integer",
-                    "description": "File ID from index (most reliable)."
+                    "description": "File path (relative to workspace)."
                 },
                 "search": {
                     "type": "string",
-                    "description": "Text to find (for text-based mode). Keep it SHORT - 2-3 unique lines max. Use distinctive identifiers."
+                    "description": "【Text-based mode】Code to find. Handles whitespace/indent differences."
                 },
                 "replace": {
                     "type": "string",
-                    "description": "Replacement text (for text-based mode). Use \\n for newlines."
+                    "description": "【Text-based mode】Replacement text."
                 },
                 "start_line": {
                     "type": "integer",
-                    "description": "Start line number (1-based, for line-based mode). Get this from file_read output."
+                    "description": "【Line-based mode】Start line number (1-based). Get this from file_read output."
                 },
                 "end_line": {
                     "type": "integer",
-                    "description": "End line number (inclusive, 1-based, for line-based mode)."
+                    "description": "【Line-based mode】End line number (inclusive, 1-based)."
                 },
                 "new_content": {
                     "type": "string",
-                    "description": "New content to replace lines start_line..end_line (for line-based mode)."
-                },
-                "edits": {
-                    "type": "array",
-                    "description": "Multiple edits in one call. Each edit: {\"old\": \"...\", \"new\": \"...\"} OR {\"start_line\": N, \"end_line\": M, \"new_content\": \"...\"}"
+                    "description": "【Line-based mode】New content to replace lines start_line..end_line."
                 }
             },
-            "examples": [
-                {
-                    "path": "src/main.rs",
-                    "search": "fn calculate() {\n    let result = a + b;",
-                    "replace": "fn calculate() {\n    let result = a * b;"
-                },
-                {
-                    "path": "src/main.rs",
-                    "start_line": 42,
-                    "end_line": 44,
-                    "new_content": "fn calculate() {\n    let result = a * b;\n}"
-                }
+            "required": ["path"],
+            "oneOf": [
+                { "required": ["search", "replace"], "description": "Text-based: find and replace by content" },
+                { "required": ["start_line", "end_line", "new_content"], "description": "Line-based: replace by line numbers (most reliable, use after file_read)" }
             ]
         })
     }
@@ -81,96 +61,30 @@ impl Tool for FilePatchTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
-        // Determine file path from parameters (priority: file_id > filename > path)
-        let resolved_path = if let Some(file_id) = args.get("file_id").and_then(|id| id.as_i64()) {
-            // Method 1: Use file_id for precise matching
-            match ctx.file_index.find_by_id(file_id) {
-                Ok(Some(entry)) => ctx.working_dir.join(&entry.full_path),
-                Ok(None) => {
-                    return ToolOutput::error(format!(
-                        "❌ File Not Found: No file with ID {}\n\n\
-                             💡 How to fix:\n\
-                             • Use file_list tool to see available files and their IDs\n\
-                             • Or use 'filename' or 'path' parameter instead",
-                        file_id
-                    ));
-                }
-                Err(e) => return ToolOutput::error(format!("Failed to query file index: {}", e)),
-            }
-        } else if let Some(filename) = args.get("filename").and_then(|f| f.as_str()) {
-            // Method 2: Use filename (may have multiple matches)
-            match ctx.file_index.find_by_filename(filename) {
-                Ok(matches) if matches.len() == 1 => ctx.working_dir.join(&matches[0].full_path),
-                Ok(matches) if matches.len() > 1 => {
-                    // Multiple matches - return options for LLM to choose
-                    let options: Vec<String> = matches
-                        .iter()
-                        .map(|e| format!("  [ID: {}] {}", e.id, e.full_path))
-                        .collect();
-
-                    return ToolOutput::error(format!(
-                        "❌ Multiple Files Matched '{}':\n{}\n\n\
-                                 💡 How to fix:\n\
-                                 • Retry with 'file_id' parameter for precise matching\n\
-                                 • Example: {{\"file_id\": {}}}",
-                        filename,
-                        options.join("\n"),
-                        matches[0].id
-                    ));
-                }
-                Ok(_) => {
-                    return ToolOutput::error(format!(
-                        "❌ File Not Found: '{}' not in index\n\n\
-                                 💡 How to fix:\n\
-                                 • Check filename spelling\n\
-                                 • Use file_list tool to see all indexed files\n\
-                                 • Or use 'path' parameter with full relative path",
-                        filename
-                    ));
-                }
-                Err(e) => return ToolOutput::error(format!("Failed to query file index: {}", e)),
-            }
-        } else if let Some(path_str) = args.get("path").and_then(|p| p.as_str()) {
-            // Method 3: Traditional path-based approach (backward compatible)
-            // Normalize path: trim whitespace and standardize separators
-            let normalized_path = path_str.trim().replace('\\', "/");
-
-            // Handle absolute vs relative paths
-            if std::path::Path::new(&normalized_path).is_absolute() {
-                std::path::PathBuf::from(&normalized_path)
-            } else {
-                ctx.working_dir.join(&normalized_path)
-            }
-        } else {
-            return ToolOutput::error(
-                "❌ Missing Required Parameter\n\n\
-                 💡 How to fix - provide ONE of:\n\
-                 • 'file_id': Precise file ID from index (recommended)\n\
-                 • 'filename': Filename to search (must be unique)\n\
-                 • 'path': Full relative path (traditional method)\n\n\
-                 📝 Examples:\n\
-                 {\"file_id\": 123, \"search\": \"...\", \"replace\": \"...\"} - Patch by ID\n\
-                 {\"filename\": \"main.rs\", \"search\": \"...\", \"replace\": \"...\"} - Patch by filename\n\
-                 {\"path\": \"src/main.rs\", \"search\": \"...\", \"replace\": \"...\"} - Patch by path",
-            );
+        // ── Resolve path (path-only, no file_id/filename) ──
+        let path_str = match args.get("path").and_then(|p| p.as_str()) {
+            Some(p) => p.trim().replace('\\', "/"),
+            None => return ToolOutput::error(
+                "❌ Missing required parameter: 'path'. Usage: {\"path\": \"<file>\", ...}",
+            ),
         };
-
-        // Keep the user-friendly path for error messages
+        let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
+            std::path::PathBuf::from(&path_str)
+        } else {
+            ctx.working_dir.join(&path_str)
+        };
         let display_path = resolved_path.clone();
-
         let path =
             match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
                 Ok(p) => p,
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
             };
 
-        // Determine edit mode: line-based OR text-based OR multiple edits
-        let edit_mode = if args.get("edits").is_some() {
-            "multiple".to_string()
-        } else if args.get("start_line").is_some() {
-            "line_based".to_string()
+        // Determine edit mode: line-based or text-based
+        let edit_mode = if args.get("start_line").is_some() {
+            "line_based"
         } else {
-            "text_based".to_string()
+            "text_based"
         };
 
         // Extract parameters based on mode
@@ -224,7 +138,7 @@ impl Tool for FilePatchTool {
         let replace_clone = replace.to_string();
         let working_dir = ctx.working_dir.clone();
         let file_index = Arc::clone(&ctx.file_index);
-        let edit_mode_clone = edit_mode.clone();
+        let edit_mode_clone = edit_mode;
         let start_line = args.get("start_line").and_then(|v| v.as_i64());
         let end_line = args.get("end_line").and_then(|v| v.as_i64());
         let new_content = args.get("new_content").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -297,97 +211,250 @@ impl Tool for FilePatchTool {
 
                 result_lines.join("\n")
             } else {
-                // Text-based mode: search and replace
-                let count = content.matches(&search_clone).count();
-                
-                if count == 0 {
-                    // If exact match fails, try fuzzy matching with normalized whitespace
-                    tracing::warn!(
-                        "Exact match failed for file {}. Trying fuzzy matching...",
-                        display_path_clone.display()
-                    );
-                    
-                    // Normalize both strings: collapse multiple whitespace into single space
-                    let normalize_whitespace = |s: &str| -> String {
-                        s.split_whitespace().collect::<Vec<&str>>().join(" ")
-                    };
-                    
-                    let normalized_search = normalize_whitespace(&search_clone);
-                    let normalized_content = normalize_whitespace(&content);
-                    
-                    // Check if normalized version matches
-                    if normalized_content.contains(&normalized_search) {
+                // ── Text-based mode: search and replace ──
+                //
+                // Strategy cascade (inspired by Aider research):
+                // 1. Exact match (fast path, zero risk)
+                // 2. Relative-indent normalized match — handles tab vs spaces, indent level changes
+                // 3. Line-smart fuzzy location finding → read exact text → clean replace
+                //
+                // ✅ Always line-based replacement — no character-level diffing.
+
+                // Step 1: Try exact match first (fast path, zero risk)
+                if content.contains(&search_clone) {
+                    let count = content.matches(&search_clone).count();
+                    if count == 1 {
+                        content.replacen(&search_clone, &replace_clone, 1)
+                    } else if count > 1 {
                         return Err(format!(
-                            "❌ Search string not found (exact match failed)\n\n\
-                             🔍 Diagnosis: Your search string has whitespace differences from the file content.\n\n\
-                             💡 Solutions:\n\
-                             1. Use file_read to get the EXACT content including spaces/newlines\n\
-                             2. Copy the exact text from file_read output\n\
-                             3. Use fewer lines but more unique context\n\
-                             4. Or use file_write to rewrite the entire file\n\n\
-                             📝 Example of proper search string:\n\
-                             \"search\": \"public void processOrder() {{\\n    Order order = validate(request);\\n}}\""
+                            "Search string found {count} times in {} (must match exactly once). Provide more context to make it unique.",
+                            display_path_clone.display()
                         ));
+                    } else {
+                        unreachable!() // contains() returned true
                     }
-                    
-                    // Provide helpful diagnostic information
-                    let lines: Vec<&str> = content.lines().collect();
-                    let total_lines = lines.len();
-                    
-                    // Try to find similar lines (first line of search string)
-                    let search_first_line = search_clone.lines().next().unwrap_or("").trim();
-                    let mut similar_lines = Vec::new();
-                    
-                    for (i, line) in lines.iter().enumerate() {
-                        if line.trim().contains(search_first_line) || 
-                           search_first_line.contains(line.trim()) && !line.trim().is_empty() {
-                            similar_lines.push((i + 1, line.trim()));
-                            if similar_lines.len() >= 5 {
+                } else {
+                    // ── Preprocess: convert both to relative-indent form ──
+                    // This makes indentation differences (tab vs space, 4 vs 2 spaces) irrelevant,
+                    // because relative-indent encodes only the CHANGE from each line to the next.
+                    // Inspired by aider/ RelativeIndenter.
+
+                    let file_lines: Vec<&str> = content.lines().collect();
+                    let search_lines: Vec<&str> = search_clone.lines().collect();
+
+                    if search_lines.is_empty() {
+                        return Err("Search string is empty.".to_string());
+                    }
+
+                    /// Convert absolute indentation to relative indentation.
+                    /// First line keeps its full indent (the base), subsequent lines
+                    /// encode only the INDENT CHANGE relative to the previous line.
+                    fn to_relative_indent(lines: &[&str]) -> Vec<String> {
+                        let mut out = Vec::with_capacity(lines.len());
+                        let mut prev_indent: usize = 0;
+                        // Choose a marker character not present in the text
+                        let marker = '←';
+                        for line in lines {
+                            let trimmed = line.trim_start();
+                            let indent = line.len() - trimmed.len();
+                            let indent_str: String;
+                            if out.is_empty() {
+                                // First line: keep full indent as base
+                                indent_str = " ".repeat(indent);
+                            } else if indent > prev_indent {
+                                // More indented: keep only the NEW whitespace
+                                let diff = indent - prev_indent;
+                                indent_str = " ".repeat(diff);
+                            } else if indent == prev_indent {
+                                // Same indent: no whitespace prefix
+                                indent_str = String::new();
+                            } else {
+                                // Less indented: marker for each level of outdent
+                                let diff = prev_indent - indent;
+                                indent_str = marker.to_string().repeat(diff);
+                            }
+                            out.push(format!("{}{}", indent_str, trimmed));
+                            prev_indent = indent;
+                        }
+                        out
+                    }
+
+                    /// Convert relative-indent lines back to absolute (using file's indent as reference).
+                    fn from_relative_indent(rel: &[String], file_lines: &[&str], start: usize) -> Vec<String> {
+                        let marker = '←';
+                        let mut out = Vec::with_capacity(rel.len());
+                        let mut prev_indent: usize = 0;
+                        // Use the file's first-line indent as reference
+                        if start < file_lines.len() {
+                            let first = file_lines[start];
+                            prev_indent = first.len() - first.trim_start().len();
+                        }
+                        for line in rel {
+                            let trimmed = line.trim_start();
+                            let prefix = &line[..line.len() - trimmed.len()];
+                            if prefix.contains(marker) {
+                                // Outdent: subtract marker count
+                                let outdent = prefix.chars().filter(|&c| c == marker).count();
+                                prev_indent = prev_indent.saturating_sub(outdent);
+                                out.push(format!("{:indent$}{}", "", trimmed, indent = prev_indent));
+                            } else if prefix.is_empty() && trimmed.len() < line.len() {
+                                // Same indent as previous
+                                out.push(format!("{:indent$}{}", "", trimmed, indent = prev_indent));
+                            } else {
+                                // More indented (or first line)
+                                let add = prefix.len();
+                                prev_indent += add;
+                                out.push(format!("{:indent$}{}", "", trimmed, indent = prev_indent));
+                            }
+                        }
+                        out
+                    }
+
+                    // Step 2: Try relative-indent normalized match
+                    let search_rel = to_relative_indent(&search_lines);
+                    let file_rel = to_relative_indent(&file_lines);
+
+                    let n_search = search_rel.len();
+                    let n_file = file_rel.len();
+
+                    let mut best_start = 0usize;
+                    let mut best_end = 0usize;
+                    let mut best_score = 0usize;
+                    // Track duplicates for disambiguation
+                    let mut duplicate_positions: Vec<(usize, usize)> = Vec::new();
+
+                    for start in 0..n_file {
+                        let mut matched = 0usize;
+                        let mut si = 0usize;
+                        let mut fi = start;
+
+                        while si < n_search && fi < n_file {
+                            if search_rel[si] == file_rel[fi] {
+                                matched += 1;
+                                si += 1;
+                                fi += 1;
+                            } else if search_lines[si].trim().is_empty() {
+                                // Allow skipping blank lines in search
+                                si += 1;
+                            } else if file_lines[fi].trim().is_empty() {
+                                // Allow skipping blank lines in file
+                                fi += 1;
+                            } else {
                                 break;
                             }
                         }
+
+                        if si == n_search {
+                            if matched > best_score {
+                                best_score = matched;
+                                best_start = start;
+                                best_end = fi;
+                                duplicate_positions.clear();
+                                duplicate_positions.push((start, fi));
+                            } else if matched == best_score {
+                                duplicate_positions.push((start, fi));
+                            }
+                        }
                     }
-                    
-                    let similar_info = if similar_lines.is_empty() {
-                        "No similar content found.".to_string()
+
+                    let threshold = if n_search >= 3 { n_search - 1 } else { n_search };
+
+                    if best_score >= threshold {
+                        // Check for duplicates
+                        if duplicate_positions.len() > 1 {
+                            let locations: Vec<String> = duplicate_positions.iter()
+                                .enumerate()
+                                .map(|(idx, (s, _))| {
+                                    let preview = file_lines[*s.min(&(file_lines.len() - 1))]
+                                        .trim()
+                                        .chars()
+                                        .take(80)
+                                        .collect::<String>();
+                                    format!("  {}. Line {}: {:.80}", idx + 1, s + 1, preview)
+                                })
+                                .collect();
+                            return Err(format!(
+                                "❌ Search matched {n} locations in {f}\n\n\
+                                 Options:\n{locs}\n\n\
+                                 💡 Fix: Add more unique context (like surrounding method name or comments) \
+                                 to disambiguate. Or use file_write for a full rewrite.",
+                                n = duplicate_positions.len(),
+                                f = display_path_clone.display(),
+                                locs = locations.join("\n"),
+                            ));
+                        }
+
+                        // Found it! Apply clean line-based replacement.
+                        let replace_text = replace_clone;
+                        tracing::info!(
+                            "[FILE_PATCH] Relative-indent match at lines {}-{} (score: {}/{}), applying clean replacement",
+                            best_start + 1, best_end, best_score, n_search
+                        );
+
+                        // Convert the LLM's replacement text to relative-indent too,
+                        // then back to absolute using the FILE's indent context.
+                        // This ensures the replacement uses the file's actual indentation,
+                        // not whatever indent style the LLM used.
+                        let replace_lines: Vec<&str> = replace_text.lines().collect();
+                        if replace_lines.is_empty() {
+                            // Deleting lines
+                            let mut result: Vec<String> = Vec::new();
+                            for i in 0..best_start {
+                                result.push(file_lines[i].to_string());
+                            }
+                            for i in best_end..n_file {
+                                result.push(file_lines[i].to_string());
+                            }
+                            result.join("\n")
+                        } else {
+                            let replace_rel = to_relative_indent(&replace_lines);
+                            let replace_abs = from_relative_indent(&replace_rel, &file_lines, best_start);
+
+                            let mut result: Vec<String> = Vec::new();
+                            for i in 0..best_start {
+                                result.push(file_lines[i].to_string());
+                            }
+                            result.extend(replace_abs);
+                            for i in best_end..n_file {
+                                result.push(file_lines[i].to_string());
+                            }
+                            result.join("\n")
+                        }
                     } else {
-                        let lines_str: Vec<String> = similar_lines
-                            .iter()
-                            .map(|(num, text)| format!("  Line {}: {}", num, text))
+                        // ── All strategies failed — provide diagnostic ──
+                        let search_first = search_lines[0].trim();
+                        let mut similar = Vec::new();
+                        for (i, line) in file_lines.iter().enumerate() {
+                            if line.trim().contains(search_first) || search_first.contains(line.trim()) {
+                                similar.push((i + 1, line.trim()));
+                                if similar.len() >= 5 { break; }
+                            }
+                        }
+                        if similar.is_empty() {
+                            return Err(format!(
+                                "❌ Search content not found in {} ({} lines)\n\
+                                 🔍 No similar content found.\n\
+                                 💡 Fix: Use file_read to verify the file content",
+                                display_path_clone.display(),
+                                n_file,
+                            ));
+                        }
+                        let sim: Vec<String> = similar.iter()
+                            .map(|(n, t)| format!("  Line {}: {}", n, t))
                             .collect();
-                        format!("🔍 Similar content found:\n{}\n\n", lines_str.join("\n"))
-                    };
-                    
-                    return Err(format!(
-                        "❌ Search string not found in {}\n\n\
-                         🔍 File has {} lines\n\
-                         {}\
-                         💡 How to fix:\n\
-                         - Use file_read to see the EXACT content first\n\
-                         - Copy exact text from file_read output (including spaces/newlines)\n\
-                         - Use shorter, more unique search strings (2-3 lines)\n\
-                         - Include unique identifiers (method names, variable names)\n\
-                         - Or use file_write to rewrite the entire file\n\n\
-                         📝 Better approach:\n\
-                         1. file_read(path=\"{}\")\n\
-                         2. Copy exact code you want to change\n\
-                         3. file_patch with that exact text",
-                        display_path_clone.display(),
-                        total_lines,
-                        similar_info,
-                        display_path_clone.display()
-                    ));
+                        return Err(format!(
+                            "❌ Search content not found in {} (matched only {}/{} lines)\n\
+                             🔍 Closest:\n{}\n\n\
+                             💡 Fix:\n\
+                             - Use file_read to get EXACT content\n\
+                             - Include 2-3 unique lines in search\n\
+                             - Or use file_write for full rewrite",
+                            display_path_clone.display(),
+                            best_score, n_search,
+                            sim.join("\n"),
+                        ));
+                    }
                 }
-
-                // Apply text-based replacement
-                if count != 1 {
-                    return Err(format!(
-                        "Search string found {count} times in {} (must match exactly once). Provide more context to make it unique.",
-                        display_path_clone.display()
-                    ));
-                }
-
-                content.replacen(&search_clone, &replace_clone, 1)
             };
 
             // Phase 3: Write file

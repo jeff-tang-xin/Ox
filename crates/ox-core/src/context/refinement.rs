@@ -204,7 +204,7 @@ pub fn generate_memory_summary(messages: &[Message]) -> Option<MemorySummary> {
         return None;
     }
     
-    // Extract topic from first user message
+    // Extract topic from first user message (keep it short)
     let topic = turns.first()?.user_message.chars().take(100).collect();
     
     // Collect all tools used
@@ -217,8 +217,50 @@ pub fn generate_memory_summary(messages: &[Message]) -> Option<MemorySummary> {
     // Check for code changes
     let has_changes = turns.iter().any(|t| t.has_code_changes);
     
-    // Extract key insights (last assistant summary)
-    let key_insights = turns.last()?.assistant_summary.clone();
+    // 🔍 Extract key insights: look for ## Done block in ALL assistant messages
+    let mut key_insights = String::new();
+    for msg in messages.iter().rev() {
+        if let Message::Assistant { content, .. } = msg {
+            // Prefer Done block content
+            if let Some(done_pos) = content.rfind("## Done") {
+                let done_content = &content[done_pos..];
+                let first_line = done_content.lines()
+                    .find(|l| !l.trim().is_empty() && !l.trim().starts_with("##"))
+                    .unwrap_or("");
+                if !first_line.trim().is_empty() {
+                    key_insights = first_line.trim().chars().take(200).collect();
+                    break;
+                }
+            }
+        }
+        // Look for successful patch in tool results
+        if let Message::ToolResult { content, .. } = msg {
+            if content.contains("Successfully patched") || content.contains("Successfully written") {
+                let line = content.lines()
+                    .find(|l| l.contains("Successfully"))
+                    .unwrap_or("");
+                key_insights = line.trim().chars().take(200).collect();
+                break;
+            }
+        }
+    }
+    
+    // Fallback to first assistant summary if no Done block found
+    if key_insights.is_empty() {
+        // Look for the LAST assistant message with real content (not just Plan)
+        for msg in messages.iter().rev() {
+            if let Message::Assistant { content, .. } = msg {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with("## Plan") && !trimmed.starts_with("▎ Plan") {
+                    key_insights = trimmed.chars().take(200).collect();
+                    break;
+                }
+            }
+        }
+    }
+    if key_insights.is_empty() {
+        key_insights = turns.last()?.assistant_summary.clone();
+    }
     
     Some(MemorySummary {
         topic,

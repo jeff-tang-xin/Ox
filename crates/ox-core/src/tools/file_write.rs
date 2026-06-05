@@ -14,14 +14,8 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create or overwrite a file. Use ONLY for new files or complete rewrites (>50% changed). For small edits, use file_patch.\n\n\
-         ⚠️ CRITICAL: You MUST provide the 'path' parameter with a COMPLETE file path:\n\
-         • For NEW files: Always specify full relative path (e.g., 'src/output.txt', 'docs/readme.md')\n\
-         • For EXISTING files: Can use 'path', 'filename', or 'file_id'\n\n\
-         💡 IMPORTANT: Large files (>1 MB) are automatically written in chunks - you can provide the full content without worrying about size limits!\n\n\
-         💡 Examples:\n\
-         - New file: {\"path\": \"src/utils/helper.rs\", \"content\": \"...\"}\n\
-         - Existing: {\"filename\": \"main.rs\", \"content\": \"...\"}"
+        "Create or overwrite a file. Use for new files or complete rewrites (>50% changed). For targeted edits, use edit_file.\n\n\
+         You MUST provide the complete relative path (e.g. 'src/utils/helper.rs'), not just a filename."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -30,38 +24,19 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "⚠️ ALWAYS REQUIRED for new files: Complete relative path including directories (e.g., 'src/main.rs', 'docs/guide.md'). For existing files, can also use filename or file_id instead."
-                },
-                "filename": {
-                    "type": "string",
-                    "description": "Alternative for EXISTING files only: Search by filename in index. NOT recommended for new files (use 'path' instead)."
-                },
-                "file_id": {
-                    "type": "integer",
-                    "description": "Alternative for EXISTING files only: Precise file ID from index. Use file_list to get IDs. Cannot be used for new files."
+                    "description": "Complete relative file path, including directory (e.g. 'src/main.rs', 'docs/guide.md')."
                 },
                 "content": {
                     "type": "string",
-                    "description": "✅ REQUIRED: The content to write to the file. Large files (>1 MB) will be automatically written in chunks."
+                    "description": "The full content to write."
                 },
                 "encoding": {
                     "type": "string",
-                    "description": "File encoding for writing. Options: 'utf-8' (default), 'gbk', 'gb18030', 'utf-16le', 'utf-16be', 'latin1'. Default is UTF-8.",
+                    "description": "File encoding: 'utf-8' (default), 'gbk', 'gb18030', 'utf-16le', 'utf-16be', 'latin1'.",
                     "enum": ["utf-8", "gbk", "gb18030", "utf-16le", "utf-16be", "latin1"]
                 }
             },
-            "required": ["content"],
-            "oneOf": [
-                {"required": ["path"]},
-                {"required": ["filename"]},
-                {"required": ["file_id"]}
-            ],
-            "examples": [
-                {"path": "src/new_file.rs", "content": "// New file with full path"},
-                {"path": "docs/tutorial.md", "content": "# Tutorial"},
-                {"filename": "existing.rs", "content": "// Modifying existing file"},
-                {"path": "legacy.txt", "content": "中文内容", "encoding": "gbk"}
-            ]
+            "required": ["path", "content"]
         })
     }
 
@@ -70,84 +45,18 @@ impl Tool for FileWriteTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
-        // Determine file path from parameters (priority: file_id > filename > path)
-        let resolved_path = if let Some(file_id) = args.get("file_id").and_then(|id| id.as_i64()) {
-            // Method 1: Use file_id for precise matching
-            match ctx.file_index.find_by_id(file_id) {
-                Ok(Some(entry)) => ctx.working_dir.join(&entry.full_path),
-                Ok(None) => {
-                    return ToolOutput::error(format!(
-                        "❌ File Not Found: No file with ID {}\n\n\
-                             💡 How to fix:\n\
-                             • Use file_list tool to see available files and their IDs\n\
-                             • Or use 'filename' or 'path' parameter instead",
-                        file_id
-                    ));
-                }
-                Err(e) => return ToolOutput::error(format!("Failed to query file index: {}", e)),
-            }
-        } else if let Some(filename) = args.get("filename").and_then(|f| f.as_str()) {
-            // Method 2: Use filename (may have multiple matches)
-            match ctx.file_index.find_by_filename(filename) {
-                Ok(matches) if matches.len() == 1 => ctx.working_dir.join(&matches[0].full_path),
-                Ok(matches) if matches.len() > 1 => {
-                    // Multiple matches - return options for LLM to choose
-                    let options: Vec<String> = matches
-                        .iter()
-                        .map(|e| format!("  [ID: {}] {}", e.id, e.full_path))
-                        .collect();
-
-                    return ToolOutput::error(format!(
-                        "❌ Multiple Files Matched '{}':\n{}\n\n\
-                                 💡 How to fix:\n\
-                                 • Retry with 'file_id' parameter for precise matching\n\
-                                 • Example: {{\"file_id\": {}}}",
-                        filename,
-                        options.join("\n"),
-                        matches[0].id
-                    ));
-                }
-                Ok(_) => {
-                    // File not in index - treat as new file creation
-                    ctx.working_dir.join(filename)
-                }
-                Err(e) => return ToolOutput::error(format!("Failed to query file index: {}", e)),
-            }
-        } else if let Some(raw_path) = args.get("path").and_then(|p| p.as_str()) {
-            // Method 3: Traditional path-based approach (backward compatible)
-            if raw_path.is_empty() {
-                return ToolOutput::error(
-                    "❌ Parameter Error: 'path' cannot be empty\n\n\
-                     💡 Example: {\"path\": \"output.txt\", \"content\": \"Hello World\"}",
-                );
-            }
-
-            // Normalize path: trim whitespace and standardize separators
-            let normalized_path = raw_path.trim().replace('\\', "/");
-
-            // Handle absolute vs relative paths
-            if std::path::Path::new(&normalized_path).is_absolute() {
-                std::path::PathBuf::from(&normalized_path)
-            } else {
-                ctx.working_dir.join(&normalized_path)
-            }
-        } else {
-            return ToolOutput::error(
-                "❌ CRITICAL ERROR: Missing 'path' parameter for file_write!\n\n\
-                 💡 For NEW files, you MUST provide a COMPLETE path:\n\
-                 • Include directory structure (e.g., 'src/utils/helper.rs')\n\
-                 • NOT just filename (e.g., 'helper.rs' is WRONG)\n\n\
-                 📝 Correct Examples:\n\
-                 {\"path\": \"src/main.rs\", \"content\": \"...\"}\n\
-                 {\"path\": \"docs/guide.md\", \"content\": \"...\"}\n\
-                 {\"path\": \"tests/unit_test.rs\", \"content\": \"...\"}\n\n\
-                 ❌ Wrong Example:\n\
-                 {\"content\": \"...\"} ← NO PATH PROVIDED!\n\
-                 {\"filename\": \"main.rs\"} ← Only works for EXISTING files!"
-            );
+        // ── Resolve path (path-only) ──
+        let path_str = match args.get("path").and_then(|p| p.as_str()) {
+            Some(p) if !p.is_empty() => p.trim().replace('\\', "/"),
+            _ => return ToolOutput::error(
+                "❌ Missing or empty 'path' parameter.\nUsage: {\"path\": \"src/output.rs\", \"content\": \"...\"}",
+            ),
         };
-
-        // Keep user-friendly path for error messages
+        let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
+            std::path::PathBuf::from(&path_str)
+        } else {
+            ctx.working_dir.join(&path_str)
+        };
         let display_path = resolved_path.clone();
 
         let path =
@@ -155,9 +64,7 @@ impl Tool for FileWriteTool {
                 Ok(p) => p,
                 Err(e) => {
                     return ToolOutput::error(format!(
-                        "❌ Security Error: {}\n\n\
-                     💡 The file path must be within the working directory:\n\
-                     {}",
+                        "❌ Security Error: {}\n\nWorking directory: {}",
                         e,
                         ctx.working_dir.display()
                     ));

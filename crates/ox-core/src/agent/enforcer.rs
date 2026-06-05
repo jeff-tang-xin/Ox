@@ -18,6 +18,10 @@ fn is_source_file(path: &str) -> bool {
 lazy_static! {
     // 计划意图的正则表达式模式（多语言支持）
     static ref PLAN_PATTERNS: Vec<Regex> = vec![
+        // Plan 块格式（LLM 实际按系统提示输出的格式）：## Plan / ▎ Plan / --- Plan ---
+        Regex::new(r"(?im)^\s*#{1,3}\s+Plan\b").unwrap(),
+        Regex::new(r"(?im)^\s*▎\s*Plan\b").unwrap(),
+        Regex::new(r"(?im)^\s*-{3,}\s*Plan\b").unwrap(),
         // 英文模式
         Regex::new(r"(?i)(?:I plan|I will|I'm going|My plan|intend to|will modify|will change)").unwrap(),
         Regex::new(r"(?i)(?:plan to|going to|would like to|want to)").unwrap(),
@@ -74,6 +78,20 @@ impl RuleEnforcer {
             }
         }
 
+        // 3. 校验: 编辑前必须先读取文件 (Read Before Edit)
+        if rules.read_before_edit {
+            if let Err(e) = Self::check_read_before_edit(tool_call, messages) {
+                return Err(e);
+            }
+        }
+
+        // 4. 校验: 修改定义前检查调用方 (Impact Analysis)
+        if rules.impact_analysis {
+            if let Err(e) = Self::check_impact_before_edit(tool_call, messages) {
+                return Err(e);
+            }
+        }
+
         Ok(())
     }
 
@@ -92,9 +110,21 @@ impl RuleEnforcer {
             }
         }
 
-        let msgs = messages;
-        // 扫描最近 5 条消息，寻找 LLM 提出的计划
-        let has_plan = msgs.iter().rev().take(5).any(|msg| {
+        // 🎯 只检查最近一次用户消息之后的消息（与 Steps Before Shell 逻辑一致）
+        // 这样用户提一个问题 → LLM 计划一次 → 多次编辑操作都可通过
+        let last_user_idx = messages.iter().rev()
+            .position(|m| matches!(m, Message::User { .. }))
+            .map(|pos| messages.len() - 1 - pos);
+
+        let search_start = last_user_idx.unwrap_or(0);
+        let recent_messages = if search_start < messages.len() {
+            &messages[search_start..]
+        } else {
+            &[]
+        };
+
+        // 在用户消息之后的消息中，寻找 LLM 提出的计划
+        let has_plan = recent_messages.iter().any(|msg| {
             if let Message::Assistant { content, .. } = msg {
                 // 使用内置正则表达式进行多语言模式匹配
                 let built_in_match = PLAN_PATTERNS.iter().any(|pattern| pattern.is_match(content));
@@ -192,6 +222,188 @@ impl RuleEnforcer {
         } else if !has_pending_tasks {
             // 有任务列表但所有任务都已完成，提示创建新任务列表
             Err("⚠️ NOTICE: All tasks in your task list appear to be completed. For a new shell command, please create a new task list with pending items.".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 检查编辑目标文件是否已被读取 (Read Before Edit)
+    ///
+    /// 在文件被修改前，确认 LLM 已经通过 file_read/recall 读取过它。
+    /// 这防止 LLM"猜测"文件内容而不是先阅读。
+    fn check_read_before_edit(tc: &ToolCall, messages: &[Message]) -> Result<(), String> {
+        if !matches!(tc.name.as_str(), "file_write" | "file_patch") {
+            return Ok(());
+        }
+
+        // 只对源码文件强制（同 plan_before_edit）
+        let target_path = match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+            Ok(args) => args.get("path").and_then(|p| p.as_str()).map(|s| s.trim().to_string()),
+            Err(_) => return Ok(()),
+        };
+        let target_path = match target_path {
+            Some(p) if !p.is_empty() => p,
+            _ => return Ok(()),
+        };
+        if !is_source_file(&target_path) {
+            return Ok(());
+        }
+
+        // 🎯 扫描最近一次用户消息之后的消息中是否有对同一路径的 file_read
+        let last_user_idx = messages.iter().rev()
+            .position(|m| matches!(m, Message::User { .. }))
+            .map(|pos| messages.len() - 1 - pos);
+
+        let search_start = last_user_idx.unwrap_or(0);
+        let recent_messages = if search_start < messages.len() {
+            &messages[search_start..]
+        } else {
+            &[]
+        };
+
+        // 提取目标路径的基础文件名（含扩展名，无目录）
+        let target_basename = std::path::Path::new(&target_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let mut has_read = false;
+        for msg in recent_messages.iter() {
+            match msg {
+                Message::Assistant { tool_calls, .. } => {
+                    for tc in tool_calls {
+                        if tc.name == "file_read" {
+                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                                if let Some(read_path) = args.get("path").and_then(|p| p.as_str()) {
+                                    let read_basename = std::path::Path::new(read_path)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    // 文件名本身匹配，或者读取路径包含目标路径
+                                    if read_path.trim() == target_path
+                                        || read_basename == target_basename
+                                        || read_path.trim().ends_with(&target_path)
+                                        || target_path.ends_with(read_path.trim())
+                                    {
+                                        has_read = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if has_read {
+                        break;
+                    }
+                }
+                Message::ToolResult { content, .. } => {
+                    // recall 的结果也视为"看过"——它恢复了 offloaded 的文件内容
+                    if content.contains(&target_basename) || content.contains(&target_path) {
+                        // 不能单纯因为文本中出现文件名就认为已读取
+                        // 需要是 recall 工具的结果
+                    }
+                }
+                _ => {}
+            }
+            if has_read {
+                break;
+            }
+        }
+
+        if !has_read {
+            Err(format!(
+                "🛑 RULE VIOLATION (read-before-edit): You edited `{path}` without reading it first!\n\n\
+                 You MUST read a file before editing it. DO NOT guess the file content.\n\
+                 The file may differ from what you expect.\n\n\
+                 💡 Fix:\n\
+                 1. Call `file_read` with `\"path\": \"{path}\"` to see the EXACT content\n\
+                 2. Then call `file_patch` or `file_write` with the correct changes\n\n\
+                 📝 Example:\n\
+                 file_read(path=\"{path}\")\n\
+                 ... then file_patch/path ...",
+                path = target_path
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 检查修改源文件前是否搜索了调用方 (Impact Analysis)
+    ///
+    /// 当编辑已存在的源码文件时，确保 LLM 调用了 code_search 来检查依赖/调用方。
+    /// 防止修改函数签名/接口后忘记更新调用处。
+    fn check_impact_before_edit(tc: &ToolCall, messages: &[Message]) -> Result<(), String> {
+        if !matches!(tc.name.as_str(), "file_write" | "file_patch") {
+            return Ok(());
+        }
+
+        // 只对已存在的源码文件强制
+        let target_path = match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+            Ok(args) => args.get("path").and_then(|p| p.as_str()).map(|s| s.trim().to_string()),
+            Err(_) => return Ok(()),
+        };
+        let target_path = match target_path {
+            Some(p) if !p.is_empty() => p,
+            _ => return Ok(()),
+        };
+        if !is_source_file(&target_path) {
+            return Ok(());
+        }
+
+        let target_basename = std::path::Path::new(&target_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // 🎯 检查最近一次用户消息之后，是否对同一文件执行过 code_search
+        let last_user_idx = messages.iter().rev()
+            .position(|m| matches!(m, Message::User { .. }))
+            .map(|pos| messages.len() - 1 - pos);
+
+        let search_start = last_user_idx.unwrap_or(0);
+        let recent_messages = if search_start < messages.len() {
+            &messages[search_start..]
+        } else {
+            &[]
+        };
+
+        let has_impact_check = recent_messages.iter().any(|msg| {
+            if let Message::Assistant { tool_calls, .. } = msg {
+                tool_calls.iter().any(|tc| {
+                    if tc.name == "code_search" {
+                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                            let search_query = args.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                            // code_search was called with the file name or path as query
+                            if search_query.contains(&target_basename)
+                                || search_query.contains(&target_path)
+                                || target_path.contains(search_query)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                })
+            } else {
+                false
+            }
+        });
+
+        if !has_impact_check {
+            Err(format!(
+                "🛑 RULE VIOLATION (impact-analysis): You are editing `{path}` but haven't checked for callers or dependents!\n\n\
+                 Before modifying an existing source file, you must check what depends on it:\n\
+                 1. Call `code_search(query=\"{name}\")` to find all references and callers\n\
+                 2. Review the impact\n\
+                 3. Then proceed with the edit\n\n\
+                 This prevents breaking changes. The system requires impact analysis before editing existing source files.\n\n\
+                 📝 Example:\n\
+                 code_search(query=\"{name}\")\n\
+                 ... review results ...\n\
+                 file_patch(path=\"{path}\")",
+                path = target_path,
+                name = target_basename,
+            ))
         } else {
             Ok(())
         }

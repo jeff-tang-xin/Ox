@@ -1,3 +1,4 @@
+pub mod injection;
 pub mod sanitizer;
 
 use std::collections::HashSet;
