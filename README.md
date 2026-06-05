@@ -27,7 +27,7 @@ Ox 是基于 Rust 构建的终端 AI 编程助手，通过 TUI 界面与 LLM 交
 ### 1. 安装
 
 ```bash
-git clone https://github.com/your-repo/Ox.git
+git clone https://github.com/jeff-tang-xin/Ox.git
 cd Ox
 cargo install --path crates/ox-cli
 ```
