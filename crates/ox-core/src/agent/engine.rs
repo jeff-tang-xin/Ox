@@ -293,7 +293,7 @@ impl WorkflowEngine {
         // Check if code modification is allowed
         if !step.allow_code_modification {
             // Check if this is a code-modifying tool
-            let is_code_tool = matches!(tool_name, "file_write" | "file_patch");
+            let is_code_tool = matches!(tool_name, "file_write" | "edit_file" | "delete_range");
 
             if is_code_tool {
                 // Extract file path from arguments

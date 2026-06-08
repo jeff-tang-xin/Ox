@@ -27,15 +27,20 @@ pub struct HybridStorage {
 
 impl HybridStorage {
     /// Create new hybrid storage
+    /// 
+    /// Note: `base_path` is expected to be the `.ox` home directory (e.g. `~/.ox`).
+    /// Do NOT append `.ox` again — use `base_path` directly.
     pub fn new(base_path: &Path) -> anyhow::Result<Self> {
-        let sqlite_path = base_path.join(".ox").join("memory.db");
-        let markdown_dir = base_path.join(".ox").join("knowledge");
+        let sqlite_path = base_path.join("memory.db");
+        let markdown_dir = base_path.join("knowledge");
         
         // Ensure directories exist
         fs::create_dir_all(&markdown_dir)?;
         
         let sqlite_store = MemoryStore::open(&sqlite_path)?;
-        let layer_manager = LayerManager::new(base_path);
+        // LayerManager internally appends `.ox/`, so pass the parent directory
+        let layer_base = base_path.parent().unwrap_or(base_path);
+        let layer_manager = LayerManager::new(layer_base);
         
         Ok(Self {
             sqlite_store,
@@ -364,8 +369,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = HybridStorage::new(temp_dir.path()).unwrap();
         
-        assert!(temp_dir.path().join(".ox").join("memory.db").exists());
-        assert!(temp_dir.path().join(".ox").join("knowledge").exists());
+        assert!(temp_dir.path().join("memory.db").exists());
+        assert!(temp_dir.path().join("knowledge").exists());
     }
 
     #[test]

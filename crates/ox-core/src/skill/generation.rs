@@ -506,7 +506,7 @@ fn extract_message_records(messages: &[Message]) -> Vec<MessageRecord> {
             Message::User { content } => {
                 ("user".to_string(), content.chars().take(100).collect(), false)
             }
-            Message::Assistant { content, tool_calls } => {
+            Message::Assistant { content, tool_calls, .. } => {
                 ("assistant".to_string(), content.chars().take(100).collect(), !tool_calls.is_empty())
             }
             Message::ToolResult { content, .. } => {

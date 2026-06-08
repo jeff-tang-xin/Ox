@@ -11,15 +11,18 @@ pub struct TurnContext {
     pub dir_structure: Option<String>,
     /// User's recent conversation summary (for continuity)
     pub recent_summary: Option<String>,
+    /// Relevant AST symbols from the code indexer (keyword + semantic match)
+    pub relevant_symbols: Option<String>,
 }
 
-/// Build the system prompt for the LLM using a 5-layer architecture:
+/// Build the system prompt for the LLM using a 6-layer architecture:
 ///
 /// Layer 1 (Base)      — Fixed persona + workflow + output format    [always present]
 /// Layer 2 (Tool)      — Dynamic tool list from registry              [always present]
-/// Layer 3 (Context)   — Git log, dir tree, recent summary            [dynamic]
+/// Layer 3 (Context)   — Git log, dir tree, AST symbols, summary      [dynamic]
 /// Layer 4 (User)      — ~/.ox/rules.md + .ox/rules.md (if exist)    [loaded from disk]
-/// Layer 5 (Safety)    — Privacy + dangerous operation rules          [always last]
+/// Layer 5 (Spec)      — Task specification content (if active)       [optional]
+/// Layer 6 (Safety)    — Privacy + injection defense + code quality   [always last]
 pub fn build_system_prompt(
     rt_env: &RuntimeEnvironment,
     tool_registry: &ToolRegistry,
@@ -29,7 +32,8 @@ pub fn build_system_prompt(
 ) -> String {
     build_system_prompt_with_context(
         rt_env, tool_registry, persona, behavior_rules, _spec_content, &TurnContext {
-            git_log: None, git_diff_stat: None, dir_structure: None, recent_summary: None,
+            git_log: None, git_diff_stat: None, dir_structure: None,
+            recent_summary: None, relevant_symbols: None,
         },
     )
 }
@@ -68,6 +72,13 @@ pub fn build_system_prompt_with_context(
     if let Some(ref dir) = ctx.dir_structure {
         context_parts.push(format!("## Project Structure\n```\n{}\n```", dir));
     }
+    if let Some(ref symbols) = ctx.relevant_symbols {
+        context_parts.push(format!(
+            "## Relevant Code Symbols (AST-indexed)\n\
+             These symbols were found in the project. Use `file_read` to view full source.\n{}",
+            symbols
+        ));
+    }
     if let Some(ref summary) = ctx.recent_summary {
         context_parts.push(format!("## Recent Context\n{}", summary));
     }
@@ -86,9 +97,19 @@ pub fn build_system_prompt_with_context(
     }
 
     // ═══════════════════════════════════════════════════
-    // LAYER 5: Safety — Hard constraints, always last
+    // LAYER 5: Spec — Task specification (if active)
+    // ═══════════════════════════════════════════════════
+    if let Some(spec) = _spec_content {
+        if !spec.trim().is_empty() {
+            parts.push(format!("## Task Specification\n{}", spec.trim()));
+        }
+    }
+
+    // ═══════════════════════════════════════════════════
+    // LAYER 6: Safety — Hard constraints, always last
     // ═══════════════════════════════════════════════════
     parts.push(SAFETY_LAYER.to_string());
+    // Runtime environment info (working dir, project, allowed paths)
     parts.push(rt_env.system_prompt_block());
 
     parts.join("\n\n")
@@ -120,14 +141,6 @@ You think in terms of architecture, trade-offs, and production readiness — not
 
 - **NO greetings, NO pleasantries, NO apologies.** Start directly with the answer or action.
 - **NO markdown explanations** unless asked a conceptual question.
-- **Plan block → tool calls → Done block.** That is all when modifying files.
-- **Answer only** when no files are changed.
-
-## Output Rules
-
-- **NO greetings, NO pleasantries, NO apologies.** Start directly with the answer or action.
-- **NO markdown explanations** unless the user asks a conceptual question.
-- **Output format**: Plan block → tool calls → Done block. That is all.
 - **If you are not modifying files**, output only the answer. No Plan/Done needed.
 - **If you are modifying files**, output EXACTLY: Plan (1-3 lines) → tools → Done (1-3 lines).
 - **NEVER** say things like Sure, I will help with that, Let me explain.
@@ -154,16 +167,16 @@ For every coding request, follow this pipeline **IN ORDER. Do NOT skip steps.**
    - Reading reveals adjacent code that may need updating
    - **If you skip this step, your edit WILL be rejected**
 
-4. **Plan** — BEFORE calling file_write/file_patch, output a ## Plan block.
+4. **Plan** — BEFORE calling file_write/edit_file, output a ## Plan block.
    ```
    ## Plan
    - File: `path/to/file`
    - Change: [what you will modify]
    - Reason: [why this change]
    ```
-   This is REQUIRED before `file_write` or `file_patch`. The system WILL block you if you skip this.
+   This is REQUIRED before `file_write` or `edit_file`. The system WILL block you if you skip this.
 
-5. **Execute** — NOW call tools. Prefer `file_patch` for small edits, `file_write` for new files.
+5. **Execute** — NOW call tools. Prefer `edit_file` for small edits, `file_write` for new files.
    - If a tool returns an error, read the error, fix the issue, retry.
    - Do NOT ignore error messages.
 
@@ -187,43 +200,13 @@ For every coding request, follow this pipeline **IN ORDER. Do NOT skip steps.**
 **CRITICAL**: Steps 1-7 are in order. Read BEFORE Plan. Plan BEFORE Execute. Verify BEFORE Done.
 **NEVER guess file content. ALWAYS read first.**
 
-## Response Format
+## General Rules
 
-You MUST follow this structure for every response:
-
-### 0. Read (REQUIRED before any edit)
-Before modifying any file, you must read it first:
-```
-file_read(path='src/file_to_edit.rs')
-```
-The system BLOCKS edits to files you haven't read. DO NOT guess content.
-
-### 1. Plan (REQUIRED before editing)
-State your plan in one sentence, then a structured block:
-```
-## Plan
-- File: `path/to/file`
-- Change: [what you will modify]
-- Reason: [why this change]
-```
-
-### 2. When referencing code
-Always use `file:line` format. Example: `src/auth.rs:42-58`.
-
-### 3. After completing work (REQUIRED)
-First verify by reading the modified file, then summarize:
-```
-## Done
-- Read: `path/to/file` — confirmed content
-- Created/Modified: `path/to/file` — [what changed]
-- Verified: [build result / test result / file_read confirmation]
-```
-
-### 4. General rules
 - Respond in the user's language.
 - Be concise. No fluff. No apologies. Just the code and reasoning.
 - If the user just asks a question, answer directly — no plan block needed.
 - If nothing was modified, omit the Done block.
+- When referencing code, always use `file:line` format. Example: `src/auth.rs:42-58`.
 - **NEVER guess. If unsure, read the file.**
 
 ## Request Handling
@@ -260,11 +243,13 @@ fn build_tool_layer(registry: &ToolRegistry) -> String {
 | Tool | Use for |
 |------|---------|
 | `file_read` | Read file content. Default 200 lines; use `limit` for more. |
+| `find_symbol` | **AST-aware symbol search** (functions, classes, structs, traits, etc.). Uses tree-sitter parsing + vector embeddings for semantic search. Try exact name first, then falls back to semantic matching. |
 | `code_search` | Find all references to a function, type, or pattern (regex). |
 | `file_search` | Find files by name or glob pattern. |
 | `file_list` | Browse directory structure. |
 | `file_write` | Create new file or full rewrite (>50% changed). |
-| `file_patch` | Small targeted edit of an existing file. |
+| `edit_file` | Targeted edit of an existing file. Supports exact, fuzzy, replace_all, and multi-edit. |
+| `delete_range` | Delete a contiguous block of lines between two exact anchor lines. |
 | `shell_exec` | Run build, test, lint, git commands. |
 | `git_status` | Check working tree state. |
 | `git_diff` | View staged/unstaged changes. |
@@ -272,8 +257,10 @@ fn build_tool_layer(registry: &ToolRegistry) -> String {
 | `recall` | Retrieve full offloaded tool output by node_id. |
 | `web_fetch` | Fetch documentation or API reference. |
 
-**Rules:**
-- **Plan first, then tools.** Output ## Plan BEFORE calling `file_write`/`file_patch`. The system will block you otherwise.
+**Tool Selection Guide:**
+- Use `find_symbol` when you need to find specific functions/classes/structs by name or description
+- Use `code_search` when you need to find all usages/references of something
+- Use `file_search` when you know the filename but not the path
 - Prefer `code_search` over `shell_exec grep`. Prefer `file_search` over `shell_exec find`.
 - Paths are relative to the working directory.{}",
     skills_section)

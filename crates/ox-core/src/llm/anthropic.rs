@@ -325,6 +325,7 @@ fn message_to_anthropic(msg: &Message) -> serde_json::Value {
         Message::Assistant {
             content,
             tool_calls,
+            ..
         } => {
             let mut blocks: Vec<serde_json::Value> = Vec::new();
             if !content.is_empty() {

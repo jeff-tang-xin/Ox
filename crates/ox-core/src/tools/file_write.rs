@@ -2,7 +2,6 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput, content_validation};
 
 pub struct FileWriteTool;
@@ -228,36 +227,20 @@ impl Tool for FileWriteTool {
         let path_clone = path.clone();
         let display_path_clone = display_path.clone();
         let content_bytes_clone = content_bytes.to_vec();
-        let working_dir = ctx.working_dir.clone();
-        let file_index = Arc::clone(&ctx.file_index);
         let is_large_file_clone = is_large_file;
         let chunk_size = CHUNK_SIZE;
-        let temp_path_clone = temp_path.clone(); // Clone for spawn_blocking
+        let temp_path_clone = temp_path.clone();
         
         tracing::info!("[FILE_WRITE] Spawning blocking task for: {:?}", display_path_clone);
         let result = tokio::task::spawn_blocking(move || {
             tracing::info!("[FILE_WRITE] Blocking task started, writing file: {:?}", path_clone);
             
             // Execute the write operation (blocking I/O)
-            let write_result = if is_large_file_clone {
-                // For large files, use chunked write
+            if is_large_file_clone {
                 chunked_write_sync(&temp_path_clone, &path_clone, &content_bytes_clone, chunk_size)
             } else {
-                // For normal files, use atomic write
                 atomic_write_sync(&temp_path_clone, &path_clone, &content_bytes_clone)
-            };
-            
-            // Update file index if successful
-            if write_result.is_ok() {
-                if let Ok(relative_path) = path_clone.strip_prefix(&working_dir) {
-                    let rel_str = relative_path.to_string_lossy();
-                    if let Err(e) = file_index.add_file(&rel_str) {
-                        tracing::warn!("Failed to update file index: {}", e);
-                    }
-                }
             }
-            
-            write_result
         }).await;
         
         // Handle spawn_blocking result
@@ -269,14 +252,6 @@ impl Tool for FileWriteTool {
 
         match final_result {
             Ok(bytes_written) => {
-                // Update file index immediately for real-time availability
-                if let Ok(relative_path) = path.strip_prefix(&ctx.working_dir) {
-                    let rel_str = relative_path.to_string_lossy();
-                    if let Err(e) = ctx.file_index.add_file(&rel_str) {
-                        tracing::warn!("Failed to update file index: {}", e);
-                    }
-                }
-
                 let size_info = if is_large_file {
                     format!(
                         "\n📦 Strategy: Chunked write ({} chunks of {} KB)",

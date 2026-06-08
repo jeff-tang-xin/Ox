@@ -200,10 +200,10 @@ mod tests {
 
     #[test]
     fn parse_trust_specific() {
-        let cmd = parse_slash_command("trust", "file_write file_patch");
+        let cmd = parse_slash_command("trust", "file_write edit_file");
         if let SlashCommand::Trust { tools, all } = cmd {
             assert!(!all);
-            assert_eq!(tools, vec!["file_write", "file_patch"]);
+            assert_eq!(tools, vec!["file_write", "edit_file"]);
         } else {
             panic!("Expected Trust");
         }

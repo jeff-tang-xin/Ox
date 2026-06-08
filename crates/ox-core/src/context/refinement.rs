@@ -127,7 +127,7 @@ pub fn refine_conversation(messages: &[Message]) -> Vec<RefinedTurn> {
             let mut j = i + 1;
             while j < messages.len() {
                 match &messages[j] {
-                    Message::Assistant { content, tool_calls } => {
+                    Message::Assistant { content, tool_calls, .. } => {
                         // Only capture the FIRST assistant response (initial answer)
                         if assistant_summary.is_empty() {
                             assistant_summary = refine_assistant_response(content);

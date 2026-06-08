@@ -26,6 +26,7 @@ pub struct OxConfig {
     pub safety: SafetyConfig,
     pub cost: CostConfig,
     pub spec: SpecConfig,
+    pub embedding: EmbeddingConfig,
 }
 
 impl OxConfig {
@@ -292,7 +293,7 @@ store_refined_memories = true  # Enable refined memory storage (default: true)
 
 [enforcement_rules]
 # enabled = true               # Enable global enforcement
-# plan_before_edit = true      # Require LLM to propose a plan before file_write/file_patch
+# plan_before_edit = true      # Require LLM to propose a plan before file_write/edit_file
 # steps_before_shell = true    # Require LLM to list steps before shell_exec
 
 # ── Safety Settings ──────────────────────────────────────
@@ -307,6 +308,16 @@ store_refined_memories = true  # Enable refined memory storage (default: true)
 #     "os.rmdir"
 # ]
 # custom_rules = []            # Additional safety rules
+
+# ── Embedding (Symbol Semantic Search) ───────────────────
+[embedding]
+# enabled = true                 # Enable semantic symbol search
+# model_source = "modelscope"    # "modelscope" (default), "huggingface", or "local"
+# modelscope_url = "https://www.modelscope.cn"  # ModelScope base URL
+# hf_endpoint = ""               # HuggingFace endpoint (auto: env → hf-mirror.com)
+# model_id = "sentence-transformers/all-MiniLM-L6-v2"
+# local_model_dir = ""           # Path to local model dir (if model_source = "local")
+# dimension = 384                # Embedding dimension
 
 # ── Cost Management ──────────────────────────────────────
 [cost]
@@ -723,6 +734,49 @@ impl Default for CostConfig {
             max_daily_cost: 2.0,
             budget_alert_threshold: 0.8,
             cost_transparency: true,
+        }
+    }
+}
+
+// ──────────────────── Embedding ────────────────────
+
+/// Configuration for the local embedding model (symbol vector search).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// Enable semantic symbol search via local embeddings.
+    pub enabled: bool,
+    /// Model source: "modelscope", "huggingface", or "local".
+    /// - "modelscope": git clone from modelscope.cn (default, fast in China)
+    /// - "huggingface": download from hf_endpoint (hf-mirror.com fallback)
+    /// - "local": load from local_model_dir (must contain config.json, model.safetensors, tokenizer.json)
+    pub model_source: String,
+    /// ModelScope base URL. Default: https://www.modelscope.cn
+    /// Full clone URL is: {modelscope_url}/{model_id}.git
+    pub modelscope_url: String,
+    /// HuggingFace endpoint URL. Leave empty for auto-detect:
+    ///   1. $HF_ENDPOINT environment variable
+    ///   2. Fallback to https://hf-mirror.com (China mirror)
+    /// Set to "https://huggingface.co" for official endpoint.
+    pub hf_endpoint: String,
+    /// Model identifier (e.g. "sentence-transformers/all-MiniLM-L6-v2").
+    pub model_id: String,
+    /// Local directory containing model files (used when model_source = "local").
+    pub local_model_dir: String,
+    /// Embedding vector dimension (all-MiniLM-L6-v2 = 384).
+    pub dimension: usize,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_source: "modelscope".into(),
+            modelscope_url: "https://www.modelscope.cn".into(),
+            hf_endpoint: String::new(), // auto: env HF_ENDPOINT → hf-mirror.com
+            model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
+            local_model_dir: String::new(),
+            dimension: 384,
         }
     }
 }

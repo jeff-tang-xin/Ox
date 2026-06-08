@@ -316,7 +316,7 @@ pub async fn run_agent_turn(
                         format!("{}...", content.chars().take(150).collect::<String>())
                     } else { content.clone() })
                 }
-                Message::Assistant { content, tool_calls } => {
+                Message::Assistant { content, tool_calls, .. } => {
                     let tc_info = if !tool_calls.is_empty() {
                         format!(" [tool_calls: {}]", tool_calls.len())
                     } else {
@@ -355,6 +355,7 @@ pub async fn run_agent_turn(
 
         // Collect the full response (text + tool calls).
         let mut full_text = String::new();
+        let mut reasoning_content = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut current_tool_args: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -373,6 +374,10 @@ pub async fn run_agent_turn(
                     // The UI can decide how to display them (or we can strip them later)
                     let _ = ui_tx.send(AgentToUiEvent::TextChunk(text.clone()));
                     full_text.push_str(&text);
+                }
+                LlmStreamEvent::ReasoningDelta(text) => {
+                    // DeepSeek reasoning_content (thinking mode) — accumulate for round-trip
+                    reasoning_content.push_str(&text);
                 }
                 LlmStreamEvent::ToolCallStart { id, name } => {
                     let _ = ui_tx.send(AgentToUiEvent::ToolStart {
@@ -471,6 +476,7 @@ pub async fn run_agent_turn(
             let msg = Message::Assistant {
                 content: full_text.clone(), // Clone for workflow check
                 tool_calls: Vec::new(),
+                reasoning_content: if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) },
             };
             new_messages.push(msg.clone());
             messages.push(msg);
@@ -490,9 +496,10 @@ pub async fn run_agent_turn(
                 // Check if key operations were completed (e.g., file creation)
                 let key_operation_completed = new_messages.iter().any(|msg| {
                     matches!(msg, Message::ToolResult { content, .. } if {
-                        // Detect successful file_write or file_patch
+                        // Detect successful file_write, edit_file, or delete_range
                         content.contains("✅ Successfully written") ||
-                        content.contains("✅ File patched") ||
+                        content.contains("✅ Patched") ||
+                        content.contains("✅ Deleted") ||
                         content.contains("Successfully created")
                     })
                 });
@@ -763,6 +770,7 @@ pub async fn run_agent_turn(
         let assistant_msg = Message::Assistant {
             content: full_text.clone(), // Clone to keep full_text for workflow advancement check
             tool_calls: valid_tool_calls,
+            reasoning_content: if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) },
         };
         new_messages.push(assistant_msg.clone());
         messages.push(assistant_msg);
@@ -823,7 +831,7 @@ pub async fn run_agent_turn(
             if truncated_ids.contains(&tc.id) {
                 // Special handling for different tools
                 let is_file_write = tc.name == "file_write";
-                let is_file_patch = tc.name == "file_patch";
+                let is_edit_file = tc.name == "edit_file";
                 let content_length = tc.arguments.len();
 
                 let error_msg = if is_file_write && content_length > 10000 {
@@ -838,14 +846,14 @@ pub async fn run_agent_turn(
                             Just resend the complete content without worrying about size.\n\n\
                          2️⃣ Split into multiple operations:\n\
                             - Write first part: {{\"path\": \"file.txt\", \"content\": \"part1...\"}}\n\
-                            - Use file_patch to append/modify remaining parts\n\n\
-                         3️⃣ Use file_patch for modifications:\n\
+                            - Use edit_file to append/modify remaining parts\n\n\
+                         3️⃣ Use edit_file for modifications:\n\
                             If modifying existing file, use search/replace instead of rewriting entire file\n\n\
                          📝 Note: Files >1 MB are automatically written in 512 KB chunks",
                         content_length as f64 / 1024.0
                     )
-                } else if is_file_patch && content_length > 500 {
-                    // Likely file_patch with long search/replace that was truncated
+                } else if is_edit_file && content_length > 500 {
+                    // Likely edit_file with long search/replace that was truncated
                     // Try to extract partial info for better error message
                     let partial_info = if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                         let path = args_val.get("path").and_then(|v| v.as_str()).unwrap_or("<not specified>");
@@ -865,7 +873,7 @@ pub async fn run_agent_turn(
                     };
                     
                     format!(
-                        "❌ Arguments Truncated - file_patch parameters incomplete:\n\
+                        "❌ Arguments Truncated - edit_file parameters incomplete:\n\
                          Your search/replace content was too long and got truncated ({:.1} KB).\n\
                          This usually happens when including too many lines of code context.\n\n\
                          💡 How to fix:\n\
@@ -878,7 +886,7 @@ pub async fn run_agent_turn(
                             - Copy the EXACT text including whitespace\n\
                             - Use line numbers to ensure you have unique context\n\n\
                          3️⃣ Break into multiple patches:\n\
-                            - Instead of one large patch, make 2-3 smaller file_patch calls\n\
+                            - Instead of one large patch, make 2-3 smaller edit_file calls\n\
                             - Each patch should change <50% of the file\n\
                             - Or use file_write to rewrite the entire file\n{}\n\n\
                          📝 Example of good search string (2-3 lines):\n\
@@ -984,14 +992,6 @@ pub async fn run_agent_turn(
                             Some(format!("{} ({} bytes)", path, size))
                         })
                 }
-                "file_patch" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| {
-                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                            let search = v.get("search").and_then(|s| s.as_str()).map(|s| if s.len()>50 {&s[..50]} else {s}).unwrap_or("");
-                            Some(format!("{} | {}", path, search))
-                        })
-                }
                 "edit_file" => {
                     serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
                         .and_then(|v| {
@@ -1003,9 +1003,26 @@ pub async fn run_agent_turn(
                             Some(format!("{} | {}", path, old))
                         })
                 }
+                "delete_range" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| {
+                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                            let start = v.get("start_line").and_then(|l| l.as_u64()).unwrap_or(0);
+                            let end = v.get("end_line").and_then(|l| l.as_u64()).unwrap_or(0);
+                            Some(format!("{} L{}-L{}", path, start, end))
+                        })
+                }
                 "code_search" => {
                     serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
                         .and_then(|v| v.get("pattern").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                }
+                "find_symbol" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| {
+                            let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("?");
+                            let kind = v.get("kind").and_then(|k| k.as_str()).map(|k| format!(" ({})", k)).unwrap_or_default();
+                            Some(format!("{}{}", query, kind))
+                        })
                 }
                 "file_search" => {
                     serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
@@ -1015,6 +1032,14 @@ pub async fn run_agent_turn(
                     serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
                         .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
                         .or_else(|| Some("(root)".to_string()))
+                }
+                "git_status" => Some(String::new()),
+                "git_diff" => {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| {
+                            let staged = v.get("staged").and_then(|s| s.as_bool()).unwrap_or(false);
+                            Some(if staged { "--staged" } else { "" }.to_string())
+                        })
                 }
                 "memory_search" => {
                     serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
@@ -1030,13 +1055,12 @@ pub async fn run_agent_turn(
                 }
                 _ => None,
             };
-            if let Some(detail) = tool_detail {
-                let _ = ui_tx.send(AgentToUiEvent::ToolStart {
-                    name: tc.name.clone(),
-                    id: tc.id.clone(),
-                    detail: Some(detail),
-                });
-            }
+            // Always send ToolStart to UI (detail is optional)
+            let _ = ui_tx.send(AgentToUiEvent::ToolStart {
+                name: tc.name.clone(),
+                id: tc.id.clone(),
+                detail: tool_detail,
+            });
 
             tracing::info!("[AGENT] About to get tool object for: {}", tc.name);
             let tool = match tool_registry.get(&tc.name) {
@@ -1271,8 +1295,8 @@ pub async fn run_agent_turn(
                             "file_write" => {
                                 "{\"path\": \"output.txt\", \"content\": \"Hello World\"}"
                             }
-                            "file_patch" => {
-                                "{\"path\": \"src/lib.rs\", \"edits\": [{\"old\": \"...\", \"new\": \"...\"}]}"
+                            "edit_file" => {
+                                "{\"path\": \"src/lib.rs\", \"old_string\": \"...\", \"new_string\": \"...\"}"
                             }
                             "shell_exec" => "{\"command\": \"ls -la\", \"timeout_ms\": 5000}",
                             "file_search" => "{\"pattern\": \"*.rs\", \"path\": \"src/\"}",
@@ -1375,7 +1399,9 @@ pub async fn run_agent_turn(
                 "file_read" => "Reading file...",
                 "shell_exec" => "Executing command...",
                 "code_search" => "Searching code...",
-                "file_patch" => "Patching file...",
+                "edit_file" => "Editing file...",
+                "delete_range" => "Deleting range...",
+                "find_symbol" => "Finding symbols...",
                 _ => "Executing...",
             };
             let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
@@ -1395,8 +1421,8 @@ pub async fn run_agent_turn(
                 tool_ctx.working_dir.clone(),
                 tool_ctx.config.clone(),
                 Arc::clone(&tool_ctx.memory),
-                Arc::clone(&tool_ctx.file_index),
-                tc.id.clone(), // Pass tool_call_id
+                Arc::clone(&tool_ctx.code_indexer),
+                tc.id.clone(),
                 move |progress: crate::tools::ToolProgress| {
                     let _ = ui_tx_clone.send(AgentToUiEvent::ToolProgress {
                         tool_call_id: progress.tool_call_id,
@@ -1434,7 +1460,7 @@ pub async fn run_agent_turn(
                     new_dir.clone(),
                     tool_ctx.config.clone(),
                     Arc::clone(&tool_ctx.memory),
-                    Arc::clone(&tool_ctx.file_index),
+                    Arc::clone(&tool_ctx.code_indexer),
                 ));
                 let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
             }
@@ -1497,7 +1523,7 @@ pub async fn run_agent_turn(
 
             // 🧠 Mid-turn memory refresh: after code-modifying tools, re-retrieve relevant memories
             // so the LLM has the latest project knowledge for subsequent iterations.
-            if matches!(tc.name.as_str(), "file_write" | "file_patch" | "shell_exec") && !result.is_error {
+            if matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range" | "shell_exec") && !result.is_error {
                 let project_id: Option<&str> = if tool_ctx.runtime.project_id.is_empty() {
                     None
                 } else {
@@ -1518,7 +1544,7 @@ pub async fn run_agent_turn(
             }
 
             // 📖 Verify-after-edit: prompt LLM to verify changes
-            if matches!(tc.name.as_str(), "file_patch" | "file_write") && !result.is_error {
+            if matches!(tc.name.as_str(), "edit_file" | "delete_range" | "file_write") && !result.is_error {
                 // Extract the file path from tool arguments
                 let file_path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                     .ok()
@@ -1544,7 +1570,7 @@ pub async fn run_agent_turn(
 
         // 🚨 Done reminder: prompt LLM to summarize using structured format
         if !tool_calls.is_empty() {
-            let has_write = tool_calls.iter().any(|tc| matches!(tc.name.as_str(), "file_write" | "file_patch"));
+            let has_write = tool_calls.iter().any(|tc| matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range"));
             if has_write {
                 messages.push(Message::system(
                     "Files were modified. Output ## Done: list what was created/modified and the verify result. 3 lines max. No extra text."
@@ -1603,7 +1629,7 @@ Recovery protocol — follow these steps IN ORDER:
 1. **Read the error** — the relevant lines are shown above
 2. **Read the affected source code** — use `file_read` on the files mentioned in the error
 3. **Diagnose root cause** — understand WHY the error occurred (wrong type? missing import? syntax error?)
-4. **Fix the issue** — use `file_patch` to apply the correction
+4. **Fix the issue** — use `edit_file` to apply the correction
 5. **Verify** — re-run the build/test command to confirm
 
 DO NOT guess. Read the source code first, then fix."

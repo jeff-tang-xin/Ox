@@ -4,8 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-
 [dependencies]
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -36,8 +34,32 @@ encoding_rs = "0.8" # 处理 GBK、GB18030 等非 UTF-8 编码
 dunce = "1.0"       # 规范化 Windows 路径，解决超长路径限制
 rusqlite = { workspace = true }
 rand = { workspace = true }
-notify = "6.1"
+
 serde_yaml = "0.9"
+
+# ── AST parsing (multi-language) ──
+tree-sitter = "0.25"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+
+# ── Vector embedding (local) ──
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+hf-hub = "0.4"
+tokenizers = "0.21"
+
+# ── Vector database (embedded) ──
+triviumdb = "0.7"
+
+# ── Project indexing ──
+walkdir = "2.5"
+notify = "6.0"
 
 [dev-dependencies]
 tempfile = "3"

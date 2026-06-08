@@ -12,6 +12,8 @@ use crate::message::{Message, TokenUsage};
 pub enum LlmStreamEvent {
     /// A chunk of text from the assistant.
     TextDelta(String),
+    /// A chunk of reasoning/thinking content (DeepSeek reasoning_content).
+    ReasoningDelta(String),
     /// A tool call has started.
     ToolCallStart { id: String, name: String },
     /// A chunk of tool call arguments JSON.

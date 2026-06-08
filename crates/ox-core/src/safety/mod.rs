@@ -145,7 +145,7 @@ mod tests {
         assert!(!tm.can_skip_confirmation("file_write", SafetyLevel::RequiresConfirmation));
         tm.trust("file_write");
         assert!(tm.can_skip_confirmation("file_write", SafetyLevel::RequiresConfirmation));
-        assert!(!tm.can_skip_confirmation("file_patch", SafetyLevel::RequiresConfirmation));
+        assert!(!tm.can_skip_confirmation("edit_file", SafetyLevel::RequiresConfirmation));
     }
 
     #[test]
@@ -153,7 +153,7 @@ mod tests {
         let mut tm = TrustManager::new();
         tm.trust_all();
         assert!(tm.can_skip_confirmation("file_write", SafetyLevel::RequiresConfirmation));
-        assert!(tm.can_skip_confirmation("file_patch", SafetyLevel::RequiresConfirmation));
+        assert!(tm.can_skip_confirmation("edit_file", SafetyLevel::RequiresConfirmation));
     }
 
     #[test]

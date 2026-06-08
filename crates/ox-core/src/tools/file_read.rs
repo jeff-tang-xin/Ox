@@ -2,6 +2,7 @@ use encoding_rs::Encoding;
 use serde_json::{Value, json};
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::sync::Arc;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
@@ -94,6 +95,16 @@ impl Tool for FileReadTool {
         // Read file with encoding support
         match read_file_with_encoding(&path, encoding) {
             Ok(content) => {
+                // Auto-index symbols in background (use absolute path)
+                let abs_path = path.to_path_buf();
+                let code_indexer = Arc::clone(&ctx.code_indexer);
+                tokio::spawn(async move {
+                    let mut idx = code_indexer.lock().await;
+                    if let Err(e) = idx.index_file(&abs_path).await {
+                        tracing::debug!("[FILE_READ] Auto-index failed for {}: {e}", abs_path.display());
+                    }
+                });
+
                 let lines: Vec<&str> = content.lines().collect();
                 let start = offset.unwrap_or(0).min(lines.len());
                 let end = limit

@@ -5,7 +5,7 @@
 
 /// Validate file content to prevent garbled/corrupted text from being written.
 ///
-/// This is the unified validation function used by both `file_write` and `file_patch`.
+/// This is the unified validation function used by both `file_write` and `edit_file`.
 ///
 /// # Validation Checks
 /// 1. **Null bytes** - Definite corruption indicator (always rejected)

@@ -70,6 +70,7 @@ pub fn replay_session_history(
             Message::Assistant {
                 content,
                 tool_calls,
+                ..
             } => {
                 if !content.is_empty() {
                     app.output.push_line(OutputLine::Markdown(content.clone()));

@@ -399,7 +399,7 @@ impl RuleBasedClassifier {
                 vec![
                     "file_read".to_string(),
                     "file_write".to_string(),
-                    "file_patch".to_string(),
+                    "edit_file".to_string(),
                 ]
             }
             QuestionType::Debugging => {
@@ -407,14 +407,14 @@ impl RuleBasedClassifier {
                     "file_read".to_string(),
                     "code_search".to_string(),
                     "shell_exec".to_string(),
-                    "file_patch".to_string(),
+                    "edit_file".to_string(),
                 ]
             }
             QuestionType::Refactoring => {
                 vec![
                     "file_read".to_string(),
                     "code_search".to_string(),
-                    "file_patch".to_string(),
+                    "edit_file".to_string(),
                 ]
             }
             QuestionType::Exploration => {

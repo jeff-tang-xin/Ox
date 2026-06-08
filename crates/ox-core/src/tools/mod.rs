@@ -1,11 +1,12 @@
 pub mod code_search;
 pub mod content_validation;
+pub mod delete_range;
 pub mod edit_file;
 pub mod file_list;
-pub mod file_patch;
 pub mod file_read;
 pub mod file_search;
 pub mod file_write;
+pub mod find_symbol;
 pub mod git;
 pub mod intent_classifier;  // 新增：意图分类器
 pub mod memory_search;
@@ -69,8 +70,8 @@ pub struct ToolContext {
     pub config: Arc<OxConfig>,
     /// Reference to the memory manager for knowledge retrieval
     pub memory: Arc<crate::memory::MemoryManager>,
-    /// Reference to the file index manager for file lookup
-    pub file_index: Arc<crate::file_index::FileIndexManager>,
+    /// Reference to the code indexer for AST-aware symbol queries
+    pub code_indexer: Arc<tokio::sync::Mutex<crate::symbol::CodeIndexer>>,
     /// Current tool call ID (for progress reporting)
     pub tool_call_id: String,
     /// Optional progress callback for real-time updates
@@ -93,14 +94,14 @@ impl ToolContext {
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
         memory: Arc<crate::memory::MemoryManager>,
-        file_index: Arc<crate::file_index::FileIndexManager>,
+        code_indexer: Arc<tokio::sync::Mutex<crate::symbol::CodeIndexer>>,
     ) -> Self {
         Self {
             runtime,
             working_dir,
             config,
             memory,
-            file_index,
+            code_indexer,
             tool_call_id: String::new(),
             progress_callback: None,
         }
@@ -112,7 +113,7 @@ impl ToolContext {
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
         memory: Arc<crate::memory::MemoryManager>,
-        file_index: Arc<crate::file_index::FileIndexManager>,
+        code_indexer: Arc<tokio::sync::Mutex<crate::symbol::CodeIndexer>>,
         tool_call_id: String,
         progress_callback: impl Fn(ToolProgress) + Send + Sync + 'static,
     ) -> Self {
@@ -121,7 +122,7 @@ impl ToolContext {
             working_dir,
             config,
             memory,
-            file_index,
+            code_indexer,
             tool_call_id,
             progress_callback: Some(Arc::new(progress_callback)),
         }
@@ -183,10 +184,11 @@ impl ToolRegistry {
         registry.register(Box::new(file_read::FileReadTool));
         registry.register(Box::new(file_write::FileWriteTool));
         registry.register(Box::new(edit_file::EditFileTool));
-        registry.register(Box::new(file_patch::FilePatchTool));
         registry.register(Box::new(file_list::FileListTool));
         registry.register(Box::new(file_search::FileSearchTool));
         registry.register(Box::new(code_search::CodeSearchTool));
+        registry.register(Box::new(delete_range::DeleteRangeTool));
+        registry.register(Box::new(find_symbol::FindSymbolTool));
         registry.register(Box::new(shell_exec::ShellExecTool));
         registry.register(Box::new(project_detect::ProjectDetectTool));
         registry.register(Box::new(web_fetch::WebFetchTool));

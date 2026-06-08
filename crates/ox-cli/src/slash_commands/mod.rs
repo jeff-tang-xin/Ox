@@ -137,6 +137,9 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     
     // Skill management
     registry.register(skill::SKILL_COMMAND);
+    
+    // Index management
+    registry.register(index::INDEX_COMMAND);
 }
 
 // Import command modules (removed spec, council, workflow)
@@ -148,3 +151,4 @@ mod memory;
 mod feedback;
 mod system;
 mod skill;
+mod index;

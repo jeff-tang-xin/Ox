@@ -388,40 +388,55 @@ async fn run_app(
         memory_arc.run_janitor(0.3, config.memory.max_nodes);
     }
 
-    // Initialize file index registry (supports multiple directories)
-    let file_index_db_dir = db_dir.join("file_indices");
-    let mut file_index_registry = ox_core::file_index::FileIndexRegistry::new(file_index_db_dir);
+    // Initialize AST-based code indexer (with embedding config for deferred VectorStore init)
+    let code_indexer = Arc::new(tokio::sync::Mutex::new(
+        ox_core::symbol::CodeIndexer::new(&rt_env.working_dir, config.embedding.clone()),
+    ));
 
-    // Get or create index for current working directory
-    let mut file_index_manager = file_index_registry
-        .get_or_create(&rt_env.working_dir)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to initialize file index: {}. Using empty index.", e);
-            // Fallback: create in-memory database
-            Arc::new(
-                ox_core::file_index::FileIndexManager::new(
-                    &std::env::temp_dir().join("file_index.db"),
-                )
-                .expect("file index with temp dir"),
-            )
-        });
+    // 🚀 Start background project indexing (non-blocking)
+    let indexer_clone = Arc::clone(&code_indexer);
+    let working_dir_clone = rt_env.working_dir.clone();
+    let memory_for_vector = Arc::clone(&memory_arc);
+    let embedding_config = config.embedding.clone();
+    let db_dir_for_memory = db_dir.clone();
+    tokio::spawn(async move {
+        tracing::info!("[INDEXER] Starting background project indexing...");
 
-    // Start file system watcher for real-time updates
-    if let Err(e) = file_index_manager.start_file_watcher(rt_env.working_dir.clone()) {
-        tracing::warn!(
-            "Failed to start file watcher: {}. Will rely on periodic refresh.",
-            e
-        );
-    } else {
-        tracing::info!("File watcher started for real-time index updates");
-    }
+        // Initialize vector store + index project while holding the lock
+        {
+            let mut idx = indexer_clone.lock().await;
+            idx.init_vector_store();
+            match idx.index_project().await {
+                Ok(count) => {
+                    tracing::info!("[INDEXER] ✅ Indexed {} symbols from {:?}", count, working_dir_clone);
+                }
+                Err(e) => {
+                    tracing::warn!("[INDEXER] ❌ Indexing failed: {}. Will rely on auto-indexing via file_read.", e);
+                }
+            }
+        } // Lock released before starting watcher
+
+        // 🧠 Initialize memory vector store for semantic memory search
+        memory_for_vector.init_vector_store(&embedding_config, &db_dir_for_memory);
+
+        // Start file system watcher for incremental updates
+        if let Err(e) = ox_core::symbol::CodeIndexer::start_watcher(indexer_clone).await {
+            tracing::warn!("[INDEXER] Failed to start file watcher: {}. Auto-indexing via file_read still works.", e);
+        } else {
+            tracing::info!("[INDEXER] 📡 File watcher started for real-time updates");
+        }
+    });
+    
+    // Notify user that indexing is happening in background
+    app.output.push_system("🔍 Background indexing started. Symbols + memory vectors will be indexed automatically.");
+    app.output.push_system("   Use /index to check status or /index build to re-index.");
 
     let mut tool_ctx = Arc::new(ToolContext::new(
         rt_env.clone(),
         rt_env.working_dir.clone(),
         Arc::new(config.clone()),
         Arc::clone(&memory_arc),
-        Arc::clone(&file_index_manager),
+        Arc::clone(&code_indexer),
     ));
 
     // Model name for cost recording.
@@ -478,6 +493,9 @@ async fn run_app(
 
     // Initialize Workflow Engine in App
     app.init_workflow_engine(&session.meta.id, &session.meta);
+    
+    // Set code_indexer in app for slash command access
+    app.code_indexer = Some(Arc::clone(&code_indexer));
 
     // 🧠 Project onboarding: queue if either conventions or architecture skill is missing
     let mut needs_onboarding = false;
@@ -486,7 +504,6 @@ async fn run_app(
         let conventions = root.join(".ox").join("skills").join("project-conventions.md");
         let architecture = root.join(".ox").join("skills").join("project-architecture.md");
         if !conventions.exists() || !architecture.exists() {
-            needs_onboarding = true;
             needs_onboarding = true;
             onboarding_prompt_text = format!(
                 "You just opened a new project at `{}`. This is the FIRST time Ox has seen this project.\n\n\
@@ -1543,31 +1560,13 @@ async fn run_app(
                                         tracing::warn!("Failed to update session working dir: {}", e);
                                     }
 
-                                    // Switch file index to new directory
-                                    match file_index_registry.get_or_create(&new_dir) {
-                                        Ok(new_file_index) => {
-                                            file_index_manager = new_file_index;
-                                            tracing::info!("Switched file index to: {:?}", new_dir);
-
-                                            // Start file watcher for the new directory
-                                            if let Err(e) = file_index_manager.start_file_watcher(new_dir.clone()) {
-                                                tracing::warn!("Failed to start file watcher for new dir: {}", e);
-                                            } else {
-                                                tracing::info!("File watcher started for: {:?}", new_dir);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("Failed to switch file index: {}. Keeping current index.", e);
-                                        }
-                                    }
-
                                     // Update tool_ctx for next agent turn.
                                     tool_ctx = Arc::new(ToolContext::new(
                                         rt_env.clone(),
                                         new_dir.clone(),
                                         Arc::new(config.clone()),
                                         Arc::clone(&memory_arc),
-                                        Arc::clone(&file_index_manager),
+                                        Arc::clone(&code_indexer),
                                     ));
                                     if project_changed {
                                         app.output.push_system(&format!(
@@ -2024,7 +2023,30 @@ fn handle_key_event(
 
                             // ⭐ Defer heavy work to a background thread so the event loop
                             // stays responsive and "Thinking..." renders immediately.
+                            let code_indexer_for_ctx = app.code_indexer.clone();
+                            let user_text_for_symbols = user_text.clone();
                             tokio::spawn(async move {
+                                // ── AST symbol search (async, before blocking) ──
+                                let relevant_symbols_str = if let Some(ref indexer) = code_indexer_for_ctx {
+                                    let idx = indexer.lock().await;
+                                    match idx.search(&user_text_for_symbols, 8).await {
+                                        Ok(result) if !result.symbols.is_empty() => {
+                                            let mut s = String::new();
+                                            for sym in &result.symbols {
+                                                s.push_str(&format!(
+                                                    "- [{}] `{}` @ {}:{}-{}\n",
+                                                    sym.kind, sym.name,
+                                                    sym.file_path, sym.start_line, sym.end_line
+                                                ));
+                                            }
+                                            Some(s)
+                                        }
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
+
                                 // ── All heavy synchronous work runs on a blocking thread ──
                                 let tr = tool_registry.clone();
                                 let blocking_result = tokio::task::spawn_blocking(move || {
@@ -2036,6 +2058,7 @@ fn handle_key_event(
                                         git_diff_stat: context::gather_diff_context(working_dir),
                                         dir_structure: None,
                                         recent_summary: None,
+                                        relevant_symbols: relevant_symbols_str,
                                     };
 
                                     // 2. Build system prompt

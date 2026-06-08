@@ -11,7 +11,7 @@ pub struct EnforcementRules {
     pub enabled: bool,
 
     /// 规则 1: 编辑前必须有计划 (Extracted from coding-principles)
-    /// 检查 LLM 在调用 file_write/file_patch 前是否在对话中提出了计划。
+    /// 检查 LLM 在调用 file_write/edit_file 前是否在对话中提出了计划。
     #[serde(default = "default_true")]
     pub plan_before_edit: bool,
 
@@ -21,7 +21,7 @@ pub struct EnforcementRules {
     pub steps_before_shell: bool,
 
     /// 规则 3: 编辑前必须先读取文件 (Read Before Edit)
-    /// 检查 LLM 在调用 file_write/file_patch 前是否通过 file_read 读取过目标文件。
+    /// 检查 LLM 在调用 file_write/edit_file 前是否通过 file_read 读取过目标文件。
     /// 防止 LLM 在没有阅读的情况下猜测文件内容。
     #[serde(default = "default_true")]
     pub read_before_edit: bool,

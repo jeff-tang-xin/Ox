@@ -499,7 +499,7 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
 
     // Remove empty Assistant messages (no content + no tool_calls after sanitization)
     messages.retain(|m| {
-        if let Message::Assistant { content, tool_calls } = m {
+        if let Message::Assistant { content, tool_calls, .. } = m {
             !(content.is_empty() && tool_calls.is_empty())
         } else {
             true
@@ -602,8 +602,12 @@ fn estimate_message_tokens(msg: &Message) -> usize {
         Message::Assistant {
             content,
             tool_calls,
+            reasoning_content,
         } => {
             let mut tokens = estimate_tokens(content);
+            if let Some(reasoning) = reasoning_content {
+                tokens += estimate_tokens(reasoning);
+            }
             for tc in tool_calls {
                 tokens += estimate_tokens(&tc.name);
                 tokens += estimate_tokens(&tc.arguments);
@@ -680,6 +684,7 @@ mod tests {
                     name: "file_read".to_string(),
                     arguments: "{\"path\": \"test.txt\"}".to_string(),
                 }],
+                reasoning_content: None,
             },
             Message::ToolResult {
                 tool_call_id: "call_xyz".to_string(), // Orphaned - no matching tool_call
@@ -706,6 +711,7 @@ mod tests {
                     name: "file_read".to_string(),
                     arguments: "{\"path\": \"test.txt\"}".to_string(),
                 }],
+                reasoning_content: None,
             },
             // No ToolResult for call_abc - orphaned tool_call
         ];
@@ -728,6 +734,7 @@ mod tests {
                     name: "file_read".to_string(),
                     arguments: "{\"path\": \"test.txt\"}".to_string(),
                 }],
+                reasoning_content: None,
             },
             // No ToolResult for call_abc - orphaned tool_call
         ];
@@ -739,6 +746,7 @@ mod tests {
         if let Message::Assistant {
             content,
             tool_calls,
+            ..
         } = &messages[0]
         {
             assert_eq!(content, "I'll read the file for you.");

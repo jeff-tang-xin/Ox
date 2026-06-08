@@ -19,6 +19,9 @@ pub enum Message {
         content: String,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         tool_calls: Vec<ToolCall>,
+        /// DeepSeek reasoning_content (thinking mode) — must be sent back to the API.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        reasoning_content: Option<String>,
     },
     #[serde(rename = "tool")]
     ToolResult {
@@ -44,6 +47,7 @@ impl Message {
         Self::Assistant {
             content: content.into(),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         }
     }
 }

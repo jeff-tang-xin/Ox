@@ -2,6 +2,7 @@ pub mod store;
 pub mod semantic;  // 🆕 Semantic association manager
 pub mod layering;  // 🆕 L0-L3 memory layering
 pub mod hybrid_storage;  // 🆕 Hybrid SQLite + Markdown storage
+pub mod memory_vector;  // 🆕 Vector-backed semantic memory search
 
 use std::fmt;
 use std::sync::Mutex;
@@ -504,7 +505,7 @@ impl MemoryNode {
     ) -> Option<Self> {
         match tool_name {
             "file_read" => Self::extract_file_read_memory(tool_args, tool_result, project_id, language),
-            "file_write" | "file_patch" => {
+            "file_write" | "edit_file" => {
                 if tool_args.len() < 20 {
                     return None;
                 }
@@ -757,6 +758,8 @@ pub struct MemoryManager {
     semantic_manager: Option<semantic::SemanticAssociationManager>,
     // 🆕 Hybrid storage for L0-L3 architecture (optional)
     hybrid_storage: Option<hybrid_storage::HybridStorage>,
+    // 🆕 Vector-backed semantic memory search (optional, requires embedding model)
+    memory_vector_store: Mutex<Option<memory_vector::MemoryVectorStore>>,
 }
 
 impl Clone for MemoryManager {
@@ -768,6 +771,7 @@ impl Clone for MemoryManager {
             query_cache: Mutex::new(HashMap::new()),  // Don't clone cache
             semantic_manager: self.semantic_manager.clone(),
             hybrid_storage: None,  // Don't clone hybrid storage (expensive)
+            memory_vector_store: Mutex::new(None),  // Don't clone vector store
         }
     }
 }
@@ -825,6 +829,7 @@ impl MemoryManager {
             query_cache: Mutex::new(HashMap::new()),  // Initialize empty cache
             semantic_manager,
             hybrid_storage,
+            memory_vector_store: Mutex::new(None),  // Initialized separately via init_vector_store
         })
     }
 
@@ -832,6 +837,9 @@ impl MemoryManager {
         node.content = crate::safety::sanitizer::DataSanitizer::sanitize_all(&node.content);
         let is_immediate = node.node_type.is_immediate_write();
         let is_long_term = node.node_type.is_long_term();
+
+        // 🆕 Index into vector store for semantic search (before potential move)
+        self.index_to_vector_store(&node);
 
         if is_immediate {
             if is_long_term || node.project_id.is_none() {
@@ -865,6 +873,50 @@ impl MemoryManager {
                 tracing::warn!("Failed to store explicit memory: {e}");
             }
         }
+        // 🆕 Index into vector store
+        self.index_to_vector_store(&node);
+    }
+
+    /// Initialize the memory vector store for semantic search.
+    /// Call this in a background task after the embedding model is loaded.
+    ///
+    /// # Arguments
+    /// * `embedding_config` - Embedding model configuration
+    /// * `db_dir` - Directory for the TriviumDB file (e.g. `~/.ox/db/`)
+    pub fn init_vector_store(&self, embedding_config: &crate::config::EmbeddingConfig, db_dir: &PathBuf) {
+        if !embedding_config.enabled {
+            tracing::info!("[MEMORY_VECTOR] Embedding disabled via config");
+            return;
+        }
+
+        let tdb_path = db_dir.join("memories.tdb");
+        let path_str = tdb_path.to_string_lossy().to_string();
+
+        match memory_vector::MemoryVectorStore::open_standalone(&path_str, embedding_config) {
+            Ok(store) => {
+                tracing::info!(
+                    "[MEMORY_VECTOR] ✅ Memory vector store initialized at {} (dim={})",
+                    path_str, store.dimension()
+                );
+                *self.memory_vector_store.lock().unwrap() = Some(store);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[MEMORY_VECTOR] ❌ Failed to initialize: {}. Semantic memory search disabled.",
+                    e
+                );
+            }
+        }
+    }
+
+    /// Index a single memory node into the vector store (if available).
+    fn index_to_vector_store(&self, node: &MemoryNode) {
+        let mut guard = self.memory_vector_store.lock().unwrap();
+        if let Some(ref mut store) = *guard {
+            if let Err(e) = store.index_node(node) {
+                tracing::debug!("[MEMORY_VECTOR] Failed to index node {}: {}", node.id, e);
+            }
+        }
     }
 
     pub fn update_from_turn(
@@ -888,6 +940,7 @@ impl MemoryManager {
             if let crate::message::Message::Assistant {
                 content,
                 tool_calls,
+                ..
             } = msg
             {
                 // Extract knowledge from tool calls (with access to results)
@@ -1041,7 +1094,7 @@ impl MemoryManager {
         let mut assistant_reasoning = String::new();
         
         for msg in messages {
-            if let Message::Assistant { content, tool_calls } = msg {
+            if let Message::Assistant { content, tool_calls, .. } = msg {
                 if assistant_reasoning.is_empty() && !content.is_empty() {
                     assistant_reasoning = content.chars().take(300).collect();
                 }
@@ -1053,7 +1106,8 @@ impl MemoryManager {
                             }
                             match tc.name.as_str() {
                                 "file_write" => operations.push(format!("created {}", path)),
-                                "file_patch" => operations.push(format!("patched {}", path)),
+                                "edit_file" => operations.push(format!("patched {}", path)),
+                                "delete_range" => operations.push(format!("deleted range in {}", path)),
                                 _ => {}
                             }
                         }
@@ -1321,6 +1375,56 @@ impl MemoryManager {
                     .or_insert_with(|| (m, 0.5));
             }
         }
+
+        // 🎯 PATH 5: Vector semantic search (weight: 0.9 — high because true semantic match)
+        // This catches memories that are semantically similar but don't share exact keywords.
+        {
+            let guard = self.memory_vector_store.lock().unwrap();
+            if let Some(ref vs) = *guard {
+                match vs.search(query, limit) {
+                    Ok(hits) if !hits.is_empty() => {
+                        tracing::debug!(
+                            "[MEMORY RETRIEVAL] PATH 5 (vector semantic): {} hits for '{}'",
+                            hits.len(), query
+                        );
+                        for hit in hits {
+                            // Only add if not already found by keyword paths (avoid duplicates)
+                            if !all_results.contains_key(&hit.node_id) {
+                                // Reconstruct a minimal MemoryNode from the vector hit
+                                let node = MemoryNode::new(
+                                    hit.content,
+                                    hit.node_type,
+                                    hit.project_id,
+                                    String::new(),
+                                    MemorySource::LlmExtraction,  // Best guess
+                                );
+                                let weight = 0.9 * hit.score.min(1.0);  // Scale by similarity
+                                all_results.entry(hit.node_id)
+                                    .or_insert_with(|| (node, weight));
+                            } else {
+                                // Boost existing keyword match with semantic confirmation
+                                all_results.entry(hit.node_id)
+                                    .and_modify(|(_, score)| {
+                                        *score = (*score + 0.4 * hit.score).min(2.0);
+                                    });
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            "[MEMORY RETRIEVAL] PATH 5 (vector semantic): no hits for '{}'",
+                            query
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[MEMORY RETRIEVAL] PATH 5 (vector semantic) failed: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
         
         // Log total candidates before filtering
         tracing::debug!(
@@ -1521,6 +1625,8 @@ impl MemoryManager {
                     tracing::warn!("Failed to flush memory (project): {e}");
                 }
             }
+            // 🆕 Index flushed nodes into vector store
+            self.index_to_vector_store(node);
         }
     }
 

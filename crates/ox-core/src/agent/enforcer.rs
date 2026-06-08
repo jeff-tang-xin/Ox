@@ -97,7 +97,7 @@ impl RuleEnforcer {
 
     /// 检查编辑操作前是否有明确的计划陈述
     fn check_plan_before_edit(tc: &ToolCall, messages: &[Message], custom_patterns: &[String]) -> Result<(), String> {
-        if !matches!(tc.name.as_str(), "file_write" | "file_patch") {
+        if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
             return Ok(());
         }
 
@@ -232,7 +232,7 @@ impl RuleEnforcer {
     /// 在文件被修改前，确认 LLM 已经通过 file_read/recall 读取过它。
     /// 这防止 LLM"猜测"文件内容而不是先阅读。
     fn check_read_before_edit(tc: &ToolCall, messages: &[Message]) -> Result<(), String> {
-        if !matches!(tc.name.as_str(), "file_write" | "file_patch") {
+        if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
             return Ok(());
         }
 
@@ -317,10 +317,10 @@ impl RuleEnforcer {
                  The file may differ from what you expect.\n\n\
                  💡 Fix:\n\
                  1. Call `file_read` with `\"path\": \"{path}\"` to see the EXACT content\n\
-                 2. Then call `file_patch` or `file_write` with the correct changes\n\n\
+                 2. Then call `edit_file` or `file_write` with the correct changes\n\n\
                  📝 Example:\n\
                  file_read(path=\"{path}\")\n\
-                 ... then file_patch/path ...",
+                 ... then edit_file/path ...",
                 path = target_path
             ))
         } else {
@@ -333,7 +333,7 @@ impl RuleEnforcer {
     /// 当编辑已存在的源码文件时，确保 LLM 调用了 code_search 来检查依赖/调用方。
     /// 防止修改函数签名/接口后忘记更新调用处。
     fn check_impact_before_edit(tc: &ToolCall, messages: &[Message]) -> Result<(), String> {
-        if !matches!(tc.name.as_str(), "file_write" | "file_patch") {
+        if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
             return Ok(());
         }
 
@@ -400,7 +400,7 @@ impl RuleEnforcer {
                  📝 Example:\n\
                  code_search(query=\"{name}\")\n\
                  ... review results ...\n\
-                 file_patch(path=\"{path}\")",
+                 edit_file(path=\"{path}\")",
                 path = target_path,
                 name = target_basename,
             ))

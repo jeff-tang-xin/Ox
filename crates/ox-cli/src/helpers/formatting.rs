@@ -5,7 +5,7 @@ use ox_core::message::Message;
 /// Summarize tool result for display.
 pub fn summarize_tool_result(name: &str, output: &str) -> String {
     match name {
-        "file_write" | "file_patch" => {
+        "file_write" | "edit_file" | "delete_range" => {
             let first_line = output.lines().next().unwrap_or(output);
             let truncated: String = first_line.chars().take(120).collect();
             if first_line.len() > 120 {
