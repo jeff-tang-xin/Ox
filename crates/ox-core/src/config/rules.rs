@@ -31,6 +31,12 @@ pub struct EnforcementRules {
     /// 防止修改后忘记更新调用处。
     #[serde(default = "default_true")]
     pub impact_analysis: bool,
+
+    /// Trivial 编辑阈值（字符数）
+    /// 当 edit_file 的 old_string 长度不超过此值时，视为 trivial 修改，
+    /// 自动跳过 plan_before_edit 规则。设为 0 可禁用此白名单。
+    #[serde(default = "default_trivial_threshold")]
+    pub trivial_edit_threshold: usize,
     
     /// 自定义计划检测模式（可选）
     /// 用户可以添加额外的正则表达式模式来检测计划意图
@@ -44,6 +50,7 @@ pub struct EnforcementRules {
 }
 
 fn default_true() -> bool { true }
+fn default_trivial_threshold() -> usize { 50 }
 
 impl Default for EnforcementRules {
     fn default() -> Self {
@@ -53,6 +60,7 @@ impl Default for EnforcementRules {
             steps_before_shell: true,
             read_before_edit: true,
             impact_analysis: true,
+            trivial_edit_threshold: default_trivial_threshold(),
             custom_plan_patterns: vec![],
             custom_step_patterns: vec![],
         }

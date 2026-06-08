@@ -66,7 +66,7 @@ impl RuleEnforcer {
 
         // 1. 校验: 编辑前必须有计划 (Plan Before Edit)
         if rules.plan_before_edit {
-            if let Err(e) = Self::check_plan_before_edit(tool_call, messages, &rules.custom_plan_patterns) {
+            if let Err(e) = Self::check_plan_before_edit(tool_call, messages, &rules.custom_plan_patterns, rules.trivial_edit_threshold) {
                 return Err(e);
             }
         }
@@ -96,7 +96,7 @@ impl RuleEnforcer {
     }
 
     /// 检查编辑操作前是否有明确的计划陈述
-    fn check_plan_before_edit(tc: &ToolCall, messages: &[Message], custom_patterns: &[String]) -> Result<(), String> {
+    fn check_plan_before_edit(tc: &ToolCall, messages: &[Message], custom_patterns: &[String], trivial_threshold: usize) -> Result<(), String> {
         if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
             return Ok(());
         }
@@ -106,6 +106,31 @@ impl RuleEnforcer {
             if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
                 if !is_source_file(path) {
                     return Ok(());
+                }
+            }
+        }
+
+        // 🎯 Trivial 编辑白名单：edit_file 的 old_string 很短时（如拼写修复），不需要 Plan
+        // 只对 edit_file 生效（file_write 是全量写入，不适用）
+        if tc.name == "edit_file" && trivial_threshold > 0 {
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                // 检查单次编辑的 old_string 长度
+                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str()) {
+                    if old_str.len() <= trivial_threshold {
+                        return Ok(());
+                    }
+                }
+                // 检查批量编辑中是否所有 old_string 都很短
+                if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
+                    let all_trivial = edits.iter().all(|e| {
+                        e.get("old_string")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len() <= trivial_threshold)
+                            .unwrap_or(false)
+                    });
+                    if all_trivial {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -407,5 +432,118 @@ impl RuleEnforcer {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_edit_file_call(path: &str, old_string: &str, new_string: &str) -> ToolCall {
+        ToolCall {
+            id: "test".to_string(),
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({
+                "path": path,
+                "old_string": old_string,
+                "new_string": new_string,
+            }).to_string(),
+        }
+    }
+
+    fn make_file_write_call(path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            id: "test".to_string(),
+            name: "file_write".to_string(),
+            arguments: serde_json::json!({
+                "path": path,
+                "content": content,
+            }).to_string(),
+        }
+    }
+
+    #[test]
+    fn test_trivial_edit_bypasses_plan_requirement() {
+        // 拼写修复：old_string 很短，应自动放行
+        let tc = make_edit_file_call("src/main.rs", "teh", "the");
+        let messages = vec![]; // 没有 plan，但 trivial 编辑应放行
+        let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
+        assert!(result.is_ok(), "Trivial edit should bypass plan requirement");
+    }
+
+    #[test]
+    fn test_non_trivial_edit_requires_plan() {
+        // 大段修改：old_string 超过阈值，没有 plan 应被拦截
+        let long_old = "fn main() {\n    println!(\"Hello, world!\");\n}".to_string();
+        let tc = make_edit_file_call("src/main.rs", &long_old, "fn main() {}");
+        let messages = vec![];
+        let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
+        assert!(result.is_err(), "Non-trivial edit should require plan");
+    }
+
+    #[test]
+    fn test_file_write_never_trivial() {
+        // file_write 是全量写入，即使内容很短也不走 trivial 白名单
+        let tc = make_file_write_call("src/main.rs", "fn main() {}");
+        let messages = vec![];
+        let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
+        assert!(result.is_err(), "file_write should never be considered trivial");
+    }
+
+    #[test]
+    fn test_trivial_threshold_zero_disables_whitelist() {
+        // 阈值为 0 时，白名单禁用，所有编辑都需要 plan
+        let tc = make_edit_file_call("src/main.rs", "teh", "the");
+        let messages = vec![];
+        let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 0);
+        assert!(result.is_err(), "Threshold 0 should disable trivial whitelist");
+    }
+
+    #[test]
+    fn test_batch_edits_all_trivial_passes() {
+        // 批量编辑中所有 old_string 都很短，应放行
+        let tc = ToolCall {
+            id: "test".to_string(),
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/main.rs",
+                "edits": [
+                    { "old_string": "teh", "new_string": "the" },
+                    { "old_string": "recieve", "new_string": "receive" },
+                ]
+            }).to_string(),
+        };
+        let messages = vec![];
+        let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
+        assert!(result.is_ok(), "All-trivial batch edits should bypass plan");
+    }
+
+    #[test]
+    fn test_batch_edits_mixed_requires_plan() {
+        // 批量编辑中有一个 old_string 很长，需要 plan
+        let long_old = "fn main() {\n    println!(\"Hello, world!\");\n}".to_string();
+        let tc = ToolCall {
+            id: "test".to_string(),
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({
+                "path": "src/main.rs",
+                "edits": [
+                    { "old_string": "teh", "new_string": "the" },
+                    { "old_string": long_old, "new_string": "fn main() {}" },
+                ]
+            }).to_string(),
+        };
+        let messages = vec![];
+        let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
+        assert!(result.is_err(), "Mixed batch with non-trivial edit should require plan");
+    }
+
+    #[test]
+    fn test_non_source_file_always_passes() {
+        // 非源码文件不受 plan 规则约束
+        let tc = make_edit_file_call("README.md", "some long text that exceeds threshold", "replacement");
+        let messages = vec![];
+        let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
+        assert!(result.is_ok(), "Non-source files should always pass");
     }
 }
