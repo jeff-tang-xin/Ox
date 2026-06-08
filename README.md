@@ -74,7 +74,7 @@ ox-cli (TUI) ──channels──▶ ox-core (business logic)
 ### 1. Install
 
 ```bash
-git clone https://github.com/your-repo/Ox.git
+git clone https://github.com/jeff-tang-xin/Ox.git
 cd Ox
 cargo build --release
 ```
