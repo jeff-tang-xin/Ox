@@ -14,17 +14,30 @@ use chrono::Utc;
 
 use super::{MemoryNode, MemoryNodeType, MemorySource};
 
-/// Memory layer levels
+/// Memory layer levels - synchronized with MemoryNode.depth
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryLayer {
     /// L0: Raw conversation logs
-    L0RawConversation,
+    L0RawConversation = 0,
     /// L1: Refined atomic facts
-    L1AtomFact,
+    L1AtomFact = 1,
     /// L2: Scenario-based chunks
-    L2ScenarioChunk,
+    L2ScenarioChunk = 2,
     /// L3: Project persona/profile
-    L3ProjectPersona,
+    L3ProjectPersona = 3,
+}
+
+impl MemoryLayer {
+    /// Convert from depth value (0-3)
+    pub fn from_depth(depth: u8) -> Option<Self> {
+        match depth {
+            0 => Some(Self::L0RawConversation),
+            1 => Some(Self::L1AtomFact),
+            2 => Some(Self::L2ScenarioChunk),
+            3 => Some(Self::L3ProjectPersona),
+            _ => None,
+        }
+    }
 }
 
 impl MemoryLayer {
@@ -286,6 +299,9 @@ impl ProjectPersona {
 }
 
 /// Layer manager - handles promotion between layers
+/// 
+/// Note: base_path should be the parent of .ox directory (e.g., project root)
+/// The manager will create `.ox/personas` for persona storage.
 pub struct LayerManager {
     base_path: std::path::PathBuf,
 }
@@ -296,6 +312,13 @@ impl LayerManager {
             base_path: base_path.to_path_buf(),
         }
     }
+
+    /// Get the personas directory path (creates if not exists)
+    fn personas_dir(&self) -> std::path::PathBuf {
+        self.base_path.join(".ox").join("personas")
+    }
+
+    
 
     /// Promote L0 conversations to L1 atoms (requires LLM distillation)
     pub fn promote_l0_to_l1(
@@ -384,7 +407,7 @@ impl LayerManager {
 
     /// Save L3 persona to white-box Markdown file
     pub fn save_persona_whitebox(&self, persona: &ProjectPersona) -> std::io::Result<std::path::PathBuf> {
-        let personas_dir = self.base_path.join(".ox").join("personas");
+        let personas_dir = self.personas_dir();
         std::fs::create_dir_all(&personas_dir)?;
         
         let filename = format!("{}.md", persona.id);
@@ -398,7 +421,7 @@ impl LayerManager {
 
     /// Load L3 persona from white-box Markdown file
     pub fn load_persona_whitebox(&self, project_id: &str) -> std::io::Result<Option<ProjectPersona>> {
-        let personas_dir = self.base_path.join(".ox").join("personas");
+        let personas_dir = self.personas_dir();
         let filename = format!("persona_{}.md", project_id.replace(' ', "_").to_lowercase());
         let path = personas_dir.join(&filename);
         

@@ -32,13 +32,14 @@ impl HybridStorage {
     /// Do NOT append `.ox` again — use `base_path` directly.
     pub fn new(base_path: &Path) -> anyhow::Result<Self> {
         let sqlite_path = base_path.join("memory.db");
+        // Use consistent knowledge directory under .ox
         let markdown_dir = base_path.join("knowledge");
         
         // Ensure directories exist
         fs::create_dir_all(&markdown_dir)?;
         
         let sqlite_store = MemoryStore::open(&sqlite_path)?;
-        // LayerManager internally appends `.ox/`, so pass the parent directory
+        // LayerManager expects parent of .ox (project root), so pass parent
         let layer_base = base_path.parent().unwrap_or(base_path);
         let layer_manager = LayerManager::new(layer_base);
         
@@ -49,6 +50,8 @@ impl HybridStorage {
             base_path: base_path.to_path_buf(),
         })
     }
+
+    
 
     /// Store L0 conversation in SQLite
     pub fn store_l0(&self, conversation: &RawConversation) -> anyhow::Result<()> {

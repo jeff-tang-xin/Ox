@@ -117,31 +117,56 @@ impl Default for ContextBuilder {
 
 impl ContextBuilder {
     /// Create a new ContextBuilder with default ratios.
+    /// Ratios must sum to 1.0 for correct budget allocation.
     pub fn new() -> Self {
         Self {
             system_prompt_ratio: 0.02,
-            memory_ratio: 0.02,
-            history_ratio: 0.10, // 10% for history
-            reply_reserve_ratio: 0.85,
+            memory_ratio: 0.03,
+            history_ratio: 0.18, // 18% for history - more room for conversation
+            reply_reserve_ratio: 0.77,
         }
     }
 
+    /// Validate that ratios sum to 1.0 (with epsilon tolerance)
+    fn validate_ratios(&self) -> bool {
+        let sum = self.system_prompt_ratio + self.memory_ratio + 
+                  self.history_ratio + self.reply_reserve_ratio;
+        (sum - 1.0).abs() < 0.001
+    }
+
     /// Create a ContextBuilder from ContextConfig ratios.
+    /// FIX: Ensure ratios sum to 1.0 by normalizing if needed.
     pub fn from_config(config: &crate::config::ContextConfig) -> Self {
         let user_ratio_sum =
             config.history_ratio + config.memory_ratio + config.system_prompt_ratio;
+        
+        // Clamp reply_reserve to [0.0, 1.0] and normalize if ratios > 1.0
         let reply_reserve = if user_ratio_sum >= 1.0 {
-            0.0 // Fallback if ratios are invalid
+            tracing::warn!("ContextConfig ratios sum to >= 1.0, clamping reply_reserve to 0");
+            0.0
         } else {
             1.0 - user_ratio_sum
         };
 
-        Self {
-            system_prompt_ratio: config.system_prompt_ratio,
-            memory_ratio: config.memory_ratio,
-            history_ratio: config.history_ratio,
-            reply_reserve_ratio: reply_reserve,
+        let builder = Self {
+            system_prompt_ratio: config.system_prompt_ratio.clamp(0.0, 1.0),
+            memory_ratio: config.memory_ratio.clamp(0.0, 1.0),
+            history_ratio: config.history_ratio.clamp(0.0, 1.0),
+            reply_reserve_ratio: reply_reserve.clamp(0.0, 1.0),
+        };
+        
+        // Debug validate (doesn't enforce, but warns)
+        if !builder.validate_ratios() {
+            tracing::warn!(
+                "ContextBuilder ratios don't sum to 1.0: sys={}, mem={}, hist={}, reply={}",
+                builder.system_prompt_ratio,
+                builder.memory_ratio,
+                builder.history_ratio,
+                builder.reply_reserve_ratio
+            );
         }
+        
+        builder
     }
 
     /// Get the history ratio (0.10 = 10% of context window).

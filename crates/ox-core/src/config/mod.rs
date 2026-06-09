@@ -431,12 +431,12 @@ pub struct ContextConfig {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            max_history_turns: 20,
-            memory_budget_tokens: 2000,
-            history_budget_tokens: 50000,
-            reply_reserve_tokens: 73000,
-            history_ratio: 0.10,
-            memory_ratio: 0.02,
+            max_history_turns: 30,
+            memory_budget_tokens: 3000,
+            history_budget_tokens: 80000,
+            reply_reserve_tokens: 50000,
+            history_ratio: 0.18,  // ↑ 10% → 18% (more history for long conversations)
+            memory_ratio: 0.03,   // ↑ 2% → 3%
             system_prompt_ratio: 0.02,
             use_refined_context: true, // 🆕 Default: ENABLED to reduce hallucinations and improve instruction following
         }
@@ -795,7 +795,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 25,
+            max_iterations: 50,
             max_per_turn_tokens: 500_000,
         }
     }

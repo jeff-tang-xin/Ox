@@ -838,19 +838,35 @@ impl MemoryManager {
         node.content = crate::safety::sanitizer::DataSanitizer::sanitize_all(&node.content);
         let is_immediate = node.node_type.is_immediate_write();
         let is_long_term = node.node_type.is_long_term();
+        let has_project = node.project_id.is_some();
 
         // 🆕 Index into vector store for semantic search (before potential move)
         self.index_to_vector_store(&node);
 
         if is_immediate {
-            if is_long_term || node.project_id.is_none() {
+            // FIX: Write to exactly ONE store, not both (avoid duplicates)
+            // - Global memories (no project_id) → overall_store
+            // - Project memories → project_store (if exists), else overall_store
+            if has_project {
+                // Project-specific memory: write to project_store (or fallback to overall)
+                if let Some(ref store) = self.project_store {
+                    if let Err(e) = store.insert(&node) {
+                        tracing::warn!("Failed to write memory (project): {e}");
+                    }
+                } else if let Err(e) = self.overall_store.insert(&node) {
+                    tracing::warn!("Failed to write memory (overall): {e}");
+                }
+            } else {
+                // Global memory: write to overall_store
                 if let Err(e) = self.overall_store.insert(&node) {
                     tracing::warn!("Failed to write memory (overall): {e}");
                 }
             }
-            if let Some(ref store) = self.project_store {
-                if let Err(e) = store.insert(&node) {
-                    tracing::warn!("Failed to write memory (project): {e}");
+            
+            // Also write to overall_store if long-term (for cross-project retrieval)
+            if is_long_term && has_project {
+                if let Err(e) = self.overall_store.insert(&node) {
+                    tracing::warn!("Failed to write memory (overall for long-term): {e}");
                 }
             }
         } else {

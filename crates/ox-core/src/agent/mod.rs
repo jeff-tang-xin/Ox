@@ -150,6 +150,8 @@ pub async fn run_agent_turn(
         if !workflow_active && iteration > 0 && iteration >= max_iterations {
             let _ = ui_tx.send(AgentToUiEvent::IterationLimitReached { iteration });
 
+            // 用户确认超时时间（秒）
+            const CONFIRM_TIMEOUT_SECS: u64 = 60;
             let should_continue = loop {
                 tokio::select! {
                     ev = ui_rx.recv() => {
@@ -171,6 +173,13 @@ pub async fn run_agent_turn(
                     }
                     _ = cancel_token.cancelled() => {
                         break false;
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(CONFIRM_TIMEOUT_SECS)) => {
+                        // 超时自动继续
+                        let _ = ui_tx.send(AgentToUiEvent::Status(
+                            "⏰ Confirmation timeout. Auto-continuing...".to_string()
+                        ));
+                        break true;
                     }
                 }
             };
