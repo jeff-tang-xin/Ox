@@ -183,9 +183,9 @@ pub async fn run_agent_turn(
         }
 
         let _ = ui_tx.send(AgentToUiEvent::Status(if iteration == 0 {
-            "Thinking...".to_string()
+            "🧠 Thinking...".to_string()
         } else {
-            format!("Thinking... (iteration {})", iteration + 1)
+            format!("🧠 Thinking... (iteration {})", iteration + 1)
         }));
 
         // Check for queued interjections before LLM call.

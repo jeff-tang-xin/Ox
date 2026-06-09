@@ -33,7 +33,8 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
     }
 
     // Calculate dynamic header height (max 3 lines to save space)
-    let header_height = app.header_info.len().min(3) as u16 + 1;
+    let indexing_bar = if app.indexing && app.index_total_files > 0 { 1u16 } else { 0 };
+    let header_height = app.header_info.len().min(3) as u16 + 1 + indexing_bar;
 
     // Input pane: 2 lines for normal mode, 3 lines for confirmation mode
     let input_height = if app.pending_confirmation.is_some() {
@@ -122,6 +123,29 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         area.height.saturating_sub(1) as usize // Only reserve 1 line for title
     };
 
+    // Show indexing progress bar in header
+    if app.indexing && app.index_total_files > 0 {
+        let pct = (app.index_files_done * 100) / app.index_total_files.max(1);
+        let bar_width = 20;
+        let filled = (app.index_files_done * bar_width) / app.index_total_files.max(1);
+        let empty = bar_width - filled;
+        let progress_bar = "█".repeat(filled) + &"░".repeat(empty);
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  ⏳ Indexing: ".to_string(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("[{}]", progress_bar),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                format!(" {}%  ({}/{} files, {} symbols)", pct, app.index_files_done, app.index_total_files, app.index_symbols),
+                Style::default().fg(TEXT),
+            ),
+        ]));
+    }
+
     for info in &app.header_info {
         if lines.len() < area.height as usize - 1 && lines.len() <= max_info_lines {
             lines.push(Line::from(vec![
@@ -170,9 +194,22 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let scroll_offset = app.scroll_offset;
 
     // Enhanced title with better scroll indication
-    let title = if app.agent_running {
+    let title = if app.indexing {
         let s = SPINNER[(spinner_frame as usize) % SPINNER.len()];
-        format!(" {s} Ox ")
+        if app.index_total_files > 0 {
+            let pct = (app.index_files_done * 100) / app.index_total_files.max(1);
+            format!(" {s} Indexing {}/{} files ({}%) ", app.index_files_done, app.index_total_files, pct)
+        } else {
+            format!(" {s} Indexing... {} symbols ", app.index_symbols)
+        }
+    } else if app.agent_running {
+        let s = SPINNER[(spinner_frame as usize) % SPINNER.len()];
+        let status_text = if !app.status.is_empty() {
+            format!(" {}", app.status)
+        } else {
+            String::new()
+        };
+        format!(" {s} Ox{} ", status_text)
     } else if app.user_scrolled && scroll_offset > 0 {
         // Show scroll position indicator
         format!(" Ox ↓ {} lines up ", scroll_offset)
@@ -185,7 +222,9 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::NONE)
         .title(title.as_str())
-        .title_style(if app.agent_running {
+        .title_style(if app.indexing {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if app.agent_running {
             Style::default().fg(STREAMING).add_modifier(Modifier::BOLD)
         } else if app.user_scrolled {
             Style::default()
@@ -421,10 +460,15 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64) {
-    let status_style = Style::default().fg(TEXT_BRIGHT).bg(BLUE);
+    // When indexing or agent running, show progress status prominently
+    let (status_style, status_bg) = if app.indexing {
+        (Style::default().fg(TEXT_BRIGHT).bg(Color::Rgb(80, 60, 0)), Color::Rgb(80, 60, 0))
+    } else {
+        (Style::default().fg(TEXT_BRIGHT).bg(BLUE), BLUE)
+    };
 
     // Left side: Model and working directory (essential info)
-    let left_parts: Vec<Span> = vec![
+    let mut left_parts: Vec<Span> = vec![
         Span::styled(
             format!(" {} ", app.model_name),
             status_style.add_modifier(Modifier::BOLD),
@@ -432,6 +476,15 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         Span::styled(" │ ", status_style),
         Span::styled(format!(" {} ", app.working_dir), status_style),
     ];
+
+    // Show app.status (indexing progress, thinking, etc.)
+    if !app.status.is_empty() {
+        left_parts.push(Span::styled(" │ ", status_style));
+        left_parts.push(Span::styled(
+            format!(" {} ", app.status),
+            status_style.add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // Right side: Message count and cost (compact format)
     let running_indicator = if app.agent_running { "⏳ " } else { "" };
@@ -449,7 +502,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         ..area
     };
     frame.render_widget(
-        Paragraph::new(left_line).style(Style::default().bg(BLUE)),
+        Paragraph::new(left_line).style(Style::default().bg(status_bg)),
         left_area,
     );
 
@@ -459,12 +512,13 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         ..area
     };
     frame.render_widget(
-        Paragraph::new(Line::from(right_span)).style(Style::default().bg(BLUE)),
+        Paragraph::new(Line::from(right_span)).style(Style::default().bg(status_bg)),
         right_area,
     );
 }
 
 fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64) {
+    let indexing_prompt: String;
     let (prompt, prompt_style) = if app.pending_confirmation.is_some() {
         (
             "❯ Y/N/T > ",
@@ -473,6 +527,10 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
                 .add_modifier(Modifier::BOLD)
                 .bg(BG_INPUT),
         )
+    } else if app.indexing {
+        let s = SPINNER[app.spinner_frame as usize % SPINNER.len()];
+        indexing_prompt = format!("{} indexing > ", s);
+        (&*indexing_prompt as &str, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD).bg(BG_INPUT))
     } else if app.agent_running {
         (
             "▸ ox > ",
@@ -492,7 +550,13 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     };
     let prompt_len = prompt.len();
 
-    let border_color = if app.agent_running { STREAMING } else { BLUE };
+    let border_color = if app.indexing {
+        Color::Yellow
+    } else if app.agent_running {
+        STREAMING
+    } else {
+        BLUE
+    };
 
     // Add visual indicator for confirmation mode
     let block = if app.pending_confirmation.is_some() {

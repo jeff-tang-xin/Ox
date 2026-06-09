@@ -1,7 +1,7 @@
 use std::path::Path;
 use tree_sitter::Node;
 use crate::symbol::types::{Symbol, SymbolType};
-use crate::symbol::language::LanguageRegistry;
+use crate::symbol::language::{LanguageRegistry, SyntaxError};
 
 pub struct AstExtractor {
     registry: LanguageRegistry,
@@ -37,6 +37,16 @@ impl AstExtractor {
         );
 
         Ok(symbols)
+    }
+
+    /// Detect language from file extension.
+    pub fn detect_language<P: AsRef<Path>>(&self, path: P) -> Option<&str> {
+        self.registry.detect_language(path)
+    }
+
+    /// Check code for syntax errors without full symbol extraction.
+    pub fn check_syntax(&mut self, code: &str, lang_name: &str) -> anyhow::Result<Vec<SyntaxError>> {
+        self.registry.check_syntax(code, lang_name)
     }
 
     fn extract_from_node(

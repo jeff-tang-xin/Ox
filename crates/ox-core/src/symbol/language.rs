@@ -75,6 +75,74 @@ impl LanguageRegistry {
             .ok_or_else(|| anyhow::anyhow!("Failed to parse code"))?;
         Ok(tree)
     }
+
+    /// Check code for syntax errors using tree-sitter.
+    /// Returns a list of error descriptions with line numbers.
+    /// Applies smart filtering to reduce false positives.
+    pub fn check_syntax(&mut self, code: &str, lang_name: &str) -> Result<Vec<SyntaxError>> {
+        let tree = self.parse(code, lang_name)?;
+        let total_lines = code.lines().count();
+        let mut errors = Vec::new();
+        Self::collect_errors(tree.root_node(), code, total_lines, &mut errors);
+        Ok(errors)
+    }
+
+    fn collect_errors(node: tree_sitter::Node, code: &str, total_lines: usize, errors: &mut Vec<SyntaxError>) {
+        if node.is_error() || node.is_missing() {
+            let line = node.start_position().row + 1;
+            let col = node.start_position().column + 1;
+
+            // ── Smart filtering: skip common false positives ──
+
+            // 1. Skip "missing" tokens (often incomplete code during editing)
+            if node.is_missing() {
+                return;
+            }
+
+            // 2. Skip ERROR nodes at the very end of file (likely incomplete/truncated)
+            if line >= total_lines.saturating_sub(2) {
+                let snippet = node.utf8_text(code.as_bytes()).unwrap_or("");
+                if snippet.is_empty() || snippet.len() < 5 {
+                    return; // Tiny or empty error node at EOF
+                }
+            }
+
+            // 3. Skip common false positive patterns
+            let snippet = node.utf8_text(code.as_bytes())
+                .unwrap_or("<invalid>")
+                .chars()
+                .take(80)
+                .collect::<String>();
+
+            // Filter: skip if it looks like a comment or string content
+            let snippet_trimmed = snippet.trim();
+            if snippet_trimmed.starts_with("//") || snippet_trimmed.starts_with("/*")
+                || snippet_trimmed.starts_with("#") || snippet_trimmed.starts_with('"')
+            {
+                return;
+            }
+
+            // Filter: skip single-character error nodes (often whitespace/indent issues)
+            if snippet.len() <= 1 {
+                return;
+            }
+
+            let description = format!("Syntax error at line {}:{}: `{}`", line, col, snippet);
+            errors.push(SyntaxError { line, column: col, description });
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::collect_errors(child, code, total_lines, errors);
+        }
+    }
+}
+
+/// A syntax error detected by tree-sitter parsing.
+#[derive(Debug, Clone)]
+pub struct SyntaxError {
+    pub line: usize,
+    pub column: usize,
+    pub description: String,
 }
 
 impl Default for LanguageRegistry {

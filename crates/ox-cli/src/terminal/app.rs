@@ -186,6 +186,18 @@ pub struct App {
     pub resolve_info: Option<ox_core::llm::ProviderResolveInfo>,
     /// Code indexer for AST-aware symbol search (optional, may not be initialized yet)
     pub code_indexer: Option<Arc<tokio::sync::Mutex<ox_core::symbol::CodeIndexer>>>,
+
+    // Indexing progress
+    /// Whether background indexing is still in progress
+    pub indexing: bool,
+    /// Receiver for indexing progress updates: (files_processed, symbols_indexed)
+    pub index_progress_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(usize, usize)>>,
+    /// Total source files to index
+    pub index_total_files: usize,
+    /// Files processed so far
+    pub index_files_done: usize,
+    /// Symbols indexed so far
+    pub index_symbols: usize,
 }
 
 impl App {
@@ -239,6 +251,13 @@ impl App {
             session_action: SessionAction::None,
             resolve_info: None,
             code_indexer: None,
+
+            // Indexing progress
+            indexing: false,
+            index_progress_rx: None,
+            index_total_files: 0,
+            index_files_done: 0,
+            index_symbols: 0,
         }
     }
 
@@ -292,7 +311,7 @@ impl App {
             return true;
         }
         // Only re-render for spinner if frame actually changed
-        if self.agent_running && self.spinner_frame != self.last_spinner_frame {
+        if (self.agent_running || self.indexing) && self.spinner_frame != self.last_spinner_frame {
             return true;
         }
         false

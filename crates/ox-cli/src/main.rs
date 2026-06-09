@@ -399,22 +399,51 @@ async fn run_app(
     let memory_for_vector = Arc::clone(&memory_arc);
     let embedding_config = config.embedding.clone();
     let db_dir_for_memory = db_dir.clone();
+    let (index_progress_tx, mut index_progress_rx) = mpsc::unbounded_channel::<(usize, usize, usize)>();
+    let (index_done_tx, mut index_done_rx) = mpsc::unbounded_channel::<usize>();
     tokio::spawn(async move {
         tracing::info!("[INDEXER] Starting background project indexing...");
 
         // Initialize vector store + index project while holding the lock
+        let total_symbols;
+        let vs_for_embed;
+        let symbols_for_embed;
         {
             let mut idx = indexer_clone.lock().await;
-            idx.init_vector_store();
-            match idx.index_project().await {
+            idx.init_vector_store().await;
+            vs_for_embed = idx.get_vector_store();
+            symbols_for_embed = idx.get_symbols();
+            match idx.index_project(Some(index_progress_tx)).await {
                 Ok(count) => {
                     tracing::info!("[INDEXER] ✅ Indexed {} symbols from {:?}", count, working_dir_clone);
+                    total_symbols = count;
                 }
                 Err(e) => {
                     tracing::warn!("[INDEXER] ❌ Indexing failed: {}. Will rely on auto-indexing via file_read.", e);
+                    total_symbols = 0;
                 }
             }
-        } // Lock released before starting watcher
+        } // Lock released — agent can use indexer now!
+
+        // Signal indexing complete (agent can start searching NOW!)
+        let _ = index_done_tx.send(total_symbols);
+
+        // 🚀 Async embedding — NO indexer lock! Only locks vector_store independently.
+        tokio::spawn(async move {
+            let all_symbols: Vec<_> = {
+                let lock = symbols_for_embed.read().await;
+                lock.clone()
+            };
+            if all_symbols.is_empty() { return; }
+            tracing::info!("[VECTOR_STORE] Background embedding {} symbols (no indexer lock)...", all_symbols.len());
+            let mut vs_guard = vs_for_embed.lock().await;
+            if let Some(ref mut vs) = *vs_guard {
+                match vs.insert_symbols_batch(&all_symbols) {
+                    Ok(count) => tracing::info!("[VECTOR_STORE] ✅ Embedded {} symbols in background", count),
+                    Err(e) => tracing::warn!("[VECTOR_STORE] ❌ Background embedding failed: {}", e),
+                }
+            }
+        });
 
         // 🧠 Initialize memory vector store for semantic memory search
         memory_for_vector.init_vector_store(&embedding_config, &db_dir_for_memory);
@@ -427,9 +456,10 @@ async fn run_app(
         }
     });
     
-    // Notify user that indexing is happening in background
-    app.output.push_system("🔍 Background indexing started. Symbols + memory vectors will be indexed automatically.");
-    app.output.push_system("   Use /index to check status or /index build to re-index.");
+    // Set indexing state on app
+    app.indexing = true;
+    app.status = "⏳ Indexing project...".to_string();
+    app.output.push_system("🔍 Checking project symbols... (incremental indexing)");
 
     let mut tool_ctx = Arc::new(ToolContext::new(
         rt_env.clone(),
@@ -533,8 +563,8 @@ async fn run_app(
     }
 
     loop {
-        // 🧠 Trigger onboarding on first tick if needed
-        if needs_onboarding {
+        // 🧠 Trigger onboarding after indexing completes
+        if needs_onboarding && !app.indexing {
             needs_onboarding = false;
             if let Some(ref provider) = provider {
                 tracing::info!("[ONBOARDING] Starting project scan...");
@@ -597,6 +627,41 @@ async fn run_app(
         // Update EMA metrics periodically
         middleware::feedback::update_feedback_metrics(&mut app, &memory_arc);
         // === END IMPLICIT FEEDBACK DETECTION ===
+
+        // ── Drain indexing progress updates ──
+        if app.indexing {
+            // Check for progress updates
+            while let Ok((files_done, total_files, symbols)) = index_progress_rx.try_recv() {
+                app.index_files_done = files_done;
+                app.index_total_files = total_files;
+                app.index_symbols = symbols;
+                if total_files > 0 {
+                    let pct = (files_done * 100) / total_files.max(1);
+                    app.status = format!("⏳ Indexing {}/{} files ({} symbols, {}%)", files_done, total_files, symbols, pct);
+                } else {
+                    app.status = format!("⏳ Indexing... {} symbols found", symbols);
+                }
+                // Increment tick to animate spinner during indexing
+                tick_count = tick_count.wrapping_add(1);
+                app.spinner_frame = tick_count;
+                app.dirty = true;
+            }
+            // Check if indexing is done
+            if let Ok(total) = index_done_rx.try_recv() {
+                app.indexing = false;
+                app.index_symbols = total;
+                app.status = String::new();
+                app.output.push_system(&format!(
+                    "✅ Indexing complete: {} symbols indexed. Ready to chat!",
+                    total
+                ));
+                app.dirty = true;
+                // Force immediate re-render to clear indexing UI and show completion
+                terminal.draw(|frame| render::render(frame, &mut app, tick_count))?;
+                app.dirty = false;
+                app.mark_spinner_rendered();
+            }
+        }
 
         // Only re-render when needed (dirty or spinner animation changed).
         if app.needs_render() {
@@ -1035,9 +1100,9 @@ async fn run_app(
                         // Update workflow display cache (avoids locking in render)
                         app.update_workflow_display();
 
-                        // Agent running needs spinner animation updates.
-                        // Only mark dirty if spinner frame actually changed and agent is running
-                        if app.agent_running && app.spinner_frame != app.last_spinner_frame {
+                        // Agent running or indexing needs spinner animation updates.
+                        // Only mark dirty if spinner frame actually changed
+                        if (app.agent_running || app.indexing) && app.spinner_frame != app.last_spinner_frame {
                             app.dirty = true;
                         }
                     }
@@ -1456,7 +1521,7 @@ async fn run_app(
                                             config.context.use_refined_context,
                                         );
                                         app.agent_running = true;
-                                        app.status = "Thinking...".to_string();
+                                        app.status = "🧠 Thinking...".to_string();
                                         let provider = Arc::clone(provider.as_ref().unwrap());
                                         let tx = agent_tx.clone();
                                         let registry = Arc::clone(&tool_registry);
@@ -1891,7 +1956,11 @@ fn handle_key_event(
 
                     }
                     UserInput::Text(text) => {
-                        if app.agent_running {
+                        if app.indexing {
+                            // Block message sending during indexing
+                            app.output.push_system("⏳ Please wait — indexing in progress...");
+                            app.dirty = true;
+                        } else if app.agent_running {
                             // Handle interjection during agent execution
                             let priority = if text.starts_with('!') {
                                 InterjectionPriority::Urgent
@@ -1919,8 +1988,8 @@ fn handle_key_event(
                             app.scroll_to_bottom();
                             app.dirty = true;
                         } else if let Some(provider) = provider {
-                            // ⚡ Show "Thinking..." immediately — UI renders this on the next tick
-                            app.status = "Thinking...".to_string();
+                            // ⚡ Show status immediately — UI renders this on the next tick
+                            app.status = "⏳ Preparing...".to_string();
                             app.dirty = true;
 
                             // 🛡️ Scan user input for prompt injection before it reaches the LLM
@@ -2027,6 +2096,7 @@ fn handle_key_event(
                             let user_text_for_symbols = user_text.clone();
                             tokio::spawn(async move {
                                 // ── AST symbol search (async, before blocking) ──
+                                let _ = tx.send(AgentToUiEvent::Status("🔍 Searching symbols...".to_string()));
                                 let relevant_symbols_str = if let Some(ref indexer) = code_indexer_for_ctx {
                                     let idx = indexer.lock().await;
                                     match idx.search(&user_text_for_symbols, 8).await {
@@ -2049,10 +2119,12 @@ fn handle_key_event(
 
                                 // ── All heavy synchronous work runs on a blocking thread ──
                                 let tr = tool_registry.clone();
+                                let status_tx = tx.clone(); // For status updates from blocking thread
                                 let blocking_result = tokio::task::spawn_blocking(move || {
                                     let working_dir = &rt_env.working_dir;
 
                                     // 1. Git context (subprocess calls)
+                                    let _ = status_tx.send(AgentToUiEvent::Status("📊 Gathering git context...".to_string()));
                                     let turn_ctx = context::TurnContext {
                                         git_log: context::gather_git_context(working_dir),
                                         git_diff_stat: context::gather_diff_context(working_dir),
@@ -2093,6 +2165,7 @@ fn handle_key_event(
                                     }
 
                                     // 4. Memory retrieval (SQLite queries)
+                                    let _ = status_tx.send(AgentToUiEvent::Status("🧠 Retrieving memories...".to_string()));
                                     let project_id: Option<&str> = if rt_env.project_id.is_empty() {
                                         None
                                     } else {
@@ -2119,6 +2192,7 @@ fn handle_key_event(
                                     };
 
                                     // 6. Token-aware context building
+                                    let _ = status_tx.send(AgentToUiEvent::Status("📐 Building context...".to_string()));
                                     let turn_messages = helpers::build_context_with_option(
                                         &context_builder,
                                         &system_prompt,
@@ -2154,7 +2228,8 @@ fn handle_key_event(
                                     }
                                 };
 
-                                // ── Now spawn the agent task with the prepared context ──
+                                // ── Context ready, calling LLM ──
+                                let _ = tx.send(AgentToUiEvent::Status("🌐 Calling LLM...".to_string()));
                                 agent::run_agent_turn(
                                     provider,
                                     turn_messages,

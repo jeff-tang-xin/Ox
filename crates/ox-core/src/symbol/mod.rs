@@ -8,11 +8,32 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
+use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 
 use types::{Symbol, SymbolQueryResult};
 use extractor::AstExtractor;
+use language::SyntaxError;
 use vector_store::VectorStore;
 use crate::config::EmbeddingConfig;
+
+/// Cached file metadata for incremental indexing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileCacheEntry {
+    /// File modification time in seconds since UNIX epoch
+    modified_secs: i64,
+    /// Symbols extracted from this file
+    symbols: Vec<Symbol>,
+}
+
+/// Persistent symbol cache for fast startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SymbolCache {
+    /// Project path this cache was built for
+    project_path: String,
+    /// Per-file cache entries
+    files: HashMap<String, FileCacheEntry>,
+}
 
 /// Code indexer with both keyword and semantic search.
 ///
@@ -22,8 +43,8 @@ use crate::config::EmbeddingConfig;
 pub struct CodeIndexer {
     /// In-memory symbol list (for keyword search)
     symbols: Arc<RwLock<Vec<Symbol>>>,
-    /// Vector store (for semantic search) — lazily initialized
-    vector_store: Option<VectorStore>,
+    /// Vector store (for semantic search) — independently locked, lazily initialized
+    vector_store: Arc<Mutex<Option<VectorStore>>>,
     /// Multi-language AST extractor
     extractor: AstExtractor,
     /// Root project path
@@ -38,23 +59,25 @@ impl CodeIndexer {
     pub fn new(project_path: &Path, embedding_config: EmbeddingConfig) -> Self {
         Self {
             symbols: Arc::new(RwLock::new(Vec::new())),
-            vector_store: None,
+            vector_store: Arc::new(Mutex::new(None)),
             extractor: AstExtractor::new(),
             project_path: project_path.to_path_buf(),
             embedding_config,
         }
     }
 
-    /// Initialize vector store (call this in a background task to avoid blocking startup).
-    /// Downloads the embedding model on first run.
-    pub fn init_vector_store(&mut self) {
+    /// Initialize vector store (async, independently locked from CodeIndexer).
+    pub async fn init_vector_store(&self) {
         if !self.embedding_config.enabled {
             tracing::info!("[INDEXER] Embedding disabled via config — semantic symbol search OFF");
             return;
         }
-        if self.vector_store.is_some() {
-            tracing::debug!("[INDEXER] Vector store already initialized");
-            return;
+        {
+            let guard = self.vector_store.lock().await;
+            if guard.is_some() {
+                tracing::debug!("[INDEXER] Vector store already initialized");
+                return;
+            }
         }
 
         let db_path = dirs::home_dir()
@@ -68,8 +91,9 @@ impl CodeIndexer {
 
         match VectorStore::open(db_path.to_str().unwrap(), &self.embedding_config) {
             Ok(store) => {
+                let mut guard = self.vector_store.lock().await;
+                *guard = Some(store);
                 tracing::info!("[INDEXER] ✅ Vector store initialized for semantic symbol search");
-                self.vector_store = Some(store);
             }
             Err(e) => {
                 tracing::warn!(
@@ -81,41 +105,246 @@ impl CodeIndexer {
         }
     }
 
-    /// Full-project index: walk all files, extract symbols.
-    pub async fn index_project(&mut self) -> anyhow::Result<usize> {
+    /// Get a clone of the vector_store Arc (for background tasks that need independent access).
+    pub fn get_vector_store(&self) -> Arc<Mutex<Option<VectorStore>>> {
+        Arc::clone(&self.vector_store)
+    }
+
+    /// Get a clone of the symbols Arc (for background tasks that need independent access).
+    pub fn get_symbols(&self) -> Arc<RwLock<Vec<Symbol>>> {
+        Arc::clone(&self.symbols)
+    }
+
+    /// Get the cache file path for this project.
+    fn cache_path(&self) -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        // Hash the full project path to avoid conflicts between projects
+        let path_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.project_path.to_string_lossy().hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        };
+        home.join(".ox").join("cache").join(format!("symbols_{}.json", path_hash))
+    }
+
+    /// Load symbol cache from disk.
+    fn load_cache(&self) -> Option<SymbolCache> {
+        let path = self.cache_path();
+        if !path.exists() {
+            return None;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<SymbolCache>(&data) {
+                Ok(cache) if cache.project_path == self.project_path.to_string_lossy() => {
+                    tracing::info!("[INDEXER] Loaded symbol cache: {} files from {:?}", cache.files.len(), path);
+                    Some(cache)
+                }
+                Ok(_) => {
+                    tracing::debug!("[INDEXER] Cache project path mismatch, will re-index");
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!("[INDEXER] Failed to parse symbol cache: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::debug!("[INDEXER] Failed to read symbol cache: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Save symbol cache to disk.
+    fn save_cache(&self, files: &HashMap<String, FileCacheEntry>) {
+        let cache = SymbolCache {
+            project_path: self.project_path.to_string_lossy().to_string(),
+            files: files.clone(),
+        };
+        let path = self.cache_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match serde_json::to_string(&cache) {
+            Ok(data) => {
+                if let Err(e) = std::fs::write(&path, data) {
+                    tracing::warn!("[INDEXER] Failed to write symbol cache: {}", e);
+                } else {
+                    tracing::info!("[INDEXER] Saved symbol cache: {} files to {:?}", files.len(), path);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[INDEXER] Failed to serialize symbol cache: {}", e);
+            }
+        }
+    }
+
+    /// Get file modification time in seconds since UNIX epoch.
+    fn file_modified_secs(path: &Path) -> Option<i64> {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            })
+    }
+
+    /// Full-project index with incremental caching.
+    /// Only re-indexes files that have been modified since last run.
+    /// Accepts an optional progress callback: (files_done, total_files, symbols_indexed).
+    pub async fn index_project(&mut self, progress: Option<tokio::sync::mpsc::UnboundedSender<(usize, usize, usize)>>) -> anyhow::Result<usize> {
         tracing::info!("[INDEXER] Indexing project: {:?}", self.project_path);
 
-        let mut total = 0usize;
+        // Load cache for incremental indexing
+        let cache = self.load_cache();
+        let mut file_cache: HashMap<String, FileCacheEntry> = cache
+            .map(|c| c.files)
+            .unwrap_or_default();
 
-        for entry in walkdir::WalkDir::new(&self.project_path)
+        // Pre-scan source files
+        let source_files: Vec<PathBuf> = walkdir::WalkDir::new(&self.project_path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
-        {
-            let path = entry.path();
-            let path_str = path.to_string_lossy();
-            // Skip common non-source directories (both / and \ separators for cross-platform)
-            if path_str.contains("target/") || path_str.contains("target\\")
-                || path_str.contains("node_modules/") || path_str.contains("node_modules\\")
-                || path_str.contains(".git/") || path_str.contains(".git\\")
-                || path_str.contains("dist/") || path_str.contains("dist\\")
-                || path_str.contains("build/") || path_str.contains("build\\")
-                || path_str.contains("__pycache__/") || path_str.contains("__pycache__\\")
-                || path_str.contains(".venv/") || path_str.contains(".venv\\")
-                || path_str.contains(".ox/") || path_str.contains(".ox\\")
-            {
-                continue;
-            }
+            .filter(|e| {
+                let p = e.path().to_string_lossy();
+                !(p.contains("target/") || p.contains("target\\")
+                    || p.contains("node_modules/") || p.contains("node_modules\\")
+                    || p.contains(".git/") || p.contains(".git\\")
+                    || p.contains("dist/") || p.contains("dist\\")
+                    || p.contains("build/") || p.contains("build\\")
+                    || p.contains("__pycache__/") || p.contains("__pycache__\\")
+                    || p.contains(".venv/") || p.contains(".venv\\")
+                    || p.contains(".ox/") || p.contains(".ox\\"))
+            })
+            .map(|e| e.path().to_path_buf())
+            .collect();
 
-            match self.index_file(path).await {
-                Ok(n) => total += n,
-                Err(e) => {
-                    tracing::debug!("[INDEXER] Skipped {}: {e}", path.display());
+        let total_files = source_files.len();
+
+        // Determine which files need re-indexing
+        let mut files_to_index: Vec<PathBuf> = Vec::new();
+        let mut cached_symbols: Vec<Symbol> = Vec::new();
+        let mut stale_keys: Vec<String> = Vec::new();
+
+        // Collect current file paths for stale detection
+        let current_paths: std::collections::HashSet<String> = source_files.iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        // Remove deleted files from cache
+        for key in file_cache.keys() {
+            if !current_paths.contains(key) {
+                stale_keys.push(key.clone());
+            }
+        }
+        for key in &stale_keys {
+            file_cache.remove(key);
+        }
+
+        for path in &source_files {
+            let path_str = path.to_string_lossy().to_string();
+            let current_mtime = Self::file_modified_secs(path).unwrap_or(0);
+
+            if let Some(entry) = file_cache.get(&path_str) {
+                if entry.modified_secs == current_mtime && !entry.symbols.is_empty() {
+                    // File unchanged — reuse cached symbols
+                    cached_symbols.extend(entry.symbols.clone());
+                    continue;
                 }
+            }
+            // File is new or modified — needs re-indexing
+            files_to_index.push(path.clone());
+        }
+
+        let changed_count = files_to_index.len();
+        let unchanged_count = total_files - changed_count;
+        tracing::info!(
+            "[INDEXER] {} files total: {} unchanged (from cache), {} to re-index",
+            total_files, unchanged_count, changed_count
+        );
+
+        // Send initial count
+        if let Some(ref tx) = progress {
+            let _ = tx.send((0, total_files, cached_symbols.len()));
+        }
+
+        // Load cached symbols into memory immediately (fast!)
+        if !cached_symbols.is_empty() {
+            let mut symbols_lock = self.symbols.write().await;
+            symbols_lock.extend(cached_symbols.clone());
+        }
+
+        // Index files: AST sync + memory update, embedding deferred
+        const BATCH_FILES: usize = 50;  // Process 50 files at once
+        let mut all_new_symbols: Vec<Symbol> = Vec::new();
+        let mut file_cache_updates: HashMap<String, (i64, Vec<Symbol>)> = HashMap::new();
+
+        for batch_start in (0..files_to_index.len()).step_by(BATCH_FILES) {
+            let batch_end = (batch_start + BATCH_FILES).min(files_to_index.len());
+            let batch = &files_to_index[batch_start..batch_end];
+            
+            // Step 1: Extract AST (FAST)
+            let mut batch_symbols: Vec<Symbol> = Vec::new();
+            for path in batch {
+                let path_str = path.to_string_lossy().to_string();
+                let current_mtime = Self::file_modified_secs(path).unwrap_or(0);
+                
+                match self.index_file_ast_only(path).await {
+                    Ok(symbols) => {
+                        batch_symbols.extend(symbols.clone());
+                        file_cache_updates.insert(path_str, (current_mtime, symbols));
+                    }
+                    Err(e) => {
+                        tracing::debug!("[INDEXER] Skipped {}: {e}", path.display());
+                    }
+                }
+            }
+            
+            // Step 2: IMMEDIATELY update memory (agent can search NOW!)
+            if !batch_symbols.is_empty() {
+                let mut symbols_lock = self.symbols.write().await;
+                symbols_lock.extend(batch_symbols.clone());
+                drop(symbols_lock);
+                all_new_symbols.extend(batch_symbols);
+            }
+            
+            // Step 3: Report progress
+            if let Some(ref tx) = progress {
+                let files_done = unchanged_count + batch_end;
+                let total_sym = cached_symbols.len() + all_new_symbols.len();
+                let _ = tx.send((files_done, total_files, total_sym));
             }
         }
 
-        tracing::info!("[INDEXER] Indexing complete. {} symbols indexed.", total);
+        // Apply cache updates
+        for (path_str, (mtime, symbols)) in file_cache_updates {
+            file_cache.insert(path_str, FileCacheEntry {
+                modified_secs: mtime,
+                symbols,
+            });
+        }
+
+        // Save updated cache
+        self.save_cache(&file_cache);
+
+        let total = cached_symbols.len() + all_new_symbols.len();
+        let new_symbols = all_new_symbols.len();
+        if changed_count == 0 {
+            tracing::info!("[INDEXER] ✅ All {} files cached. {} symbols loaded instantly.", total_files, total);
+        } else {
+            tracing::info!("[INDEXER] Indexing complete. {} symbols indexed ({} from cache, {} re-indexed).", total, cached_symbols.len(), new_symbols);
+        }
+        
+        // Embedding is now deferred to background task
+        // Return immediately so agent can start searching!
+        if !all_new_symbols.is_empty() {
+            tracing::info!("[INDEXER] {} symbols ready for keyword search. Embedding will complete in background.", new_symbols);
+        }
+        
         Ok(total)
     }
 
@@ -137,13 +366,46 @@ impl CodeIndexer {
         drop(symbols_lock);
 
         // Batch-insert into vector store (semantic search)
-        if let Some(ref mut vs) = self.vector_store {
-            if let Err(e) = vs.insert_symbols(&symbols) {
-                tracing::debug!("[VECTOR_STORE] Failed to batch insert for {}: {}", path_str, e);
+        {
+            let mut vs_guard = self.vector_store.lock().await;
+            if let Some(ref mut vs) = *vs_guard {
+                if let Err(e) = vs.insert_symbols(&symbols) {
+                    tracing::debug!("[VECTOR_STORE] Failed to batch insert for {}: {}", path_str, e);
+                }
             }
         }
 
         Ok(count)
+    }
+
+    /// Embed all in-memory symbols to vector store (for background/async embedding).
+    /// Only locks vector_store independently — does NOT block CodeIndexer.
+    pub async fn embed_all_symbols(&self) {
+        let all_symbols: Vec<Symbol> = {
+            let lock = self.symbols.read().await;
+            lock.clone()
+        };
+
+        if all_symbols.is_empty() {
+            return;
+        }
+
+        tracing::info!("[VECTOR_STORE] Background embedding {} symbols...", all_symbols.len());
+        let mut vs_guard = self.vector_store.lock().await;
+        if let Some(ref mut vs) = *vs_guard {
+            if let Err(e) = vs.insert_symbols_batch(&all_symbols) {
+                tracing::warn!("[VECTOR_STORE] Background batch embed failed: {}", e);
+            } else {
+                tracing::info!("[VECTOR_STORE] Background embedding complete.");
+            }
+        }
+    }
+
+    /// Extract AST symbols only (no embedding). Used for batch embedding optimization.
+    pub async fn index_file_ast_only(&mut self, path: &Path) -> anyhow::Result<Vec<Symbol>> {
+        let code = std::fs::read_to_string(path)?;
+        let symbols = self.extractor.extract_symbols(path, &code)?;
+        Ok(symbols)
     }
 
     /// Keyword search against in-memory symbol list.
@@ -189,7 +451,8 @@ impl CodeIndexer {
         }
 
         // Step 2: Semantic search fallback
-        if let Some(ref vs) = self.vector_store {
+        let vs_guard = self.vector_store.lock().await;
+        if let Some(ref vs) = *vs_guard {
             match vs.search(query, top_k) {
                 Ok(semantic_results) if !semantic_results.is_empty() => {
                     let count = semantic_results.len();
@@ -209,6 +472,23 @@ impl CodeIndexer {
 
         // Nothing found
         Ok(kw_result)
+    }
+
+    /// Check a file for syntax errors without full indexing.
+    /// Only checks source code files (.rs, .py, .js, .ts, .go, .java, .cpp, etc.)
+    /// Skips non-source files (.md, .txt, .toml, .json, .yaml, .html, .css, etc.)
+    /// Returns None if the file is valid or unsupported, Some(errors) if syntax issues found.
+    pub fn check_syntax(&mut self, path: &Path, code: &str) -> Option<Vec<SyntaxError>> {
+        // Only check files with recognized source language extensions
+        let lang_name = self.extractor.detect_language(path)?.to_string();
+        match self.extractor.check_syntax(code, &lang_name) {
+            Ok(errors) if errors.is_empty() => None,
+            Ok(errors) => Some(errors),
+            Err(e) => {
+                tracing::debug!("[SYNTAX_CHECK] Parse failed for {}: {}", path.display(), e);
+                None
+            }
+        }
     }
 
     /// Get total in-memory symbol count.

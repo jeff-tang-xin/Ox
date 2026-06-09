@@ -80,14 +80,14 @@ impl RuleEnforcer {
 
         // 3. 校验: 编辑前必须先读取文件 (Read Before Edit)
         if rules.read_before_edit {
-            if let Err(e) = Self::check_read_before_edit(tool_call, messages) {
+            if let Err(e) = Self::check_read_before_edit(tool_call, messages, rules.trivial_edit_threshold) {
                 return Err(e);
             }
         }
 
         // 4. 校验: 修改定义前检查调用方 (Impact Analysis)
         if rules.impact_analysis {
-            if let Err(e) = Self::check_impact_before_edit(tool_call, messages) {
+            if let Err(e) = Self::check_impact_before_edit(tool_call, messages, rules.trivial_edit_threshold) {
                 return Err(e);
             }
         }
@@ -256,7 +256,7 @@ impl RuleEnforcer {
     ///
     /// 在文件被修改前，确认 LLM 已经通过 file_read/recall 读取过它。
     /// 这防止 LLM"猜测"文件内容而不是先阅读。
-    fn check_read_before_edit(tc: &ToolCall, messages: &[Message]) -> Result<(), String> {
+    fn check_read_before_edit(tc: &ToolCall, messages: &[Message], trivial_threshold: usize) -> Result<(), String> {
         if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
             return Ok(());
         }
@@ -272,6 +272,28 @@ impl RuleEnforcer {
         };
         if !is_source_file(&target_path) {
             return Ok(());
+        }
+
+        // 🎯 Trivial 编辑白名单：短修改不需要先读取（与 plan_before_edit 一致）
+        if tc.name == "edit_file" && trivial_threshold > 0 {
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str()) {
+                    if old_str.len() <= trivial_threshold {
+                        return Ok(());
+                    }
+                }
+                if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
+                    let all_trivial = edits.iter().all(|e| {
+                        e.get("old_string")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len() <= trivial_threshold)
+                            .unwrap_or(false)
+                    });
+                    if all_trivial {
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         // 🎯 扫描最近一次用户消息之后的消息中是否有对同一路径的 file_read
@@ -357,7 +379,7 @@ impl RuleEnforcer {
     ///
     /// 当编辑已存在的源码文件时，确保 LLM 调用了 code_search 来检查依赖/调用方。
     /// 防止修改函数签名/接口后忘记更新调用处。
-    fn check_impact_before_edit(tc: &ToolCall, messages: &[Message]) -> Result<(), String> {
+    fn check_impact_before_edit(tc: &ToolCall, messages: &[Message], trivial_threshold: usize) -> Result<(), String> {
         if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
             return Ok(());
         }
@@ -373,6 +395,28 @@ impl RuleEnforcer {
         };
         if !is_source_file(&target_path) {
             return Ok(());
+        }
+
+        // 🎯 Trivial 编辑白名单：短修改不需要 impact analysis
+        if tc.name == "edit_file" && trivial_threshold > 0 {
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str()) {
+                    if old_str.len() <= trivial_threshold {
+                        return Ok(());
+                    }
+                }
+                if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
+                    let all_trivial = edits.iter().all(|e| {
+                        e.get("old_string")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len() <= trivial_threshold)
+                            .unwrap_or(false)
+                    });
+                    if all_trivial {
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         let target_basename = std::path::Path::new(&target_path)

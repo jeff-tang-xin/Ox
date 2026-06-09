@@ -1,77 +1,83 @@
 # Ox 🐂
 
-> **Terminal AI Coding Assistant — Understands your project, remembers context, reflects and writes code**
+> **终端 AI 编程助手 — 先读代码，再动手；记住上下文，强制纪律，写生产级代码**
 
-Ox is a Rust-based terminal AI coding assistant that interacts with LLMs through a beautiful TUI interface, providing code reading, writing, searching, and execution capabilities. It supports **OpenAI**, **Anthropic**, **DeepSeek**, and any OpenAI-compatible API. Features **four-layer progressive memory**, **context refinement & offloading**, **auto-reflection Skill generation**, **symbol-aware search**, and **enforcement-based safety**.
+Ox 是一个用 Rust 构建的终端 AI 编程助手，拥有精美的 TUI 界面。它不只是聊天 —— 它**编辑前必先读文件**、**写入前必须出方案**、**跨会话记忆上下文**、**在代码层面强制编码纪律**，而非仅靠提示词约束。
 
----
+## 为什么选择 Ox？
 
-## ✨ Core Features
-
-| Feature | Description |
-|---------|-------------|
-| 🤖 **Smart Code Assistant** | File read/write/edit, code search (ripgrep), AST symbol search, shell execution, git status/diff, project detection |
-| 🧠 **Four-Layer Progressive Memory** | L0 Raw Conversation → L1 Atomic Facts → L2 Scenario Chunks → L3 Project Persona (SQLite + Markdown hybrid storage) |
-| 🔄 **Context Refinement** | Auto-condenses verbose conversations into compact summaries, removes thinking blocks, preserves key decisions |
-| 📦 **Context Offloading** | Long tool outputs auto-saved to `.ox/refs/`, context keeps summary + reference only, 60%+ token savings |
-| 🪞 **Auto-Reflection & Skill Generation** | Analyzes execution traces post-workflow, extracts reusable patterns into Skills (Markdown) |
-| 🔍 **Symbol-Aware Search** | tree-sitter AST parsing + local vector embedding (Candle) for semantic symbol search across 7 languages |
-| 🛡️ **Enforcement Rules** | Plan-before-edit, read-before-edit, steps-before-shell, impact-analysis — enforced at code level, not just prompting |
-| ⚠️ **Layered Safety** | Three safety tiers (Safe / RequiresConfirmation / Dangerous), session-scoped trust manager, prompt injection defense |
-| 💬 **Interactive Feedback** | Interrupt AI anytime, implicit feedback detection, EMA trend tracking |
-| 🎯 **User Intent Detection** | Automatic classification (Exploration / CodeUnderstanding / CodeModification / General) for smart context assembly |
+| 痛点 | Ox 的解决方案 |
+|------|--------------|
+| AI 猜测文件内容 | **先读后改** — 代码层面强制 LLM 修改前必须先读取目标文件 |
+| AI 不规划就改代码 | **先方案后编辑** — `file_write` / `edit_file` 前必须提出修改方案 |
+| 上下文爆炸 | **智能卸载** — 长输出保存到 `.ox/refs/`，上下文仅保留摘要（节省 60%+ Token） |
+| 跨会话无记忆 | **四层渐进记忆** (L0→L3)，SQLite + Markdown 混合存储 |
+| 不理解项目结构 | **符号感知搜索** — tree-sitter AST + 本地向量嵌入，支持 7 种语言 |
+| 工具执行不安全 | **分层安全机制** — Safe / 需确认 / 危险，带会话级信任管理器 |
 
 ---
 
-## 🏗️ Architecture
+## ✨ 核心特性
+
+- **17 个内置工具** — 文件读写/编辑、ripgrep 代码搜索、AST 符号搜索、Shell 执行、Git 操作、网页抓取、记忆搜索、项目检测
+- **四层记忆系统** — L0 原始对话 → L1 原子事实 → L2 场景块 → L3 项目人设（SQLite + Markdown + 本地向量库）
+- **上下文精炼与卸载** — 自动压缩冗长对话；长工具输出卸载到 `.ox/refs/`，保留摘要 + 引用
+- **强制规则** — `plan_before_edit`、`read_before_edit`、`steps_before_shell`、`impact_analysis` — 可配置，Rust 代码层面强制执行
+- **符号感知搜索** — tree-sitter AST 解析 + Candle 本地向量嵌入 + TriviumDB 向量搜索（Rust、Python、JS/TS、C++、Go、Java）
+- **自动反思与技能生成** — 工作流结束后分析执行轨迹，提取可复用模式为 Markdown 技能
+- **分层安全** — 三个安全级别，会话级信任域，提示注入防御
+- **交互式反馈** — 随时中断、隐式反馈检测、EMA 趋势追踪
+- **多 LLM 提供商** — OpenAI、Anthropic、DeepSeek 及任何 OpenAI 兼容 API
+
+---
+
+## 🏗️ 架构
 
 ```
 Ox/
 ├── crates/
-│   ├── ox-core/              # Core library — pure logic, no TUI dependency
+│   ├── ox-core/              # 核心库 — 纯逻辑，不依赖 TUI
 │   │   └── src/
-│   │       ├── agent/        # Agent loop, engine, enforcer, session, auto-reflect, context offloader
-│   │       ├── llm/          # LLM providers (OpenAI, Anthropic, DeepSeek), SSE streaming, tokenizer
-│   │       ├── tools/        # Tool trait + 17 tool implementations
-│   │       ├── context/      # Context building, compression, refinement, system prompt
-│   │       ├── memory/       # Memory nodes, store, layering, hybrid storage, semantic, vector
-│   │       ├── skill/        # Skill loading (System/Global/Project), generation
-│   │       ├── config/       # TOML config with serde defaults + enforcement rules
-│   │       ├── safety/       # Trust manager, injection defense, path sanitizer
-│   │       ├── symbol/       # AST extraction, embedding, vector store (7 languages)
-│   │       ├── feedback/     # Feedback tracking and EMA trend analysis
-│   │       ├── message/      # Message types, session persistence
-│   │       ├── cost/         # Token cost tracking
-│   │       ├── runtime/      # Environment detection
-│   │       └── slash/        # Slash command definitions
-│   └── ox-cli/               # Terminal UI binary
+│   │       ├── agent/        # Agent 循环、引擎、强制器、会话、自动反思、卸载器
+│   │       ├── llm/          # LLM 提供商 (OpenAI, Anthropic, DeepSeek)，SSE，分词器
+│   │       ├── tools/        # Tool trait + 17 个工具实现
+│   │       ├── context/      # 上下文构建、压缩、精炼
+│   │       ├── memory/       # 记忆节点、存储、分层、混合存储、向量
+│   │       ├── skill/        # 技能加载（系统/全局/项目），生成
+│   │       ├── config/       # TOML 配置，serde 默认值
+│   │       ├── safety/       # 信任管理器、注入防御、路径清洗
+│   │       ├── symbol/       # AST 提取、嵌入、向量存储
+│   │       ├── feedback/     # 反馈追踪和 EMA 趋势
+│   │       ├── message/      # 消息类型、会话持久化
+│   │       ├── cost/         # Token 成本追踪
+│   │       └── runtime/      # 环境检测
+│   └── ox-cli/               # 终端 UI 二进制
 │       └── src/
-│           ├── terminal/     # Ratatui TUI (app, render, events, input/output panes, markdown)
-│           ├── slash_commands/  # /help, /config, /memory, /skill, /trust, /model, etc.
-│           ├── middleware/    # Request/response middleware (feedback, interjection)
-│           └── helpers/      # Utility functions (formatting, session, input, context)
-└── .ox/skills/               # Project-level skill files (Markdown)
+│           ├── terminal/     # Ratatui TUI（应用、渲染、事件、输入/输出、Markdown）
+│           ├── slash_commands/  # /help, /config, /memory, /skill, /trust, /model…
+│           ├── middleware/    # 请求/响应中间件（反馈、插话）
+│           └── helpers/      # 格式化、会话、输入工具
+└── .ox/skills/               # 项目级技能文件
 ```
 
-### Layer Boundaries
+### 层级边界
 
 ```
-ox-cli (TUI) ──channels──▶ ox-core (business logic)
+ox-cli (TUI) ──mpsc 通道──▶ ox-core (业务逻辑)
   terminal / slash_commands ──▶ agent ──▶ tools / llm / memory / context
-  UI events ⟷ Agent events (mpsc channels)
 ```
 
-- **ox-cli** owns the TUI and user interaction; depends on `ox-core`
-- **ox-core** is pure logic; never depends on TUI types
-- **Agent** orchestrates: receives messages, calls LLM, dispatches tools, emits UI events
-- **Tools** implement the `Tool` trait; `ToolRegistry` dispatches by name
-- **Enforcer** intercepts tool calls before execution to validate rules
+- **ox-cli** 拥有 TUI 和用户交互；依赖 `ox-core`
+- **ox-core** 是纯逻辑；不依赖 TUI 类型
+- **Agent** 编排：接收消息 → 调用 LLM → 分发工具 → 发送 UI 事件
+- **Tools** 实现 `Tool` trait；`ToolRegistry` 按名称分发
+- **Enforcer** 在工具执行前拦截，验证规则
 
 ---
 
-## 🚀 Quick Start
+## 🚀 快速开始
 
-### 1. Install
+### 安装
 
 ```bash
 git clone https://github.com/jeff-tang-xin/Ox.git
@@ -79,16 +85,14 @@ cd Ox
 cargo build --release
 ```
 
-Binary at `target/release/ox` (Linux/macOS) or `target/release/ox.exe` (Windows).
+二进制文件：`target/release/ox`（Linux/macOS）或 `target/release/ox.exe`（Windows）。
 
-### 2. Configure API Key
-
-Ox supports multiple LLM providers:
+### 配置 API Key
 
 ```bash
-# OpenAI (or compatible API)
+# OpenAI（或兼容端点）
 export OPENAI_API_KEY=sk-...
-export OPENAI_BASE_URL=https://api.openai.com/v1   # optional custom endpoint
+export OPENAI_BASE_URL=https://api.openai.com/v1   # 可选
 
 # Anthropic
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -96,264 +100,180 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # DeepSeek
 export DEEPSEEK_API_KEY=sk-...
 
-# Generic format (highest priority, overrides above)
+# 通用覆盖（最高优先级）
 export OX_OPENAI_API_KEY=sk-...
-export OX_ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Windows PowerShell:
+Windows PowerShell：
 ```powershell
 $env:OPENAI_API_KEY="sk-..."
 ```
 
-### 3. Launch
+### 启动
 
 ```bash
-ox
+ox                  # TUI 模式（默认）
+ox "解释这段代码"    # 单次模式
+ox --no-tui "实现快速排序"  # 无 TUI 模式
 ```
 
 ---
 
-## 💬 Interaction
+## ⚡ 斜杠命令
 
-### TUI Mode (default)
-
-Type directly in the terminal interface:
-
-```
-> Help me refactor the auth module's login logic
-> Add user avatar upload feature
-> Why is this test failing?
-```
-
-### Command-Line Mode
-
-```bash
-ox "Explain this code" --file src/auth.rs   # with file context
-ox --no-tui "implement a quicksort"          # no TUI mode
-```
-
----
-
-## ⚡ Slash Commands
-
-### Common Commands
-
-| Command | Description |
-|---------|-------------|
-| `/exit` | Exit program |
-| `/clear` | Clear current session |
-| `/debug` | Toggle debug mode |
-| `/cost` | Show token cost |
-| `/reload` | Reload configuration |
-| `/cd <path>` | Change working directory |
-| `/cancel` | Cancel current operation |
-| `/plan` | View session plan |
-| `/model <name>` | Switch model |
-| `/skill` | Manage Skills |
-| `/trust` | Manage trust mode |
-| `/system` | View/edit system prompt |
-
-### Feedback Commands
-
-| Command | Description |
-|---------|-------------|
-| `/Y` | Confirm / Agree |
-| `/N` | Reject |
-| `/O <text>` | Offer alternative or feedback |
-
-### Memory Management
-
-| Command | Description |
-|---------|-------------|
-| `/memory show` | Show current memories |
-| `/memory search <query>` | Search memories |
-| `/memory transform` | Manually trigger memory transform (L0→L1→L2→L3) |
+| 命令 | 说明 |
+|------|------|
+| `/exit` | 退出程序 |
+| `/clear` | 清除会话 |
+| `/debug` | 切换调试模式 |
+| `/cost` | 显示 Token 成本 |
+| `/reload` | 重载配置 |
+| `/cd <路径>` | 切换工作目录 |
+| `/cancel` | 取消当前操作 |
+| `/plan` | 查看会话方案 |
+| `/model <名称>` | 切换模型 |
+| `/skill` | 管理技能 |
+| `/trust` | 管理信任模式 |
+| `/system` | 查看/编辑系统提示词 |
+| `/Y` / `/N` | 确认 / 拒绝 |
+| `/O <文本>` | 提出替代方案或反馈 |
+| `/memory show` | 显示当前记忆 |
+| `/memory search <查询>` | 搜索记忆 |
+| `/memory transform` | 触发记忆转化（L0→L1→L2→L3） |
 
 ---
 
-## 🛠️ Built-in Tools
+## 🛠️ 内置工具 (17)
 
-Ox has 17 built-in tools:
-
-| Tool | Safety Level | Description |
-|------|-------------|-------------|
-| `file_read` | Safe | Read file content (multi-encoding, line numbers) |
-| `file_list` | Safe | List directory structure |
-| `file_search` | Safe | Search files by glob pattern |
-| `code_search` | Safe | High-performance ripgrep regex code search |
-| `find_symbol` | Safe | AST semantic symbol search (Rust, Python, JS/TS, C++, Go, Java) |
-| `memory_search` | Safe | Search memory knowledge base |
-| `recall` | Safe | Retrieve offloaded content by node_id |
-| `project_detect` | Safe | Detect project language/framework |
-| `web_fetch` | Safe | Fetch URL content |
-| `git_status` | Safe | View git working tree status |
-| `git_diff` | Safe | View git diff (staged/unstaged) |
-| `shell_exec` | Dangerous | Execute shell commands |
-| `file_write` | RequiresConfirmation | Create or overwrite file |
-| `edit_file` | RequiresConfirmation | Precise text editing (single/multi-edit, replace-all, fuzzy match) |
-| `delete_range` | RequiresConfirmation | Delete code block by start/end anchors |
-| `content_validation` | Internal | Validate content before write operations |
-| `intent_classifier` | Internal | Classify user intent for context assembly |
+| 工具 | 安全级别 | 说明 |
+|------|---------|------|
+| `file_read` | 安全 | 读取文件内容（多编码、行号） |
+| `file_list` | 安全 | 列出目录结构 |
+| `file_search` | 安全 | 按 glob 模式搜索文件 |
+| `code_search` | 安全 | Ripgrep 驱动的正则代码搜索 |
+| `find_symbol` | 安全 | AST 语义符号搜索（7 种语言） |
+| `memory_search` | 安全 | 搜索记忆知识库 |
+| `recall` | 安全 | 按 node_id 取回卸载内容 |
+| `project_detect` | 安全 | 检测项目语言/框架 |
+| `web_fetch` | 安全 | 抓取 URL 内容 |
+| `git_status` | 安全 | 查看 Git 工作树状态 |
+| `git_diff` | 安全 | 查看 Git 差异 |
+| `shell_exec` | 危险 | 执行 Shell 命令 |
+| `file_write` | 需确认 | 创建或覆盖文件 |
+| `edit_file` | 需确认 | 精确文本编辑（单次/批量、模糊匹配） |
+| `delete_range` | 需确认 | 按锚点删除代码块 |
+| `content_validation` | 内部 | 写入前验证内容 |
+| `intent_classifier` | 内部 | 分类用户意图用于上下文组装 |
 
 ---
 
-## 🛡️ Enforcement Rules
+## 🛡️ 强制规则
 
-Ox enforces coding discipline at the **code level** — not just via prompting. These rules are configurable in `config.toml`:
+在 Rust 代码中强制执行 —— 不是靠提示词。可在 `config.toml` 中配置：
 
-| Rule | Default | Description |
-|------|---------|-------------|
-| `plan_before_edit` | ✅ | LLM must propose a plan before calling `file_write` / `edit_file` |
-| `read_before_edit` | ✅ | LLM must read the target file first (prevents guessing content) |
-| `steps_before_shell` | ✅ | LLM must list steps before calling `shell_exec` |
-| `impact_analysis` | ✅ | LLM must search for callers/dependents before modifying source files |
+| 规则 | 默认 | 说明 |
+|------|------|------|
+| `plan_before_edit` | ✅ | `file_write` / `edit_file` 前必须提出方案 |
+| `read_before_edit` | ✅ | 必须先读取目标文件 |
+| `steps_before_shell` | ✅ | `shell_exec` 前必须列出步骤 |
+| `impact_analysis` | ✅ | 修改源码前必须搜索调用方/依赖方 |
 
-Custom patterns can be added via `custom_plan_patterns` and `custom_step_patterns`.
+自定义模式：`custom_plan_patterns`、`custom_step_patterns`。
 
 ---
 
-## 🧠 Memory Architecture
-
-### Four-Layer Progressive Memory
+## 🧠 记忆架构
 
 ```
-L0 Raw Conversation  ──refine──▶  L1 Atomic Facts
-       (SQLite)                       (SQLite)
+L0 原始对话 ──精炼──▶ L1 原子事实
+     (SQLite)               (SQLite)
 
-L1 Atomic Facts      ──cluster──▶  L2 Scenario Chunks
-                                      (Markdown)
+L1 原子事实   ──聚类──▶ L2 场景块
+                            (Markdown)
 
-L2 Scenario Chunks   ──abstract──▶  L3 Project Persona
-                                      (Markdown)
+L2 场景块     ──抽象──▶ L3 项目人设
+                            (Markdown)
 ```
 
-| Layer | Storage | Purpose |
-|-------|---------|---------|
-| **L0** Raw Conversation | SQLite | Full conversation logs, fast indexed queries |
-| **L1** Atomic Facts | SQLite | Refined atomic facts extracted from conversations |
-| **L2** Scenario Chunks | Markdown files | Clustered scenarios, human-readable & editable |
-| **L3** Project Persona | Markdown files | Project-level patterns & preferences |
+| 层级 | 存储 | 用途 |
+|------|------|------|
+| **L0** 原始 | SQLite | 完整对话日志 |
+| **L1** 事实 | SQLite | 精炼后的原子事实 |
+| **L2** 场景 | Markdown | 聚类场景，人可编辑 |
+| **L3** 人设 | Markdown | 项目级模式与偏好 |
 
-### Hybrid Storage
-
-- **SQLite** (L0–L1): Fast indexed storage with bidirectional traceability via `node_id`
-- **Markdown** (L2–L3): Human-readable "white-box" files in `.ox/knowledge/`, directly editable
-- **Vector search**: Local Candle embeddings + TriviumDB for semantic retrieval
+混合存储：**SQLite**（L0–L1）快速查询 + **Markdown**（L2–L3）在 `.ox/knowledge/` 中人类可读 + **本地向量**（Candle + TriviumDB）语义检索。
 
 ---
 
-## 🔧 Configuration
+## 🔧 配置
 
-### Config File Location
-
-- **Default**: `~/.ox/config.toml`
-- **Fallback**: `~/.config/ox/config.toml`
-- **Custom**: Set `OX_CONFIG_PATH` environment variable
-
-### Full Configuration Example
+配置文件：`~/.ox/config.toml`（备选：`~/.config/ox/config.toml`，覆盖：`OX_CONFIG_PATH`）
 
 ```toml
-# ── Model Config ──────────────────────────────────────
 [models]
 default = "gpt-4o"
-backup = ["claude-sonnet-4", "gpt-4-turbo"]
 adaptive_thinking = true
 effort_level = "high"
 
-
 [models.providers.openai]
-api_key = "sk-..."              # or use env var OPENAI_API_KEY
+api_key = "sk-..."          # 或环境变量 OPENAI_API_KEY
 base_url = "https://api.openai.com/v1"
 max_tokens = 4096
 
 [models.providers.anthropic]
-api_key = "sk-ant-..."          # or use env var ANTHROPIC_API_KEY
+api_key = "sk-ant-..."      # 或环境变量 ANTHROPIC_API_KEY
 max_tokens = 8192
 
-[models.providers.deepseek]
-api_key = "sk-..."              # or use env var DEEPSEEK_API_KEY
-base_url = "https://api.deepseek.com/v1"
-
-# ── Agent Config ───────────────────────────────────────
 [agent]
 max_iterations = 25
-max_per_turn_tokens = 500000
 
-# ── Safety Config ──────────────────────────────────────
 [safety]
-enable_sandbox = false
 confirm_dangerous_ops = true
-high_risk_apis = [
-    "Command::new",
-    "remove_dir_all",
-    "fs::remove_dir_all",
-]
 
-# ── Memory Config ──────────────────────────────────────
-[memory]
-max_nodes = 1000
-
-# ── Enforcement Rules ──────────────────────────────────
 [enforcement_rules]
-enabled = true
 plan_before_edit = true
 read_before_edit = true
 steps_before_shell = true
 impact_analysis = true
-# custom_plan_patterns = []
-# custom_step_patterns = []
 
-# ── Embedding Config ───────────────────────────────────
 [embedding]
 model = "all-MiniLM-L6-v2"
 ```
 
 ---
 
-## 🪞 Skill System
+## 🪞 技能系统
 
-Skills are Markdown files that inject behavioral guidance into the LLM context. Three scopes:
+Markdown 文件，向 LLM 上下文注入行为指导：
 
-| Scope | Location | Description |
-|-------|----------|-------------|
-| **System** | Built-in (`ox-core/src/skill/builtin/`) | Hardcoded, always loaded |
-| **Global** | `~/.ox/skills/` | User-level, applied to all projects |
-| **Project** | `.ox/skills/` | Project-specific, version-controllable |
+| 作用域 | 位置 | 说明 |
+|--------|------|------|
+| **系统** | 内置（`ox-core/src/skill/builtin/`） | 始终加载 |
+| **全局** | `~/.ox/skills/` | 用户级，所有项目共享 |
+| **项目** | `.ox/skills/` | 项目特定，可版本控制 |
 
-### Built-in Skills
+**内置技能：** coding-principles、concise-communication、engineering-practices
 
-- **coding-principles** — Think before coding, simplicity first, surgical changes, goal-driven execution
-- **concise-communication** — Direct, no-fluff communication style
-- **engineering-practices** — Universal engineering practices: file organization, documentation, testing
-
-### Auto-Generated Skills
-
-After completing a workflow, the **Auto-Reflector** analyzes the execution trace and can generate new project-level Skills in `.ox/skills/`.
+**自动生成：** 工作流结束后，Auto-Reflector 分析执行轨迹，在 `.ox/skills/` 中生成新技能。
 
 ---
 
-## 📦 Key Dependencies
+## 📦 核心依赖
 
-| Dependency | Role |
-|-----------|------|
-| `tokio` | Async runtime, channels, mutex |
-| `reqwest` | HTTP client for LLM APIs |
-| `serde` + `serde_json` + `toml` | Serialization everywhere |
-| `ratatui` + `crossterm` | Terminal UI (ox-cli only) |
-| `rusqlite` | Persistent storage (memory, sessions) |
-| `blake3` | File content hashing |
-| `grep` + `ignore` + `termcolor` | Ripgrep-based code search |
-| `tree-sitter` (7 languages) | AST parsing for symbol extraction |
-| `candle` + `hf-hub` + `tokenizers` | Local vector embeddings (MiniLM) |
-| `triviumdb` | Embedded vector database |
-| `syntect` | Syntax highlighting in TUI |
-| `pulldown-cmark` | Markdown rendering |
-| `tracing` | Structured logging |
-| `anyhow` | Error handling |
+| 分类 | 依赖 |
+|------|------|
+| 异步 | `tokio`, `tokio-util`, `futures`, `async-trait` |
+| LLM / HTTP | `reqwest`, `serde`, `serde_json`, `toml` |
+| TUI | `ratatui`, `crossterm`, `syntect`, `pulldown-cmark`, `unicode-width` |
+| 存储 | `rusqlite`, `blake3` |
+| 代码搜索 | `grep`, `ignore`, `termcolor`, `encoding_rs` |
+| AST / 嵌入 | `tree-sitter`（7 语言）, `candle-core/nn/transformers`, `hf-hub`, `tokenizers` |
+| 向量库 | `triviumdb` |
+| 日志 / 错误 | `tracing`, `anyhow` |
 
 ---
 
-## 📄 License
+## 📄 许可证
 
 MIT

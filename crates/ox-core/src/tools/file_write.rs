@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput, content_validation};
 
 pub struct FileWriteTool;
@@ -267,14 +268,43 @@ impl Tool for FileWriteTool {
                     None => "UTF-8",
                 };
 
+                // ── AST syntax check: parse the written file and warn on errors ──
+                let ast_warning = {
+                    let code_indexer = Arc::clone(&ctx.code_indexer);
+                    let check_path = display_path.clone();
+                    tokio::spawn(async move {
+                        let mut idx = code_indexer.lock().await;
+                        // Re-read the written file for syntax check
+                        if let Ok(code) = std::fs::read_to_string(&check_path) {
+                            idx.check_syntax(&check_path, &code)
+                        } else {
+                            None
+                        }
+                    }).await
+                };
+                let ast_warning = match ast_warning {
+                    Ok(Some(errors)) => {
+                        let mut warn = format!("\n\n⚠️ AST Syntax Check: {} issue(s) detected:", errors.len());
+                        for (i, err) in errors.iter().take(5).enumerate() {
+                            warn.push_str(&format!("\n   {}. {}", i + 1, err.description));
+                        }
+                        if errors.len() > 5 {
+                            warn.push_str(&format!("\n   ... and {} more", errors.len() - 5));
+                        }
+                        warn.push_str("\n   💡 Fix syntax errors before proceeding.");
+                        warn
+                    }
+                    _ => String::new(),
+                };
+
                 ToolOutput::success(format!(
                     "✅ Successfully written {} bytes to {}{}\n\
-                     📄 Encoding: {}\n\
-                     💡 Tip: Use 'file_read' to verify the content",
+                     📄 Encoding: {}{}",
                     bytes_written,
                     display_path.display(),
                     size_info,
-                    encoding_name
+                    encoding_name,
+                    ast_warning
                 ))
             }
             Err(e) => {

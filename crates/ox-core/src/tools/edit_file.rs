@@ -14,6 +14,7 @@
 /// of the previous one — and the file is only written if ALL edits succeed.
 
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput, content_validation};
 
@@ -194,7 +195,7 @@ impl EditFileTool {
         &self,
         path: &std::path::Path,
         edits: &[SingleEdit],
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> ToolOutput {
         let path_clone = path.to_path_buf();
         let display_path = path.display().to_string();
@@ -271,7 +272,36 @@ impl EditFileTool {
         }).await;
 
         match result {
-            Ok(Ok(msg)) => ToolOutput::success(msg),
+            Ok(Ok(msg)) => {
+                // ── AST syntax check after edit ──
+                let ast_warning = {
+                    let code_indexer = Arc::clone(&ctx.code_indexer);
+                    let check_path = path.to_path_buf();
+                    tokio::spawn(async move {
+                        let mut idx = code_indexer.lock().await;
+                        if let Ok(code) = std::fs::read_to_string(&check_path) {
+                            idx.check_syntax(&check_path, &code)
+                        } else {
+                            None
+                        }
+                    }).await
+                };
+                let ast_suffix = match ast_warning {
+                    Ok(Some(errors)) => {
+                        let mut warn = format!("\n\n⚠️ AST Syntax Check: {} issue(s):", errors.len());
+                        for (i, err) in errors.iter().take(5).enumerate() {
+                            warn.push_str(&format!("\n   {}. {}", i + 1, err.description));
+                        }
+                        if errors.len() > 5 {
+                            warn.push_str(&format!("\n   ... and {} more", errors.len() - 5));
+                        }
+                        warn.push_str("\n   💡 Fix syntax errors before proceeding.");
+                        warn
+                    }
+                    _ => String::new(),
+                };
+                ToolOutput::success(format!("{}{}", msg, ast_suffix))
+            }
             Ok(Err(e)) => ToolOutput::error(e),
             Err(join_err) => ToolOutput::error(format!("Edit task panicked: {join_err}")),
         }

@@ -45,7 +45,7 @@ fn handle_index_command(
                 let indexer_clone = Arc::clone(indexer);
                 tokio::spawn(async move {
                     let mut idx = indexer_clone.lock().await;
-                    match idx.index_project().await {
+                    match idx.index_project(None).await {
                         Ok(count) => {
                             tracing::info!("[INDEX] ✅ Re-indexed {} symbols", count);
                         }
