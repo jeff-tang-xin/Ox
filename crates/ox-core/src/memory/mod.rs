@@ -1113,7 +1113,9 @@ impl MemoryManager {
                         }
                         if tc.name == "shell_exec" {
                             let cmd = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                            operations.push(format!("ran `{}`", if cmd.len() > 60 { &cmd[..60] } else { cmd }));
+                            let cmd_display: String = cmd.chars().take(60).collect();
+                            let suffix = if cmd.chars().count() > 60 { "..." } else { "" };
+                            operations.push(format!("ran `{}{}`", cmd_display, suffix));
                         }
                     }
                 }
