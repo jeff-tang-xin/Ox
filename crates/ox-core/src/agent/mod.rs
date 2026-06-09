@@ -998,7 +998,14 @@ pub async fn run_agent_turn(
                             let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
                             let old = v.get("old_string").and_then(|s| s.as_str()).map(|s| {
                                 let one_line = s.lines().next().unwrap_or(s);
-                                if one_line.len() > 60 { &one_line[..60] } else { one_line }
+                                if one_line.len() > 60 {
+                                    let boundary = one_line.char_indices()
+                                        .take_while(|(i, _)| *i < 60)
+                                        .last()
+                                        .map(|(i, c)| i + c.len_utf8())
+                                        .unwrap_or(one_line.len());
+                                    &one_line[..boundary]
+                                } else { one_line }
                             }).unwrap_or("");
                             Some(format!("{} | {}", path, old))
                         })

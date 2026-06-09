@@ -95,12 +95,22 @@ impl ExecutionTrace {
                 call.tool_name,
                 if call.is_error { "❌" } else { "✅" },
                 if call.arguments.len() > 200 {
-                    format!("{}...", &call.arguments[..200])
+                    let boundary = call.arguments.char_indices()
+                        .take_while(|(i, _)| *i < 200)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(call.arguments.len());
+                    format!("{}...", &call.arguments[..boundary])
                 } else {
                     call.arguments.clone()
                 },
                 if call.result_summary.len() > 200 {
-                    format!("{}...", &call.result_summary[..200])
+                    let boundary = call.result_summary.char_indices()
+                        .take_while(|(i, _)| *i < 200)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(call.result_summary.len());
+                    format!("{}...", &call.result_summary[..boundary])
                 } else {
                     call.result_summary.clone()
                 },

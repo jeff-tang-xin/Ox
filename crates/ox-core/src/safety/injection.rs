@@ -152,7 +152,12 @@ impl PromptInjectionDetector {
                         pattern: re.as_str().to_string(),
                         category: *category,
                         matched_text: if cap.as_str().len() > 120 {
-                            format!("{}...", &cap.as_str()[..120])
+                            let boundary = cap.as_str().char_indices()
+                                .take_while(|(i, _)| *i < 120)
+                                .last()
+                                .map(|(i, c)| i + c.len_utf8())
+                                .unwrap_or(cap.as_str().len());
+                            format!("{}...", &cap.as_str()[..boundary])
                         } else {
                             cap.as_str().to_string()
                         },

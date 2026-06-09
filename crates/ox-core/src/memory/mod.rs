@@ -561,7 +561,7 @@ impl MemoryNode {
             }
             "code_search" | "file_search" => {
                 // Remember what was searched for — helps with context
-                let query_info = if tool_args.len() > 300 { &tool_args[..300] } else { tool_args };
+                let query_info = if tool_args.len() > 300 { truncate_str(tool_args, 300) } else { tool_args };
                 let result_count = tool_result.map(|r| r.lines().count()).unwrap_or(0);
                 let content = format!("[SEARCH] {} | {} results", query_info, result_count);
                 Some(Self::new(
@@ -1819,7 +1819,7 @@ impl MemoryManager {
                             
                             // Create a brief summary
                             let summary = if mem.content.len() > 200 {
-                                format!("{}...", &mem.content[..200])
+                                format!("{}...", truncate_str(&mem.content, 200))
                             } else {
                                 mem.content.clone()
                             };
