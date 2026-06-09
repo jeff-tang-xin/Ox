@@ -73,6 +73,8 @@ impl SymbolType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
+    /// Fully qualified name (module::parent::name) to avoid ambiguity
+    pub fq_name: String,
     pub kind: SymbolType,
     pub start_line: usize,
     pub end_line: usize,
@@ -80,6 +82,9 @@ pub struct Symbol {
     pub language: String,
     pub signature: String,
     pub parent: Option<String>,
+    /// Function names called by this function (stored as FQ names)
+    #[serde(default)]
+    pub calls: Vec<String>,
 }
 
 /// Result of a symbol query.
@@ -88,4 +93,18 @@ pub struct SymbolQueryResult {
     pub symbols: Vec<Symbol>,
     pub total_count: usize,
     pub query: String,
+}
+
+/// Result of a call graph query (who calls a given function).
+#[derive(Debug, Clone, Serialize)]
+pub struct CallGraphResult {
+    pub name: String,
+    /// Fully qualified name
+    pub fq_name: String,
+    pub file_path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: SymbolType,
+    /// Relation type: "calls" (direct) or "calls_calls" (2nd level)
+    pub relation: String,
 }

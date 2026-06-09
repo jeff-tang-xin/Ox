@@ -561,7 +561,7 @@ impl MemoryNode {
             }
             "code_search" | "file_search" => {
                 // Remember what was searched for — helps with context
-                let query_info = if tool_args.len() > 300 { truncate_str(tool_args, 300) } else { tool_args };
+                let query_info = if tool_args.chars().count() > 300 { truncate_str(tool_args, 300) } else { tool_args };
                 let result_count = tool_result.map(|r| r.lines().count()).unwrap_or(0);
                 let content = format!("[SEARCH] {} | {} results", query_info, result_count);
                 Some(Self::new(
@@ -698,15 +698,16 @@ fn calculate_word_overlap(query: &str, content: &str) -> f32 {
     (score * 0.3).min(0.3) // Cap at 30%
 }
 
-/// Safe string truncation that respects UTF-8 character boundaries.
+/// Safe string truncation by character count (not bytes).
+/// Preserves UTF-8 boundaries and respects `max_chars` as actual character count.
 fn truncate_str(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
+    if s.chars().count() <= max_chars {
         return s;
     }
-    let mut end = max_chars;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = s.char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
     &s[..end]
 }
 

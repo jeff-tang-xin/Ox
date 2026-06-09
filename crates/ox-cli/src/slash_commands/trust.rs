@@ -25,6 +25,20 @@ pub const UNTRUST_COMMAND: CommandMeta = CommandMeta {
     handler: handle_untrust,
 };
 
+pub const BLOCK_COMMAND: CommandMeta = CommandMeta {
+    name: "block",
+    aliases: &[],
+    description: "Block command pattern: /block <pattern> (e.g. /block rm -rf)",
+    handler: handle_block,
+};
+
+pub const UNBLOCK_COMMAND: CommandMeta = CommandMeta {
+    name: "unblock",
+    aliases: &[],
+    description: "Unblock command pattern: /unblock <pattern>",
+    handler: handle_unblock,
+};
+
 pub fn handle_trust(
     app: &mut AppState,
     args: &str,
@@ -83,5 +97,77 @@ pub fn handle_untrust(
     }
     app.trusted_all = false;
     app.output.push_system("All tool trust revoked. Confirmations restored.");
+    CommandResult::Success
+}
+
+pub fn handle_block(
+    app: &mut AppState,
+    args: &str,
+    _session: &mut Session,
+    _rt_env: &mut RuntimeEnvironment,
+    _config: &OxConfig,
+    _memory: &Arc<MemoryManager>,
+    _cost_tracker: &mut CostTracker,
+    trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
+) -> CommandResult {
+    let args = args.trim();
+    if args.is_empty() {
+        // Show current blacklist.
+        let tm = match trust_manager.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                app.output.push_line(OutputLine::Error(format!("Failed to lock trust manager: {}", e)));
+                return CommandResult::Error("Lock failed".to_string());
+            }
+        };
+        let list = tm.blacklist();
+        if list.is_empty() {
+            app.output.push_system("No blocked command patterns. Use /block <pattern> to add one.");
+        } else {
+            app.output.push_system(&format!("Blocked patterns: {}", list.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ")));
+        }
+        return CommandResult::Success;
+    }
+    // Add each pattern.
+    let mut tm = match trust_manager.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            app.output.push_line(OutputLine::Error(format!("Failed to lock trust manager: {}", e)));
+            return CommandResult::Error("Lock failed".to_string());
+        }
+    };
+    for pattern in args.split_whitespace() {
+        tm.block_command(pattern);
+    }
+    app.output.push_system(&format!("Blocked command patterns containing: {}", args));
+    CommandResult::Success
+}
+
+pub fn handle_unblock(
+    app: &mut AppState,
+    args: &str,
+    _session: &mut Session,
+    _rt_env: &mut RuntimeEnvironment,
+    _config: &OxConfig,
+    _memory: &Arc<MemoryManager>,
+    _cost_tracker: &mut CostTracker,
+    trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
+) -> CommandResult {
+    let args = args.trim();
+    if args.is_empty() {
+        app.output.push_system("Usage: /unblock <pattern>");
+        return CommandResult::Success;
+    }
+    let mut tm = match trust_manager.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            app.output.push_line(OutputLine::Error(format!("Failed to lock trust manager: {}", e)));
+            return CommandResult::Error("Lock failed".to_string());
+        }
+    };
+    for pattern in args.split_whitespace() {
+        tm.unblock_command(pattern);
+    }
+    app.output.push_system(&format!("Unblocked command patterns: {}", args));
     CommandResult::Success
 }

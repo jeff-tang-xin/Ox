@@ -357,7 +357,11 @@ async fn run_app(
     let db_dir = rt_env.ox_home_dir.join("db");
     let mut cost_tracker = CostTracker::load_or_create(&db_dir).unwrap_or_else(|e| {
         tracing::warn!("Failed to load cost tracker: {e}");
-        CostTracker::load_or_create(&std::env::temp_dir()).expect("temp dir fallback")
+        CostTracker::load_or_create(&std::env::temp_dir()).unwrap_or_else(|e2| {
+            tracing::error!("Failed to create cost tracker even with temp dir: {}", e2);
+            // Last resort: create with current directory (will use default values)
+            CostTracker::load_or_create(std::path::Path::new(".")).unwrap()
+        })
     });
 
     // Memory system -- system-level: ~/.ox/db/memories_*.db
@@ -365,8 +369,12 @@ async fn run_app(
         .unwrap_or_else(|e| {
             tracing::warn!("Failed to init memory system: {e}");
             let temp = std::env::temp_dir();
-            MemoryManager::init(&temp, &rt_env.project_id, &config.memory)
-                .expect("memory init with temp dir")
+            MemoryManager::init(&temp, &rt_env.project_id, &config.memory).unwrap_or_else(|e2| {
+                tracing::error!("Failed to create memory system even with temp dir: {}", e2);
+                // This is unrecoverable - memory system is core to Ox
+                tracing::error!("Cannot initialize memory system. Exiting.");
+                std::process::exit(1);
+            })
         });
 
     // Wrap in Arc for shared access
@@ -503,7 +511,18 @@ async fn run_app(
             ox_core::context::compressed_store::CompressedContextStore::open(
                 &std::env::temp_dir().join("compressed_context.db"),
             )
-            .expect("compressed context store with temp dir")
+            .unwrap_or_else(|_| {
+                // In-memory fallback - won't persist but won't crash
+                // This should virtually never fail
+                match ox_core::context::compressed_store::CompressedContextStore::open_in_memory() {
+                    Ok(store) => store,
+                    Err(e) => {
+                        tracing::error!("Even in-memory store failed: {}", e);
+                        // Last resort: use a no-op implementation
+                        panic!("Cannot create compressed context store: {}", e);
+                    }
+                }
+            })
         }),
     );
 
@@ -732,8 +751,11 @@ async fn run_app(
                                 if app.agent_running {
                                     // Move current session to background, create new one
                                     let project_id = rt_env.project_id.clone();
-                                    let new_s = Session::new(&session_dir, &project_id)
-                                        .expect("failed to create new session");
+                                    let new_s = Session::new(&session_dir, &project_id).unwrap_or_else(|e| {
+                                        tracing::error!("Failed to create new session: {}", e);
+                                        tracing::error!("Cannot create new session. Exiting.");
+                                        std::process::exit(1);
+                                    });
                                     background_session = Some(std::mem::replace(&mut session, new_s));
                                     // Clear UI→Agent channel for background session
                                     app.ui_to_agent_tx = None;

@@ -110,7 +110,13 @@ impl InputPane {
         if !text.is_empty() {
             // Truncate if too long.
             let entry = if text.len() > Self::MAX_ENTRY_LEN {
-                text.get(..Self::MAX_ENTRY_LEN).unwrap_or(&text).to_string()
+                let end = text
+                    .char_indices()
+                    .take_while(|(i, _)| *i < Self::MAX_ENTRY_LEN)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                text.get(..end).unwrap_or(&text).to_string()
             } else {
                 text.clone()
             };

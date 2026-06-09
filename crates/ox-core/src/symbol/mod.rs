@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, RwLock};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
-use types::{Symbol, SymbolQueryResult};
+use types::{Symbol, SymbolQueryResult, CallGraphResult};
 use extractor::AstExtractor;
 use language::SyntaxError;
 use vector_store::VectorStore;
@@ -82,14 +82,17 @@ impl CodeIndexer {
 
         let db_path = dirs::home_dir()
             .map(|home| home.join(".ox").join("symbols.tdb"))
-            .expect("Cannot determine home directory");
+            .unwrap_or_else(|| {
+                tracing::warn!("Cannot determine home directory, using temp dir");
+                std::env::temp_dir().join(".ox").join("symbols.tdb")
+            });
 
         tracing::info!(
             "[INDEXER] Initializing vector store at {:?} (model={}, dim={})...",
             db_path, self.embedding_config.model_id, self.embedding_config.dimension
         );
 
-        match VectorStore::open(db_path.to_str().unwrap(), &self.embedding_config) {
+        match VectorStore::open(db_path.to_str().unwrap_or("symbols.tdb"), &self.embedding_config) {
             Ok(store) => {
                 let mut guard = self.vector_store.lock().await;
                 *guard = Some(store);
@@ -349,6 +352,7 @@ impl CodeIndexer {
     }
 
     /// Index a single file: extract symbols and store in memory + vector store.
+    /// Uses two-phase approach: Phase1 = insert all symbols, Phase2 = link calls via FQ names.
     pub async fn index_file(&mut self, path: &Path) -> anyhow::Result<usize> {
         let code = std::fs::read_to_string(path)?;
         let symbols = self.extractor.extract_symbols(path, &code)?;
@@ -358,19 +362,46 @@ impl CodeIndexer {
             return Ok(0);
         }
 
-        // Update in-memory store (deduplicate by file_path)
-        let mut symbols_lock = self.symbols.write().await;
-        let path_str = path.to_string_lossy().to_string();
-        symbols_lock.retain(|s| s.file_path != path_str);
-        symbols_lock.extend(symbols.clone());
-        drop(symbols_lock);
+        // === PHASE 1: Insert all symbols first (to build lookup table) ===
+        {
+            let mut symbols_lock = self.symbols.write().await;
+            let path_str = path.to_string_lossy().to_string();
+            symbols_lock.retain(|s| s.file_path != path_str);
+            symbols_lock.extend(symbols.clone());
+        }
+
+        // === PHASE 2: Resolve calls to FQ names ===
+        // Resolve each call: if it matches another symbol's fq_name or name, resolve to fq_name
+        {
+            let mut symbols_lock = self.symbols.write().await;
+            // First pass: build a lookup map from name/fq_name -> fq_name
+            let lookup: std::collections::HashMap<String, String> = symbols_lock.iter()
+                .flat_map(|s| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(s.name.clone(), s.fq_name.clone());
+                    if !s.fq_name.is_empty() {
+                        m.insert(s.fq_name.clone(), s.fq_name.clone());
+                    }
+                    m
+                })
+                .collect();
+            // Second pass: resolve calls
+            for sym in symbols_lock.iter_mut() {
+                if !sym.calls.is_empty() {
+                    let resolved: Vec<String> = sym.calls.iter()
+                        .filter_map(|call| lookup.get(call).cloned())
+                        .collect();
+                    sym.calls = resolved;
+                }
+            }
+        }
 
         // Batch-insert into vector store (semantic search)
         {
             let mut vs_guard = self.vector_store.lock().await;
             if let Some(ref mut vs) = *vs_guard {
                 if let Err(e) = vs.insert_symbols(&symbols) {
-                    tracing::debug!("[VECTOR_STORE] Failed to batch insert for {}: {}", path_str, e);
+                    tracing::debug!("[VECTOR_STORE] Failed to batch insert for {}: {}", path.display(), e);
                 }
             }
         }
@@ -472,6 +503,91 @@ impl CodeIndexer {
 
         // Nothing found
         Ok(kw_result)
+    }
+
+    /// Find all symbols that call the given function name (callers).
+    /// Uses FQ names for accurate matching. Expands 1 level: finds functions that call the target,
+    /// and also what those callers call (2nd level).
+    pub async fn find_callers(&self, name: &str) -> Vec<CallGraphResult> {
+        let symbols = self.symbols.read().await;
+
+        // Build lookup: fq_name -> Symbol
+        let fq_lookup: std::collections::HashMap<String, &Symbol> = symbols.iter()
+            .map(|s| (s.fq_name.clone(), s))
+            .collect();
+
+        // Resolve input name to FQ name
+        let target_fq = {
+            let mut found: Option<String> = None;
+            // Try exact FQ match
+            for (fq, _) in &fq_lookup {
+                if fq.to_lowercase() == name.to_lowercase() {
+                    found = Some(fq.clone());
+                    break;
+                }
+            }
+            // Try simple name match
+            if found.is_none() {
+                for (fq, _) in &fq_lookup {
+                    if fq.ends_with(&format!("::{}", name)) || fq == name {
+                        found = Some(fq.clone());
+                        break;
+                    }
+                }
+            }
+            found.unwrap_or_else(|| name.to_string())
+        };
+
+        let target_lower = target_fq.to_lowercase();
+
+        // First pass: find all functions that directly call `target_fq`
+        let mut results = Vec::new();
+
+        for sym in symbols.iter() {
+            if !sym.calls.is_empty() {
+                for call in &sym.calls {
+                    if call.to_lowercase() == target_lower {
+                        // This symbol calls the target
+                        results.push(CallGraphResult {
+                            name: sym.name.clone(),
+                            fq_name: sym.fq_name.clone(),
+                            file_path: sym.file_path.clone(),
+                            start_line: sym.start_line,
+                            end_line: sym.end_line,
+                            kind: sym.kind.clone(),
+                            relation: "calls".to_string(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Second pass: expand 1 level - find what these callers call
+        let caller_fqs: std::collections::HashSet<String> = results.iter()
+            .map(|r| r.fq_name.to_lowercase())
+            .collect();
+
+        for sym in symbols.iter() {
+            if !sym.calls.is_empty() {
+                for call in &sym.calls {
+                    if caller_fqs.contains(&call.to_lowercase()) {
+                        results.push(CallGraphResult {
+                            name: sym.name.clone(),
+                            fq_name: sym.fq_name.clone(),
+                            file_path: sym.file_path.clone(),
+                            start_line: sym.start_line,
+                            end_line: sym.end_line,
+                            kind: sym.kind.clone(),
+                            relation: "calls_calls".to_string(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        results
     }
 
     /// Check a file for syntax errors without full indexing.

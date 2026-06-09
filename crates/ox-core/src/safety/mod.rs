@@ -18,9 +18,16 @@ fn normalize_path(path: &Path) -> PathBuf {
 ///
 /// Tracks which tools the user has temporarily trusted (via `/trust`).
 /// Trust is session-scoped only — it expires when the REPL exits.
+///
+/// Also maintains a command blacklist — patterns that are always blocked
+/// even when the tool is trusted. Blacklisted commands require a second
+/// confirmation even for trusted tools.
 #[derive(Debug, Clone, Default)]
 pub struct TrustManager {
     trusted_tools: HashSet<String>,
+    /// Command patterns that are always blocked (e.g. "rm -rf", "format").
+    /// Even if shell_exec is trusted, blacklisted commands require re-confirmation.
+    command_blacklist: Vec<String>,
 }
 
 impl TrustManager {
@@ -37,6 +44,32 @@ impl TrustManager {
             }
             SafetyLevel::Dangerous => self.trusted_tools.contains("__all__"),
         }
+    }
+
+    /// Check if a shell command is blocked by the blacklist.
+    /// Returns the matching pattern if blocked.
+    pub fn is_command_blacklisted(&self, command: &str) -> Option<&str> {
+        let lower = command.to_lowercase();
+        self.command_blacklist.iter().find(|p| lower.contains(&p.to_lowercase())).map(|s| s.as_str())
+    }
+
+    /// Add a pattern to the command blacklist.
+    pub fn block_command(&mut self, pattern: &str) {
+        let p = pattern.trim().to_lowercase();
+        if !p.is_empty() && !self.command_blacklist.contains(&p) {
+            self.command_blacklist.push(p);
+        }
+    }
+
+    /// Remove a pattern from the command blacklist.
+    pub fn unblock_command(&mut self, pattern: &str) {
+        let p = pattern.trim().to_lowercase();
+        self.command_blacklist.retain(|x| x != &p);
+    }
+
+    /// List blacklisted command patterns.
+    pub fn blacklist(&self) -> &[String] {
+        &self.command_blacklist
     }
 
     /// Trust a specific tool for the current session.

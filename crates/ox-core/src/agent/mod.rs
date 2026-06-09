@@ -1182,6 +1182,23 @@ pub async fn run_agent_turn(
                 }
             };
 
+            // Blacklist override: even if the tool is trusted, blacklisted
+            // commands within shell_exec still require confirmation.
+            let mut blacklist_warning: Option<String> = None;
+            if !should_confirm && tc.name == "shell_exec" {
+                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    if let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
+                        let tm = trust_manager.lock().unwrap();
+                        if let Some(pattern) = tm.is_command_blacklisted(cmd) {
+                            blacklist_warning = Some(format!("BLOCKED COMMAND (matches blacklist pattern: \"{}\")", pattern));
+                            drop(tm);
+                            // Force confirmation even though tool is trusted.
+                        }
+                    }
+                }
+            }
+            let should_confirm = should_confirm || blacklist_warning.is_some();
+
             if should_confirm {
                 tracing::info!("[AGENT] Tool {} requires confirmation", tc.name);
                 // Build args_summary (truncated, sanitized).
@@ -1203,16 +1220,23 @@ pub async fn run_agent_turn(
                     // Try to extract command from args JSON.
                     if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                         if let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
+                            let mut warning = None;
                             if crate::safety::is_high_risk_command(cmd) {
-                                Some("HIGH RISK COMMAND".to_string())
-                            } else {
-                                None
+                                warning = Some("HIGH RISK COMMAND".to_string());
                             }
+                            // Merge blacklist warning if present.
+                            if let Some(ref bw) = blacklist_warning {
+                                warning = Some(match warning {
+                                    Some(mut w) => { w.push_str(" + "); w.push_str(bw); w }
+                                    None => bw.clone(),
+                                });
+                            }
+                            warning
                         } else {
-                            None
+                            blacklist_warning.clone()
                         }
                     } else {
-                        None
+                        blacklist_warning.clone()
                     }
                 } else {
                     None

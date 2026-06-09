@@ -182,6 +182,10 @@ impl VectorStore {
                 language: payload["language"].as_str().unwrap_or("").to_string(),
                 signature: payload["signature"].as_str().unwrap_or("").to_string(),
                 parent: payload["parent"].as_str().map(|s| s.to_string()),
+                fq_name: payload["fq_name"].as_str().unwrap_or("").to_string(),
+                calls: payload["calls"].as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default(),
             }
         }).collect();
 

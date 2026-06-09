@@ -214,9 +214,15 @@ impl RuleEnforcer {
                                         content.contains("待完成") ||
                                         content.contains("未完成");
                     
-                    if has_unfinished {
-                        has_pending_tasks = true;
-                    }
+                    // 检查是否有已完成的标记
+                    let has_completed = content.contains("- [x]") ||
+                                       content.contains("- [X]") ||
+                                       content.contains("✓") ||
+                                       content.contains("✔") ||
+                                       content.contains("✅");
+                    
+                    // 默认认为有 pending 任务，除非检测到明确的完成标记且无未完成标记
+                    has_pending_tasks = has_unfinished || !has_completed;
                     
                     break; // 找到最近的任务列表即可
                 }

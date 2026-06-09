@@ -113,6 +113,8 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     // Trust management
     registry.register(trust::TRUST_COMMAND);
     registry.register(trust::UNTRUST_COMMAND);
+    registry.register(trust::BLOCK_COMMAND);
+    registry.register(trust::UNBLOCK_COMMAND);
     
     // Memory management
     registry.register(memory::REMEMBER_COMMAND);

@@ -58,7 +58,23 @@ impl AstExtractor {
         parent: Option<String>,
         symbols: &mut Vec<Symbol>,
     ) {
-        if let Some(symbol) = self.node_to_symbol(node, code, lang_name, path, parent.clone()) {
+        // Extract function body calls BEFORE processing the symbol itself
+        // This ensures we capture calls before the parent is added
+        let extracted_calls = if matches!(
+            node.kind(),
+            "function_item" | "function_signature_item" | "function_declaration"
+                | "function_definition" | "method_definition" | "function_declarator"
+        ) {
+            self.extract_function_calls(node, code)
+        } else {
+            Vec::new()
+        };
+
+        if let Some(mut symbol) = self.node_to_symbol(node, code, lang_name, path, parent.clone()) {
+            // Generate FQ name using parent path
+            symbol.fq_name = self.make_fq_name(&symbol.name, parent.as_deref());
+            // Inject the extracted calls (as simple names, we'll resolve to FQ later)
+            symbol.calls = extracted_calls;
             symbols.push(symbol);
         }
 
@@ -76,11 +92,52 @@ impl AstExtractor {
         } else {
             parent
         };
-
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             self.extract_from_node(child, code, lang_name, path, child_parent.clone(), symbols);
         }
+    }
+
+    /// Generate fully qualified name from simple name and parent context.
+    fn make_fq_name(&self, name: &str, parent: Option<&str>) -> String {
+        match parent {
+            Some(p) if !p.is_empty() => format!("{}::{}", p, name),
+            _ => name.to_string(),
+        }
+    }
+
+    /// Extract all function/method calls within a function body.
+    fn extract_function_calls(&self, node: Node, code: &str) -> Vec<String> {
+        let mut calls = Vec::new();
+        let _cursor = node.walk();
+
+        // Recursively find all call_expression nodes
+        fn find_calls(parent: &Node, code: &str, calls: &mut Vec<String>) {
+            let mut cursor = parent.walk();
+            for child in parent.children(&mut cursor) {
+                let kind = child.kind();
+                if kind == "call_expression" {
+                    // Extract the function being called
+                    let mut func_cursor = child.walk();
+                    for func_child in child.children(&mut func_cursor) {
+                        let fc = func_child.kind();
+                        if fc == "identifier" || fc == "scoped_identifier" || fc == "field_expression" {
+                            if let Ok(text) = func_child.utf8_text(code.as_bytes()) {
+                                let name = text.trim().to_string();
+                                if !name.is_empty() && !calls.contains(&name) {
+                                    calls.push(name);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Continue searching in child nodes
+                find_calls(&child, code, calls);
+            }
+        }
+
+        find_calls(&node, code, &mut calls);
+        calls
     }
 
     fn node_to_symbol(
@@ -108,6 +165,7 @@ impl AstExtractor {
 
         Some(Symbol {
             name,
+            fq_name: String::new(), // Will be set in extract_from_node after we know parent
             kind,
             start_line,
             end_line,
@@ -115,6 +173,7 @@ impl AstExtractor {
             language: lang_name.to_string(),
             signature,
             parent,
+            calls: Vec::new(),
         })
     }
 

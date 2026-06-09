@@ -153,11 +153,16 @@ impl ContextOffloader {
         let filename = format!("{}.md", node_id);
         let ref_path = self.refs_dir.join(&filename);
 
-        // Generate summary (first 200 chars + line count)
+        // Generate summary (first 200 chars + line count) - safe UTF-8 truncation
         let summary = if content.len() > 200 {
+            let boundary = content.char_indices()
+                .take_while(|(i, _)| *i < 200)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(200);
             format!(
                 "{}... ({} lines total)",
-                content.get(..200).unwrap_or(content),
+                &content[..boundary],
                 content.lines().count()
             )
         } else {

@@ -80,7 +80,7 @@ impl Tool for ShellExecTool {
     }
 
     fn safety_level(&self) -> SafetyLevel {
-        SafetyLevel::Dangerous
+        SafetyLevel::RequiresConfirmation
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
