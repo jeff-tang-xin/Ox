@@ -36,16 +36,15 @@ fn handle_index_command(
     
     match args_trimmed {
         "build" | "rebuild" => {
-            // Trigger background re-indexing
             app.output.push_system("🔨 Starting full project re-indexing...");
             app.output.push_system("   This will parse all source files and build semantic embeddings.");
             app.output.push_system("   The process runs in the background. You can continue working.");
             
-            if let Some(ref indexer) = app.code_indexer {
-                let indexer_clone = Arc::clone(indexer);
+            if let Some(ref engine) = app.knowledge_engine {
+                let engine_clone = Arc::clone(engine);
                 tokio::spawn(async move {
-                    let mut idx = indexer_clone.lock().await;
-                    match idx.index_project(None).await {
+                    let mut eng = engine_clone.lock().await;
+                    match eng.index_project() {
                         Ok(count) => {
                             tracing::info!("[INDEX] ✅ Re-indexed {} symbols", count);
                         }
@@ -55,26 +54,21 @@ fn handle_index_command(
                     }
                 });
             } else {
-                app.output.push_system("⚠️ Code indexer not initialized. Restart Ox to enable indexing.");
+                app.output.push_system("⚠️ Knowledge engine not initialized. Restart Ox.");
             }
             
             CommandResult::Success
         }
         
         "clear" | "reset" => {
-            // Clear the database file
-            let db_path = std::env::var("OX_HOME")
-                .ok()
-                .map(|home| std::path::PathBuf::from(home).join("db").join("symbols.tdb"))
-                .or_else(|| {
-                    dirs::home_dir().map(|h| h.join(".ox").join("db").join("symbols.tdb"))
-                });
+            let db_path = dirs::home_dir()
+                .map(|h| h.join(".ox").join("db").join("knowledge.tdb"));
             
             if let Some(path) = db_path {
                 if path.exists() {
                     match std::fs::remove_file(&path) {
                         Ok(_) => {
-                            app.output.push_system(&format!("✅ Cleared symbol database: {:?}", path));
+                            app.output.push_system(&format!("✅ Cleared knowledge database: {:?}", path));
                             app.output.push_system("   Restart Ox or run /index build to rebuild.");
                         }
                         Err(e) => {
@@ -82,7 +76,7 @@ fn handle_index_command(
                         }
                     }
                 } else {
-                    app.output.push_system("ℹ️ Symbol database does not exist.");
+                    app.output.push_system("ℹ️ Knowledge database does not exist.");
                 }
             } else {
                 app.output.push_system("⚠️ Could not determine database path.");
@@ -92,20 +86,14 @@ fn handle_index_command(
         }
         
         "" | "status" | "stat" => {
-            // Show index status
-            if let Some(ref indexer) = app.code_indexer {
-                let indexer_clone = Arc::clone(indexer);
+            if let Some(ref engine) = app.knowledge_engine {
+                let engine_clone = Arc::clone(engine);
                 tokio::spawn(async move {
-                    let idx = indexer_clone.lock().await;
-                    let count = idx.symbol_count().await;
+                    let eng = engine_clone.lock().await;
+                    let _dim = eng.dimension();
                     
-                    // Check if database file exists
-                    let db_path = std::env::var("OX_HOME")
-                        .ok()
-                        .map(|home| std::path::PathBuf::from(home).join("db").join("symbols.tdb"))
-                        .or_else(|| {
-                            dirs::home_dir().map(|h| h.join(".ox").join("db").join("symbols.tdb"))
-                        });
+                    let db_path = dirs::home_dir()
+                        .map(|h| h.join(".ox").join("db").join("knowledge.tdb"));
                     
                     let db_status = if let Some(path) = db_path {
                         if path.exists() {
@@ -118,11 +106,9 @@ fn handle_index_command(
                         "⚠️ Unknown".to_string()
                     };
                     
-                    // We can't directly push to app.output from async context
-                    // So we log and the user can check logs
                     tracing::info!(
-                        "[INDEX STATUS] Symbols: {}, {}",
-                        count,
+                        "[INDEX STATUS] dim={}, {}",
+                        _dim,
                         db_status
                     );
                 });
@@ -130,7 +116,7 @@ fn handle_index_command(
                 app.output.push_system("📊 Checking index status... (see logs for details)");
                 app.output.push_system("   Tip: Use /index build to trigger full indexing");
             } else {
-                app.output.push_system("⚠️ Code indexer not initialized.");
+                app.output.push_system("⚠️ Knowledge engine not initialized.");
             }
             
             CommandResult::Success

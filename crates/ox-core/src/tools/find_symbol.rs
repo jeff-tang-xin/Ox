@@ -52,47 +52,51 @@ impl Tool for FindSymbolTool {
             .map(|v| v as usize)
             .unwrap_or(10);
 
-        let code_indexer = Arc::clone(&ctx.code_indexer);
+        let knowledge = Arc::clone(&ctx.knowledge);
         let name_owned = name.to_string();
 
         let result = tokio::task::spawn(async move {
-            let idx = code_indexer.lock().await;
-            // search() handles keyword-first + semantic-fallback internally
-            idx.search(&name_owned, top_k)
-                .await
+            let engine = knowledge.lock().await;
+            engine.retrieve_code(&name_owned, top_k)
                 .map_err(|e| e.to_string())
         }).await;
 
         match result {
-            Ok(Ok(query_result)) => {
-                if query_result.symbols.is_empty() {
+            Ok(Ok(hits)) => {
+                if hits.is_empty() {
                     ToolOutput::success(format!(
                         "🔍 No symbols found for '{}'.\n\
                          💡 The project index may not be built yet. \
                          Use file_read on key files to auto-index, \
                          or trigger a full index.",
-                        query_result.query
+                        name
                     ))
                 } else {
                     let mut output = format!(
                         "🔍 Found {} symbol(s) for '{}':\n\n",
-                        query_result.total_count, query_result.query
+                        hits.len(), name
                     );
-                    for sym in &query_result.symbols {
-                        output.push_str(&format!(
-                            "  [{}] `{}` @ {}:{}-{}\n",
-                            sym.kind, sym.name,
-                            sym.file_path, sym.start_line, sym.end_line
-                        ));
-                        if let Some(ref parent) = sym.parent {
-                            output.push_str(&format!("       └ in {}\n", parent));
-                        }
-                        if !sym.signature.is_empty() {
-                            let sig: String = sym.signature
-                                .chars()
-                                .take(100)
-                                .collect();
-                            output.push_str(&format!("       └ {}\n", sig));
+                    for hit in &hits {
+                        let entity = &hit.entity;
+                        if let crate::knowledge::entity::EntityMetadata::CodeSymbol {
+                            ref symbol_type, ref fq_name, ref file_path,
+                            start_line, end_line, ref signature, ref parent, ..
+                        } = entity.metadata {
+                            output.push_str(&format!(
+                                "  [{}] `{}` @ {}:{}-{}\n",
+                                symbol_type, fq_name,
+                                file_path, start_line, end_line
+                            ));
+                            if let Some(p) = parent {
+                                output.push_str(&format!("       └ in {}\n", p));
+                            }
+                            if !signature.is_empty() {
+                                let sig: String = signature
+                                    .chars()
+                                    .take(100)
+                                    .collect();
+                                output.push_str(&format!("       └ {}\n", sig));
+                            }
                         }
                     }
                     output.push_str("\n💡 Use file_read to view full source. Use edit_file to modify.");

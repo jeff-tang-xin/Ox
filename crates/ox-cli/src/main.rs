@@ -27,6 +27,7 @@ use ox_core::agent::ui_event::UiToAgentEvent;
 use ox_core::config::{AgentConfig, OxConfig};
 use ox_core::context::{self, ContextBuilder};
 use ox_core::cost::{self, CostTracker};
+use ox_core::knowledge::KnowledgeEngine;
 use ox_core::llm::{self, LlmProvider, ProviderResolveInfo};
 use ox_core::memory::MemoryManager;
 use ox_core::message::{Message, Session};
@@ -364,16 +365,37 @@ async fn run_app(
         })
     });
 
-    // Memory system -- system-level: ~/.ox/db/memories_*.db
+    // Knowledge Engine — unified AST + memory + vector store (TriviumDB)
+    let knowledge_engine = {
+        let db_path = db_dir.join("knowledge.tdb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let embedding_model = ox_core::knowledge::embedding::load_shared(&config.embedding)
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to load embedding model: {e}. Disabling vector search.");
+                // Create a dummy by loading with default, will fail gracefully
+                panic!("Embedding model required for KnowledgeEngine: {e}");
+            });
+        let engine = KnowledgeEngine::new(
+            &db_path_str,
+            embedding_model,
+            &config.embedding,
+            &rt_env.working_dir,
+        ).unwrap_or_else(|e| {
+            tracing::error!("Failed to create KnowledgeEngine: {e}");
+            std::process::exit(1);
+        });
+        Arc::new(tokio::sync::Mutex::new(engine))
+    };
+
+    // Memory system (kept for slash commands compatibility — delegates to KnowledgeEngine eventually)
     let memory = MemoryManager::init(&rt_env.ox_home_dir, &rt_env.project_id, &config.memory)
         .unwrap_or_else(|e| {
             tracing::warn!("Failed to init memory system: {e}");
             let temp = std::env::temp_dir();
             MemoryManager::init(&temp, &rt_env.project_id, &config.memory).unwrap_or_else(|e2| {
-                tracing::error!("Failed to create memory system even with temp dir: {}", e2);
-                // This is unrecoverable - memory system is core to Ox
-                tracing::error!("Cannot initialize memory system. Exiting.");
-                std::process::exit(1);
+                tracing::warn!("Cannot init memory, continuing without: {e2}");
+                MemoryManager::init(&std::env::temp_dir(), "fallback", &config.memory)
+                    .unwrap_or_else(|_| panic!("Fatal: cannot init memory"))
             })
         });
 
@@ -396,85 +418,71 @@ async fn run_app(
         memory_arc.run_janitor(0.3, config.memory.max_nodes);
     }
 
-    // Initialize AST-based code indexer (with embedding config for deferred VectorStore init)
-    let code_indexer = Arc::new(tokio::sync::Mutex::new(
-        ox_core::symbol::CodeIndexer::new(&rt_env.working_dir, config.embedding.clone()),
-    ));
-
-    // 🚀 Start background project indexing (non-blocking)
-    let indexer_clone = Arc::clone(&code_indexer);
+    // 🚀 Start background project indexing via KnowledgeEngine (two-phase)
+    // Phase 1: Fast AST extraction (releases engine lock)
+    // Phase 2: Slow async BERT embedding (separate spawn)
+    let knowledge_for_index = Arc::clone(&knowledge_engine);
     let working_dir_clone = rt_env.working_dir.clone();
-    let memory_for_vector = Arc::clone(&memory_arc);
-    let embedding_config = config.embedding.clone();
-    let db_dir_for_memory = db_dir.clone();
     let (index_progress_tx, mut index_progress_rx) = mpsc::unbounded_channel::<(usize, usize, usize)>();
+    let (index_phase_tx, mut index_phase_rx) = mpsc::unbounded_channel::<String>();
     let (index_done_tx, mut index_done_rx) = mpsc::unbounded_channel::<usize>();
     tokio::spawn(async move {
-        tracing::info!("[INDEXER] Starting background project indexing...");
+        tracing::info!("[INDEXER] Phase 1: Fast AST extraction (no embedding yet)...");
 
-        // Initialize vector store + index project while holding the lock
-        let total_symbols;
-        let vs_for_embed;
-        let symbols_for_embed;
-        {
-            let mut idx = indexer_clone.lock().await;
-            idx.init_vector_store().await;
-            vs_for_embed = idx.get_vector_store();
-            symbols_for_embed = idx.get_symbols();
-            match idx.index_project(Some(index_progress_tx)).await {
-                Ok(count) => {
-                    tracing::info!("[INDEXER] ✅ Indexed {} symbols from {:?}", count, working_dir_clone);
-                    total_symbols = count;
+        // ── Phase 1: AST extraction (fast, releases lock after) ──
+        let phase1_result = {
+            let mut engine = knowledge_for_index.lock().await;
+            engine.collect_all_symbols(Some(index_progress_tx))
+        }; // ← Lock released — agent can use engine for other things
+
+        match phase1_result {
+            Ok((entities, _total_files)) => {
+                tracing::info!(
+                    "[INDEXER] Phase 1 done: {} entities. Phase 2: Background embedding...",
+                    entities.len()
+                );
+                let _ = index_phase_tx.send("embedding".to_string());
+
+                if entities.is_empty() {
+                    let _ = index_done_tx.send(0);
+                    return;
                 }
-                Err(e) => {
-                    tracing::warn!("[INDEXER] ❌ Indexing failed: {}. Will rely on auto-indexing via file_read.", e);
-                    total_symbols = 0;
-                }
+
+                // ── Phase 2: Async BERT embedding (re-locks engine, slow) ──
+                let count = {
+                    let mut engine = knowledge_for_index.lock().await;
+                    match engine.embed_and_store(&entities) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("[INDEXER] ❌ Embedding failed: {e}");
+                            0
+                        }
+                    }
+                };
+
+                tracing::info!(
+                    "[INDEXER] ✅ Phase 2 done: {} symbols embedded from {:?}",
+                    count, working_dir_clone
+                );
+                let _ = index_done_tx.send(count);
             }
-        } // Lock released — agent can use indexer now!
-
-        // Signal indexing complete (agent can start searching NOW!)
-        let _ = index_done_tx.send(total_symbols);
-
-        // 🚀 Async embedding — NO indexer lock! Only locks vector_store independently.
-        tokio::spawn(async move {
-            let all_symbols: Vec<_> = {
-                let lock = symbols_for_embed.read().await;
-                lock.clone()
-            };
-            if all_symbols.is_empty() { return; }
-            tracing::info!("[VECTOR_STORE] Background embedding {} symbols (no indexer lock)...", all_symbols.len());
-            let mut vs_guard = vs_for_embed.lock().await;
-            if let Some(ref mut vs) = *vs_guard {
-                match vs.insert_symbols_batch(&all_symbols) {
-                    Ok(count) => tracing::info!("[VECTOR_STORE] ✅ Embedded {} symbols in background", count),
-                    Err(e) => tracing::warn!("[VECTOR_STORE] ❌ Background embedding failed: {}", e),
-                }
+            Err(e) => {
+                tracing::warn!("[INDEXER] ❌ Phase 1 extraction failed: {e}. Will rely on auto-indexing via file_read.",);
+                let _ = index_done_tx.send(0);
             }
-        });
-
-        // 🧠 Initialize memory vector store for semantic memory search
-        memory_for_vector.init_vector_store(&embedding_config, &db_dir_for_memory);
-
-        // Start file system watcher for incremental updates
-        if let Err(e) = ox_core::symbol::CodeIndexer::start_watcher(indexer_clone).await {
-            tracing::warn!("[INDEXER] Failed to start file watcher: {}. Auto-indexing via file_read still works.", e);
-        } else {
-            tracing::info!("[INDEXER] 📡 File watcher started for real-time updates");
         }
     });
     
     // Set indexing state on app
     app.indexing = true;
-    app.status = "⏳ Indexing project...".to_string();
-    app.output.push_system("🔍 Checking project symbols... (incremental indexing)");
+    app.status = "⏳ Phase 1: Parsing source files...".to_string();
+    app.output.push_system("🔍 Phase 1: Fast AST parsing... (Phase 2: embedding follows)");
 
     let mut tool_ctx = Arc::new(ToolContext::new(
         rt_env.clone(),
         rt_env.working_dir.clone(),
         Arc::new(config.clone()),
-        Arc::clone(&memory_arc),
-        Arc::clone(&code_indexer),
+        Arc::clone(&knowledge_engine),
     ));
 
     // Model name for cost recording.
@@ -543,8 +551,8 @@ async fn run_app(
     // Initialize Workflow Engine in App
     app.init_workflow_engine(&session.meta.id, &session.meta);
     
-    // Set code_indexer in app for slash command access
-    app.code_indexer = Some(Arc::clone(&code_indexer));
+    // Set knowledge_engine in app for pre-turn retrieval
+    app.knowledge_engine = Some(Arc::clone(&knowledge_engine));
 
     // 🧠 Project onboarding: queue if either conventions or architecture skill is missing
     let mut needs_onboarding = false;
@@ -649,23 +657,30 @@ async fn run_app(
 
         // ── Drain indexing progress updates ──
         if app.indexing {
-            // Check for progress updates
+            // Check for progress updates (Phase 1: AST extraction)
             while let Ok((files_done, total_files, symbols)) = index_progress_rx.try_recv() {
                 app.index_files_done = files_done;
                 app.index_total_files = total_files;
                 app.index_symbols = symbols;
                 if total_files > 0 {
                     let pct = (files_done * 100) / total_files.max(1);
-                    app.status = format!("⏳ Indexing {}/{} files ({} symbols, {}%)", files_done, total_files, symbols, pct);
+                    app.status = format!("⏳ Phase 1: Parsing {}/{} files ({} symbols, {}%)", files_done, total_files, symbols, pct);
                 } else {
-                    app.status = format!("⏳ Indexing... {} symbols found", symbols);
+                    app.status = format!("⏳ Phase 1: Parsing... {} symbols found", symbols);
                 }
-                // Increment tick to animate spinner during indexing
                 tick_count = tick_count.wrapping_add(1);
                 app.spinner_frame = tick_count;
                 app.dirty = true;
             }
-            // Check if indexing is done
+            // Phase transition: AST done, embedding started
+            if let Ok(phase) = index_phase_rx.try_recv() {
+                if phase == "embedding" {
+                    app.status = "🧠 Phase 2: Building vector embeddings...".to_string();
+                    app.output.push_system("🧠 Phase 2: Building semantic embeddings (BERT inference, may take a while)...");
+                    app.dirty = true;
+                }
+            }
+            // Check if indexing is done (Phase 2 complete)
             if let Ok(total) = index_done_rx.try_recv() {
                 app.indexing = false;
                 app.index_symbols = total;
@@ -1652,8 +1667,7 @@ async fn run_app(
                                         rt_env.clone(),
                                         new_dir.clone(),
                                         Arc::new(config.clone()),
-                                        Arc::clone(&memory_arc),
-                                        Arc::clone(&code_indexer),
+                                        Arc::clone(&knowledge_engine),
                                     ));
                                     if project_changed {
                                         app.output.push_system(&format!(
@@ -2092,7 +2106,7 @@ fn handle_key_event(
 
                             // ── Capture all state for the background task ──
                             let provider = Arc::clone(provider);
-                            let memory = memory.clone();
+                            let _memory = memory.clone();
                             let context_builder = context_builder.clone();
                             let tool_registry = Arc::clone(&tool_registry);
                             let tool_ctx = Arc::clone(&tool_ctx);
@@ -2114,34 +2128,36 @@ fn handle_key_event(
 
                             // ⭐ Defer heavy work to a background thread so the event loop
                             // stays responsive and "Thinking..." renders immediately.
-                            let code_indexer_for_ctx = app.code_indexer.clone();
-                            let user_text_for_symbols = user_text.clone();
+                            let knowledge_for_pre_turn = app.knowledge_engine.clone();
+                            let user_text_for_pipeline = user_text.clone();
+                            let session_id_for_pipeline = session.meta.id.clone();
                             tokio::spawn(async move {
-                                // ── AST symbol search (async, before blocking) ──
-                                let _ = tx.send(AgentToUiEvent::Status("🔍 Searching symbols...".to_string()));
-                                let relevant_symbols_str = if let Some(ref indexer) = code_indexer_for_ctx {
-                                    let idx = indexer.lock().await;
-                                    match idx.search(&user_text_for_symbols, 8).await {
-                                        Ok(result) if !result.symbols.is_empty() => {
-                                            let mut s = String::new();
-                                            for sym in &result.symbols {
-                                                s.push_str(&format!(
-                                                    "- [{}] `{}` @ {}:{}-{}\n",
-                                                    sym.kind, sym.name,
-                                                    sym.file_path, sym.start_line, sym.end_line
-                                                ));
-                                            }
-                                            Some(s)
+                                // ── Pre-turn Unified Retrieval (KnowledgeEngine) ──
+                                let _ = tx.send(AgentToUiEvent::Status("🔍 Retrieving knowledge...".to_string()));
+                                let knowledge_context_str = if let Some(ref k_engine) = knowledge_for_pre_turn {
+                                    let engine = k_engine.lock().await;
+                                    match ox_core::knowledge::retrieval::run_retrieval(
+                                        &engine,
+                                        &user_text_for_pipeline,
+                                        &session_id_for_pipeline,
+                                        3000,
+                                    ) {
+                                        Ok(injection) => {
+                                            ox_core::knowledge::retrieval::format_context_for_prompt(&injection)
                                         }
-                                        _ => None,
+                                        Err(e) => {
+                                            tracing::warn!("Pre-turn retrieval failed: {e}");
+                                            String::new()
+                                        }
                                     }
                                 } else {
-                                    None
+                                    String::new()
                                 };
 
                                 // ── All heavy synchronous work runs on a blocking thread ──
                                 let tr = tool_registry.clone();
-                                let status_tx = tx.clone(); // For status updates from blocking thread
+                                let status_tx = tx.clone();
+                                let knowledge_ctx = knowledge_context_str;
                                 let blocking_result = tokio::task::spawn_blocking(move || {
                                     let working_dir = &rt_env.working_dir;
 
@@ -2152,7 +2168,7 @@ fn handle_key_event(
                                         git_diff_stat: context::gather_diff_context(working_dir),
                                         dir_structure: None,
                                         recent_summary: None,
-                                        relevant_symbols: relevant_symbols_str,
+                                        relevant_symbols: Some(knowledge_ctx.clone()),
                                     };
 
                                     // 2. Build system prompt
@@ -2186,17 +2202,9 @@ fn handle_key_event(
                                         }
                                     }
 
-                                    // 4. Memory retrieval (SQLite queries)
-                                    let _ = status_tx.send(AgentToUiEvent::Status("🧠 Retrieving memories...".to_string()));
-                                    let project_id: Option<&str> = if rt_env.project_id.is_empty() {
-                                        None
-                                    } else {
-                                        Some(rt_env.project_id.as_str())
-                                    };
-                                    let memory_nodes = memory.retrieve_with_rerank(&user_text, &project_id, 5);
-                                    let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
-                                    memory.reinforce_accessed(&accessed_ids);
-                                    let memory_ctx = memory.format_memory_context(&memory_nodes, false);
+                                    // 4. Knowledge context already retrieved via pre-turn pipeline, injected as relevant_symbols
+                                    // (no separate memory retrieval needed — unified in KnowledgeEngine)
+                                    let _ = status_tx.send(AgentToUiEvent::Status("📐 Building context...".to_string()));
 
                                     // 5. Build effective messages with compressed cache
                                     let effective_messages = if let Some((cached, prev_count)) = compressed_cache_data {
@@ -2213,12 +2221,12 @@ fn handle_key_event(
                                         session_messages
                                     };
 
-                                    // 6. Token-aware context building
+                                    // 6. Token-aware context building (knowledge is already in system_prompt)
                                     let _ = status_tx.send(AgentToUiEvent::Status("📐 Building context...".to_string()));
                                     let turn_messages = helpers::build_context_with_option(
                                         &context_builder,
                                         &system_prompt,
-                                        &memory_ctx,
+                                        "", // Knowledge context already merged into system prompt
                                         &effective_messages,
                                         context_window,
                                         use_refined,

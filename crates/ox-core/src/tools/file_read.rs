@@ -97,10 +97,10 @@ impl Tool for FileReadTool {
             Ok(content) => {
                 // Auto-index symbols in background (use absolute path)
                 let abs_path = path.to_path_buf();
-                let code_indexer = Arc::clone(&ctx.code_indexer);
+                let knowledge = Arc::clone(&ctx.knowledge);
                 tokio::spawn(async move {
-                    let mut idx = code_indexer.lock().await;
-                    if let Err(e) = idx.index_file(&abs_path).await {
+                    let mut engine = knowledge.lock().await;
+                    if let Err(e) = engine.index_file(&abs_path) {
                         tracing::debug!("[FILE_READ] Auto-index failed for {}: {e}", abs_path.display());
                     }
                 });

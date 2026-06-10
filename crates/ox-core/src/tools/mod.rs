@@ -68,10 +68,8 @@ pub struct ToolContext {
     pub runtime: RuntimeEnvironment,
     pub working_dir: std::path::PathBuf,
     pub config: Arc<OxConfig>,
-    /// Reference to the memory manager for knowledge retrieval
-    pub memory: Arc<crate::memory::MemoryManager>,
-    /// Reference to the code indexer for AST-aware symbol queries
-    pub code_indexer: Arc<tokio::sync::Mutex<crate::symbol::CodeIndexer>>,
+    /// Unified knowledge engine (replaces memory + code_indexer)
+    pub knowledge: Arc<tokio::sync::Mutex<crate::knowledge::KnowledgeEngine>>,
     /// Current tool call ID (for progress reporting)
     pub tool_call_id: String,
     /// Optional progress callback for real-time updates
@@ -93,15 +91,13 @@ impl ToolContext {
         runtime: RuntimeEnvironment,
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
-        memory: Arc<crate::memory::MemoryManager>,
-        code_indexer: Arc<tokio::sync::Mutex<crate::symbol::CodeIndexer>>,
+        knowledge: Arc<tokio::sync::Mutex<crate::knowledge::KnowledgeEngine>>,
     ) -> Self {
         Self {
             runtime,
             working_dir,
             config,
-            memory,
-            code_indexer,
+            knowledge,
             tool_call_id: String::new(),
             progress_callback: None,
         }
@@ -112,8 +108,7 @@ impl ToolContext {
         runtime: RuntimeEnvironment,
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
-        memory: Arc<crate::memory::MemoryManager>,
-        code_indexer: Arc<tokio::sync::Mutex<crate::symbol::CodeIndexer>>,
+        knowledge: Arc<tokio::sync::Mutex<crate::knowledge::KnowledgeEngine>>,
         tool_call_id: String,
         progress_callback: impl Fn(ToolProgress) + Send + Sync + 'static,
     ) -> Self {
@@ -121,8 +116,7 @@ impl ToolContext {
             runtime,
             working_dir,
             config,
-            memory,
-            code_indexer,
+            knowledge,
             tool_call_id,
             progress_callback: Some(Arc::new(progress_callback)),
         }

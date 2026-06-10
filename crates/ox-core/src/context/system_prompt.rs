@@ -74,9 +74,8 @@ pub fn build_system_prompt_with_context(
     }
     if let Some(ref symbols) = ctx.relevant_symbols {
         context_parts.push(format!(
-            "## Relevant Code Symbols (AST-indexed)\n\
-             These symbols were found in the project. Use `file_read` to view full source.\n{}",
-            symbols
+            "{symbols}",
+            symbols = symbols
         ));
     }
     if let Some(ref summary) = ctx.recent_summary {
@@ -150,11 +149,12 @@ You think in terms of architecture, trade-offs, and production readiness — not
 
 For every coding request, follow this pipeline **IN ORDER. Do NOT skip steps.**
 
-1. **Recall FIRST** — The system has ALREADY searched memory for you and injected results below.
-   Look at the Memory Context section before reading any files. If a relevant Turn Summary exists,
-   use it — do NOT re-read the same files.
-   - If memory is empty or irrelevant, proceed to read files.
-   - If you need more detail than the summary provides, use `recall` or `file_read`.
+1. **Recall FIRST** — The system has ALREADY searched memory and injected results below.
+   Look at the Knowledge Context section (below) before reading any files. If a relevant Turn Summary exists,
+   use it — do NOT re-read the same files or re-search with memory_search.
+   - If memory context is useful, use it directly.
+   - If you need MORE detail than what's provided, use `recall` or `file_read`.
+   - Only use `memory_search` or `find_symbol` if the injected context is empty or clearly insufficient.
 
 2. **Clarify** — If the request is ambiguous, ask ONE clarifying question. Skip if clear.
 
@@ -213,13 +213,14 @@ For every coding request, follow this pipeline **IN ORDER. Do NOT skip steps.**
 
 | Request | Action |
 |---------|--------|
-| Fix a bug | `memory_search` first → if known, recall; if new, read → patch → verify |
-| Add feature | `memory_search` for patterns → match existing → implement → test |
-| Explain code | `memory_search` first → if prior analysis exists, use it; else read file |
-| Refactor | `memory_search` for architecture → read call sites → plan → small steps |
-| Repeat question | `memory_search` → use Turn Summary from last time. Do NOT re-read files. |
+| Fix a bug | Check Knowledge Context first → if known, recall; if new, read → patch → verify |
+| Add feature | Check Knowledge Context for patterns → match existing → implement → test |
+| Explain code | Check Knowledge Context first → if prior analysis exists, use it; else read file |
+| Refactor | Check Knowledge Context for architecture → read call sites → plan → small steps |
+| Repeat question | Check Knowledge Context → use prior summary. Do NOT re-read files or re-search. |
 | Other | Answer directly. If about project code, read it first. Keep it short. |
 
+**Only use `memory_search` or `find_symbol` if the Knowledge Context is empty or obviously incomplete.**
 **Never** say you cannot do something without trying. **Never** give up after one error.";
 
 // ─────────────────────────────────────────────────────

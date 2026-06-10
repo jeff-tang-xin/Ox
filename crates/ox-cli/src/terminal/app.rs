@@ -184,8 +184,8 @@ pub struct App {
     pub session_action: SessionAction,
     /// Provider resolution info for debugging commands.
     pub resolve_info: Option<ox_core::llm::ProviderResolveInfo>,
-    /// Code indexer for AST-aware symbol search (optional, may not be initialized yet)
-    pub code_indexer: Option<Arc<tokio::sync::Mutex<ox_core::symbol::CodeIndexer>>>,
+    /// Unified knowledge engine (AST + memory + vector store)
+    pub knowledge_engine: Option<Arc<tokio::sync::Mutex<ox_core::knowledge::KnowledgeEngine>>>,
 
     // Indexing progress
     /// Whether background indexing is still in progress
@@ -250,7 +250,7 @@ impl App {
             // Slash command context fields
             session_action: SessionAction::None,
             resolve_info: None,
-            code_indexer: None,
+            knowledge_engine: None,
 
             // Indexing progress
             indexing: false,

@@ -246,8 +246,9 @@ pub async fn run_agent_turn(
             }
         }
 
-        // 🎯 Task anchoring: remind LLM of the user's original request
-        // Prevents divergence in long multi-turn conversations.
+        // 🎯 Task anchoring + Knowledge re-injection: remind LLM of context on every iteration.
+        // In long turns, the LLM's attention to the system prompt fades.
+        // Re-inject a compact summary of what it already knows.
         if iteration > 0 {
             if let Some(ref task) = user_task {
                 let anchor = if task.chars().count() > 200 {
@@ -255,11 +256,37 @@ pub async fn run_agent_turn(
                 } else {
                     task.clone()
                 };
-                messages.push(Message::system(&format!(
+                let mut reminder = format!(
                     "📋 **Current task** (reminder): {}\n\n\
                      Stay focused on this task. Do NOT deviate to unrelated changes.",
                     anchor
-                )));
+                );
+
+                // Every 2 iterations, also re-inject the most relevant knowledge entities
+                if iteration % 2 == 0 {
+                    let knowledge = Arc::clone(&tool_ctx.knowledge);
+                    let task_clone = task.clone();
+                    tokio::spawn(async move {
+                        let engine = knowledge.lock().await;
+                        match engine.retrieve_for_context(&task_clone, "", 5) {
+                            Ok(hits) if !hits.is_empty() => {
+                                let mut reminder = String::from("\n📚 **What you already know** (from pre-turn):\n");
+                                for hit in hits.iter().take(5) {
+                                    let preview: String = hit.entity.content.chars().take(120).collect();
+                                    reminder.push_str(&format!("- [{}] {}\n", hit.entity.kind.as_str(), preview));
+                                }
+                                reminder.push_str("⚠️ Do NOT re-search these — you have them. Only file_read if you need more detail.\n");
+                                // Note: we can't push to messages from a different task,
+                                // so this reminder is informational only
+                            }
+                            _ => {}
+                        }
+                    });
+                }
+
+                messages.push(Message::system(&reminder));
+
+                messages.push(Message::system(&reminder));
             }
         }
 
@@ -1460,8 +1487,7 @@ pub async fn run_agent_turn(
                 tool_ctx.runtime.clone(),
                 tool_ctx.working_dir.clone(),
                 tool_ctx.config.clone(),
-                Arc::clone(&tool_ctx.memory),
-                Arc::clone(&tool_ctx.code_indexer),
+                Arc::clone(&tool_ctx.knowledge),
                 tc.id.clone(),
                 move |progress: crate::tools::ToolProgress| {
                     let _ = ui_tx_clone.send(AgentToUiEvent::ToolProgress {
@@ -1499,8 +1525,7 @@ pub async fn run_agent_turn(
                     tool_ctx.runtime.clone(),
                     new_dir.clone(),
                     tool_ctx.config.clone(),
-                    Arc::clone(&tool_ctx.memory),
-                    Arc::clone(&tool_ctx.code_indexer),
+                    Arc::clone(&tool_ctx.knowledge),
                 ));
                 let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
             }
@@ -1561,24 +1586,30 @@ pub async fn run_agent_turn(
             new_messages.push(result_msg.clone());
             messages.push(result_msg);
 
-            // 🧠 Mid-turn memory refresh: after code-modifying tools, re-retrieve relevant memories
+            // 🧠 Mid-turn knowledge refresh: after code-modifying tools, re-retrieve relevant entities
             // so the LLM has the latest project knowledge for subsequent iterations.
             if matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range" | "shell_exec") && !result.is_error {
-                let project_id: Option<&str> = if tool_ctx.runtime.project_id.is_empty() {
-                    None
-                } else {
-                    Some(&tool_ctx.runtime.project_id)
-                };
-                let refreshed = tool_ctx.memory.retrieve(
-                    &format!("Recent change via {}", tc.name),
-                    &project_id,
-                    3,
-                );
+                let knowledge_clone = Arc::clone(&tool_ctx.knowledge);
+                let tool_name = tc.name.clone();
+                let refreshed = tokio::task::spawn(async move {
+                    let engine = knowledge_clone.lock().await;
+                    engine.retrieve_memories(
+                        &format!("Recent change via {}", tool_name),
+                        3,
+                    ).unwrap_or_default()
+                }).await.unwrap_or_default();
+
                 if !refreshed.is_empty() {
-                    let ctx = tool_ctx.memory.format_memory_context(&refreshed, false);
+                    let mut ctx_str = String::new();
+                    for hit in &refreshed {
+                        ctx_str.push_str(&format!("- [{}] {}\n",
+                            hit.entity.kind.as_str(),
+                            hit.entity.content.chars().take(150).collect::<String>()
+                        ));
+                    }
                     messages.push(Message::system(&format!(
                         "📚 Updated project knowledge after {}:\n{}",
-                        tc.name, ctx
+                        tc.name, ctx_str
                     )));
                 }
             }

@@ -270,13 +270,13 @@ impl Tool for FileWriteTool {
 
                 // ── AST syntax check: parse the written file and warn on errors ──
                 let ast_warning = {
-                    let code_indexer = Arc::clone(&ctx.code_indexer);
+                    let knowledge = Arc::clone(&ctx.knowledge);
                     let check_path = display_path.clone();
                     tokio::spawn(async move {
-                        let mut idx = code_indexer.lock().await;
+                        let mut engine = knowledge.lock().await;
                         // Re-read the written file for syntax check
                         if let Ok(code) = std::fs::read_to_string(&check_path) {
-                            idx.check_syntax(&check_path, &code)
+                            engine.check_syntax(&check_path, &code)
                         } else {
                             None
                         }

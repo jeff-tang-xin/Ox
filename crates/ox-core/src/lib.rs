@@ -3,6 +3,7 @@ pub mod config;
 pub mod context;
 pub mod cost;
 pub mod feedback;
+pub mod knowledge;
 pub mod llm;
 pub mod memory;
 pub mod message;

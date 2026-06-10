@@ -9,6 +9,7 @@
 //! - Best practices and anti-patterns
 
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::tools::{Tool, ToolContext, ToolOutput};
 
@@ -90,7 +91,7 @@ impl Tool for MemorySearchTool {
             }
         };
 
-        let scope = args.get("scope").and_then(|s| s.as_str()).unwrap_or("both");
+        let _scope = args.get("scope").and_then(|s| s.as_str()).unwrap_or("both");
 
         let max_results = args
             .get("max_results")
@@ -98,16 +99,19 @@ impl Tool for MemorySearchTool {
             .unwrap_or(5)
             .min(20) as usize;
 
-        // Access memory system through ToolContext
-        let memory = &ctx.memory;
-        let project_id = if scope != "global" {
-            Some(ctx.runtime.project_id.as_str())
-        } else {
-            None
-        };
+        // Access knowledge engine through ToolContext
+        let knowledge = Arc::clone(&ctx.knowledge);
+        let _project_id = ctx.runtime.project_id.clone();
+        let query_owned = query.to_string();
 
-        // Perform the search
-        let nodes = memory.retrieve(query, &project_id, max_results);
+        let nodes = tokio::task::spawn(async move {
+            let engine = knowledge.lock().await;
+            engine.retrieve_memories(&query_owned, max_results)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|h| h.entity)
+                .collect::<Vec<_>>()
+        }).await.unwrap_or_default();
 
         if nodes.is_empty() {
             return ToolOutput::success(format!(
@@ -127,33 +131,16 @@ impl Tool for MemorySearchTool {
             query
         );
 
-        for (i, node) in nodes.iter().enumerate() {
-            let scope_tag = if node.project_id.is_some() {
-                "[Project]"
-            } else {
-                "[Global]"
-            };
-
-            let type_tag = format!("[{}]", node.node_type.as_str());
-
-            // Calculate confidence score based on depth and recency
-            let confidence = calculate_confidence(node);
-            let confidence_bar = format_confidence_bar(confidence);
-
-            // Format source information
-            let source_info = format_source(&node.source);
+        for (i, entity) in nodes.iter().enumerate() {
+            let kind_tag = format!("[{}]", entity.kind.as_str());
+            let depth = entity.coordinate.depth;
 
             output.push_str(&format!(
-                "{}. {} {} (Depth: {} | Confidence: {})\n\
-                   Source: {}\n\
-                   {}\n\n",
+                "{}. {} (Depth: {})\n   {}\n\n",
                 i + 1,
-                scope_tag,
-                type_tag,
-                node.depth,
-                confidence_bar,
-                source_info,
-                node.content
+                kind_tag,
+                depth,
+                entity.content
             ));
         }
 
@@ -165,47 +152,4 @@ impl Tool for MemorySearchTool {
 
         ToolOutput::success(output)
     }
-}
-
-/// Calculate confidence score based on depth and node type
-fn calculate_confidence(node: &crate::memory::MemoryNode) -> f32 {
-    // Depth is a good indicator of reliability (0-5 scale)
-    let depth_score = (node.depth as f32 / 5.0).min(1.0);
-
-    // Node type affects confidence
-    let type_weight = match node.node_type {
-        crate::memory::MemoryNodeType::Architectural => 0.9,
-        crate::memory::MemoryNodeType::BestPractice => 0.85,
-        crate::memory::MemoryNodeType::Style => 0.8,
-        crate::memory::MemoryNodeType::MetaSkill => 0.85,
-        crate::memory::MemoryNodeType::AntiPattern => 0.8,
-        crate::memory::MemoryNodeType::Business => 0.75,
-        crate::memory::MemoryNodeType::Pattern => 0.75,
-        crate::memory::MemoryNodeType::Fact => 0.7,
-    };
-
-    (depth_score * 0.6 + type_weight * 0.4).clamp(0.0, 1.0)
-}
-
-/// Format confidence as a visual bar
-fn format_confidence_bar(confidence: f32) -> String {
-    let filled = (confidence * 10.0).round() as usize;
-    let empty = 10 - filled;
-    format!(
-        "{}{:.0}%",
-        "█".repeat(filled) + &"░".repeat(empty),
-        confidence * 100.0
-    )
-}
-
-/// Format source information in human-readable form
-fn format_source(source: &crate::memory::MemorySource) -> String {
-    match source {
-        crate::memory::MemorySource::ToolObservation => "🔧 Observed from tool output",
-        crate::memory::MemorySource::LlmExtraction => "🤖 Extracted by LLM",
-        crate::memory::MemorySource::UserExplicit => "👤 User explicitly stated",
-        crate::memory::MemorySource::Feedback => "💬 From user feedback",
-        crate::memory::MemorySource::RefinedSummary => "✨ Refined conversation summary",
-    }
-    .to_string()
 }

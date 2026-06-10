@@ -275,12 +275,12 @@ impl EditFileTool {
             Ok(Ok(msg)) => {
                 // ── AST syntax check after edit ──
                 let ast_warning = {
-                    let code_indexer = Arc::clone(&ctx.code_indexer);
+                    let knowledge = Arc::clone(&ctx.knowledge);
                     let check_path = path.to_path_buf();
                     tokio::spawn(async move {
-                        let mut idx = code_indexer.lock().await;
+                        let mut engine = knowledge.lock().await;
                         if let Ok(code) = std::fs::read_to_string(&check_path) {
-                            idx.check_syntax(&check_path, &code)
+                            engine.check_syntax(&check_path, &code)
                         } else {
                             None
                         }
