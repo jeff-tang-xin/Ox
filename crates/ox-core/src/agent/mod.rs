@@ -10,6 +10,9 @@ pub mod ui_event;
 pub mod workflow;
 pub mod context_offloader;
 pub mod auto_reflect;  // 🆕 Auto-reflection for skill generation
+pub mod context_injector;  // 🆕 Task anchoring + knowledge re-injection
+pub mod error_recovery;    // 🆕 Build/test failure auto-fix
+pub mod tool_executor;     // 🆕 Tool detail display + error formatting
 
 
 
@@ -21,6 +24,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
+use crate::knowledge::entity::Entity;
 use crate::llm::{LlmProvider, LlmStreamEvent};
 use crate::message::{Message, TokenUsage, ToolCall};
 use crate::safety::injection;
@@ -246,54 +250,22 @@ pub async fn run_agent_turn(
             }
         }
 
-        // 🎯 Task anchoring + Knowledge re-injection: remind LLM of context on every iteration.
-        // In long turns, the LLM's attention to the system prompt fades.
-        // Re-inject a compact summary of what it already knows.
-        if iteration > 0 {
-            if let Some(ref task) = user_task {
-                let anchor = if task.chars().count() > 200 {
-                    format!("{}...", task.chars().take(200).collect::<String>())
-                } else {
-                    task.clone()
-                };
-                let mut reminder = format!(
-                    "📋 **Current task** (reminder): {}\n\n\
-                     Stay focused on this task. Do NOT deviate to unrelated changes.",
-                    anchor
-                );
-
-                // Every 2 iterations, also re-inject the most relevant knowledge entities
-                if iteration % 2 == 0 {
-                    let knowledge = Arc::clone(&tool_ctx.knowledge);
-                    let task_clone = task.clone();
-                    tokio::spawn(async move {
-                        let engine = knowledge.lock().await;
-                        match engine.retrieve_for_context(&task_clone, "", 5) {
-                            Ok(hits) if !hits.is_empty() => {
-                                let mut reminder = String::from("\n📚 **What you already know** (from pre-turn):\n");
-                                for hit in hits.iter().take(5) {
-                                    let preview: String = hit.entity.content.chars().take(120).collect();
-                                    reminder.push_str(&format!("- [{}] {}\n", hit.entity.kind.as_str(), preview));
-                                }
-                                reminder.push_str("⚠️ Do NOT re-search these — you have them. Only file_read if you need more detail.\n");
-                                // Note: we can't push to messages from a different task,
-                                // so this reminder is informational only
-                            }
-                            _ => {}
-                        }
-                    });
-                }
-
-                messages.push(Message::system(&reminder));
-
-                messages.push(Message::system(&reminder));
-            }
-        }
+        // 🎯 Task anchoring + periodic knowledge re-injection
+        context_injector::inject_context(&mut messages, &user_task, iteration, &tool_ctx);
 
         // 🚨 Sanitize tool pairs before EVERY LLM call within the agent turn.
         // This prevents OpenAI API errors like "ToolResult references non-existent tool call"
         // when a tool_call was skipped or only partially executed.
         crate::context::sanitize_tool_pairs(&mut messages);
+
+        // ── Determine if current step is "internal" BEFORE LLM call ──
+        // Internal steps (0, 2, 3): suppress raw JSON output from UI
+        let (is_internal_step, pre_llm_step_idx) = if let Some(ref engine_arc) = workflow_engine {
+            if let Ok(engine) = engine_arc.try_lock() {
+                let idx = engine.get_current_step_index();
+                (idx != 4, idx)  // All non-execution steps are internal
+            } else { (false, 5) }
+        } else { (false, 5) };
 
         // Stream LLM response.
         let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmStreamEvent>();
@@ -406,9 +378,10 @@ pub async fn run_agent_turn(
         } {
             match event {
                 LlmStreamEvent::TextDelta(text) => {
-                    // Simple approach: just pass through all text including think tags
-                    // The UI can decide how to display them (or we can strip them later)
-                    let _ = ui_tx.send(AgentToUiEvent::TextChunk(text.clone()));
+                    // Suppress raw JSON output for internal workflow steps
+                    if !is_internal_step {
+                        let _ = ui_tx.send(AgentToUiEvent::TextChunk(text.clone()));
+                    }
                     full_text.push_str(&text);
                 }
                 LlmStreamEvent::ReasoningDelta(text) => {
@@ -519,223 +492,117 @@ pub async fn run_agent_turn(
 
             // ── Workflow Step Advancement Logic (before returning) ──
             // Check if we should advance to the next workflow step
+            // ── Workflow auto-advance ──
             if let Some(ref engine_arc) = workflow_engine {
                 let mut engine = engine_arc.lock().await;
 
-                // Check if AI signaled step completion via [STEP_COMPLETE] marker
-                let ai_signaled_complete = full_text.contains("[STEP_COMPLETE]");
-                
-                // Also check for Phase completion messages
-                let phase_complete = full_text.contains("✅ Phase") && 
-                    (full_text.contains("Complete") || full_text.contains("complete"));
+                // If LLM called tools in a no-tool step, those tools were rejected.
+                // Still check if the text contains valid JSON — LLM may have finished correctly.
+                let had_successful_tool_calls = !tool_calls.is_empty() && new_messages.iter().any(|msg| {
+                    matches!(msg, Message::ToolResult { content, .. } if !content.contains("❌") && !content.contains("not allowed"))
+                });
+                let (advance_result, validation_error) = engine.advance_on_output(&full_text, had_successful_tool_calls);
 
-                // Check if key operations were completed (e.g., file creation)
-                let key_operation_completed = new_messages.iter().any(|msg| {
-                    matches!(msg, Message::ToolResult { content, .. } if {
-                        // Detect successful file_write, edit_file, or delete_range
-                        content.contains("✅ Successfully written") ||
-                        content.contains("✅ Patched") ||
-                        content.contains("✅ Deleted") ||
-                        content.contains("Successfully created")
-                    })
-                });
-                
-                // Check if there were tool errors that need attention
-                let has_tool_errors = new_messages.iter().any(|msg| {
-                    matches!(msg, Message::ToolResult { content, .. } if {
-                        content.contains("Missing Required Parameter") ||
-                        content.contains("JSON Parse Error") ||
-                        content.contains("❌")
-                    })
-                });
-                
-                // If there are tool errors, don't advance - let LLM retry
-                if has_tool_errors {
-                    tracing::warn!("⚠️ Tool execution failed, not advancing step. Letting LLM retry...");
-                    
-                    // Inject guidance message if it's a parameter error
-                    let has_param_error = new_messages.iter().any(|msg| {
-                        matches!(msg, Message::ToolResult { content, .. } if {
-                            content.contains("Missing Required Parameter")
-                        })
-                    });
-                    
-                    if has_param_error {
-                        messages.push(Message::user(
-                            "⚠️ IMPORTANT: Your tool call failed due to missing parameters.\n\n\
-                             When calling file_write, you MUST provide:\n\
-                             - 'path': The file path (e.g., '.ox/order-optimization/spec.md')\n\
-                             - 'content': The file content as a string\n\n\
-                             Example:\n\
-                             {{\"path\": \".ox/order-optimization/spec.md\", \"content\": \"# Title\\n\\nContent here\"}}\n\n\
-                             Please retry with COMPLETE parameters."
-                        ));
-                    }
-                    
-                    // Return without advancing
-                    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                        new_messages,
-                        usage: total_usage,
-                    });
-                    return;
+                // If validation failed, inject error so LLM can retry
+                if let Some(ref err) = validation_error {
+                    messages.push(Message::system(err));
                 }
 
-                // Advance step if:
-                // 1. AI explicitly signaled completion with [STEP_COMPLETE], OR
-                // 2. AI outputted Phase completion message (e.g., "✅ Phase 1 Complete!"), OR
-                // 3. Key operations were completed (file creation) AND step requires confirmation
-                // 
-                // NOTE: We rely on AI to signal completion, not on tool execution results.
-                // This allows AI to make multiple tool calls within a single phase.
-                let should_advance = ai_signaled_complete || phase_complete || key_operation_completed;
-                
-                // If AI completed work but forgot to signal, and step requires confirmation,
-                // we still need to wait for user's explicit command (/Y, /N, /O).
-                // The confirmation flag will be set when user inputs the command.
+                match advance_result {
+                    Some(_) => {
+                        engine.set_previous_output(&full_text);
 
-                if should_advance && !engine.is_workflow_complete() {
-                    tracing::info!(
-                        "Advancing workflow step (AI signaled: {}, Key op completed: {})",
-                        ai_signaled_complete,
-                        key_operation_completed
-                    );
-                    
-                    // 🚨 PATH VALIDATION: Verify file paths before advancing (Spec/Council Mode only)
-                    let current_step = engine.current_step();
-                    let needs_path_validation = current_step.map(|step| {
-                        step.name == "phase_1_documentation" || step.name == "topic_definition"
-                    }).unwrap_or(false);
-                    
-                    if needs_path_validation {
-                        // Check if files were created in correct location (.ox/{name}/ not .ox/)
-                        let has_wrong_path = new_messages.iter().any(|msg| {
-                            matches!(msg, Message::ToolResult { content, .. } if {
-                                // Detect file_write to .ox/ directly (without subdirectory)
-                                content.contains(".ox/") && (
-                                    content.contains(".ox/spec.md") ||
-                                    content.contains(".ox/task.md") ||
-                                    content.contains(".ox/council_record.md")
-                                )
-                            })
-                        });
-                        
-                        if has_wrong_path {
-                            tracing::warn!("❌ Path validation failed: Files created in wrong location!");
-                            
-                            // Inject error message and force retry
-                            messages.push(Message::user(
-                                "❌ CRITICAL ERROR: Files were created in the WRONG location!\n\n\
-                                 Expected format: `.ox/{requirement_name}/spec.md`\n\
-                                 Your format: `.ox/spec.md` (MISSING requirement name!)\n\n\
-                                 💡 How to fix:\n\
-                                 1. Generate a requirement name (e.g., 'order-optimization')\n\
-                                 2. Create files in `.ox/order-optimization/` directory\n\
-                                 3. Example paths:\n\
-                                    - `.ox/order-optimization/spec.md`\n\
-                                    - `.ox/order-optimization/task.md`\n\n\
-                                 Please REDO Phase 1 with CORRECT paths now."
-                            ));
-                            
-                            // Don't advance - force LLM to retry
-                            let _ = ui_tx.send(AgentToUiEvent::Status(
-                                "❌ Path validation failed. Retrying Phase 1...".to_string()
-                            ));
-                            
-                            // Return early without advancing
-                            let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                                new_messages,
-                                usage: total_usage,
+                        let step_name = engine.current_step()
+                            .map(|s| if s.name.is_empty() { format!("step-{}", 0) } else { s.name.clone() })
+                            .unwrap_or_else(|| "step-0".to_string());
+                        let output_snippet: String = full_text.chars().take(500).collect();
+                        let l0_entity = Entity::working_memory(
+                            "current",
+                            &format!("[{}] {}", step_name, output_snippet),
+                            None, None, vec![], false,
+                        );
+                        {
+                            let knowledge = Arc::clone(&tool_ctx.knowledge);
+                            tokio::spawn(async move {
+                                if let Ok(mut eng) = knowledge.try_write() {
+                                    eng.push_turn_buffer(l0_entity);
+                                }
                             });
-                            return;
                         }
-                    }
-                    
-                    // 🚨 CONFIRMATION CHECK: Check if CURRENT step requires confirmation BEFORE advancing
-                    let current_step_requires_confirmation = engine.requires_user_confirmation();
-                    
-                    if current_step_requires_confirmation {
-                        tracing::info!("Current step requires user confirmation - setting flag and blocking next LLM call");
-                        
-                        // Set confirmation flag to block next LLM call
-                        engine.set_confirmation_flag();
-                        
-                        // Notify UI about waiting for confirmation
-                        if let Some(step_name) = get_current_step_name(&engine) {
-                            let status_msg = format!(
-                                "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
-                                step_name
-                            );
-                            let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
-                        }
-                        
-                        // DON'T advance yet - wait for user confirmation
-                        let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                            new_messages,
-                            usage: total_usage,
-                        });
-                        return;
-                    }
 
-                    // No confirmation needed, advance normally
-                    match engine.advance_step() {
-                        Ok(has_next_step) => {
-                            if has_next_step {
-                                // Check if the NEW step requires confirmation
+                        // Advance to next step
+                        match engine.advance_step() {
+                            Ok(true) => {
                                 let needs_confirmation = engine.requires_user_confirmation();
-
-                                if needs_confirmation {
-                                    // Set confirmation flag to block next LLM call
-                                    engine.set_confirmation_flag();
-
-                                    tracing::info!(
-                                        "New step requires user confirmation - setting flag"
-                                    );
+                                if needs_confirmation { engine.set_confirmation_flag(); }
+                                let display = engine.current_step()
+                                    .map(|s| if s.display_status.is_empty() { s.name.clone() } else { s.display_status.clone() })
+                                    .unwrap_or_else(|| "处理中".to_string());
+                                let status_msg = if needs_confirmation {
+                                    format!("{} — ⏸️ 等待确认 (/Y)", display)
+                                } else {
+                                    display.clone()
+                                };
+                                let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
+                                // Inject new step's prompt as a system message
+                                if let Some(new_prompt) = engine.get_step_system_prompt() {
+                                    let mut prompt_text = format!("【当前步骤】\n{}", new_prompt);
+                                    if engine.get_current_step_index() == 1 {
+                                        let skills_list = tool_registry.get_skills_list().iter()
+                                            .map(|s| format!("- `{}` ({}) — {}", s.id, s.scope, s.description))
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        if skills_list.is_empty() {
+                                            prompt_text.push_str("\n\n【可用 Skill】\n（无项目 Skill，使用内置默认）\n\n⚠️ skills 字段填写 `[\"coding-workflow\"]`。");
+                                        } else {
+                                            prompt_text.push_str(&format!(
+                                                "\n\n【可用 Skill】\n{}\n\n⚠️ 必须从上面选择至少一个 skill。coding 任务优先选 project 级别的。",
+                                                skills_list
+                                            ));
+                                        }
+                                    }
+                                    // Push to both messages (LLM context) and new_messages (session persistence)
+                                    let step_msg = Message::system(&prompt_text);
+                                    new_messages.push(step_msg.clone());
+                                    messages.push(step_msg);
                                 }
 
-                                // Notify UI about step transition
-                                if let Some(step_name) = get_current_step_name(&engine) {
-                                    let status_msg = if needs_confirmation {
-                                        format!(
-                                            "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
-                                            step_name
-                                        )
-                                    } else {
-                                        format!(
-                                            "✅ Step completed. Moving to: {}",
-                                            step_name
-                                        )
-                                    };
-
-                                    let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
-                                }
-                            } else {
-                                // Workflow complete — trigger auto-reflection for skill generation
-                                let _ = ui_tx.send(AgentToUiEvent::Status(
-                                    "🎉 Workflow completed!".to_string(),
-                                ));
-                                // Extract task context for auto-reflection
-                                let task_desc = messages.iter()
-                                    .filter_map(|m| if let Message::User { content } = m { Some(content.as_str()) } else { None })
-                                    .last()
-                                    .unwrap_or("task completed")
-                                    .chars().take(200).collect::<String>();
-                                let exec_summary = new_messages.iter()
-                                    .filter_map(|m| if let Message::Assistant { content, .. } = m { Some(content.as_str()) } else { None })
-                                    .last()
-                                    .unwrap_or("execution finished")
-                                    .chars().take(300).collect::<String>();
-                                let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
-                                    task_description: task_desc,
-                                    execution_summary: exec_summary,
+                                // Send formatted status so user sees step progress
+                                let formatted = format_step_output(pre_llm_step_idx, &full_text, &display);
+                                let _ = ui_tx.send(AgentToUiEvent::Status(formatted));
+                                // Return TurnDone — main loop orchestrates next step
+                                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                                    new_messages,
+                                    usage: total_usage,
                                 });
+                                return;
                             }
+                            Ok(false) => {
+                                let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
+                                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                                    new_messages,
+                                    usage: total_usage,
+                                });
+                                return;
+                            }
+                            Err(e) => tracing::warn!("Failed to advance: {e}"),
                         }
-                        Err(e) => {
-                            tracing::warn!("Failed to advance workflow step: {}", e);
+                    }
+                    None => {
+                        // Validation error or LLM needs more iterations
+                        if validation_error.is_some() {
+                            iteration += 1;
+                            continue;
                         }
+                        // Step 4 (Execution): ## Done detected — advance past last step
+                        if pre_llm_step_idx == 4 {
+                            let _ = engine.advance_step();
+                        }
+                        // Fall through to TurnDone
                     }
                 }
             }
+            // ── Workflow auto-advance END ──
 
             let _ = ui_tx.send(AgentToUiEvent::TurnDone {
                 new_messages,
@@ -802,14 +669,58 @@ pub async fn run_agent_turn(
             .cloned()
             .collect();
 
-        // Push assistant message with ONLY valid (non-truncated) tool calls.
+        // Push assistant message — format internal step JSON as user-readable summary
+        // Step 0 (Intent): "🧠 exploring(complex) — 项目流程架构分析"
+        // Step 1 (Plan): show full plan JSON (user needs to see it)
+        // Step 2 (Params): "explain: 分析项目流程架构"
+        // Step 3 (Safety): "✅ 安全" or "⚠️ 需要注意"
+        // Step 4 (Exec): show normally
+        let (is_internal, step_idx, step_status) = if let Some(ref engine_arc) = workflow_engine {
+            if let Ok(engine) = engine_arc.try_lock() {
+                let idx = engine.get_current_step_index();
+                let status = engine.current_step()
+                    .map(|s| if s.display_status.is_empty() { s.name.clone() } else { s.display_status.clone() })
+                    .unwrap_or_else(|| String::new());
+                (idx != 1 && idx != 4, idx, status)
+            } else { (false, 5, String::new()) }
+        } else { (false, 5, String::new()) };
+
+        let display = if is_internal {
+            // Try to parse JSON and format a human-readable summary
+            let summary = format_step_output(step_idx, &full_text, &step_status);
+            tracing::debug!("[STEP OUTPUT] step={}, formatted={}", step_idx, summary);
+            summary
+        } else { full_text.clone() };
+
+        // If internal step, clear tool_calls from UI display (they were rejected anyway)
+        let display_tool_calls = if is_internal { Vec::new() } else { valid_tool_calls.clone() };
+
         let assistant_msg = Message::Assistant {
-            content: full_text.clone(), // Clone to keep full_text for workflow advancement check
-            tool_calls: valid_tool_calls,
+            content: display,
+            tool_calls: display_tool_calls,
             reasoning_content: if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) },
         };
         new_messages.push(assistant_msg.clone());
         messages.push(assistant_msg);
+
+        // 🧠 Record this turn as L0 WorkingMemory with the LLM's raw response
+        let user_text = user_task.as_deref().unwrap_or("");
+        let assistant_preview: String = full_text.chars().take(400).collect();
+        let assistant_truncated = if assistant_preview.len() < full_text.len() { "..." } else { "" };
+        let l0_content = format!(
+            "User: {}\n\nAssistant: {}{}",
+            user_text.chars().take(300).collect::<String>(),
+            assistant_preview,
+            assistant_truncated
+        );
+        {
+            let knowledge = Arc::clone(&tool_ctx.knowledge);
+            tokio::task::spawn(async move {
+                if let Ok(mut engine) = knowledge.try_write() {
+                    let _ = engine.record_turn("current", &l0_content, None, None, vec![], true);
+                }
+            });
+        }
 
         // ── Context Offloader: created once and reused across all tools in this iteration ──
         let mut offloader = context_offloader::ContextOffloader::new(
@@ -987,13 +898,18 @@ pub async fn run_agent_turn(
                 if let Err(e) = engine.validate_tool_call(&tc.name, &args_value) {
                     tracing::warn!("Workflow validation failed for tool '{}': {}", tc.name, e);
 
-                    // Return error to LLM
+                    // Directive message: tell LLM what to do instead
+                    let step_idx = engine.get_current_step_index();
+                    let directive = match step_idx {
+                        0 => "\n\n⚡ You are in Step 1 (Intent Classification). Tools are BLOCKED here. \nOutput ONLY the JSON: {\"intent\": \"...\", \"complexity\": \"...\", \"files\": [...], \"topic\": \"...\"}",
+                        1 => "\n\n⚡ You are in Step 2 (Task Planning). Only load_skill is allowed. \nOutput ONLY the JSON: {\"plan\": [...], \"skills\": [...], \"estimated_steps\": N}",
+                        2 => "\n\n⚡ You are in Step 3 (Parameter Extraction). No tools allowed. \nOutput ONLY the JSON: {\"target_file\": \"...\", \"action\": \"...\", \"description\": \"...\"}",
+                        3 => "\n\n⚡ You are in Step 4 (Safety Check). No tools allowed. \nOutput ONLY the JSON: {\"safe\": true|false, \"reason\": \"...\", \"warnings\": [...]}",
+                        _ => "\n\n💡 Please follow the current step requirements.",
+                    };
                     let result_msg = Message::ToolResult {
                         tool_call_id: tc.id.clone(),
-                        content: format!(
-                            "❌ Workflow Restriction: {}\n\n💡 Please follow the current workflow step requirements.",
-                            e
-                        ),
+                        content: format!("❌ {}\n{}", e, directive),
                     };
                     new_messages.push(result_msg.clone());
                     messages.push(result_msg);
@@ -1007,97 +923,7 @@ pub async fn run_agent_turn(
             }
 
             // Send detailed ToolStart for UI display
-            let tool_detail = match tc.name.as_str() {
-                "shell_exec" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_string()))
-                }
-                "file_read" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| {
-                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                            let limit = v.get("limit").and_then(|l| l.as_u64()).map(|l| format!(" (limit:{})", l)).unwrap_or_default();
-                            Some(format!("{} {}", path, limit))
-                        })
-                }
-                "file_write" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| {
-                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                            let size = v.get("content").and_then(|c| c.as_str()).map(|c| c.len()).unwrap_or(0);
-                            Some(format!("{} ({} bytes)", path, size))
-                        })
-                }
-                "edit_file" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| {
-                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                            let old = v.get("old_string").and_then(|s| s.as_str()).map(|s| {
-                                let one_line = s.lines().next().unwrap_or(s);
-                                if one_line.len() > 60 {
-                                    let boundary = one_line.char_indices()
-                                        .take_while(|(i, _)| *i < 60)
-                                        .last()
-                                        .map(|(i, c)| i + c.len_utf8())
-                                        .unwrap_or(one_line.len());
-                                    &one_line[..boundary]
-                                } else { one_line }
-                            }).unwrap_or("");
-                            Some(format!("{} | {}", path, old))
-                        })
-                }
-                "delete_range" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| {
-                            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                            let start = v.get("start_line").and_then(|l| l.as_u64()).unwrap_or(0);
-                            let end = v.get("end_line").and_then(|l| l.as_u64()).unwrap_or(0);
-                            Some(format!("{} L{}-L{}", path, start, end))
-                        })
-                }
-                "code_search" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| v.get("pattern").and_then(|p| p.as_str()).map(|s| s.to_string()))
-                }
-                "find_symbol" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| {
-                            let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("?");
-                            let kind = v.get("kind").and_then(|k| k.as_str()).map(|k| format!(" ({})", k)).unwrap_or_default();
-                            Some(format!("{}{}", query, kind))
-                        })
-                }
-                "file_search" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| v.get("pattern").and_then(|p| p.as_str()).map(|s| format!("glob: {}", s)))
-                }
-                "file_list" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
-                        .or_else(|| Some("(root)".to_string()))
-                }
-                "git_status" => Some(String::new()),
-                "git_diff" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| {
-                            let staged = v.get("staged").and_then(|s| s.as_bool()).unwrap_or(false);
-                            Some(if staged { "--staged" } else { "" }.to_string())
-                        })
-                }
-                "memory_search" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| v.get("query").and_then(|q| q.as_str()).map(|s| s.to_string()))
-                }
-                "recall" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| v.get("node_id").and_then(|q| q.as_str()).map(|s| s.to_string()))
-                }
-                "web_fetch" => {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
-                        .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
-                }
-                _ => None,
-            };
+            let tool_detail = tool_executor::extract_tool_detail(&tc.name, &tc.arguments);
             // Always send ToolStart to UI (detail is optional)
             let _ = ui_tx.send(AgentToUiEvent::ToolStart {
                 name: tc.name.clone(),
@@ -1112,40 +938,9 @@ pub async fn run_agent_turn(
                     t
                 }
                 None => {
-                    let available = tool_registry.names().join(", ");
-                    // Find similar tool names (simple string matching)
-                    let mut suggestions: Vec<&str> = Vec::new();
-                    for name in tool_registry.names() {
-                        let tc_name_prefix = tc.name.get(..tc.name.len().min(3)).unwrap_or(&tc.name);
-                        let name_prefix = name.get(..name.len().min(3)).unwrap_or(name);
-                        if name.starts_with(tc_name_prefix)
-                            || tc.name.starts_with(name_prefix)
-                        {
-                            suggestions.push(name);
-                        }
-                    }
-
-                    let suggestion_text = if !suggestions.is_empty() {
-                        format!("\n\n💡 Did you mean: {}?", suggestions.join(", "))
-                    } else {
-                        String::new()
-                    };
-
-                    let error_msg = format!(
-                        "❌ Unknown tool: '{}'\n\n\
-                         Available tools: {}{}\n\n\
-                         💡 Tips:\n\
-                         • Check the tool name spelling\n\
-                         • Use /help to see all available tools\n\
-                         • Tool names are case-sensitive",
-                        tc.name, available, suggestion_text
-                    );
-
-                    tracing::warn!(
-                        "Unknown tool requested: '{}'. Available: {}",
-                        tc.name,
-                        available
-                    );
+                    let tool_names: Vec<String> = tool_registry.names().iter().map(|s| s.to_string()).collect();
+                    let error_msg = tool_executor::build_unknown_tool_error(&tc.name, &tool_names);
+                    tracing::warn!("Unknown tool requested: '{}'", tc.name);
 
                     let result_msg = Message::ToolResult {
                         tool_call_id: tc.id.clone(),
@@ -1181,29 +976,36 @@ pub async fn run_agent_turn(
                     false
                 };
 
-            // 🆕 NEW: Enforce mandatory rules (e.g., plan_before_edit)
-            if let Err(violation_msg) = crate::agent::enforcer::RuleEnforcer::validate(
-                &tool_ctx.config.enforcement_rules,
-                &tc,
-                &messages,
-            ) {
-                tracing::warn!("🚫 Rule Enforcer blocked tool '{}': {}", tc.name, violation_msg);
+            // 🆕 Workflow step validation before execution
+            // In 5-step pipeline mode, the pipeline ensures planning was done in Steps 2-4.
+            // Rule enforcement (plan_before_edit, read_before_edit) is bypassed for Step 5+.
+            let skip_plan_rules = matches!(&workflow_engine, Some(wf) if {
+                wf.try_lock().map_or(false, |e| e.is_workflow_active() && e.get_current_step_index() >= 4)
+            });
 
-                // Send error to LLM as a tool result
-                let error_result = Message::ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: violation_msg.clone(),
-                };
-                new_messages.push(error_result.clone());
-                messages.push(error_result);
+            if !skip_plan_rules {
+                if let Err(violation_msg) = crate::agent::enforcer::RuleEnforcer::validate(
+                    &tool_ctx.config.enforcement_rules,
+                    &tc,
+                    &messages,
+                ) {
+                    tracing::warn!("🚫 Rule Enforcer blocked tool '{}': {}", tc.name, violation_msg);
 
-                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                    name: tc.name.clone(),
-                    output: violation_msg,
-                    is_error: true,
-                });
+                    let error_result = Message::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: violation_msg.clone(),
+                    };
+                    new_messages.push(error_result.clone());
+                    messages.push(error_result);
 
-                continue; // Skip this tool call and move to the next iteration
+                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                        name: tc.name.clone(),
+                        output: violation_msg,
+                        is_error: true,
+                    });
+
+                    continue;
+                }
             }
 
             let should_confirm = if path_outside {
@@ -1551,13 +1353,19 @@ pub async fn run_agent_turn(
                 result.content.clone()
             };
 
-            // ── Context Offloading: Save verbose results to external files ──
+            // ── Context Offloading: only offload shell_exec (build logs can be huge) ──
+            // file_read results are essential context — never offload
+            let offload_threshold: usize = if tc.name == "shell_exec" {
+                4000
+            } else {
+                usize::MAX // Never offload non-shell_exec results
+            };
             let offloaded = offloader.process_result(
                 &tc.name,
                 &tc.arguments,
                 &sanitized_content,
                 iteration as usize,
-                10000, // threshold: 10000 chars — only offload truly enormous outputs
+                offload_threshold,
             );
 
             // Send notification about offloading
@@ -1586,51 +1394,50 @@ pub async fn run_agent_turn(
             new_messages.push(result_msg.clone());
             messages.push(result_msg);
 
-            // 🧠 Mid-turn knowledge refresh: after code-modifying tools, re-retrieve relevant entities
-            // so the LLM has the latest project knowledge for subsequent iterations.
-            if matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range" | "shell_exec") && !result.is_error {
-                let knowledge_clone = Arc::clone(&tool_ctx.knowledge);
+            // 📋 Status log: tell LLM what it just accomplished (critical for multi-step awareness)
+            if !result.is_error {
                 let tool_name = tc.name.clone();
-                let refreshed = tokio::task::spawn(async move {
-                    let engine = knowledge_clone.lock().await;
-                    engine.retrieve_memories(
-                        &format!("Recent change via {}", tool_name),
-                        3,
-                    ).unwrap_or_default()
-                }).await.unwrap_or_default();
-
-                if !refreshed.is_empty() {
-                    let mut ctx_str = String::new();
-                    for hit in &refreshed {
-                        ctx_str.push_str(&format!("- [{}] {}\n",
-                            hit.entity.kind.as_str(),
-                            hit.entity.content.chars().take(150).collect::<String>()
-                        ));
-                    }
-                    messages.push(Message::system(&format!(
-                        "📚 Updated project knowledge after {}:\n{}",
-                        tc.name, ctx_str
-                    )));
-                }
+                let file_info = if matches!(tool_name.as_str(), "file_write" | "edit_file") {
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).ok()
+                        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                        .map(|p| format!(" → {}", p))
+                        .unwrap_or_default()
+                } else { String::new() };
+                messages.push(Message::system(&format!(
+                    "📋 ✅ {tool_name}{file_info} — 已完成",
+                    tool_name = tool_name, file_info = file_info
+                )));
             }
 
             // 📖 Verify-after-edit: prompt LLM to verify changes
             if matches!(tc.name.as_str(), "edit_file" | "delete_range" | "file_write") && !result.is_error {
-                // Extract the file path from tool arguments
-                let file_path = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("path")
-                            .and_then(|p| p.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_else(|| "the file".to_string());
-                messages.push(Message::system(&format!(
-                    "📖 You modified `{path}`. Please verify by reading the file:\n\
-                     file_read(path=\"{path}\")\n\n\
-                     Then check if the result matches your plan. If not, fix it.",
-                    path = file_path
-                )));
+                // Step 5 skill file creation: tell LLM to output ## Done
+                let is_step5 = workflow_engine.as_ref().map_or(false, |wf| {
+                    wf.try_lock().map_or(false, |e| e.get_current_step_index() == 4)
+                });
+                let is_skill = tc.arguments.contains(".ox/skills/");
+
+                if is_step5 && is_skill {
+                    messages.push(Message::system(
+                        "✅ 文件已写入。如果所有需要的文件都已完成，输出 `## Done` 结束。"
+                    ));
+                }
+            } // verify-after-edit
+        } // end for tc
+
+        // 🧭 Step 2 exploration guidance: prevent infinite exploration loops
+        if pre_llm_step_idx == 1 {
+            let explore_tool_count = new_messages.iter()
+                .filter(|m| matches!(m, Message::ToolResult { .. }))
+                .count();
+            if explore_tool_count >= 4 {
+                messages.push(Message::system(
+                    "已探索足够。立即输出计划 JSON，不要再调用工具。"
+                ));
+            } else if explore_tool_count >= 2 {
+                messages.push(Message::system(
+                    &format!("已探索 {} 轮。再探索 1 轮后必须输出计划 JSON。", explore_tool_count)
+                ));
             }
         }
 
@@ -1639,7 +1446,7 @@ pub async fn run_agent_turn(
             messages.push(Message::system(&canvas_ctx));
         }
 
-        // 🚨 Done reminder: prompt LLM to summarize using structured format
+        // 🚨 Done reminder + tool loop detection
         if !tool_calls.is_empty() {
             let has_write = tool_calls.iter().any(|tc| matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range"));
             if has_write {
@@ -1649,96 +1456,7 @@ pub async fn run_agent_turn(
             }
 
             // 🔄 Auto-fix: if build/test failed, inject error for self-repair
-            for tc in tool_calls {
-                if tc.name == "shell_exec" {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                        let cmd = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                        let is_build_or_test = cmd.contains("cargo build") || cmd.contains("cargo test")
-                            || cmd.contains("npm test") || cmd.contains("pytest") || cmd.contains("go test")
-                            || cmd.contains("cargo clippy") || cmd.contains("npm run lint");
-                        if is_build_or_test {
-                            // Find the tool result for this shell_exec
-                            for msg in new_messages.iter().rev() {
-                                if let Message::ToolResult { tool_call_id, content, .. } = msg {
-                                    if tool_call_id == &tc.id && content.contains("[exit code:") {
-                                        let exit_code = content.lines()
-                                            .filter(|l| l.contains("exit code:"))
-                                            .last()
-                                            .unwrap_or("");
-                                        if !exit_code.contains("exit code: 0") {
-                                            // Structured error recovery protocol
-                                            // Extract more context for better diagnosis
-                                            let error_lines: Vec<&str> = content.lines()
-                                                .filter(|l| {
-                                                    l.contains("error[") || l.contains("error:") ||
-                                                    l.contains("Error:") || l.contains("❌") ||
-                                                    l.contains("fatal") || l.contains("cannot find") ||
-                                                    l.contains("expected") || l.contains("unexpected") ||
-                                                    l.contains("not found") || l.contains("undefined")
-                                                })
-                                                .collect();
-                                            let error_summary = if error_lines.is_empty() {
-                                                content.lines().take(5).collect::<Vec<_>>().join("\n")
-                                            } else {
-                                                error_lines.iter().take(5).map(|l| l.trim()).collect::<Vec<_>>().join("\n")
-                                            };
-
-                                            let fix_attempts = messages.iter()
-                                                .filter(|m| matches!(m, Message::System { content } if content.contains("BUILD/TOOL FAILED")))
-                                                .count() + 1;
-
-                                            let recovery_msg = if fix_attempts == 1 {
-                                                format!(
-"🔧 BUILD/TOOL FAILED (attempt 1/3)
-
-Error summary:
-```
-{error_summary}
-```
-
-Recovery protocol — follow these steps IN ORDER:
-1. **Read the error** — the relevant lines are shown above
-2. **Read the affected source code** — use `file_read` on the files mentioned in the error
-3. **Diagnose root cause** — understand WHY the error occurred (wrong type? missing import? syntax error?)
-4. **Fix the issue** — use `edit_file` to apply the correction
-5. **Verify** — re-run the build/test command to confirm
-
-DO NOT guess. Read the source code first, then fix."
-                                                )
-                                            } else {
-                                                format!(
-"🔧 BUILD/TOOL FAILED (attempt {attempts}/3)
-
-Error summary:
-```
-{error_summary}
-```
-
-Previous fix did NOT resolve the issue. Try a different approach:
-1. **Re-read the error** — you may have misread it
-2. **Re-read the source code** — the actual code may differ from what you expect
-3. **Change your approach** — the fix you tried was incorrect, try something else
-4. **Verify** — re-run and check if the error changes",
-                                                    attempts = fix_attempts
-                                                )
-                                            };
-
-                                            messages.push(Message::system(&recovery_msg));
-
-                                            if fix_attempts >= 3 {
-                                                messages.push(Message::system(
-                                                    "3 fix attempts exhausted. Report the remaining error to the user and ask for guidance."
-                                                ));
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            error_recovery::check_and_recover(&mut messages, &new_messages, &tool_calls);
         }
 
         // ── Workflow Step Advancement Logic (after tool execution) ──
@@ -1747,20 +1465,11 @@ Previous fix did NOT resolve the issue. Try a different approach:
         if let Some(ref engine_arc) = workflow_engine {
             let mut engine = engine_arc.lock().await;
 
-            // Check if AI signaled step completion via [STEP_COMPLETE] marker
+            // Check completion signals
             let ai_signaled_complete = full_text.contains("[STEP_COMPLETE]");
-            
-            // Also check for Phase completion messages
-            let phase_complete = full_text.contains("✅ Phase") && 
+            let phase_complete = full_text.contains("✅ Phase") &&
                 (full_text.contains("Complete") || full_text.contains("complete"));
-            
-            // Advance step if:
-            // 1. AI explicitly signaled completion with [STEP_COMPLETE], OR
-            // 2. AI outputted Phase completion message (e.g., "✅ Phase 1 Complete!")
-            // 
-            // NOTE: We do NOT advance based on tool execution results (file_write, etc.)
-            // because the AI may perform multiple operations within a single phase.
-            // We wait for the AI to explicitly signal completion.
+
             let should_advance = ai_signaled_complete || phase_complete;
             
             if should_advance && !engine.is_workflow_complete() {
@@ -1927,6 +1636,74 @@ fn is_likely_json_truncation(json_str: &str, error: &serde_json::Error) -> bool 
         (trimmed.matches('"').count() % 2 != 0) ;
 
     is_eof_error || has_unclosed_structure
+}
+
+/// Format JSON output from internal workflow steps into a user-readable summary.
+fn format_step_output(step_idx: usize, text: &str, fallback: &str) -> String {
+    let json_str = if let (Some(s), Some(e)) = (text.find('{'), text.rfind('}')) {
+        &text[s..=e]
+    } else {
+        return format!("_{}_", fallback);
+    };
+
+    let parsed: Option<serde_json::Value> = serde_json::from_str(json_str).ok();
+
+    match step_idx {
+        0 => {
+            // Step 0: Intent Classification
+            if let Some(ref v) = parsed {
+                let intent = v.get("intent").and_then(|s| s.as_str()).unwrap_or("?");
+                let complexity = v.get("complexity").and_then(|s| s.as_str()).unwrap_or("");
+                let topic = v.get("topic").and_then(|s| s.as_str()).unwrap_or("");
+                let emoji = match intent {
+                    "coding" => "💻", "exploring" => "🔍", "chat" => "💬", _ => "🤔",
+                };
+                if topic.is_empty() {
+                    format!("{} {}({})", emoji, intent, complexity)
+                } else {
+                    format!("{} {}({}) — {}", emoji, intent, complexity, topic)
+                }
+            } else {
+                format!("_🤔 分析意图_")
+            }
+        }
+        2 => {
+            // Step 2: Parameter Extraction
+            if let Some(ref v) = parsed {
+                let action = v.get("action").and_then(|s| s.as_str()).unwrap_or("?");
+                let desc = v.get("description").and_then(|s| s.as_str()).unwrap_or("");
+                let file = v.get("target_file").and_then(|s| s.as_str()).unwrap_or("");
+                let sym = v.get("target_symbol").and_then(|s| s.as_str()).unwrap_or("");
+                let target = if !file.is_empty() && file != "null" {
+                    if !sym.is_empty() && sym != "null" {
+                        format!(" {}::{}", file, sym)
+                    } else { format!(" {}", file) }
+                } else { String::new() };
+                if desc.is_empty() {
+                    format!("{} {}{}", match action {"add"=>"➕","modify"=>"✏️","delete"=>"🗑️","explain"=>"🔍",_=>"→"}, action, target)
+                } else {
+                    format!("{} {}{}: {}", match action {"add"=>"➕","modify"=>"✏️","delete"=>"🗑️","explain"=>"🔍",_=>"→"}, action, target, desc)
+                }
+            } else {
+                format!("_🔎 提取参数_")
+            }
+        }
+        3 => {
+            // Step 3: Safety Check
+            if let Some(ref v) = parsed {
+                let safe = v.get("safe").and_then(|s| s.as_bool()).unwrap_or(true);
+                if safe {
+                    "✅ 安全".to_string()
+                } else {
+                    let reason = v.get("reason").and_then(|s| s.as_str()).unwrap_or("");
+                    format!("⚠️ 不安全 — {}", reason)
+                }
+            } else {
+                "🛡️ 安全检查".to_string()
+            }
+        }
+        _ => format!("_{}_", fallback),
+    }
 }
 
 /// Helper function to get current step name from workflow engine.

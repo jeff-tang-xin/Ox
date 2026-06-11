@@ -43,7 +43,7 @@ fn handle_index_command(
             if let Some(ref engine) = app.knowledge_engine {
                 let engine_clone = Arc::clone(engine);
                 tokio::spawn(async move {
-                    let mut eng = engine_clone.lock().await;
+                    let mut eng = engine_clone.write().await;
                     match eng.index_project() {
                         Ok(count) => {
                             tracing::info!("[INDEX] ✅ Re-indexed {} symbols", count);
@@ -89,7 +89,7 @@ fn handle_index_command(
             if let Some(ref engine) = app.knowledge_engine {
                 let engine_clone = Arc::clone(engine);
                 tokio::spawn(async move {
-                    let eng = engine_clone.lock().await;
+                    let eng = engine_clone.read().await;
                     let _dim = eng.dimension();
                     
                     let db_path = dirs::home_dir()

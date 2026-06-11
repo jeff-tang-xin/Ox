@@ -26,7 +26,7 @@ impl SessionState {
         Self {
             session_id: session_id.to_string(),
             current_mode: "free".to_string(),
-            current_workflow: "free_workflow".to_string(),
+            current_workflow: "five_step_pipeline".to_string(),
             current_step_index: 0,
             awaiting_user_confirmation: false,
             variables: std::collections::HashMap::new(),

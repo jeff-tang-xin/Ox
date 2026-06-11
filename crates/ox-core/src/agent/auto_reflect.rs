@@ -140,32 +140,61 @@ impl AutoReflector {
         Ok(full_content)
     }
 
-    /// Parse the LLM-generated markdown and save as a skill
+    /// Parse the LLM-generated markdown and save as a skill.
+    /// If frontmatter is missing or malformed, repair it before saving.
     fn parse_and_save_skill(&self, content: &str) -> Result<String> {
-        // Extract skill metadata from YAML frontmatter
-        let (metadata, _body) = self.extract_frontmatter(content)?;
-        
-        let skill_id = metadata.get("id")
-            .ok_or_else(|| anyhow::anyhow!("Missing 'id' in skill frontmatter"))?
-            .clone();
-        
-        let _name = metadata.get("name")
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' in skill frontmatter"))?
-            .clone();
-        
-        let _description = metadata.get("description")
-            .ok_or_else(|| anyhow::anyhow!("Missing 'description' in skill frontmatter"))?
-            .clone();
+        let default_skills_dir = self.project_root.join(".ox").join("skills");
 
-        // Save skill to project-level skills directory
-        let skills_dir = self.project_root.join(".ox").join("skills");
+        let (repaired_content, skill_id, scope) = match self.extract_frontmatter(content) {
+            Ok((metadata, body)) => {
+                let id = metadata.get("id").cloned().unwrap_or_else(|| {
+                    body.lines().next()
+                        .and_then(|l| l.strip_prefix("# "))
+                        .unwrap_or("generated-skill")
+                        .to_lowercase().replace(' ', "-")
+                });
+                let name = metadata.get("name").cloned()
+                    .unwrap_or_else(|| id.replace('-', " "));
+                let description = metadata.get("description").cloned()
+                    .unwrap_or_else(|| "AI generated skill".to_string());
+                let scope = metadata.get("scope").cloned()
+                    .unwrap_or_else(|| "project".to_string());
+                let scope = match scope.as_str() {
+                    "project" | "global" | "system" => scope,
+                    _ => "project".to_string(),
+                };
+                let fixed = format!(
+                    "---\nname: \"{}\"\ndescription: \"{}\"\nscope: \"{}\"\n---\n\n{}",
+                    name, description, scope, body.trim()
+                );
+                (fixed, id, scope)
+            }
+            Err(_) => {
+                let body = content.trim();
+                let title = body.lines().next()
+                    .and_then(|l| l.strip_prefix("# "))
+                    .unwrap_or("generated-skill");
+                let id = title.to_lowercase().replace(' ', "-");
+                let fixed = format!(
+                    "---\nname: \"{}\"\ndescription: \"AI generated skill\"\nscope: \"project\"\n---\n\n{}",
+                    title, body
+                );
+                (fixed, id, "project".to_string())
+            }
+        };
+
+        // Route to correct directory based on scope
+        let skills_dir = if scope == "global" {
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            home.join(".ox").join("skills")
+        } else {
+            default_skills_dir
+        };
         fs::create_dir_all(&skills_dir)?;
-        
+
         let skill_file = skills_dir.join(format!("{}.md", skill_id));
-        fs::write(&skill_file, content)?;
-        
-        tracing::info!("[AUTO-REFLECT] Saved skill to: {:?}", skill_file);
-        
+        fs::write(&skill_file, &repaired_content)?;
+        tracing::info!("[AUTO-REFLECT] Saved {} skill to: {:?}", scope, skill_file);
         Ok(skill_id)
     }
 

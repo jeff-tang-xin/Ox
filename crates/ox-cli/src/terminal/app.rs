@@ -185,7 +185,7 @@ pub struct App {
     /// Provider resolution info for debugging commands.
     pub resolve_info: Option<ox_core::llm::ProviderResolveInfo>,
     /// Unified knowledge engine (AST + memory + vector store)
-    pub knowledge_engine: Option<Arc<tokio::sync::Mutex<ox_core::knowledge::KnowledgeEngine>>>,
+    pub knowledge_engine: Option<Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>>,
 
     // Indexing progress
     /// Whether background indexing is still in progress
@@ -404,18 +404,18 @@ impl App {
                 tracing::warn!("Failed to activate spec workflow: {}", e);
             } else {
                 // 🚨 Restore step index if we're in Spec Mode
-                if session_meta.workflow_step_index > 0 && session_meta.workflow_step_index < 6 {
+                if session_meta.workflow_step_index > 0 && session_meta.workflow_step_index < 5 {
                     // Advance to the saved step
                     for _ in 0..session_meta.workflow_step_index {
                         let _ = engine.advance_step();
                     }
-                    tracing::info!("Advanced to step {}/6", session_meta.workflow_step_index + 1);
+                    tracing::info!("Advanced to step {}/5", session_meta.workflow_step_index + 1);
                 }
             }
         } else {
-            // Default to free workflow
-            if let Err(e) = engine.activate_workflow("free_workflow") {
-                tracing::warn!("Failed to activate free workflow: {}", e);
+            // Default to 5-step pipeline (no free mode anymore)
+            if let Err(e) = engine.activate_workflow("five_step_pipeline") {
+                tracing::warn!("Failed to activate five_step_pipeline: {}", e);
             }
         }
 
@@ -445,10 +445,10 @@ impl App {
                             let requirement_name = engine.get_variable("requirement_name");
                             
                             self.workflow_display = Some(WorkflowDisplayInfo {
-                                workflow_name: workflow.name.clone(),
+                                workflow_name: if step.display_status.is_empty() { step.name.clone() } else { step.display_status.clone() },
                                 step_num,
                                 total_steps,
-                                step_name: step.name.clone(),
+                                step_name: if step.display_status.is_empty() { step.name.clone() } else { step.display_status.clone() },
                                 step_prompt: engine.get_step_system_prompt(),
                                 allows_code_modification: engine.allows_code_modification(),
                                 requirement_name,

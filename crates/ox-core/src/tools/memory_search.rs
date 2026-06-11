@@ -99,14 +99,15 @@ impl Tool for MemorySearchTool {
             .unwrap_or(5)
             .min(20) as usize;
 
-        // Access knowledge engine through ToolContext
+        // Access knowledge engine — search ALL knowledge including WorkingMemory (L0)
         let knowledge = Arc::clone(&ctx.knowledge);
         let _project_id = ctx.runtime.project_id.clone();
         let query_owned = query.to_string();
 
         let nodes = tokio::task::spawn(async move {
-            let engine = knowledge.lock().await;
-            engine.retrieve_memories(&query_owned, max_results)
+            let engine = knowledge.read().await;
+            // Search all entity kinds (including WorkingMemory L0, not just L1-L3)
+            engine.retrieve_for_context(&query_owned, "", max_results)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|h| h.entity)
@@ -114,13 +115,15 @@ impl Tool for MemorySearchTool {
         }).await.unwrap_or_default();
 
         if nodes.is_empty() {
+            // With RwLock, reads don't block — just show "no results" without busy message
+            let extra = "";
             return ToolOutput::success(format!(
-                "🔍 No relevant knowledge found for '{}'.\n\n\
+                "🔍 No relevant knowledge found for '{}'.{}\n\n\
                  💡 Suggestions:\n\
                  • Try rephrasing your query with different keywords\n\
                  • Broaden the scope (e.g., change from 'project' to 'both')\n\
                  • Check if this knowledge needs to be captured first",
-                query
+                query, extra
             ));
         }
 

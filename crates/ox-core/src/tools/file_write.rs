@@ -273,7 +273,10 @@ impl Tool for FileWriteTool {
                     let knowledge = Arc::clone(&ctx.knowledge);
                     let check_path = display_path.clone();
                     tokio::spawn(async move {
-                        let mut engine = knowledge.lock().await;
+                        let mut engine = match knowledge.try_write() {
+                            Ok(e) => e,
+                            Err(_) => return None,
+                        };
                         // Re-read the written file for syntax check
                         if let Ok(code) = std::fs::read_to_string(&check_path) {
                             engine.check_syntax(&check_path, &code)

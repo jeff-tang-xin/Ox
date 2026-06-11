@@ -121,6 +121,7 @@ fn handle_skill_list(app: &mut AppState, rt_env: &RuntimeEnvironment) {
                 return;
             }
             
+            let skills = loader.load_enabled_skills().unwrap_or_default();
             let summary = skills.iter()
                 .map(|s| format!("  - {} [{}] - {}", s.id, s.scope, s.description))
                 .collect::<Vec<_>>()

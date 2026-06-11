@@ -193,9 +193,10 @@ impl EmbeddingModel {
         // Mean pooling: average all token embeddings (exclude padding)
         let hidden = output; // [1, seq_len, dim]
         let mask = attention_mask.unsqueeze(2)?.to_dtype(candle_core::DType::F32)?; // [1, seq_len, 1]
-        let sum = hidden.broadcast_mul(&mask)?.sum(1)?; // [1, dim] — candle * is strict, use broadcast_mul
-        let count = attention_mask.sum(1)?.to_dtype(DType::F32)?.unsqueeze(1)?; // [1, 1]
-        let pooled = (&sum / &count)?; // [1, dim]
+        let sum = hidden.broadcast_mul(&mask)?.sum(1)?; // [1, dim]
+        let count = mask.sum(1)?.to_dtype(DType::F32)?.squeeze(1)?; // [1] → scalar-like
+        // Use broadcast_div — candle ops are strict (no auto-broadcast)
+        let pooled = sum.broadcast_div(&count.unsqueeze(1)?)?; // [1, dim]
 
         let embedding: Vec<f32> = pooled.squeeze(0)?.to_vec1()?;
         Ok(embedding)
@@ -260,10 +261,11 @@ impl EmbeddingModel {
 
         // 5. Mean pooling per sequence (exclude padding via attention mask)
         let mask_f32 = attention_mask.unsqueeze(2)?.to_dtype(DType::F32)?; // [batch, seq_len, 1]
-        let masked = hidden.broadcast_mul(&mask_f32)?; // [batch, seq_len, dim] — candle * is strict, use broadcast_mul
+        let masked = hidden.broadcast_mul(&mask_f32)?; // [batch, seq_len, dim]
         let sum = masked.sum(1)?; // [batch, dim]
-        let count = attention_mask.sum(1)?.to_dtype(DType::F32)?.unsqueeze(1)?; // [batch, 1]
-        let pooled = (&sum / &count)?; // [batch, dim]
+        let count = mask_f32.sum(1)?; // [batch, 1]
+        // broadcast_div — candle ops are strict, no auto-broadcast
+        let pooled = sum.broadcast_div(&count)?; // [batch, dim]
 
         // 6. Extract per-text embeddings
         let pooled_vec = pooled.to_vec2()?; // Vec<Vec<f32>>

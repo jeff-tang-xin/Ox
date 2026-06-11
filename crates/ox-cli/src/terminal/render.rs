@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use super::app::App;
 use super::input_pane::InputPane;
@@ -32,9 +33,10 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
         return;
     }
 
-    // Calculate dynamic header height (max 3 lines to save space)
+    // Calculate dynamic header height
     let indexing_bar = if app.indexing && app.index_total_files > 0 { 1u16 } else { 0 };
-    let header_height = app.header_info.len().min(3) as u16 + 1 + indexing_bar;
+    let has_workflow = app.workflow_display.is_some() as u16;
+    let header_height = (2u16 + has_workflow + indexing_bar).min(4); // Max 4 lines
 
     // Input pane: 2 lines for normal mode, 3 lines for confirmation mode
     let input_height = if app.pending_confirmation.is_some() {
@@ -81,44 +83,20 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ]));
 
-    // Line 2: Workflow status (if active) - use cached data to avoid locking
+    // Line 2: Workflow step status (if active) — compact single-line display
     if let Some(ref wf_info) = app.workflow_display {
-        let progress_pct = (wf_info.step_num as f32 / wf_info.total_steps as f32 * 100.0) as u32;
-        let filled = (wf_info.step_num * 10 / wf_info.total_steps) as usize;
-        let empty = 10 - filled;
-        let progress_bar = "█".repeat(filled) + &"░".repeat(empty);
-
         lines.push(Line::from(vec![
-            Span::styled(" 📋 ".to_string(), Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format!("{}", wf_info.workflow_name),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" | Step {}/{}", wf_info.step_num, wf_info.total_steps),
-                Style::default().fg(TEXT),
-            ),
-            Span::styled(
-                format!(" [{}] {}%", progress_bar, progress_pct),
-                Style::default().fg(Color::Green),
-            ),
-        ]));
-
-        // Current step name
-        lines.push(Line::from(vec![
-            Span::styled("   → ".to_string(), Style::default().fg(TEXT_DIM)),
+            Span::styled(" ● ".to_string(), Style::default().fg(Color::Cyan)),
             Span::styled(
                 wf_info.step_name.clone(),
-                Style::default().fg(STREAMING).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
         ]));
     }
 
     // Additional header info (max remaining lines)
     let max_info_lines = if app.workflow_engine.is_some() {
-        area.height.saturating_sub(3) as usize // Reserve 3 lines for workflow
+        area.height.saturating_sub(2) as usize // Reserve 2 lines for workflow
     } else {
         area.height.saturating_sub(1) as usize // Only reserve 1 line for title
     };
@@ -196,22 +174,11 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     // Enhanced title with better scroll indication
     let title = if app.indexing {
         let s = SPINNER[(spinner_frame as usize) % SPINNER.len()];
-        if app.index_total_files > 0 {
-            let pct = (app.index_files_done * 100) / app.index_total_files.max(1);
-            format!(" {s} Indexing {}/{} files ({}%) ", app.index_files_done, app.index_total_files, pct)
-        } else {
-            format!(" {s} Indexing... {} symbols ", app.index_symbols)
-        }
+        format!(" {s} Indexing… ")
     } else if app.agent_running {
         let s = SPINNER[(spinner_frame as usize) % SPINNER.len()];
-        let status_text = if !app.status.is_empty() {
-            format!(" {}", app.status)
-        } else {
-            String::new()
-        };
-        format!(" {s} Ox{} ", status_text)
+        format!(" {s} Ox ")
     } else if app.user_scrolled && scroll_offset > 0 {
-        // Show scroll position indicator
         format!(" Ox ↓ {} lines up ", scroll_offset)
     } else if app.user_scrolled {
         " Ox ↓ Scrolled ".to_string()
@@ -479,9 +446,16 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
 
     // Show app.status (indexing progress, thinking, etc.)
     if !app.status.is_empty() {
+        let max_status_len = (area.width as usize).saturating_sub(60); // reserve space for model+dir
+        let status_text = if app.status.chars().count() > max_status_len && max_status_len > 5 {
+            let truncated: String = app.status.chars().take(max_status_len - 1).collect();
+            format!("{truncated}…")
+        } else {
+            app.status.clone()
+        };
         left_parts.push(Span::styled(" │ ", status_style));
         left_parts.push(Span::styled(
-            format!(" {} ", app.status),
+            format!(" {} ", status_text),
             status_style.add_modifier(Modifier::BOLD),
         ));
     }
@@ -492,13 +466,13 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         "{}{} msgs | {}",
         running_indicator, app.message_count, app.cost_summary
     );
-    let right_len = right_text.len() as u16;
+    let right_width = UnicodeWidthStr::width(right_text.as_str()) as u16;
 
     let left_line = Line::from(left_parts);
     let right_span = Span::styled(right_text, status_style);
 
     let left_area = Rect {
-        width: area.width.saturating_sub(right_len),
+        width: area.width.saturating_sub(right_width),
         ..area
     };
     frame.render_widget(
@@ -507,8 +481,8 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     );
 
     let right_area = Rect {
-        x: area.x + area.width.saturating_sub(right_len),
-        width: right_len,
+        x: area.x + area.width.saturating_sub(right_width),
+        width: right_width,
         ..area
     };
     frame.render_widget(

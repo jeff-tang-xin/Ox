@@ -56,25 +56,42 @@ pub struct ContextBlocks {
 
 /// Run the full pre-turn retrieval pipeline.
 ///
-/// This is called once per user message BEFORE the LLM call,
-/// replacing the old pattern of LLM calling tools to search.
+/// This is called once per user message BEFORE the LLM call.
+///
+/// Strategy: **layered retrieval** — L0 is always injected (conversation continuity),
+/// L1-L3 + CodeSymbols fill the remaining budget (semantic search).
 pub fn run_retrieval(
     engine: &KnowledgeEngine,
     user_query: &str,
-    session_id: &str,
+    _session_id: &str,
     max_tokens: usize,
 ) -> Result<ContextInjection> {
     // ── Step 1: Intent Classify ──
     let intent = classify_intent(user_query);
 
-    // ── Step 2: Multi-path Search ──
+    // ── Step 2: ALWAYS inject recent L0 WorkingMemory (conversation continuity) ──
+    let recent_turns = engine.get_recent_turns(3);
     let mut candidates: HashMap<String, (Entity, f32)> = HashMap::new();
+    for turn in &recent_turns {
+        candidates
+            .entry(turn.id.clone())
+            .or_insert_with(|| (turn.clone(), 1.0)); // Score 1.0 = always present
+    }
 
-    // Path A: Semantic search (all kinds, expand_depth=2 via KnowledgeEngine)
-    let hits = engine.retrieve_for_context(
+    // ── Step 3: Semantic search for L1-L3 + CodeSymbols (fill remaining budget) ──
+    // Exclude WorkingMemory — we already have recent turns above
+    let hits = engine.search_by_kinds(
         &intent.search_query,
-        session_id,
-        20, // Over-fetch for fusion
+        &[
+            EntityKind::CodeSymbol,
+            EntityKind::CodeFile,
+            EntityKind::CodeModule,
+            EntityKind::AtomicMemory,
+            EntityKind::EpisodicMemory,
+            EntityKind::SemanticMemory,
+        ],
+        15,
+        0.2,
     )?;
     for hit in hits {
         candidates
@@ -104,27 +121,33 @@ pub fn run_retrieval(
         }
     }
 
-    // ── Step 3: Result Fusion ──
+    // ── Step 4: Result Fusion ──
+    // L0 WorkingMemory entities ALWAYS come first, then by injection priority + score
     let mut fused: Vec<(Entity, f32)> = candidates.into_values().collect();
 
-    // Sort by injection priority, then by score
     fused.sort_by(|(a, a_score), (b, b_score)| {
-        injection_priority(a.kind)
-            .cmp(&injection_priority(b.kind))
-            .then_with(|| b_score.partial_cmp(a_score).unwrap_or(std::cmp::Ordering::Equal))
+        // L0 always top
+        let a_l0 = a.kind == EntityKind::WorkingMemory;
+        let b_l0 = b.kind == EntityKind::WorkingMemory;
+        match (a_l0, b_l0) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => injection_priority(a.kind)
+                .cmp(&injection_priority(b.kind))
+                .then_with(|| b_score.partial_cmp(a_score).unwrap_or(std::cmp::Ordering::Equal)),
+        }
     });
 
-    // Deduplicate by content similarity (prevent near-duplicate entities)
     let fused = deduplicate_near_duplicates(fused);
 
-    // ── Step 4: Budget-aware Cut ──
+    // ── Step 5: Budget-aware Cut ──
     let (selected, blocks) = cut_by_budget(&fused, max_tokens);
 
     let token_estimate = estimate_tokens(&blocks);
 
     tracing::info!(
-        "[RETRIEVAL] Query '{}' → {} entities ({} tokens, intent={:?})",
-        user_query, selected.len(), token_estimate, intent.intent
+        "[RETRIEVAL] Query '{}' → {} entities ({} L0 recent, {} tokens)",
+        user_query, selected.len(), recent_turns.len(), token_estimate
     );
 
     Ok(ContextInjection {
@@ -132,6 +155,83 @@ pub fn run_retrieval(
         blocks,
         token_estimate,
     })
+}
+
+/// Run retrieval targeted to specific memory layers (for workflow steps).
+///
+/// `memory_layers` is a list of EntityKind strings like ["WorkingMemory", "AtomicMemory"].
+/// Only entities matching these kinds are retrieved. L0 WorkingMemory is always included
+/// as conversation continuity regardless of what's in `memory_layers`.
+pub fn run_retrieval_for_step(
+    engine: &KnowledgeEngine,
+    user_query: &str,
+    _session_id: &str,
+    max_tokens: usize,
+    memory_layers: &[String],
+) -> Result<ContextInjection> {
+    // Parse memory layers to EntityKind
+    let kinds: Vec<EntityKind> = memory_layers.iter()
+        .filter_map(|s| EntityKind::from_str(s))
+        .collect();
+
+    let intent = classify_intent(user_query);
+
+    // Always inject recent L0 turns (conversation continuity)
+    let recent_turns = engine.get_recent_turns(3);
+    let mut candidates: HashMap<String, (Entity, f32)> = HashMap::new();
+    for turn in &recent_turns {
+        candidates.entry(turn.id.clone()).or_insert_with(|| (turn.clone(), 1.0));
+    }
+
+    // Semantic search — ONLY for the specified memory layers (not all kinds)
+    if !kinds.is_empty() {
+        let hits = engine.search_by_kinds(
+            &intent.search_query,
+            &kinds,
+            15,
+            0.2,
+        )?;
+        for hit in hits {
+            candidates.entry(hit.entity.id.clone())
+                .and_modify(|(_, score)| *score = (*score + hit.score).min(2.0))
+                .or_insert_with(|| (hit.entity, hit.score));
+        }
+    }
+
+    // Precise file-path match
+    for file_path in &intent.file_paths {
+        if let Ok(symbols) = engine.find_symbols_in_file(file_path) {
+            for sym in symbols {
+                candidates.entry(sym.id.clone())
+                    .and_modify(|(_, score)| *score = (*score + 0.95).min(2.0))
+                    .or_insert_with(|| (sym, 0.95));
+            }
+        }
+    }
+
+    // Fusion: L0 always top
+    let mut fused: Vec<(Entity, f32)> = candidates.into_values().collect();
+    fused.sort_by(|(a, a_score), (b, b_score)| {
+        let a_l0 = a.kind == EntityKind::WorkingMemory;
+        let b_l0 = b.kind == EntityKind::WorkingMemory;
+        match (a_l0, b_l0) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => injection_priority(a.kind)
+                .cmp(&injection_priority(b.kind))
+                .then_with(|| b_score.partial_cmp(a_score).unwrap_or(std::cmp::Ordering::Equal)),
+        }
+    });
+    let fused = deduplicate_near_duplicates(fused);
+    let (selected, blocks) = cut_by_budget(&fused, max_tokens);
+    let token_estimate = estimate_tokens(&blocks);
+
+    tracing::info!(
+        "[RETRIEVAL-STEP] '{}' → {} entities (layers={:?}, L0={})",
+        user_query, selected.len(), memory_layers, recent_turns.len()
+    );
+
+    Ok(ContextInjection { entities: selected, blocks, token_estimate })
 }
 
 /// Classify the user's query intent and extract entities.

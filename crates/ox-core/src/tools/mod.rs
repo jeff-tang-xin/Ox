@@ -9,6 +9,7 @@ pub mod file_write;
 pub mod find_symbol;
 pub mod git;
 pub mod intent_classifier;  // 新增：意图分类器
+pub mod load_skill;
 pub mod memory_search;
 pub mod project_detect;
 pub mod recall;
@@ -69,7 +70,7 @@ pub struct ToolContext {
     pub working_dir: std::path::PathBuf,
     pub config: Arc<OxConfig>,
     /// Unified knowledge engine (replaces memory + code_indexer)
-    pub knowledge: Arc<tokio::sync::Mutex<crate::knowledge::KnowledgeEngine>>,
+    pub knowledge: Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>,
     /// Current tool call ID (for progress reporting)
     pub tool_call_id: String,
     /// Optional progress callback for real-time updates
@@ -91,7 +92,7 @@ impl ToolContext {
         runtime: RuntimeEnvironment,
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
-        knowledge: Arc<tokio::sync::Mutex<crate::knowledge::KnowledgeEngine>>,
+        knowledge: Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>,
     ) -> Self {
         Self {
             runtime,
@@ -108,7 +109,7 @@ impl ToolContext {
         runtime: RuntimeEnvironment,
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
-        knowledge: Arc<tokio::sync::Mutex<crate::knowledge::KnowledgeEngine>>,
+        knowledge: Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>,
         tool_call_id: String,
         progress_callback: impl Fn(ToolProgress) + Send + Sync + 'static,
     ) -> Self {
@@ -158,7 +159,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
     /// Skills loaded from files (treated as special composite tools)
-    pub skills: Vec<crate::skill::Skill>,
+    skills: std::sync::Mutex<Vec<crate::skill::Skill>>,
 }
 
 impl Default for ToolRegistry {
@@ -172,7 +173,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             tools: HashMap::new(),
-            skills: Vec::new(),
+            skills: std::sync::Mutex::new(Vec::new()),
         };
 
         registry.register(Box::new(file_read::FileReadTool));
@@ -183,6 +184,7 @@ impl ToolRegistry {
         registry.register(Box::new(code_search::CodeSearchTool));
         registry.register(Box::new(delete_range::DeleteRangeTool));
         registry.register(Box::new(find_symbol::FindSymbolTool));
+        registry.register(Box::new(load_skill::LoadSkillTool));
         registry.register(Box::new(shell_exec::ShellExecTool));
         registry.register(Box::new(project_detect::ProjectDetectTool));
         registry.register(Box::new(web_fetch::WebFetchTool));
@@ -195,7 +197,7 @@ impl ToolRegistry {
     }
     
     /// Load Skills from filesystem and register them
-    pub fn load_skills(&mut self, rt_env: &crate::runtime::RuntimeEnvironment) -> anyhow::Result<()> {
+    pub fn load_skills(&self, rt_env: &crate::runtime::RuntimeEnvironment) -> anyhow::Result<()> {
         use crate::skill::SkillLoader;
         
         let loader = SkillLoader::new(
@@ -213,11 +215,26 @@ impl ToolRegistry {
             skills.truncate(MAX_SKILLS);
             tracing::info!("Capped skills at {} (oldest trimmed)", MAX_SKILLS);
         }
-        self.skills = skills;
+        *self.skills.lock().unwrap() = skills;
         
-        tracing::info!("Loaded {} skills", self.skills.len());
+        tracing::info!("Loaded {} skills", self.skills.lock().unwrap().len());
         
         Ok(())
+    }
+
+    /// Get a snapshot of all loaded skills.
+    pub fn get_skills_list(&self) -> Vec<crate::skill::Skill> {
+        self.skills.lock().unwrap().clone()
+    }
+
+    /// Return true if any skills are loaded.
+    pub fn has_skills(&self) -> bool {
+        !self.skills.lock().unwrap().is_empty()
+    }
+
+    /// Reload skills from disk. Call after files created/modified in .ox/skills/.
+    pub fn reload_skills(&self, rt_env: &RuntimeEnvironment) -> anyhow::Result<()> {
+        self.load_skills(rt_env)
     }
 
     fn register(&mut self, tool: Box<dyn Tool>) {
@@ -241,7 +258,8 @@ impl ToolRegistry {
             .collect();
         
         // Add Skills as special composite tools
-        for skill in &self.skills {
+        let skills = self.skills.lock().unwrap();
+        for skill in skills.iter() {
             schemas.push(crate::llm::ToolSchema {
                 name: format!("skill_{}", skill.id),
                 description: format!(

@@ -278,7 +278,10 @@ impl EditFileTool {
                     let knowledge = Arc::clone(&ctx.knowledge);
                     let check_path = path.to_path_buf();
                     tokio::spawn(async move {
-                        let mut engine = knowledge.lock().await;
+                        let mut engine = match knowledge.try_write() {
+                            Ok(e) => e,
+                            Err(_) => return None,
+                        };
                         if let Ok(code) = std::fs::read_to_string(&check_path) {
                             engine.check_syntax(&check_path, &code)
                         } else {

@@ -8,7 +8,7 @@ pub mod refinement;
 pub use effort::{EffortLevel, estimate_effort};
 pub use skill_prompts::SKILL_CREATION_PROMPT;
 pub use spec::{TASK_TYPE_PROMPT, load_spec, save_spec, spec_exists};
-pub use system_prompt::{build_system_prompt, build_system_prompt_with_context, TurnContext, gather_git_context, gather_diff_context, gather_dir_context};
+pub use system_prompt::{build_system_prompt, build_system_prompt_with_context, build_system_prompt_with_step, TurnContext, gather_git_context, gather_diff_context, gather_dir_context};
 pub use refinement::{RefinedTurn, refine_conversation, build_refined_context, refine_assistant_response, generate_memory_summary, MemorySummary};
 
 use crate::llm::tokenizer::estimate_tokens;
@@ -279,30 +279,56 @@ impl ContextBuilder {
         let history_budget = budgets.history as usize;
         let mut used_tokens: usize = 0;
         let mut selected_indices: Vec<usize> = Vec::new();
+        let mut skipped_indices: Vec<usize> = Vec::new();
 
         // Skip the first message if it's a system message (already merged above)
         let start_idx = if has_leading_system { 1 } else { 0 };
 
+        // Phase 1: Fill with high-priority messages (user messages, assistant plans)
+        // These are the conversation backbone — must keep
         for (i, msg) in history.iter().enumerate().skip(start_idx).rev() {
             let msg_tokens = estimate_message_tokens(msg);
             if used_tokens + msg_tokens > history_budget {
                 break;
             }
-            used_tokens += msg_tokens;
-            selected_indices.push(i);
+            let is_high_prio = matches!(msg, Message::User { .. })
+                || matches!(msg, Message::Assistant { content, .. } if content.contains("## Plan") || content.contains("## Done"));
+            if is_high_prio {
+                used_tokens += msg_tokens;
+                selected_indices.push(i);
+            } else {
+                skipped_indices.push(i);
+            }
         }
 
-        // Reverse to maintain chronological order.
-        selected_indices.reverse();
+        // Phase 2: Fill remaining budget with regular messages (tool results, etc.)
+        // Only include messages between the selected range
+        if !selected_indices.is_empty() {
+            let min_idx = *selected_indices.iter().min().unwrap();
+            let max_idx = *selected_indices.iter().max().unwrap();
+            for i in skipped_indices {
+                if i >= min_idx && i <= max_idx
+                    && used_tokens + estimate_message_tokens(&history[i]) <= history_budget
+                {
+                    used_tokens += estimate_message_tokens(&history[i]);
+                    selected_indices.push(i);
+                }
+            }
+        }
+
+        // Sort by index to maintain chronological order
+        selected_indices.sort();
         for i in selected_indices {
             result.push(history[i].clone());
         }
 
         // Sanitize: remove orphaned ToolResults and strip orphaned tool_calls
-        // caused by budget truncation breaking tool interaction sequences.
         sanitize_tool_pairs(&mut result);
-        
-        // 🚨 NEW: Filter out noisy intermediate messages to reduce context bloat
+
+        // 🚨 Deduplicate repeated file_read results — keep only most recent
+        deduplicate_file_reads(&mut result);
+
+        // Filter out noisy intermediate messages to reduce context bloat
         filter_noisy_messages(&mut result);
 
         result
@@ -782,14 +808,75 @@ mod tests {
     }
 }
 
-/// 🚨 NEW: Filter out noisy intermediate messages that add little value.
-/// 
-/// This function removes or consolidates messages that:
-/// 1. Contain repeated "Infinite Loop Detected" errors (keep only the last one)
-/// 2. Have multiple consecutive failed tool calls with similar errors
-/// 3. Contain verbose error messages that can be summarized
-/// 
-/// Goal: Reduce context bloat while preserving essential information.
+/// Deduplicate repeated file_read results — keep only the most recent read per file.
+/// Older reads of the same file are replaced with a compact summary.
+fn deduplicate_file_reads(messages: &mut Vec<Message>) {
+    use std::collections::HashMap;
+
+    // Find all file_read tool_call IDs and their paths
+    let mut file_reads: Vec<(usize, String)> = Vec::new(); // (index, path)
+    for (i, msg) in messages.iter().enumerate() {
+        if let Message::Assistant { tool_calls, .. } = msg {
+            for tc in tool_calls {
+                if tc.name == "file_read" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                            file_reads.push((i, path.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if file_reads.len() < 2 {
+        return;
+    }
+
+    // Find repeated files — keep last occurrence, summarize earlier ones
+    let mut last_occurrence: HashMap<String, usize> = HashMap::new();
+    for (idx, path) in &file_reads {
+        last_occurrence.insert(path.clone(), *idx);
+    }
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut replaced = 0;
+    for &(idx, ref path) in &file_reads {
+        let count = seen.entry(path.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            // Find the corresponding ToolResult for this file_read
+            let msg = &messages[idx];
+            let tool_call_id = if let Message::Assistant { tool_calls, .. } = msg {
+                tool_calls.iter()
+                    .find(|tc| tc.name == "file_read")
+                    .map(|tc| tc.id.clone())
+            } else { None };
+
+            if let Some(tc_id) = tool_call_id {
+                // Replace the ToolResult with a compact summary
+                for msg in messages.iter_mut() {
+                    if let Message::ToolResult { tool_call_id, content } = msg {
+                        if tool_call_id == &tc_id {
+                            let line_count = content.lines().count();
+                            *content = format!(
+                                "(previously read {} — {} lines, latest version kept in context)",
+                                path, line_count
+                            );
+                            replaced += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if replaced > 0 {
+        tracing::info!("[DEDUP] Summarized {} repeated file_read results", replaced);
+    }
+}
+
+/// 🚨 Filter out noisy intermediate messages that add little value.
 pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
     if messages.len() < 5 {
         return; // Only apply to longer conversations

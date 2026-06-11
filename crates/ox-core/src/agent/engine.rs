@@ -22,8 +22,11 @@ impl WorkflowEngine {
             session_state,
         };
 
-        // Register default workflows
-        engine.register_workflow(crate::agent::workflow::create_free_workflow());
+        // Register default workflow (5-step pipeline)
+        engine.register_workflow(crate::agent::workflow::create_default_workflow());
+
+        // Auto-activate the default workflow — no "free mode", all requests go through 5-step pipeline
+        let _ = engine.activate_workflow("five_step_pipeline");
 
         engine
     }
@@ -154,25 +157,48 @@ impl WorkflowEngine {
         }
     }
 
-    /// Advance to next step
+    /// Advance to next step (or jump to `target_step` if provided).
+    /// Returns Ok(true) if more steps remain, Ok(false) if workflow complete.
     pub fn advance_step(&mut self) -> Result<bool, String> {
+        self.advance_to_step(None)
+    }
+
+    /// Advance to a specific step index (used for route-based skipping).
+    pub fn advance_to_step(&mut self, target: Option<usize>) -> Result<bool, String> {
         let workflow = self.current_workflow.as_mut().ok_or("No active workflow")?;
 
         if let Ok(mut session) = self.session_state.try_lock() {
-            if session.advance_step(workflow.total_steps()) {
+            let new_idx = if let Some(t) = target {
+                t.min(workflow.total_steps() - 1)
+            } else {
+                session.current_step_index + 1
+            };
+            
+            let jumped = new_idx > session.current_step_index + 1;
+            session.current_step_index = new_idx;
+            session.awaiting_user_confirmation = false;
+            
+            if jumped {
+                tracing::info!(
+                    "[WORKFLOW] Jumped to step {}/{}: {} (skipped intermediate steps)",
+                    session.current_step_index + 1,
+                    workflow.total_steps(),
+                    workflow.get_step(session.current_step_index).map(|s| s.name.as_str()).unwrap_or("Unknown")
+                );
+            } else {
                 tracing::info!(
                     "Advanced to step {}/{}: {}",
                     session.current_step_index + 1,
                     workflow.total_steps(),
-                    workflow
-                        .get_step(session.current_step_index)
-                        .map(|s| s.name.as_str())
-                        .unwrap_or("Unknown")
+                    workflow.get_step(session.current_step_index).map(|s| s.name.as_str()).unwrap_or("Unknown")
                 );
-                Ok(true)
-            } else {
-                tracing::info!("Workflow completed");
+            }
+            
+            // Only mark complete when PAST the last step (index >= total_steps)
+            if session.current_step_index >= workflow.total_steps() {
                 Ok(false)
+            } else {
+                Ok(true)
             }
         } else {
             Err("Failed to acquire session lock".to_string())
@@ -183,7 +209,7 @@ impl WorkflowEngine {
     pub fn is_workflow_complete(&self) -> bool {
         if let Some(workflow) = &self.current_workflow {
             if let Ok(session) = self.session_state.try_lock() {
-                session.current_step_index >= workflow.total_steps() - 1
+                session.current_step_index >= workflow.total_steps()
             } else {
                 true // If we can't get the lock, assume complete to avoid blocking
             }
@@ -249,11 +275,26 @@ impl WorkflowEngine {
         }
     }
 
-    /// Get system prompt for current step (to inject into LLM context)
+    /// Get system prompt for current step (with {PREVIOUS_OUTPUT} template substitution)
     pub fn get_step_system_prompt(&self) -> Option<String> {
         if let Some(step) = self.current_step() {
             if !step.step_prompt.is_empty() {
-                Some(step.step_prompt.clone())
+                let mut prompt = step.step_prompt.clone();
+                // Substitute {PREVIOUS_OUTPUT} template
+                if prompt.contains("{PREVIOUS_OUTPUT}") {
+                    if let Some(prev) = self.get_previous_step_output() {
+                        let truncated: String = prev.chars().take(2000).collect();
+                        prompt = prompt.replace("{PREVIOUS_OUTPUT}", &truncated);
+                    } else {
+                        prompt = prompt.replace("{PREVIOUS_OUTPUT}", "（无上一步输出）");
+                    }
+                }
+                // Substitute {ALL_PREVIOUS_OUTPUTS} — full aggregate for Step 5
+                if prompt.contains("{ALL_PREVIOUS_OUTPUTS}") {
+                    let all = self.get_all_step_outputs_summary();
+                    prompt = prompt.replace("{ALL_PREVIOUS_OUTPUTS}", &all);
+                }
+                Some(prompt)
             } else {
                 None
             }
@@ -268,7 +309,10 @@ impl WorkflowEngine {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Result<(), String> {
-        let step = self.current_step().ok_or("No active workflow step")?;
+        let step = match self.current_step() {
+            Some(s) => s,
+            None => return Ok(()), // No active workflow — allow all tools
+        };
 
         // Check if tools are allowed at all
         if !step.allow_tool_execution {
@@ -391,6 +435,160 @@ impl WorkflowEngine {
             None
         }
     }
+
+    /// Store the LLM output from the previous step (used as {PREVIOUS_OUTPUT} in next step's prompt)
+    pub fn set_previous_output(&self, output: &str) {
+        self.set_variable("_prev_output", output.to_string());
+        // Also store per-step for Step 5's aggregated context
+        let step_idx = self.get_current_step_index();
+        self.set_variable(&format!("_step{}_output", step_idx), output.to_string());
+    }
+
+    /// Retrieve the LLM output from the previous step
+    pub fn get_previous_step_output(&self) -> Option<String> {
+        self.get_variable("_prev_output")
+    }
+
+    /// Build an aggregated summary of all previous steps for Step 5
+    pub fn get_all_step_outputs_summary(&self) -> String {
+        let mut summaries = Vec::new();
+        let labels = ["意图分类", "任务规划", "参数提取", "安全检查"];
+        for i in 0..4 {
+            if let Some(output) = self.get_variable(&format!("_step{}_output", i)) {
+                let label = labels.get(i).copied().unwrap_or(&"未知");
+                // Extract the JSON portion only (strip surrounding text)
+                let json_or_summary = if let (Some(s), Some(e)) = (output.find('{'), output.rfind('}')) {
+                    &output[s..=e]
+                } else {
+                    &output[..output.len().min(500)]
+                };
+                summaries.push(format!("Step {}: {}\n{}", i + 1, label, json_or_summary));
+            }
+        }
+        if summaries.is_empty() {
+            "（无上一步输出）".to_string()
+        } else {
+            summaries.join("\n\n")
+        }
+    }
+
+    /// Check if the LLM's response should auto-advance to the next step.
+    /// Validates structured output per step. Returns (next_step_idx, None) on success,
+    /// or (None, Some(error_message)) if output is invalid.
+    ///
+    /// Validation per step:
+    /// - Step 1: JSON with "intent" field
+    /// - Step 2: JSON with "plan" array
+    /// - Step 3: JSON with "action" + "description" fields
+    /// - Step 4: JSON with "safe" boolean field
+    /// - Step 5: text contains "## Done" or "【Done】"
+    pub fn advance_on_output(
+        &mut self,
+        assistant_text: &str,
+        had_tool_calls: bool,
+    ) -> (Option<usize>, Option<String>) {
+        let step_idx = self.get_current_step_index();
+        let workflow = match self.current_workflow.as_ref() {
+            Some(w) => w, None => return (None, None),
+        };
+        let _total = workflow.total_steps();
+
+        // In Step 5, check ## Done BEFORE the had_tool_calls check.
+        // LLM often outputs ## Done in the same message as the last file_write.
+        if step_idx == 4 && (assistant_text.contains("## Done") || assistant_text.contains("【Done】")) {
+            return if step_idx + 1 >= _total { (None, None) } else { (Some(step_idx + 1), None) };
+        }
+
+        // If tools were called, stay and execute them first.
+        if had_tool_calls { return (None, None); }
+
+        match step_idx {
+            0 => {
+                // Step 1: Intent → always move to step 2
+                match validate_json_field(assistant_text, &["intent"]) {
+                    Ok(_) => (Some(1), None),
+                    Err(msg) => (None, Some(msg)),
+                }
+            }
+            1 => {
+                // Step 2: Planning → move to step 3
+                match validate_json_field(assistant_text, &["plan", "skills"]) {
+                    Ok(_) => (Some(2), None),
+                    Err(msg) => (None, Some(msg)),
+                }
+            }
+            2 => {
+                // Step 3: Params → move to step 4
+                match validate_json_field(assistant_text, &["action", "description"]) {
+                    Ok(_) => (Some(3), None),
+                    Err(msg) => (None, Some(msg)),
+                }
+            }
+            3 => {
+                // Step 4: Safety → move to step 5
+                match validate_json_field(assistant_text, &["safe"]) {
+                    Ok(_) => (Some(4), None),
+                    Err(msg) => (None, Some(msg)),
+                }
+            }
+            4 => {
+                // Step 5: Execute until ## Done
+                if assistant_text.contains("## Done") || assistant_text.contains("【Done】") {
+                    if step_idx + 1 >= _total { (None, None) } else { (Some(step_idx + 1), None) }
+                } else {
+                    (None, None)
+                }
+            }
+            _ => (None, None),
+        }
+    }
+}
+
+/// Find and parse JSON from LLM output, validate required fields exist.
+fn validate_json_field(text: &str, required_fields: &[&str]) -> Result<(), String> {
+    let json_str = extract_json_block(text)
+        .ok_or_else(|| format!(
+            "❌ 你的回复不包含有效的 JSON。请输出 JSON 对象，包含以下字段：{}。\n请重新输出。",
+            required_fields.join("、")
+        ))?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| format!("❌ JSON 解析失败：{}。请检查格式后重新输出。", e))?;
+
+    let obj = parsed.as_object()
+        .ok_or_else(|| "❌ 你的输出不是 JSON 对象。请输出 {{...}} 格式的 JSON。".to_string())?;
+
+    let mut missing = Vec::new();
+    for field in required_fields {
+        if !obj.contains_key(*field) || obj[*field].is_null() {
+            missing.push(*field);
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "❌ JSON 缺少必填字段：{}。请补全后重新输出。",
+            missing.join("、")
+        ))
+    }
+}
+
+/// Extract JSON object from LLM text (handles code fences and inline JSON).
+fn extract_json_block(text: &str) -> Option<String> {
+    // Try code-fenced JSON first
+    if let (Some(start), Some(end)) = (text.find("```json"), text.rfind("```")) {
+        let inner = &text[start + 7..end].trim();
+        if inner.starts_with('{') { return Some(inner.to_string()); }
+    }
+    // Try raw JSON object
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
+        if start < end {
+            return Some(text[start..=end].to_string());
+        }
+    }
+    None
 }
 
 /// Display information for the current workflow step
