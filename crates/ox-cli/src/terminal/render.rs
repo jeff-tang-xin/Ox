@@ -33,23 +33,19 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
         return;
     }
 
-    // Calculate dynamic header height
+    // Adaptive layout based on terminal height
+    let is_tiny = area.height < 15;
     let indexing_bar = if app.indexing && app.index_total_files > 0 { 1u16 } else { 0 };
     let has_workflow = app.workflow_display.is_some() as u16;
-    let header_height = (2u16 + has_workflow + indexing_bar).min(4); // Max 4 lines
+    let header_height = if is_tiny { 0 } else { (2u16 + has_workflow + indexing_bar).min(5) };
 
-    // Input pane: 2 lines for normal mode, 3 lines for confirmation mode
-    let input_height = if app.pending_confirmation.is_some() {
-        3
-    } else {
-        2
-    };
+    let input_height = if app.pending_confirmation.is_some() { 3 } else { 2 };
 
     let chunks = Layout::vertical([
-        Constraint::Length(header_height), // Header
-        Constraint::Min(5),                // Main output (flexible)
+        Constraint::Length(header_height), // Header (hidden on tiny screens)
+        Constraint::Min(3),                // Main output
         Constraint::Length(1),             // Status bar
-        Constraint::Length(input_height),  // Input pane (dynamic)
+        Constraint::Length(input_height),  // Input pane
     ])
     .split(area);
 
@@ -60,31 +56,21 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
-    if area.height == 0 {
+    if area.height == 0 || area.width == 0 {
         return;
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let max_lines = area.height as usize;
 
-    // Line 1: Main title
+    // Line 1: Title (all owned to satisfy 'static)
+    let title_line = format!(" ◆ Ox  {} ", app.model_name);
     lines.push(Line::from(vec![
-        Span::styled(
-            " ◆ ".to_string(),
-            Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "Ox".to_string(),
-            Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" v0.1.0".to_string(), Style::default().fg(TEXT_DIM)),
-        Span::styled(
-            " — AI Programming Assistant".to_string(),
-            Style::default().fg(TEXT),
-        ),
+        Span::styled(title_line, Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
     ]));
 
-    // Line 2: Workflow step status (if active) — compact single-line display
-    if let Some(ref wf_info) = app.workflow_display {
+    // Line 2: Workflow step status
+    if let Some(ref wf_info) = app.workflow_display && lines.len() < max_lines {
         lines.push(Line::from(vec![
             Span::styled(" ● ".to_string(), Style::default().fg(Color::Cyan)),
             Span::styled(
@@ -94,50 +80,32 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
-    // Additional header info (max remaining lines)
-    let max_info_lines = if app.workflow_engine.is_some() {
-        area.height.saturating_sub(2) as usize // Reserve 2 lines for workflow
-    } else {
-        area.height.saturating_sub(1) as usize // Only reserve 1 line for title
-    };
+    // Additional header info (within remaining lines)
+    let max_lines = area.height as usize;
 
-    // Show indexing progress bar in header
-    if app.indexing && app.index_total_files > 0 {
+    // Indexing progress bar
+    if app.indexing && app.index_total_files > 0 && lines.len() < max_lines {
         let pct = (app.index_files_done * 100) / app.index_total_files.max(1);
-        let bar_width = 20;
-        let filled = (app.index_files_done * bar_width) / app.index_total_files.max(1);
+        let bar_width = 20u64;
+        let filled = (app.index_files_done as u64 * bar_width) / app.index_total_files.max(1) as u64;
         let empty = bar_width - filled;
-        let progress_bar = "█".repeat(filled) + &"░".repeat(empty);
+        let progress_bar = "█".repeat(filled as usize) + &"░".repeat(empty as usize);
         lines.push(Line::from(vec![
-            Span::styled(
-                "  ⏳ Indexing: ".to_string(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("[{}]", progress_bar),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(
-                format!(" {}%  ({}/{} files, {} symbols)", pct, app.index_files_done, app.index_total_files, app.index_symbols),
-                Style::default().fg(TEXT),
-            ),
+            Span::styled("  ⏳ ", Style::default().fg(Color::Yellow)),
+            Span::styled(format!("[{progress_bar}] {pct}%"), Style::default().fg(Color::Green)),
+            Span::styled(format!(" {}/{} files", app.index_files_done, app.index_total_files), Style::default().fg(TEXT)),
         ]));
     }
 
-    for info in &app.header_info {
-        if lines.len() < area.height as usize - 1 && lines.len() <= max_info_lines {
-            lines.push(Line::from(vec![
-                Span::styled(" ● ".to_string(), Style::default().fg(SYS_COLOR)),
-                Span::styled(info.clone(), Style::default().fg(TEXT_DIM)),
-            ]));
-        }
+    for info in app.header_info.iter().take(max_lines.saturating_sub(lines.len())) {
+        let text = info.clone();
+        lines.push(Line::from(vec![
+            Span::styled(" ● ".to_string(), Style::default().fg(SYS_COLOR)),
+            Span::styled(text, Style::default().fg(TEXT_DIM)),
+        ]));
     }
 
-    let bottom_border = if lines.len() < area.height as usize - 1 {
-        Borders::BOTTOM
-    } else {
-        Borders::NONE
-    };
+    let bottom_border = if lines.len() < max_lines { Borders::BOTTOM } else { Borders::NONE };
     let block = Block::default()
         .borders(bottom_border)
         .border_style(Style::default().fg(BORDER))
@@ -152,7 +120,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
     let has_sidebar_content = !app.sessions.is_empty() || !app.plan_items.is_empty();
     let sidebar_w = if has_sidebar_content {
-        app.sidebar_width.min(area.width / 4)
+        (area.width / 5).clamp(18, 35) // Adaptive sidebar width
     } else {
         0
     };
@@ -446,18 +414,16 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
 
     // Show app.status (indexing progress, thinking, etc.)
     if !app.status.is_empty() {
-        let max_status_len = (area.width as usize).saturating_sub(60); // reserve space for model+dir
-        let status_text = if app.status.chars().count() > max_status_len && max_status_len > 5 {
-            let truncated: String = app.status.chars().take(max_status_len - 1).collect();
-            format!("{truncated}…")
+        let available = (area.width as usize).saturating_sub(80);
+        let status_text = if app.status.chars().count() > available && available > 10 {
+            format!("{}…", app.status.chars().take(available.saturating_sub(1)).collect::<String>())
         } else {
             app.status.clone()
         };
+        // Pad with spaces to ensure old text is fully overwritten on re-render
+        let padded = format!(" {:<width$} ", status_text, width = available.min(80));
         left_parts.push(Span::styled(" │ ", status_style));
-        left_parts.push(Span::styled(
-            format!(" {} ", status_text),
-            status_style.add_modifier(Modifier::BOLD),
-        ));
+        left_parts.push(Span::styled(padded, status_style.add_modifier(Modifier::BOLD)));
     }
 
     // Right side: Message count and cost (compact format)

@@ -119,61 +119,84 @@ impl Workflow {
     }
 }
 
-/// Create the default 5-step pipeline workflow — used for ALL user interactions.
+/// Create the default 4-step pipeline workflow — used for ALL user interactions.
 ///
-/// Step 1 (Intent Classify): L0 WorkingMemory — recent turns
-/// Step 2 (Task Planning): L2 EpisodicMemory + L3 SemanticMemory — history + patterns
-/// Step 3 (Parameter Extract): L0 WorkingMemory + CodeSymbol — context completion
-/// Step 4 (Safety Check): L1 AtomicMemory — rules, anti-patterns
-/// Step 5 (Execution): L0 WorkingMemory + L1 AtomicMemory — state + tooling experience
+/// Step 1 (Intent):   L0 WorkingMemory — recent context
+/// Step 2 (Plan):     L2 EpisodicMemory + L3 SemanticMemory — history + patterns + exploration
+/// Step 3 (Review):   L1 AtomicMemory — rules, anti-patterns, safety review of the plan
+/// Step 4 (Execute):  L0 WorkingMemory + L1 AtomicMemory — state + tooling experience
+///
+/// This pipeline is generic: it works for coding, exploring, debugging, and chat tasks.
+/// Only Step 2 and Step 4 allow tool calls; Step 1 and Step 3 are JSON-only.
 pub fn create_default_workflow() -> Workflow {
-    let mut workflow = Workflow::new("five_step_pipeline", "5-Step Pipeline");
+    let mut workflow = Workflow::new("five_step_pipeline", "4-Step Pipeline");
 
-    // ── Step 1: Intent Classification ──
+    // ── Step 0: Intent Classification ──
     workflow.add_step(
-        WorkflowStep::new("step1_intent", "Intent Classification", "Analyze user intent")
+        WorkflowStep::new("step0_intent", "Intent", "Classify user intent")
             .with_prompt("\
-【任务】你是意图分类器。分析用户的消息，输出 JSON 分类结果。
+【任务】分析用户意图，输出分类结果。
 
-【输出格式】只输出一个 JSON 对象：
+【输出格式】只输出 JSON：
 {\"intent\": \"coding\"|\"exploring\"|\"chat\",
  \"complexity\": \"simple\"|\"complex\",
- \"files\": [\"提到的文件路径\"],
+ \"files\": [\"提到的文件\"],
  \"topic\": \"主题关键词\"}
 
 【规则】
-- 输出 JSON 后立即结束，不要输出其他内容，不要调用工具
-- coding: 需要读/写/改代码
-- exploring: 探索项目结构、解释架构
-- chat: 闲聊、问候、一般问题")
+- 输出 JSON 后立即结束，不要调用工具
+- coding: 需要读写改代码
+- exploring: 探索项目结构、理解架构
+- chat: 闲聊、问答、一般帮助")
             .disallow_tools()
             .with_memory_layers(&["WorkingMemory"])
             .with_display_status("🤔 分析意图")
     );
 
-    // ── Step 2: Explore + Task Planning ──
+    // ── Step 1: Explore + Plan ──
     workflow.add_step(
-        WorkflowStep::new("step2_plan", "Task Planning", "Explore codebase then plan the task")
+        WorkflowStep::new("step1_plan", "Plan", "Explore and make a detailed plan")
             .with_prompt("\
-【任务】先探索项目，再制定计划。
+【任务】探索项目，制定详细的执行计划。
 
-【上一步分析】{PREVIOUS_OUTPUT}
+【上一步意图】{PREVIOUS_OUTPUT}
+
+【工具使用规则】
+- project_detect — 只调一次，结果不变
+- file_list <dir> — 列出目录内容，可多次用于不同子目录
+- file_read <file> — 读文件内容
+- find_symbol <name> — 按函数/结构体/方法名查找定义位置（如 find_symbol handle_key）
+- code_search <pattern> — 按文本模式搜索（如搜索 TODO、Ctrl+C 等字符串）
+- load_skill <name> — 加载项目 skill
+- 已读过的文件不要重复读
 
 【步骤】
-1. 用 file_read / file_list / find_symbol / code_search 了解相关代码
+1. 探索项目结构和相关代码
 2. 加载需要的 skill
-3. 制定具体执行计划
-4. 输出 JSON：
-{\"plan\": [\"步骤1\", \"步骤2\"],
- \"skills\": [\"必须加载的skill名\"],
- \"estimated_steps\": 步骤数,
- \"key_files\": [\"涉及的关键文件路径\"]}
+3. 制定详细执行计划
+4. 输出 JSON（禁止输出其他内容）
+
+【输出格式】
+{
+  \"plan\": [
+    {{
+      \"step\": 1,
+      \"file\": \"文件路径\",
+      \"action\": \"add|modify|delete|create|explain\",
+      \"target\": \"函数/结构体/模块名\",
+      \"desc\": \"具体做什么、怎么做的描述\",
+      \"verify\": \"验证方法（cargo check / test / 读回文件）\"
+    }}
+  ],
+  \"skills\": [\"需要的 skill 名\"],
+  \"key_files\": [\"涉及的关键文件路径\"]
+}
 
 【规则】
-- 先探索再规划：不了解代码就制定的计划毫无价值
-- 最多 3 轮探索（file_read/file_list/project_detect），然后必须输出 JSON
-- 已经看过的文件不要再重复看
-- 输出 JSON 后立即结束，不要继续探索")
+- desc 必须具体！\"修改函数\"不合格，\"在 handle_key 的 match 前添加 Ctrl+S 判断\"合格
+- 每个 step 必须有 target
+- 先读代码再写计划
+- 输出 JSON 后立即结束")
             .with_allowed_tools(&["file_read", "file_list", "file_search", "code_search",
                                   "find_symbol", "project_detect", "load_skill",
                                   "memory_search", "recall"])
@@ -182,69 +205,53 @@ pub fn create_default_workflow() -> Workflow {
             .with_display_status("📋 探索+规划")
     );
 
-    // ── Step 3: Parameter Extraction ──
+    // ── Step 2: Review (Safety + Completeness) ──
     workflow.add_step(
-        WorkflowStep::new("step3_params", "Parameter Extraction", "Extract structured parameters from context")
+        WorkflowStep::new("step2_review", "Review", "Review plan for safety and completeness")
             .with_prompt("\
-【任务】你是参数提取器。从用户消息和上下文提取结构化的执行参数。
+【任务】审阅上一步生成的计划，检查安全性和完整性。
 
-【上一步规划】{PREVIOUS_OUTPUT}
+【上一步计划】{PREVIOUS_OUTPUT}
 
-【输出格式】只输出 JSON：
-{\"target_file\": \"文件路径\",
- \"target_symbol\": \"函数/类名\",
- \"action\": \"add|modify|delete|explain\",
- \"description\": \"变更描述\"}
-
-【规则】
-- 输出 JSON 后立即结束，不要调用工具
-- 利用上一步的规划和\"最近上下文\"来补全参数
-- 如果参数不足，在 missing 字段列出需要用户补充的信息
-- 不要编造值 — 不确定就标为 null")
-            .disallow_tools()
-            .with_memory_layers(&["WorkingMemory", "CodeSymbol"])
-            .with_display_status("🔎 提取参数")
-    );
-
-    // ── Step 4: Safety Check ──
-    workflow.add_step(
-        WorkflowStep::new("step4_safety", "Safety Check", "Verify operation safety before execution")
-            .with_prompt("\
-【任务】你是安全审计器。评估要执行的操作是否安全。
-
-【上一步参数】{PREVIOUS_OUTPUT}
+【检查项】
+1. 安全性：是否有删除文件、危险命令、跨项目操作？
+2. 完整性：计划是否覆盖了用户意图的全部？
+3. 可行性：每个步骤的文件和函数是否已在探索中确认存在？
+4. 依赖：步骤顺序是否正确？有无遗漏的前置步骤？
 
 【输出格式】只输出 JSON：
 {\"safe\": true|false,
- \"reason\": \"不安全的原因（safe=true 时为空）\",
- \"warnings\": [\"需要注意的事项（可选）\"]}
+ \"complete\": true|false,
+ \"issues\": [\"发现的问题（safe/complete 为 false 时必填）\"],
+ \"warnings\": [\"需要注意但可继续的事项（可选）\"]}
 
 【规则】
 - 输出 JSON 后立即结束，不要调用工具
-- 基于上一步的参数来评估安全性
-- 参考下面的「用户规则」和「已知反模式」
-- 涉及删除文件、破坏性命令、跨项目操作 → 标记 unsafe")
+- 基于上一步探索结果来评估，不要猜测
+- safe=false → 必须列出具体原因
+- complete=false → 必须列出缺少什么")
             .disallow_tools()
             .with_validator("safety_check")
             .with_memory_layers(&["AtomicMemory"])
-            .with_display_status("🛡️ 安全检查")
+            .with_display_status("🛡️ 审阅计划")
     );
 
-    // ── Step 5: Execution ──
+    // ── Step 3: Execute ──
     workflow.add_step(
-        WorkflowStep::new("step5_execute", "Execution", "Execute the planned task")
+        WorkflowStep::new("step3_execute", "Execute", "Execute the plan")
             .with_prompt("\
-【任务】执行计划。探索已在 Step 2 完成，现在直接执行代码修改。
+【任务】按照计划逐步执行。
 
-【前序步骤全部输出】{ALL_PREVIOUS_OUTPUTS}
+【全部前序输出】{ALL_PREVIOUS_OUTPUTS}
 
 【规则】
-1. 需要时用 file_read 查看具体代码行
-2. 用 file_write / edit_file / delete_range 执行修改
-3. 改后验证（读回或 cargo check / cargo test）
-4. 完成全部修改后输出 ## Done
+1. 按照计划中的步骤顺序执行
+2. 修改前用 file_read / find_symbol 确认当前代码
+3. 用 file_write / edit_file / delete_range 执行修改
+4. 每步修改后按要求验证（cargo check / test / file_read）
+5. 全部完成后输出 ## Done
 
-不要重复探索。Step 2 已经完成了探索。直接执行。")
+不要重复探索。探索已在计划阶段完成。直接执行。")
             .with_memory_layers(&["WorkingMemory", "AtomicMemory"])
             .with_display_status("⚡ 执行")
     );

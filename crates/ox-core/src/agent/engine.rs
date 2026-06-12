@@ -449,11 +449,11 @@ impl WorkflowEngine {
         self.get_variable("_prev_output")
     }
 
-    /// Build an aggregated summary of all previous steps for Step 5
+    /// Build an aggregated summary of all previous steps for the Execute step
     pub fn get_all_step_outputs_summary(&self) -> String {
         let mut summaries = Vec::new();
-        let labels = ["意图分类", "任务规划", "参数提取", "安全检查"];
-        for i in 0..4 {
+        let labels = ["意图分类", "任务规划", "审阅计划"];
+        for i in 0..3 {
             if let Some(output) = self.get_variable(&format!("_step{}_output", i)) {
                 let label = labels.get(i).copied().unwrap_or(&"未知");
                 // Extract the JSON portion only (strip surrounding text)
@@ -504,35 +504,28 @@ impl WorkflowEngine {
 
         match step_idx {
             0 => {
-                // Step 1: Intent → always move to step 2
+                // Step 0: Intent → advance to Plan
                 match validate_json_field(assistant_text, &["intent"]) {
                     Ok(_) => (Some(1), None),
                     Err(msg) => (None, Some(msg)),
                 }
             }
             1 => {
-                // Step 2: Planning → move to step 3
+                // Step 1: Plan → advance to Review
                 match validate_json_field(assistant_text, &["plan", "skills"]) {
                     Ok(_) => (Some(2), None),
                     Err(msg) => (None, Some(msg)),
                 }
             }
             2 => {
-                // Step 3: Params → move to step 4
-                match validate_json_field(assistant_text, &["action", "description"]) {
+                // Step 2: Review → advance to Execute
+                match validate_json_field(assistant_text, &["safe", "complete"]) {
                     Ok(_) => (Some(3), None),
                     Err(msg) => (None, Some(msg)),
                 }
             }
             3 => {
-                // Step 4: Safety → move to step 5
-                match validate_json_field(assistant_text, &["safe"]) {
-                    Ok(_) => (Some(4), None),
-                    Err(msg) => (None, Some(msg)),
-                }
-            }
-            4 => {
-                // Step 5: Execute until ## Done
+                // Step 3: Execute until ## Done
                 if assistant_text.contains("## Done") || assistant_text.contains("【Done】") {
                     if step_idx + 1 >= _total { (None, None) } else { (Some(step_idx + 1), None) }
                 } else {

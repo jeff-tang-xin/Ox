@@ -593,7 +593,10 @@ async fn run_app(
                             }
                         }
                     }
-                    Some(Event::Resize(_, _)) => { app.dirty = true; }
+                    Some(Event::Resize(_, _)) => {
+                        app.output.invalidate_cache();
+                        app.dirty = true;
+                    }
                     Some(Event::Tick) | None => {
                         tick_count = tick_count.wrapping_add(1);
                         app.spinner_frame = tick_count;
@@ -872,8 +875,104 @@ fn process_text_input(
     app.status = "⏳ Preparing...".to_string();
     app.dirty = true;
 
+    // Reset interrupt flag on new user input
+    app.workflow_interrupted = false;
+
+    // ── Workflow confirmation handling: user sent text while workflow awaits confirmation ──
+    let pending_confirmation_step = if let Some(ref wf) = app.workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            if engine.is_current_step_waiting_confirmation() {
+                Some(engine.get_current_step_index())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(step_idx) = pending_confirmation_step {
+        let is_confirmation = {
+            let t = text.trim().to_lowercase();
+            t == "ok" || t == "y" || t == "yes" || t == "go"
+                || t == "继续" || t == "确认" || t == "好" || t == "可以"
+                || t == "行" || t == "是的" || t == "对"
+        };
+
+        if step_idx == 1 {
+            if is_confirmation {
+                // ── Plan confirmed: advance and SPAWN NEXT STEP directly ──
+                app.output.push_system("✅ 计划已确认。继续执行...");
+                if let Some(ref wf) = app.workflow_engine {
+                    if let Ok(mut engine) = wf.try_lock() {
+                        engine.clear_confirmation_flag();
+                        let _ = engine.advance_step();
+                    }
+                }
+                // Record confirmation as system message (not user message)
+                let _ = session.append_message(Message::system(
+                    "User confirmed the plan. Continue to next step."
+                ));
+                app.dirty = true;
+                // ⚡ Directly spawn next workflow step — DON'T fall through to normal text processing
+                spawn_next_workflow_step_if_needed(
+                    app, session, provider, agent_tx, tool_registry, tool_ctx,
+                    context_builder, context_window, interrupt_ctrl, agent_config,
+                    trust_manager, config, rt_env, "",
+                );
+                return;
+            } else {
+                // ── Plan feedback: rewind and re-run Step 1 with feedback ──
+                app.output.push_system(&format!(
+                    "📝 修改意见已收到。重新生成计划...\n修改意见: {}",
+                    text
+                ));
+                if let Some(ref wf) = app.workflow_engine {
+                    if let Ok(mut engine) = wf.try_lock() {
+                        engine.clear_confirmation_flag();
+                        let _ = engine.go_to_step(1);
+                    }
+                }
+                let _ = session.append_message(Message::system(&format!(
+                    "📝 User reviewed the plan and gave feedback:\n{}\n\nPlease revise the plan based on this feedback and output the updated JSON.",
+                    text
+                )));
+                // Fall through to spawn agent turn with feedback context
+            }
+        } else if step_idx == 2 {
+            // Review feedback — treat text as feedback to revise
+            app.output.push_system(&format!(
+                "📝 Feedback on review. Revising...\n{}",
+                text
+            ));
+            if let Some(ref wf) = app.workflow_engine {
+                if let Ok(mut engine) = wf.try_lock() {
+                    engine.clear_confirmation_flag();
+                    let _ = engine.go_to_step(2);
+                }
+            }
+            let _ = session.append_message(Message::system(&format!(
+                "📝 User reviewed the safety check and gave feedback:\n{}\nPlease re-evaluate and output the updated JSON.",
+                text
+            )));
+        } else {
+            // Other confirmation steps — treat as approve and advance
+            if let Some(ref wf) = app.workflow_engine {
+                if let Ok(mut engine) = wf.try_lock() {
+                    engine.clear_confirmation_flag();
+                    let _ = engine.advance_step();
+                }
+            }
+            app.output.push_system("✅ Confirmed. Continuing to next step...");
+            let _ = session.append_message(Message::system("User confirmed. Continue to next step."));
+        }
+        // Fall through to spawn agent turn with updated state
+    }
+
     // Injection scan
-    let user_text = if injection::is_suspicious(text) {
+    let text = if injection::is_suspicious(text) {
         let result = injection::detect(text);
         let categories: Vec<String> =
             result.matches.iter().map(|m| format!("{:?}", m.category)).collect();
@@ -888,10 +987,10 @@ fn process_text_input(
     };
 
     // Save user message
-    let _ = session.append_message(Message::user(&user_text));
+    let _ = session.append_message(Message::user(&text));
 
     // Workflow feedback detection
-    detect_workflow_feedback(app, session, &user_text);
+    detect_workflow_feedback(app, session, &text);
 
     // Spawn agent turn with pre-turn pipeline
     let rt_env_clone = rt_env.clone();
@@ -919,7 +1018,7 @@ fn process_text_input(
         let result = handlers::pre_turn::prepare_turn(
             &config_clone, &rt_env_clone, &tool_registry_clone,
             &context_builder_clone, context_window,
-            &knowledge_engine_clone, &user_text,
+            &knowledge_engine_clone, &text,
             &session_messages, &compressed_cache_data,
             TurnVariant::Normal,
             &workflow_engine_clone, &session_id, &status_tx,
@@ -940,18 +1039,18 @@ fn process_text_input(
 }
 
 /// Detect workflow feedback in user text and trigger rewind if needed.
-fn detect_workflow_feedback(app: &mut App, session: &mut Session, user_text: &str) {
+fn detect_workflow_feedback(app: &mut App, session: &mut Session, text: &str) {
     if let Some(ref wf_info) = app.workflow_display {
-        let is_feedback = user_text.contains("修改")
-            || user_text.contains("改")
-            || user_text.contains("调整")
-            || user_text.contains("优化")
-            || user_text.contains("不对")
-            || user_text.contains("错误")
-            || user_text.to_lowercase().contains("revise")
-            || user_text.to_lowercase().contains("modify")
-            || user_text.to_lowercase().contains("change")
-            || user_text.to_lowercase().contains("update");
+        let is_feedback = text.contains("修改")
+            || text.contains("改")
+            || text.contains("调整")
+            || text.contains("优化")
+            || text.contains("不对")
+            || text.contains("错误")
+            || text.to_lowercase().contains("revise")
+            || text.to_lowercase().contains("modify")
+            || text.to_lowercase().contains("change")
+            || text.to_lowercase().contains("update");
         if is_feedback {
             let rewind_step = match wf_info.step_name.as_str() {
                 "Await Spec Confirmation" => Some(1),
@@ -970,7 +1069,7 @@ fn detect_workflow_feedback(app: &mut App, session: &mut Session, user_text: &st
                 }
                 let _ = session.append_message(Message::system(&format!(
                     "📝 User provided revision feedback:\n{}\n\nPlease revise your work based on this feedback.",
-                    user_text
+                    text
                 )));
             }
         }
@@ -1298,16 +1397,29 @@ fn spawn_next_workflow_step_if_needed(
     rt_env: &runtime::RuntimeEnvironment,
     _system_prompt: &str,
 ) {
-    let (step_prompt, step_idx, should_continue) = if let Some(ref wf) = app.workflow_engine {
+    // ── Don't auto-spawn if user interrupted the previous step ──
+    if app.workflow_interrupted {
+        tracing::info!("[WORKFLOW] Skipping auto-spawn: user interrupted previous step");
+        return;
+    }
+
+    let (step_prompt, step_idx, should_continue, awaiting_confirmation) = if let Some(ref wf) = app.workflow_engine {
         if let Ok(engine) = wf.try_lock() {
             let prompt = engine.get_step_system_prompt();
             let idx = engine.get_current_step_index();
             let cont = engine.is_workflow_active() && !engine.is_workflow_complete();
-            (prompt, idx, cont)
-        } else { (None, 0, false) }
-    } else { (None, 0, false) };
+            let waiting = engine.is_current_step_waiting_confirmation();
+            (prompt, idx, cont, waiting)
+        } else { (None, 0, false, false) }
+    } else { (None, 0, false, false) };
 
     if !should_continue || provider.is_none() {
+        return;
+    }
+
+    // ── Don't auto-spawn if workflow is waiting for user confirmation ──
+    if awaiting_confirmation {
+        tracing::info!("[WORKFLOW] Skipping auto-spawn: waiting for user confirmation");
         return;
     }
 

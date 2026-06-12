@@ -100,13 +100,13 @@ fn build_system_prompt_inner(
     let is_wf = workflow_step_prompt.is_some();
     let si = step_index.unwrap_or(5); // 5 = no trim (full)
 
-    // Tools: only Step 5 (Execution)
-    if !is_wf || si >= 4 {
+    // Tools: only Step 3 (Execute)
+    if !is_wf || si >= 3 {
         parts.push(build_tool_block());
     }
 
-    // Skills: only Step 2 (Planning) and Step 5 (Execution)
-    if !is_wf || si == 1 || si >= 4 {
+    // Skills: Step 1 (Plan) and Step 3 (Execute)
+    if !is_wf || si == 1 || si >= 3 {
         if tool_registry.has_skills() {
             let mut s = String::from("【方法】\n");
             for skill in &tool_registry.get_skills_list() {
@@ -116,7 +116,7 @@ fn build_system_prompt_inner(
         }
     }
 
-    // Spec: only Step 2 (Planning)
+    // Spec: only Step 1 (Plan)
     if !is_wf || si == 1 {
         if let Some(spec) = _spec_content {
             if !spec.trim().is_empty() {
@@ -125,8 +125,8 @@ fn build_system_prompt_inner(
         }
     }
 
-    // User rules: only Step 4 (Safety) and Step 5 (Execution)
-    if !is_wf || si >= 3 {
+    // User rules: Step 2 (Review) and Step 3 (Execute)
+    if !is_wf || si >= 2 {
         if let Some(rules_md) = load_user_rules(rt_env) {
             parts.push(format!("【用户规则】\n{}\n", rules_md));
         } else if let Some(br) = behavior_rules {

@@ -124,6 +124,7 @@ pub async fn run_agent_turn(
     const MAX_SAME_TOOL_CALLS: u32 = 5; // Maximum times the same tool can be called in one turn
 
     let mut iteration = 0u32;
+    let mut tools_used_this_turn: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // 🎯 Capture the first user message for task anchoring
     let user_task = messages.iter()
@@ -250,8 +251,8 @@ pub async fn run_agent_turn(
             }
         }
 
-        // 🎯 Task anchoring + periodic knowledge re-injection
-        context_injector::inject_context(&mut messages, &user_task, iteration, &tool_ctx);
+        // 🎯 Task anchoring + exploration progress + multi-layer memory re-injection
+        context_injector::inject_context(&mut messages, &user_task, iteration, &tool_ctx, &workflow_engine);
 
         // 🚨 Sanitize tool pairs before EVERY LLM call within the agent turn.
         // This prevents OpenAI API errors like "ToolResult references non-existent tool call"
@@ -259,11 +260,11 @@ pub async fn run_agent_turn(
         crate::context::sanitize_tool_pairs(&mut messages);
 
         // ── Determine if current step is "internal" BEFORE LLM call ──
-        // Internal steps (0, 2, 3): suppress raw JSON output from UI
+        // Steps 0,1,2 (Intent, Plan, Review): suppress raw JSON; Step 3 (Execute): show full output
         let (is_internal_step, pre_llm_step_idx) = if let Some(ref engine_arc) = workflow_engine {
             if let Ok(engine) = engine_arc.try_lock() {
                 let idx = engine.get_current_step_index();
-                (idx != 4, idx)  // All non-execution steps are internal
+                (idx != 3, idx)  // Only Step 3 (Execute) is not internal
             } else { (false, 5) }
         } else { (false, 5) };
 
@@ -274,23 +275,32 @@ pub async fn run_agent_turn(
         let msgs = messages.clone();
 
         // Filter tool schemas based on current workflow step
-        let schemas = if planning_mode && iteration == 0 {
+        let schemas: Vec<_> = if planning_mode && iteration == 0 {
             vec![] // Planning mode: no tools in first iteration
         } else if let Some(ref engine_arc) = workflow_engine {
             let engine = engine_arc.lock().await;
             let allowed_tools = engine.get_allowed_tools();
+            let step_idx = engine.get_current_step_index();
 
-            if allowed_tools.is_empty() {
-                // Empty list means all tools allowed
+            let mut schemas: Vec<_> = if allowed_tools.is_empty() {
                 tool_schemas.clone()
             } else {
-                // Filter to only include allowed tools
                 tool_schemas
                     .iter()
                     .filter(|schema| allowed_tools.contains(&schema.name))
                     .cloned()
                     .collect()
+            };
+
+            // ── Step 1: remove project_detect after first use ──
+            if step_idx == 1 && tools_used_this_turn.contains("project_detect") {
+                let before = schemas.len();
+                schemas.retain(|s| s.name != "project_detect");
+                if schemas.len() < before {
+                    tracing::info!("[STEP1] Removed project_detect from schema (already used, iter {})", iteration);
+                }
             }
+            schemas
         } else {
             tool_schemas.clone()
         };
@@ -389,11 +399,9 @@ pub async fn run_agent_turn(
                     reasoning_content.push_str(&text);
                 }
                 LlmStreamEvent::ToolCallStart { id, name } => {
-                    let _ = ui_tx.send(AgentToUiEvent::ToolStart {
-                        name: name.clone(),
-                        id: id.clone(),
-                        detail: None,
-                    });
+                    // Don't show ToolStart in UI yet — the tool may be rejected
+                    // by workflow validation later. Only show when actually executing.
+                    tracing::debug!("[AGENT] LLM requested tool: {} (id={})", name, id);
                     current_tool_args.insert(id.clone(), String::new());
                     tool_calls.push(ToolCall {
                         id,
@@ -482,8 +490,22 @@ pub async fn run_agent_turn(
 
         // If no tool calls, the turn is complete.
         if tool_calls.is_empty() {
+            // Format internal step outputs for session storage (same as tool-calls path)
+            let content_for_session = if is_internal_step {
+                let step_status = workflow_engine.as_ref().and_then(|wf| {
+                    wf.try_lock().ok().and_then(|e| {
+                        e.current_step().map(|s| {
+                            if s.display_status.is_empty() { s.name.clone() } else { s.display_status.clone() }
+                        })
+                    })
+                }).unwrap_or_else(|| String::new());
+                format_step_output(pre_llm_step_idx, &full_text, &step_status)
+            } else {
+                full_text.clone()
+            };
+
             let msg = Message::Assistant {
-                content: full_text.clone(), // Clone for workflow check
+                content: content_for_session,
                 tool_calls: Vec::new(),
                 reasoning_content: if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) },
             };
@@ -511,6 +533,50 @@ pub async fn run_agent_turn(
                 match advance_result {
                     Some(_) => {
                         engine.set_previous_output(&full_text);
+
+                        // ── Plan Review Pause: after Step 1 (Plan), show plan and wait for user ──
+                        if pre_llm_step_idx == 1 {
+                            // Format the plan for display
+                            let plan_display = format_step_output(1, &full_text, "📋 任务规划");
+                            // Send plan to UI before TurnDone (internal steps suppress streaming,
+                            // so we must explicitly push the formatted plan to the output pane)
+                            let _ = ui_tx.send(AgentToUiEvent::TextChunk(format!("\n{}\n", plan_display)));
+                            let _ = ui_tx.send(AgentToUiEvent::TextChunk(
+                                "\n---\n请审阅以上计划。\n- 输入修改意见来调整计划\n- 输入 **ok** / **继续** / **确认** 来执行\n".to_string()
+                            ));
+                            // Replace the raw JSON Assistant message with formatted plan for session storage
+                            if let Some(last_assistant) = new_messages.iter_mut().rev()
+                                .find(|m| matches!(m, Message::Assistant { .. }))
+                            {
+                                if let Message::Assistant { content, .. } = last_assistant {
+                                    *content = plan_display.clone();
+                                }
+                            }
+                            let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                                "📋 计划已生成 — 请审阅后回复确认或提出修改意见"
+                            )));
+                            // Save entity
+                            let l0_entity = Entity::working_memory(
+                                "current",
+                                &format!("[Plan] {}", &full_text.chars().take(500).collect::<String>()),
+                                None, None, vec![], false,
+                            );
+                            {
+                                let knowledge = Arc::clone(&tool_ctx.knowledge);
+                                tokio::spawn(async move {
+                                    if let Ok(mut eng) = knowledge.try_write() {
+                                        eng.push_turn_buffer(l0_entity);
+                                    }
+                                });
+                            }
+                            // Set confirmation flag to pause workflow
+                            engine.set_confirmation_flag();
+                            let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                                new_messages,
+                                usage: total_usage,
+                            });
+                            return;
+                        }
 
                         let step_name = engine.current_step()
                             .map(|s| if s.name.is_empty() { format!("step-{}", 0) } else { s.name.clone() })
@@ -595,7 +661,7 @@ pub async fn run_agent_turn(
                             continue;
                         }
                         // Step 4 (Execution): ## Done detected — advance past last step
-                        if pre_llm_step_idx == 4 {
+                        if pre_llm_step_idx == 3 {
                             let _ = engine.advance_step();
                         }
                         // Fall through to TurnDone
@@ -670,18 +736,15 @@ pub async fn run_agent_turn(
             .collect();
 
         // Push assistant message — format internal step JSON as user-readable summary
-        // Step 0 (Intent): "🧠 exploring(complex) — 项目流程架构分析"
-        // Step 1 (Plan): show full plan JSON (user needs to see it)
-        // Step 2 (Params): "explain: 分析项目流程架构"
-        // Step 3 (Safety): "✅ 安全" or "⚠️ 需要注意"
-        // Step 4 (Exec): show normally
+        // Step 0 (Intent), Step 1 (Plan), Step 2 (Review): formatted summary
+        // Step 3 (Execute): show full output normally
         let (is_internal, step_idx, step_status) = if let Some(ref engine_arc) = workflow_engine {
             if let Ok(engine) = engine_arc.try_lock() {
                 let idx = engine.get_current_step_index();
                 let status = engine.current_step()
                     .map(|s| if s.display_status.is_empty() { s.name.clone() } else { s.display_status.clone() })
                     .unwrap_or_else(|| String::new());
-                (idx != 1 && idx != 4, idx, status)
+                (idx != 3, idx, status)
             } else { (false, 5, String::new()) }
         } else { (false, 5, String::new()) };
 
@@ -977,10 +1040,10 @@ pub async fn run_agent_turn(
                 };
 
             // 🆕 Workflow step validation before execution
-            // In 5-step pipeline mode, the pipeline ensures planning was done in Steps 2-4.
-            // Rule enforcement (plan_before_edit, read_before_edit) is bypassed for Step 5+.
+            // In pipeline mode, Steps 0-2 handle planning/review. Rule enforcement
+            // (plan_before_edit, read_before_edit) is bypassed for Step 3 (Execute).
             let skip_plan_rules = matches!(&workflow_engine, Some(wf) if {
-                wf.try_lock().map_or(false, |e| e.is_workflow_active() && e.get_current_step_index() >= 4)
+                wf.try_lock().map_or(false, |e| e.is_workflow_active() && e.get_current_step_index() >= 3)
             });
 
             if !skip_plan_rules {
@@ -1407,17 +1470,18 @@ pub async fn run_agent_turn(
                     "📋 ✅ {tool_name}{file_info} — 已完成",
                     tool_name = tool_name, file_info = file_info
                 )));
+                tools_used_this_turn.insert(tool_name);
             }
 
             // 📖 Verify-after-edit: prompt LLM to verify changes
             if matches!(tc.name.as_str(), "edit_file" | "delete_range" | "file_write") && !result.is_error {
-                // Step 5 skill file creation: tell LLM to output ## Done
-                let is_step5 = workflow_engine.as_ref().map_or(false, |wf| {
-                    wf.try_lock().map_or(false, |e| e.get_current_step_index() == 4)
+                // Execute step skill creation: tell LLM to output ## Done
+                let is_execute_step = workflow_engine.as_ref().map_or(false, |wf| {
+                    wf.try_lock().map_or(false, |e| e.get_current_step_index() == 3)
                 });
                 let is_skill = tc.arguments.contains(".ox/skills/");
 
-                if is_step5 && is_skill {
+                if is_execute_step && is_skill {
                     messages.push(Message::system(
                         "✅ 文件已写入。如果所有需要的文件都已完成，输出 `## Done` 结束。"
                     ));
@@ -1425,20 +1489,11 @@ pub async fn run_agent_turn(
             } // verify-after-edit
         } // end for tc
 
-        // 🧭 Step 2 exploration guidance: prevent infinite exploration loops
-        if pre_llm_step_idx == 1 {
-            let explore_tool_count = new_messages.iter()
-                .filter(|m| matches!(m, Message::ToolResult { .. }))
-                .count();
-            if explore_tool_count >= 4 {
-                messages.push(Message::system(
-                    "已探索足够。立即输出计划 JSON，不要再调用工具。"
-                ));
-            } else if explore_tool_count >= 2 {
-                messages.push(Message::system(
-                    &format!("已探索 {} 轮。再探索 1 轮后必须输出计划 JSON。", explore_tool_count)
-                ));
-            }
+        // 🧭 Step 2 exploration guidance: only warn about truly immutable tools
+        if pre_llm_step_idx == 1 && tools_used_this_turn.contains("project_detect") {
+            messages.push(Message::system(
+                "⚡ project_detect 已经调用过，结果不会改变，不要重复。file_list 可以用于探索不同子目录。"
+            ));
         }
 
         // 🗺️ Inject task canvas if any results were offloaded
@@ -1667,39 +1722,89 @@ fn format_step_output(step_idx: usize, text: &str, fallback: &str) -> String {
                 format!("_🤔 分析意图_")
             }
         }
-        2 => {
-            // Step 2: Parameter Extraction
+        1 => {
+            // Step 1: Task Planning — parse detailed plan JSON
             if let Some(ref v) = parsed {
-                let action = v.get("action").and_then(|s| s.as_str()).unwrap_or("?");
-                let desc = v.get("description").and_then(|s| s.as_str()).unwrap_or("");
-                let file = v.get("target_file").and_then(|s| s.as_str()).unwrap_or("");
-                let sym = v.get("target_symbol").and_then(|s| s.as_str()).unwrap_or("");
-                let target = if !file.is_empty() && file != "null" {
-                    if !sym.is_empty() && sym != "null" {
-                        format!(" {}::{}", file, sym)
-                    } else { format!(" {}", file) }
-                } else { String::new() };
-                if desc.is_empty() {
-                    format!("{} {}{}", match action {"add"=>"➕","modify"=>"✏️","delete"=>"🗑️","explain"=>"🔍",_=>"→"}, action, target)
-                } else {
-                    format!("{} {}{}: {}", match action {"add"=>"➕","modify"=>"✏️","delete"=>"🗑️","explain"=>"🔍",_=>"→"}, action, target, desc)
+                let mut lines = vec!["📋 **执行计划**".to_string()];
+                if let Some(plan) = v.get("plan").and_then(|p| p.as_array()) {
+                    for step in plan {
+                        if let Some(obj) = step.as_object() {
+                            let num = obj.get("step").and_then(|s| s.as_u64()).unwrap_or(0);
+                            let file = obj.get("file").and_then(|s| s.as_str()).unwrap_or("");
+                            let action = obj.get("action").and_then(|s| s.as_str()).unwrap_or("");
+                            let target = obj.get("target").and_then(|s| s.as_str()).unwrap_or("");
+                            let desc = obj.get("desc").and_then(|s| s.as_str()).unwrap_or("");
+                            let verify = obj.get("verify").and_then(|s| s.as_str()).unwrap_or("");
+
+                            let action_icon = match action {
+                                "add" | "create" => "➕",
+                                "modify" => "✏️",
+                                "delete" => "🗑️",
+                                _ => "→",
+                            };
+                            let target_str = if target.is_empty() { String::new() } else { format!(" `{}`", target) };
+                            let file_str = if file.is_empty() { String::new() } else { format!(" 📄`{}`", file) };
+                            let verify_str = if verify.is_empty() { String::new() } else { format!(" 🔍{}", verify) };
+
+                            lines.push(format!(
+                                "  {}. {}{}{} — {}{}",
+                                num, action_icon, target_str, file_str, desc, verify_str
+                            ));
+                        } else if let Some(s) = step.as_str() {
+                            // Backward compat: old string format
+                            lines.push(format!("  - {}", s));
+                        }
+                    }
                 }
+                if let Some(skills) = v.get("skills").and_then(|s| s.as_array()) {
+                    let skill_names: Vec<&str> = skills.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect();
+                    if !skill_names.is_empty() {
+                        lines.push(format!("\n🧠 Skills: {}", skill_names.join(", ")));
+                    }
+                }
+                if let Some(files) = v.get("key_files").and_then(|f| f.as_array()) {
+                    let file_names: Vec<&str> = files.iter()
+                        .filter_map(|f| f.as_str())
+                        .collect();
+                    if !file_names.is_empty() {
+                        lines.push(format!("📁 关键文件: {}", file_names.join(", ")));
+                    }
+                }
+                lines.join("\n")
             } else {
-                format!("_🔎 提取参数_")
+                format!("_📋 任务规划_")
             }
         }
-        3 => {
-            // Step 3: Safety Check
+        2 => {
+            // Step 2: Review — safety + completeness check on the plan
             if let Some(ref v) = parsed {
                 let safe = v.get("safe").and_then(|s| s.as_bool()).unwrap_or(true);
-                if safe {
-                    "✅ 安全".to_string()
+                let complete = v.get("complete").and_then(|c| c.as_bool()).unwrap_or(true);
+                let issues = v.get("issues").and_then(|i| i.as_array())
+                    .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let warnings = v.get("warnings").and_then(|w| w.as_array())
+                    .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+
+                let mut lines = Vec::new();
+                if safe && complete && issues.is_empty() {
+                    lines.push("✅ 计划通过审阅".to_string());
                 } else {
-                    let reason = v.get("reason").and_then(|s| s.as_str()).unwrap_or("");
-                    format!("⚠️ 不安全 — {}", reason)
+                    if !safe { lines.push("⚠️ 安全问题".to_string()); }
+                    if !complete { lines.push("⚠️ 计划不完整".to_string()); }
+                    for issue in &issues {
+                        lines.push(format!("  ❌ {}", issue));
+                    }
                 }
+                for warning in &warnings {
+                    lines.push(format!("  💡 {}", warning));
+                }
+                lines.join("\n")
             } else {
-                "🛡️ 安全检查".to_string()
+                "🛡️ 审阅计划".to_string()
             }
         }
         _ => format!("_{}_", fallback),

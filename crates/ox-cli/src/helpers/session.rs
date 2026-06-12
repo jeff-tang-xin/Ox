@@ -73,7 +73,9 @@ pub fn replay_session_history(
                 ..
             } => {
                 if !content.is_empty() {
-                    app.output.push_line(OutputLine::Markdown(content.clone()));
+                    // For old sessions: detect internal step JSON and format it for display
+                    let display = maybe_format_internal_step_output(content);
+                    app.output.push_line(OutputLine::Markdown(display));
                 }
                 for tc in tool_calls {
                     tc_map.insert(tc.id.clone(), tc.name.clone());
@@ -106,6 +108,109 @@ pub fn replay_session_history(
 
     refresh_header_info(app, rt_env, has_provider);
     app.message_count = messages.len();
+}
+
+/// Detect and format internal workflow step JSON output for display.
+/// Used during session replay to prettify raw JSON stored in older sessions.
+fn maybe_format_internal_step_output(content: &str) -> String {
+    let json_str = if let (Some(s), Some(e)) = (content.find('{'), content.rfind('}')) {
+        &content[s..=e]
+    } else {
+        return content.to_string();
+    };
+
+    let parsed: Option<serde_json::Value> = serde_json::from_str(json_str).ok();
+    let v = match parsed {
+        Some(v) => v,
+        None => return content.to_string(),
+    };
+
+    // Detect step type by JSON fields and format accordingly
+    if v.get("intent").and_then(|s| s.as_str()).is_some() {
+        // Step 0: Intent Classification
+        let intent = v.get("intent").and_then(|s| s.as_str()).unwrap_or("?");
+        let complexity = v.get("complexity").and_then(|s| s.as_str()).unwrap_or("");
+        let topic = v.get("topic").and_then(|s| s.as_str()).unwrap_or("");
+        let emoji = match intent {
+            "coding" => "💻", "exploring" => "🔍", "chat" => "💬", _ => "🤔",
+        };
+        if topic.is_empty() {
+            format!("{} {}({})", emoji, intent, complexity)
+        } else {
+            format!("{} {}({}) — {}", emoji, intent, complexity, topic)
+        }
+    } else if v.get("plan").and_then(|p| p.as_array()).is_some() {
+        // Step 1: Task Planning (supports both old string format and new object format)
+        let mut lines = vec!["📋 **执行计划**".to_string()];
+        if let Some(plan) = v.get("plan").and_then(|p| p.as_array()) {
+            for step in plan {
+                if let Some(obj) = step.as_object() {
+                    let num = obj.get("step").and_then(|s| s.as_u64()).unwrap_or(0);
+                    let file = obj.get("file").and_then(|s| s.as_str()).unwrap_or("");
+                    let action = obj.get("action").and_then(|s| s.as_str()).unwrap_or("");
+                    let target = obj.get("target").and_then(|s| s.as_str()).unwrap_or("");
+                    let desc = obj.get("desc").and_then(|s| s.as_str()).unwrap_or("");
+                    let verify = obj.get("verify").and_then(|s| s.as_str()).unwrap_or("");
+                    let action_icon = match action {
+                        "add" | "create" => "➕", "modify" => "✏️", "delete" => "🗑️", _ => "→",
+                    };
+                    let target_str = if target.is_empty() { String::new() } else { format!(" `{}`", target) };
+                    let file_str = if file.is_empty() { String::new() } else { format!(" 📄`{}`", file) };
+                    let verify_str = if verify.is_empty() { String::new() } else { format!(" 🔍{}", verify) };
+                    lines.push(format!(
+                        "  {}. {}{}{} — {}{}", num, action_icon, target_str, file_str, desc, verify_str
+                    ));
+                } else if let Some(s) = step.as_str() {
+                    lines.push(format!("  - {}", s));
+                }
+            }
+        }
+        if let Some(skills) = v.get("skills").and_then(|s| s.as_array()) {
+            let names: Vec<&str> = skills.iter().filter_map(|s| s.as_str()).collect();
+            if !names.is_empty() { lines.push(format!("\n🧠 Skills: {}", names.join(", "))); }
+        }
+        if let Some(files) = v.get("key_files").and_then(|f| f.as_array()) {
+            let names: Vec<&str> = files.iter().filter_map(|f| f.as_str()).collect();
+            if !names.is_empty() { lines.push(format!("📁 关键文件: {}", names.join(", "))); }
+        }
+        lines.join("\n")
+    } else if v.get("safe").and_then(|s| s.as_bool()).is_some()
+        && v.get("complete").and_then(|c| c.as_bool()).is_some()
+    {
+        // Step 2: Review (new format with safe + complete)
+        let safe = v.get("safe").and_then(|s| s.as_bool()).unwrap_or(true);
+        let complete = v.get("complete").and_then(|c| c.as_bool()).unwrap_or(true);
+        let issues = v.get("issues").and_then(|i| i.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let warnings = v.get("warnings").and_then(|w| w.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut lines = Vec::new();
+        if safe && complete && issues.is_empty() {
+            lines.push("✅ 计划通过审阅".to_string());
+        } else {
+            if !safe { lines.push("⚠️ 安全问题".to_string()); }
+            if !complete { lines.push("⚠️ 计划不完整".to_string()); }
+            for issue in &issues { lines.push(format!("  ❌ {}", issue)); }
+        }
+        for warning in &warnings { lines.push(format!("  💡 {}", warning)); }
+        lines.join("\n")
+    } else if v.get("safe").and_then(|s| s.as_bool()).is_some()
+        && v.get("complete").is_none()
+    {
+        // Old Safety Check (backward compat: safe but no "complete" field)
+        let safe = v.get("safe").and_then(|s| s.as_bool()).unwrap_or(true);
+        if safe {
+            "✅ 安全".to_string()
+        } else {
+            let reason = v.get("reason").and_then(|s| s.as_str()).unwrap_or("");
+            format!("⚠️ 不安全 — {}", reason)
+        }
+    } else {
+        // Not an internal step output — leave as-is
+        content.to_string()
+    }
 }
 
 /// Refresh header_info from current runtime state.

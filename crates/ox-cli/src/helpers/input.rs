@@ -174,6 +174,7 @@ pub fn handle_interrupt_key(
                 }
                 InterruptAction::CancelAgent => {
                     app.agent_running = false;
+                    app.workflow_interrupted = true;
                     app.output.push_system("Agent interrupted.");
                     app.status = "Ox".to_string();
                 }

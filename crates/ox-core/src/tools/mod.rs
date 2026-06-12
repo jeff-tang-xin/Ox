@@ -246,37 +246,17 @@ impl ToolRegistry {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
-    /// Get all tool schemas for LLM API calls (includes Skills as special tools).
+    /// Get all tool schemas for LLM API calls.
+    /// Skills are listed in the system prompt, not as tool schemas.
     pub fn schemas(&self) -> Vec<crate::llm::ToolSchema> {
-        let mut schemas: Vec<crate::llm::ToolSchema> = self.tools
+        self.tools
             .values()
             .map(|t| crate::llm::ToolSchema {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
                 parameters: t.parameters_schema(),
             })
-            .collect();
-        
-        // Add Skills as special composite tools
-        let skills = self.skills.lock().unwrap();
-        for skill in skills.iter() {
-            schemas.push(crate::llm::ToolSchema {
-                name: format!("skill_{}", skill.id),
-                description: format!(
-                    "[SKILL] {} - {}\n\n{}",
-                    skill.name,
-                    skill.description,
-                    skill.content
-                ),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "description": "This skill provides guidance. No parameters needed."
-                }),
-            });
-        }
-        
-        schemas
+            .collect()
     }
 
     /// List all tool names.

@@ -179,6 +179,10 @@ pub struct App {
     // 🆕 Plan tracking: parsed from LLM ## Plan / ## Done blocks
     pub plan_items: Vec<PlanItem>,
 
+    /// Flag set when user interrupts the agent (Ctrl+C). Prevents auto-spawning
+    /// the next workflow step after the interrupted turn completes.
+    pub workflow_interrupted: bool,
+
     // Fields needed by slash command handlers
     /// Session action signaled by slash commands, processed in the main event loop.
     pub session_action: SessionAction,
@@ -246,6 +250,9 @@ impl App {
 
             // Plan tracking
             plan_items: Vec::new(),
+
+            // Interrupt tracking
+            workflow_interrupted: false,
 
             // Slash command context fields
             session_action: SessionAction::None,
@@ -404,12 +411,12 @@ impl App {
                 tracing::warn!("Failed to activate spec workflow: {}", e);
             } else {
                 // 🚨 Restore step index if we're in Spec Mode
-                if session_meta.workflow_step_index > 0 && session_meta.workflow_step_index < 5 {
+                if session_meta.workflow_step_index > 0 && session_meta.workflow_step_index < 4 {
                     // Advance to the saved step
                     for _ in 0..session_meta.workflow_step_index {
                         let _ = engine.advance_step();
                     }
-                    tracing::info!("Advanced to step {}/5", session_meta.workflow_step_index + 1);
+                    tracing::info!("Advanced to step {}/4", session_meta.workflow_step_index + 1);
                 }
             }
         } else {
