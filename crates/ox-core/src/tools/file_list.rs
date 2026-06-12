@@ -16,7 +16,7 @@ impl Tool for FileListTool {
     }
 
     fn description(&self) -> &str {
-        "List files and directories. Supports glob patterns. Use to explore project structure."
+        "List immediate children of a directory (non-recursive, one level only). Supports glob patterns. Use separate calls for subdirectories."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -25,7 +25,7 @@ impl Tool for FileListTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory path or glob pattern (e.g., 'src/**/*.rs'). Default: list root."
+                    "description": "Directory path (non-recursive, one level). Use specific subdirectory paths to drill deeper. Default: root."
                 }
             }
         })

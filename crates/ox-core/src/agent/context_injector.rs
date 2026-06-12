@@ -95,10 +95,25 @@ fn build_exploration_progress(messages: &[Message]) -> String {
                         }
                     }
                     "file_list" => {
-                        // Extract first line as directory hint
-                        let first_line = content.lines().nth(1).unwrap_or("");
-                        let hint: String = first_line.chars().take(40).collect();
-                        parts.push(format!("  file_list → {}", hint));
+                        // file_list output starts with "📁 <dir>/" — extract the directory path
+                        let dir_hint = if let Some(line) = content.lines().nth(1) {
+                            let line = line.trim();
+                            if line.starts_with("📁 ") {
+                                // Keep just the last 2 path components for readability
+                                let path = &line[2..].trim_end_matches('/');
+                                let components: Vec<&str> = path.split('/').collect();
+                                if components.len() > 2 {
+                                    format!("{}/{}", components[components.len()-2], components[components.len()-1])
+                                } else {
+                                    path.to_string()
+                                }
+                            } else {
+                                line.chars().take(50).collect()
+                            }
+                        } else {
+                            "?".to_string()
+                        };
+                        parts.push(format!("  file_list({}) → 已列出", dir_hint));
                     }
                     "file_read" => {
                         parts.push("  file_read → 已读取".to_string());

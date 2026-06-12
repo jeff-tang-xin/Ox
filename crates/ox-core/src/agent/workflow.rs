@@ -163,10 +163,11 @@ pub fn create_default_workflow() -> Workflow {
 
 【工具使用规则】
 - project_detect — 只调一次，结果不变
-- file_list <dir> — 列出目录内容，可多次用于不同子目录
-- file_read <file> — 读文件内容
-- find_symbol <name> — 按函数/结构体/方法名查找定义位置（如 find_symbol handle_key）
-- code_search <pattern> — 按文本模式搜索（如搜索 TODO、Ctrl+C 等字符串）
+- file_list <dir> — 列出指定目录的直接子项（不递归），不同子目录需分别调用
+  ⚠️ file_list 只返回一层！要深入子目录需指定路径如 file_list src/main/java
+- file_read <file> — 读文件完整内容
+- find_symbol <name> — 按函数/类/方法名查找定义位置
+- code_search <pattern> — 按文本模式搜索代码
 - load_skill <name> — 加载项目 skill
 - 已读过的文件不要重复读
 
