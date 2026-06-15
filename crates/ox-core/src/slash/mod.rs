@@ -43,7 +43,6 @@ pub enum SlashCommand {
         /// Subcommand: status, show, on, off, edit, clear, or inline content
         action: String,
     },
-    Free,
     // Workflow confirmation commands
     Approve, // /Y - Approve and proceed
     Reject,  // /N - Reject and abort
@@ -116,7 +115,6 @@ pub fn parse_slash_command(cmd: &str, args: &str) -> SlashCommand {
         "spec" => SlashCommand::Spec {
             action: args.to_string(),
         },
-        "free" => SlashCommand::Free,
         // Workflow confirmation commands
         "y" | "Y" => SlashCommand::Approve,
         "n" | "N" => SlashCommand::Reject,
@@ -172,7 +170,6 @@ Commands:
   /init             Create default config (~/.ox/config.toml)
   /debug            Show debug info
   /spec <action>    Spec mode (on/off/edit/status) - structured workflow
-  /free             Switch to free mode (deactivate any workflow)
   /reload           Reload session from disk (JSONL)
 
   /y                Approve and proceed to next phase (workflow confirmation)

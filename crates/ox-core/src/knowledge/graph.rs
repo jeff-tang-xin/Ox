@@ -102,6 +102,15 @@ impl EntityGraph {
         self.entities.remove(entity_id);
     }
 
+    /// Return entity ids associated with a file path.
+    pub fn entity_ids_for_file(&self, file_path: &str) -> Vec<String> {
+        self.entities
+            .iter()
+            .filter(|(_, e)| e.file_path() == Some(file_path))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Remove all entities associated with a file path (for re-indexing).
     pub fn remove_by_file(&mut self, file_path: &str) {
         let ids: Vec<String> = self.entities

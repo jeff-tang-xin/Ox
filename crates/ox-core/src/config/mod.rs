@@ -309,15 +309,24 @@ store_refined_memories = true  # Enable refined memory storage (default: true)
 # ]
 # custom_rules = []            # Additional safety rules
 
-# ── Embedding (Symbol Semantic Search) ───────────────────
+# ── Embedding (Knowledge / Symbol Semantic Search) ───────
 [embedding]
-# enabled = true                 # Enable semantic symbol search
+# enabled = true                 # Enable semantic search
 # model_source = "modelscope"    # "modelscope" (default), "huggingface", or "local"
 # modelscope_url = "https://www.modelscope.cn"  # ModelScope base URL
 # hf_endpoint = ""               # HuggingFace endpoint (auto: env → hf-mirror.com)
-# model_id = "sentence-transformers/all-MiniLM-L6-v2"
+# model_id = "intfloat/multilingual-e5-small"
 # local_model_dir = ""           # Path to local model dir (if model_source = "local")
-# dimension = 384                # Embedding dimension
+# dimension = 384                # Embedding dimension (multilingual-e5-small = 384)
+# query_prefix = "query: "       # E5 query prefix
+# passage_prefix = "passage: "   # E5 passage prefix (prose)
+# code_passage_prefix = "code: " # E5 passage prefix (code symbols)
+# index_embed_chunk_size = 128   # Symbols per startup embedding batch (higher = faster, more RAM)
+# index_embed_progress_step = 40 # UI progress update step during startup embed (30-50 typical)
+# index_embed_max_chars = 2048   # Safety ceiling for embedding text (code uses structured header, not blind chop)
+# lazy_index = true              # On-demand embed: chat immediately, index query paths per turn
+# lazy_index_max_files_per_turn = 20  # Cap per-message lazy embed work
+# background_full_index = true   # When lazy_index: still embed full project in background (non-blocking)
 
 # ── Cost Management ──────────────────────────────────────
 [cost]
@@ -759,12 +768,30 @@ pub struct EmbeddingConfig {
     ///   2. Fallback to https://hf-mirror.com (China mirror)
     /// Set to "https://huggingface.co" for official endpoint.
     pub hf_endpoint: String,
-    /// Model identifier (e.g. "sentence-transformers/all-MiniLM-L6-v2").
+    /// Model identifier (e.g. "intfloat/multilingual-e5-small").
     pub model_id: String,
     /// Local directory containing model files (used when model_source = "local").
     pub local_model_dir: String,
-    /// Embedding vector dimension (all-MiniLM-L6-v2 = 384).
+    /// Embedding vector dimension (multilingual-e5-small = 384).
     pub dimension: usize,
+    /// E5-style query prefix (e.g. "query: ").
+    pub query_prefix: String,
+    /// E5-style passage prefix for prose (e.g. "passage: ").
+    pub passage_prefix: String,
+    /// Prefix for code passages (e.g. "code: ").
+    pub code_passage_prefix: String,
+    /// Startup indexer: symbols embedded per batch (default 128).
+    pub index_embed_chunk_size: usize,
+    /// Progress/UI update step during startup embed (default 40; 30-50 is a good range).
+    pub index_embed_progress_step: usize,
+    /// Safety ceiling for embedding text length (code symbols use structured headers).
+    pub index_embed_max_chars: usize,
+    /// When true, skip blocking full-project embed at startup; index on demand per turn.
+    pub lazy_index: bool,
+    /// Max files to embed per user message when lazy_index is enabled.
+    pub lazy_index_max_files_per_turn: usize,
+    /// When lazy_index is true, continue full-project embed in background (non-blocking).
+    pub background_full_index: bool,
 }
 
 impl Default for EmbeddingConfig {
@@ -774,9 +801,18 @@ impl Default for EmbeddingConfig {
             model_source: "modelscope".into(),
             modelscope_url: "https://www.modelscope.cn".into(),
             hf_endpoint: String::new(), // auto: env HF_ENDPOINT → hf-mirror.com
-            model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
+            model_id: "intfloat/multilingual-e5-small".into(),
             local_model_dir: String::new(),
             dimension: 384,
+            query_prefix: "query: ".into(),
+            passage_prefix: "passage: ".into(),
+            code_passage_prefix: "code: ".into(),
+            index_embed_chunk_size: 128,
+            index_embed_progress_step: 40,
+            index_embed_max_chars: 2048,
+            lazy_index: true,
+            lazy_index_max_files_per_turn: 20,
+            background_full_index: true,
         }
     }
 }

@@ -474,6 +474,103 @@ impl AutoLayering {
             rejected_count,
         }
     }
+
+    /// Promote memory layers using rule prefilter only (no LLM judge).
+    /// Uses each candidate's hint text as the stored content.
+    pub fn apply_rule_based_promotions(
+        &mut self,
+        graph: &EntityGraph,
+        session_id: &str,
+        project_id: Option<&str>,
+    ) -> LayeringResult {
+        self.prefilter(graph);
+        let candidates = self.drain_candidates();
+        let mut new_entities = Vec::new();
+        let mut updated_source_ids = Vec::new();
+        let mut confirmed_count = 0;
+
+        for candidate in &candidates {
+            match candidate {
+                LayeringCandidate::L0ToL1 {
+                    source_turns,
+                    summary_hint,
+                    ..
+                } if !summary_hint.is_empty() => {
+                    let mut entity = Entity::atomic_memory(
+                        summary_hint,
+                        "Fact",
+                        project_id,
+                        "",
+                        "AutoLayering",
+                    );
+                    for tid in source_turns {
+                        entity.relations.push(Relation {
+                            target_id: tid.clone(),
+                            relation_type: RelationType::Precedes,
+                            weight: 0.8,
+                        });
+                    }
+                    new_entities.push(entity);
+                    updated_source_ids.extend(source_turns.iter().cloned());
+                    confirmed_count += 1;
+                }
+                LayeringCandidate::L1ToL2 {
+                    source_facts,
+                    topic,
+                    episode_hint,
+                } => {
+                    let content = if episode_hint.is_empty() {
+                        topic.clone()
+                    } else {
+                        format!("{topic}\n{episode_hint}")
+                    };
+                    let mut entity =
+                        Entity::episodic_memory(topic, session_id, project_id, &content);
+                    for fid in source_facts {
+                        entity.relations.push(Relation {
+                            target_id: fid.clone(),
+                            relation_type: RelationType::BelongsTo,
+                            weight: 0.8,
+                        });
+                    }
+                    new_entities.push(entity);
+                    updated_source_ids.extend(source_facts.iter().cloned());
+                    confirmed_count += 1;
+                }
+                LayeringCandidate::L2ToL3 {
+                    source_episodes,
+                    pattern_hint,
+                    domain,
+                } => {
+                    let mut entity = Entity::semantic_memory(
+                        project_id.unwrap_or("global"),
+                        pattern_hint,
+                        domain,
+                        source_episodes.clone(),
+                    );
+                    for eid in source_episodes {
+                        entity.relations.push(Relation {
+                            target_id: eid.clone(),
+                            relation_type: RelationType::Abstracts,
+                            weight: 0.9,
+                        });
+                    }
+                    new_entities.push(entity);
+                    updated_source_ids.extend(source_episodes.iter().cloned());
+                    confirmed_count += 1;
+                }
+                _ => {}
+            }
+        }
+
+        let rejected_count = candidates.len().saturating_sub(confirmed_count);
+        LayeringResult {
+            new_entities,
+            updated_source_ids,
+            confirmed_count,
+            rejected_count,
+        }
+    }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

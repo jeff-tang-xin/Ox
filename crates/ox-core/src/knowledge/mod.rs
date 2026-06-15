@@ -25,21 +25,34 @@
 /// "深度优先 + Token 预算": inject L0 first (always), then L1/L2 by semantic
 /// similarity, then L3 only if highly relevant, until token budget exhausted.
 
+pub mod index_progress;
+pub use index_progress::IndexProgress;
+pub mod bm25;
+pub mod bridge;
 pub mod entity;
 pub mod embedding;
 pub mod extractor;
 pub mod graph;
 pub mod language;
 pub mod layering;
+pub mod keywords;
+pub mod memory_node;
 pub mod live_update;
 pub mod retrieval;
 pub mod vector_store;
 
+pub use memory_node::{format_memory_context, MemoryNode, MemoryNodeType};
+pub use keywords::KeywordExtraction;
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use anyhow::Result;
 
 use entity::{Entity, EntityKind, injection_priority};
+use graph::EntityGraph;
+use layering::AutoLayering;
+use bm25::Bm25Index;
 use vector_store::{UnifiedVectorStore, SearchHit};
 use std::sync::Mutex as StdMutex;
 use extractor::AstExtractor;
@@ -63,6 +76,12 @@ pub struct KnowledgeEngine {
     recent_turns: std::collections::VecDeque<Entity>,
     /// Max recent turns to keep
     max_recent_turns: usize,
+    /// In-memory relation graph for layering + consolidation
+    entity_graph: StdMutex<EntityGraph>,
+    /// L0→L3 promotion engine
+    auto_layering: StdMutex<AutoLayering>,
+    /// BM25 inverted index for hybrid retrieval
+    bm25_index: StdMutex<Bm25Index>,
 }
 
 impl KnowledgeEngine {
@@ -79,7 +98,11 @@ impl KnowledgeEngine {
         embedding_config: &EmbeddingConfig,
         project_path: &Path,
     ) -> Result<Self> {
-        let store = UnifiedVectorStore::open(db_path, embedding_model, embedding_config)?;
+        let mut store = UnifiedVectorStore::open(db_path, embedding_model, embedding_config)?;
+        let file_ids_path = Self::file_ids_cache_path(project_path);
+        store.load_file_id_map(&file_ids_path);
+        let bm25_path = Self::bm25_cache_path(project_path);
+        let bm25_index = Bm25Index::load(&bm25_path);
         let extractor = AstExtractor::new();
         let dimension = embedding_config.dimension;
 
@@ -95,7 +118,206 @@ impl KnowledgeEngine {
             dimension,
             recent_turns: std::collections::VecDeque::new(),
             max_recent_turns: 20,
+            entity_graph: StdMutex::new(EntityGraph::new()),
+            auto_layering: StdMutex::new(AutoLayering::with_defaults()),
+            bm25_index: StdMutex::new(bm25_index),
         })
+    }
+
+    fn bm25_cache_path(project_path: &Path) -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            project_path.to_string_lossy().hash(&mut hasher);
+            hasher.finish()
+        };
+        home.join(".ox")
+            .join("cache")
+            .join(format!("bm25_{:016x}.json", hash))
+    }
+
+    fn persist_bm25(&self) {
+        let path = Self::bm25_cache_path(&self.project_path);
+        if let Ok(index) = self.bm25_index.try_lock() {
+            if let Err(e) = index.save(&path) {
+                tracing::warn!("[KNOWLEDGE_ENGINE] Failed to persist BM25 index: {e}");
+            }
+        }
+    }
+
+    fn index_bm25(&self, entity: &Entity) {
+        if let Ok(mut index) = self.bm25_index.try_lock() {
+            index.index_document(&entity.id, &entity.content);
+        }
+    }
+
+    fn remove_bm25(&self, entity_id: &str) {
+        if let Ok(mut index) = self.bm25_index.try_lock() {
+            index.remove_document(entity_id);
+        }
+    }
+
+    /// BM25 keyword search — returns entity ids with normalized scores.
+    pub fn bm25_search(&self, query: &str, top_k: usize) -> Vec<(String, f32)> {
+        self.bm25_index
+            .lock()
+            .unwrap()
+            .search(query, top_k)
+    }
+
+    /// Hybrid retrieval: fuse vector hits with BM25 scores.
+    pub fn hybrid_search_by_kinds(
+        &self,
+        query: &str,
+        kinds: &[EntityKind],
+        top_k: usize,
+        min_vector_score: f32,
+    ) -> Result<Vec<SearchHit>> {
+        const VECTOR_WEIGHT: f32 = 0.65;
+        const BM25_WEIGHT: f32 = 0.35;
+
+        let vector_hits = self.search_by_kinds(query, kinds, top_k * 2, min_vector_score)?;
+        let bm25_hits = self.bm25_search(query, top_k * 2);
+
+        let mut fused: HashMap<String, (Option<Entity>, f32)> = HashMap::new();
+
+        for hit in vector_hits {
+            let score = hit.score * VECTOR_WEIGHT;
+            fused
+                .entry(hit.entity.id.clone())
+                .and_modify(|(_, s)| *s += score)
+                .or_insert_with(|| (Some(hit.entity), score));
+        }
+
+        for (entity_id, bm25_score) in bm25_hits {
+            let boost = bm25_score * BM25_WEIGHT;
+            if let Some((_entity, score)) = fused.get_mut(&entity_id) {
+                *score += boost;
+            } else if let Some(e) = self.entity_graph.lock().unwrap().get(&entity_id) {
+                fused.insert(entity_id, (Some(e.clone()), boost));
+            } else {
+                fused.insert(entity_id, (None, boost));
+            }
+        }
+
+        let mut results: Vec<SearchHit> = fused
+            .into_iter()
+            .filter_map(|(id, (entity, score))| {
+                entity.map(|e| SearchHit { entity: e, score }).or_else(|| {
+                    tracing::debug!("[HYBRID] BM25 hit without entity: {id}");
+                    None
+                })
+            })
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(top_k);
+        Ok(results)
+    }
+
+    /// Delete memories matching keyword (for /forget).
+    pub fn forget_matching(&mut self, keyword: &str) -> usize {
+        let hits = self.bm25_search(keyword, 50);
+        let mut deleted = 0;
+        for (entity_id, _) in hits {
+            if self.store.delete_entity_by_id(&entity_id).unwrap_or(false) {
+                self.remove_bm25(&entity_id);
+                if let Ok(mut graph) = self.entity_graph.try_lock() {
+                    graph.remove(&entity_id);
+                }
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            self.persist_bm25();
+        }
+        deleted
+    }
+
+    fn purge_file_indexes(&mut self, file_path: &str) {
+        let ids = self.entity_graph.lock().unwrap().entity_ids_for_file(file_path);
+        for id in ids {
+            self.remove_bm25(&id);
+            self.entity_graph.lock().unwrap().remove(&id);
+        }
+    }
+
+    fn after_entity_stored(&self, entity: &Entity) {
+        self.index_bm25(entity);
+    }
+
+    fn after_entities_batch_stored(&self, entities: &[Entity]) {
+        for entity in entities {
+            self.index_bm25(entity);
+        }
+        self.persist_bm25();
+    }
+
+    fn file_ids_cache_path(project_path: &Path) -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            project_path.to_string_lossy().hash(&mut hasher);
+            hasher.finish()
+        };
+        home.join(".ox")
+            .join("cache")
+            .join(format!("file_ids_{:016x}.json", hash))
+    }
+
+    fn persist_file_ids(&self) {
+        let path = Self::file_ids_cache_path(&self.project_path);
+        if let Err(e) = self.store.save_file_id_map(&path) {
+            tracing::warn!("[KNOWLEDGE_ENGINE] Failed to persist file_ids: {e}");
+        }
+    }
+
+    /// Upsert entity into the in-memory graph (for layering).
+    pub fn track_entity(&self, entity: &Entity) {
+        if let Ok(mut g) = self.entity_graph.try_lock() {
+            g.upsert(entity.clone());
+        }
+    }
+
+    /// Rule-based L0→L3 promotion (no LLM). Returns number of new entities stored.
+    pub fn run_consolidation(&mut self, session_id: &str, project_id: Option<&str>) -> Result<usize> {
+        let result = {
+            let graph = self.entity_graph.lock().unwrap();
+            let mut layering = self.auto_layering.lock().unwrap();
+            layering.apply_rule_based_promotions(&graph, session_id, project_id)
+        };
+        let mut stored = 0;
+        for entity in result.new_entities {
+            self.store.insert_entity(&entity)?;
+            self.track_entity(&entity);
+            stored += 1;
+        }
+        if stored > 0 {
+            self.persist_file_ids();
+        }
+        tracing::info!("[KNOWLEDGE_ENGINE] Consolidation stored {stored} entities");
+        Ok(stored)
+    }
+
+    /// Record an L2 episodic checkpoint after workflow completion.
+    pub fn record_workflow_episode(
+        &mut self,
+        session_id: &str,
+        project_id: Option<&str>,
+        task_description: &str,
+        execution_summary: &str,
+    ) -> Result<Entity> {
+        let name: String = task_description.chars().take(80).collect();
+        let desc = format!("{task_description}\n\nSummary: {execution_summary}");
+        let entity = self.record_episode(&name, session_id, project_id, &desc)?;
+        self.track_entity(&entity);
+        Ok(entity)
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -117,6 +339,15 @@ impl KnowledgeEngine {
     /// Extract AST symbols from a single file WITHOUT embedding/storing.
     /// Returns entities ready for batch embedding. Fast (no BERT inference).
     pub fn extract_file_symbols(&self, file_path: &Path) -> Result<Vec<Entity>> {
+        if self
+            .extractor
+            .lock()
+            .unwrap()
+            .detect_language(file_path)
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
         let code = std::fs::read_to_string(file_path)?;
         let entities = self.extractor.lock().unwrap().extract_entities(file_path, &code)?;
         Ok(entities)
@@ -129,7 +360,7 @@ impl KnowledgeEngine {
     /// Returns (all_entities, total_files) for Phase 2 batch embedding.
     pub fn collect_all_symbols(
         &self,
-        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<(usize, usize, usize)>>,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<IndexProgress>>,
     ) -> Result<(Vec<Entity>, usize)> {
         use std::collections::HashMap;
         use std::io::Read;
@@ -160,6 +391,7 @@ impl KnowledgeEngine {
         let mut total_symbols = 0;
         let mut new_cache: HashMap<String, i64> = HashMap::new();
         let mut skipped_from_cache = 0;
+        let mut skipped_non_source = 0;
 
         for (i, path) in all_files.iter().enumerate() {
             let path_str = path.to_string_lossy().to_string();
@@ -174,11 +406,16 @@ impl KnowledgeEngine {
                 new_cache.insert(path_str.clone(), mtime);
 
                 if let Some(&cached_mtime) = file_cache.get(&path_str) {
-                    if cached_mtime == mtime {
+                    if cached_mtime == mtime && self.store.has_file_vectors(&path_str) {
                         skipped_from_cache += 1;
-                        continue; // Skip — file unchanged, entities already in TriviumDB
+                        continue; // Unchanged and already embedded
                     }
                 }
+            }
+
+            if self.detect_language(path).is_none() {
+                skipped_non_source += 1;
+                continue;
             }
 
             // Parse and extract
@@ -193,7 +430,9 @@ impl KnowledgeEngine {
             }
 
             if let Some(ref tx) = progress_tx {
-                let _ = tx.send((i + 1, total_files, total_symbols));
+                if (i + 1) % 20 == 0 || i + 1 == total_files {
+                    let _ = tx.send(IndexProgress::parsing(i + 1, total_files, total_symbols));
+                }
             }
         }
 
@@ -206,8 +445,12 @@ impl KnowledgeEngine {
         }
 
         tracing::info!(
-            "[KNOWLEDGE_ENGINE] Phase 1: {} symbols from {} files ({} skipped from cache, {} parsed)",
-            total_symbols, total_files, skipped_from_cache, total_files - skipped_from_cache
+            "[KNOWLEDGE_ENGINE] Phase 1 done: {} symbols, {} source files indexed ({} non-source skipped, {} cache-hit, {} walk total)",
+            total_symbols,
+            total_files - skipped_from_cache - skipped_non_source,
+            skipped_non_source,
+            skipped_from_cache,
+            total_files
         );
 
         Ok((all_entities, total_files))
@@ -224,6 +467,14 @@ impl KnowledgeEngine {
         home.join(".ox").join("cache").join(format!("ast_{:016x}.json", hash))
     }
 
+    /// Returns true if the vector store already has indexed code symbols.
+    pub fn has_code_index(&self) -> bool {
+        self.store
+            .search_code("function struct impl", 1)
+            .map(|hits| !hits.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Phase 2: Batch-embed and store pre-extracted entities.
     /// Slow — runs BERT inference on all entities in chunks of 100.
     /// Call this AFTER collect_all_symbols(), ideally in a separate spawn.
@@ -232,6 +483,8 @@ impl KnowledgeEngine {
             return Ok(0);
         }
         let total = self._embed_chunk(entities, 0, entities.len())?;
+        self.persist_file_ids();
+        self.persist_bm25();
         tracing::info!("[KNOWLEDGE_ENGINE] Embedding complete: {} entities", total);
         Ok(total)
     }
@@ -245,19 +498,41 @@ impl KnowledgeEngine {
         offset: usize,
         chunk_size: usize,
     ) -> Result<usize> {
-        // On first chunk, remove old vectors
-        if offset == 0 {
-            use std::collections::HashSet;
-            let mut seen = HashSet::new();
-            for e in entities {
-                if let Some(fp) = e.file_path() {
-                    if seen.insert(fp.to_string()) {
-                        self.store.remove_by_file(fp);
-                    }
+        let count = self._embed_chunk(entities, offset, chunk_size)?;
+        self.persist_file_ids();
+        if offset + chunk_size >= entities.len() {
+            self.persist_bm25();
+        }
+        Ok(count)
+    }
+
+    /// Sort entities so core source paths (`src/`, `crates/`) embed first.
+    pub fn sort_entities_for_startup_index(entities: &mut [Entity]) {
+        entities.sort_by(|a, b| {
+            fn path_priority(path: &str) -> u8 {
+                let p = path.replace('\\', "/");
+                if p.contains("/src/") || p.starts_with("src/") {
+                    0
+                } else if p.contains("/crates/") {
+                    1
+                } else if p.contains("/lib/") {
+                    2
+                } else if p.contains("/tests/") || p.contains("/test/") {
+                    4
+                } else if p.contains("/docs/") || p.contains("/doc/") {
+                    5
+                } else {
+                    3
                 }
             }
-        }
-        self._embed_chunk(entities, offset, chunk_size)
+            let pa = a.file_path().map(path_priority).unwrap_or(6);
+            let pb = b.file_path().map(path_priority).unwrap_or(6);
+            pa.cmp(&pb).then_with(|| {
+                a.file_path()
+                    .unwrap_or("")
+                    .cmp(b.file_path().unwrap_or(""))
+            })
+        });
     }
 
     fn _embed_chunk(&mut self, entities: &[Entity], offset: usize, count: usize) -> Result<usize> {
@@ -266,7 +541,12 @@ impl KnowledgeEngine {
         if chunk.is_empty() {
             return Ok(0);
         }
-        self.store.insert_entities_batch(chunk)
+        let stored = self.store.insert_entities_batch(chunk)?;
+        for entity in chunk {
+            self.track_entity(entity);
+        }
+        self.after_entities_batch_stored(chunk);
+        Ok(stored)
     }
 
     /// Collect all eligible source file paths in the project directory.
@@ -296,9 +576,15 @@ impl KnowledgeEngine {
         }
 
         let file_path_str = file_path.to_string_lossy().to_string();
+        self.purge_file_indexes(&file_path_str);
         self.store.remove_by_file(&file_path_str);
 
         let count = self.store.insert_entities_batch(&entities)?;
+        for entity in &entities {
+            self.track_entity(entity);
+        }
+        self.after_entities_batch_stored(&entities);
+        self.persist_file_ids();
 
         tracing::info!(
             "[KNOWLEDGE_ENGINE] Indexed {} → {} symbols",
@@ -306,6 +592,60 @@ impl KnowledgeEngine {
         );
 
         Ok(count)
+    }
+
+    /// Embed a single file if vectors are missing or the file changed since last index.
+    pub fn ensure_file_indexed(&mut self, file_path: &Path) -> Result<usize> {
+        if !file_path.is_file() {
+            return Ok(0);
+        }
+        let path_str = file_path.to_string_lossy().to_string();
+        if self.store.has_file_vectors(&path_str) {
+            if let Ok(meta) = std::fs::metadata(file_path) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let cache_path = self.cache_path();
+                if let Ok(data) = std::fs::read_to_string(&cache_path) {
+                    if let Ok(cache) = serde_json::from_str::<std::collections::HashMap<String, i64>>(&data)
+                    {
+                        if cache.get(&path_str) == Some(&mtime) {
+                            return Ok(0);
+                        }
+                    }
+                }
+            }
+        }
+        self.index_file(file_path)
+    }
+
+    /// Embed up to `max_files` paths that are not yet indexed (session-relevant lazy load).
+    pub fn ensure_paths_indexed(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        max_files: usize,
+    ) -> Result<usize> {
+        let mut indexed = 0usize;
+        let mut done = 0usize;
+        for path in paths {
+            if done >= max_files {
+                break;
+            }
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                self.project_path.join(path)
+            };
+            if !resolved.is_file() {
+                continue;
+            }
+            done += 1;
+            indexed += self.ensure_file_indexed(&resolved)?;
+        }
+        Ok(indexed)
     }
 
     /// Full project index: walk the project directory and index all source files.
@@ -319,7 +659,7 @@ impl KnowledgeEngine {
     /// Respects .gitignore via `ignore` crate; only walks within `self.project_path`.
     pub fn index_project_with_progress(
         &mut self,
-        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<(usize, usize, usize)>>,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<IndexProgress>>,
     ) -> Result<usize> {
         // Pre-count eligible files (single walk, .gitignore-aware)
         let walker = ignore::WalkBuilder::new(&self.project_path)
@@ -342,7 +682,7 @@ impl KnowledgeEngine {
                 Ok(count) => {
                     total_symbols += count;
                     if let Some(ref tx) = progress_tx {
-                        let _ = tx.send((i + 1, total_files, total_symbols));
+                        let _ = tx.send(IndexProgress::parsing(i + 1, total_files, total_symbols));
                     }
                 }
                 Err(e) => {
@@ -366,15 +706,23 @@ impl KnowledgeEngine {
         let entities = self.extractor.lock().unwrap().extract_entities(file_path, &code)?;
 
         let file_path_str = file_path.to_string_lossy().to_string();
+        self.purge_file_indexes(&file_path_str);
         self.store.remove_by_file(&file_path_str);
 
         if !entities.is_empty() {
             self.store.insert_entities_batch(&entities)?;
+            for entity in &entities {
+                self.track_entity(entity);
+            }
+            self.after_entities_batch_stored(&entities);
+        } else {
+            self.persist_bm25();
         }
 
         tracing::info!(
             "[KNOWLEDGE_ENGINE] Re-indexed {} → {} symbols",
-            file_path.display(), entities.len()
+            file_path.display(),
+            entities.len()
         );
 
         Ok(entities)
@@ -386,12 +734,21 @@ impl KnowledgeEngine {
 
     /// Store an entity (memory or code) into the knowledge base.
     pub fn store_entity(&mut self, entity: &Entity) -> Result<u64> {
-        self.store.insert_entity(entity)
+        let id = self.store.insert_entity(entity)?;
+        self.after_entity_stored(entity);
+        self.track_entity(entity);
+        self.persist_bm25();
+        Ok(id)
     }
 
     /// Store a batch of entities.
     pub fn store_entities(&mut self, entities: &[Entity]) -> Result<usize> {
-        self.store.insert_entities_batch(entities)
+        let count = self.store.insert_entities_batch(entities)?;
+        for entity in entities {
+            self.track_entity(entity);
+        }
+        self.after_entities_batch_stored(entities);
+        Ok(count)
     }
 
     /// Create and store an L0 WorkingMemory entity for the current turn.
@@ -408,11 +765,13 @@ impl KnowledgeEngine {
             session_id, action, intent, result, tools_used, has_code_changes,
         );
         self.store.insert_entity(&entity)?;
+        self.after_entity_stored(&entity);
         // Push into ring buffer for fast conversation continuity retrieval
         self.recent_turns.push_back(entity.clone());
         if self.recent_turns.len() > self.max_recent_turns {
             self.recent_turns.pop_front();
         }
+        self.track_entity(&entity);
         Ok(entity)
     }
 
@@ -436,6 +795,9 @@ impl KnowledgeEngine {
     ) -> Result<Entity> {
         let entity = Entity::atomic_memory(content, memory_type, project_id, language, source);
         self.store.insert_entity(&entity)?;
+        self.after_entity_stored(&entity);
+        self.track_entity(&entity);
+        self.persist_bm25();
         Ok(entity)
     }
 
@@ -449,6 +811,9 @@ impl KnowledgeEngine {
     ) -> Result<Entity> {
         let entity = Entity::episodic_memory(episode_name, session_id, project_id, task_description);
         self.store.insert_entity(&entity)?;
+        self.after_entity_stored(&entity);
+        self.track_entity(&entity);
+        self.persist_bm25();
         Ok(entity)
     }
 
@@ -462,6 +827,9 @@ impl KnowledgeEngine {
     ) -> Result<Entity> {
         let entity = Entity::semantic_memory(project_id, content, domain, source_episodes);
         self.store.insert_entity(&entity)?;
+        self.after_entity_stored(&entity);
+        self.track_entity(&entity);
+        self.persist_bm25();
         Ok(entity)
     }
 
@@ -576,12 +944,21 @@ impl KnowledgeEngine {
         session_id: &str,
         max_results: usize,
     ) -> Result<Vec<SearchHit>> {
-        // Search across all memory layers + code symbols
-        let mut hits = self.store.search_unified(
+        // Hybrid retrieval: dense vectors + BM25 keyword fusion
+        let all_kinds = [
+            EntityKind::WorkingMemory,
+            EntityKind::AtomicMemory,
+            EntityKind::EpisodicMemory,
+            EntityKind::SemanticMemory,
+            EntityKind::CodeSymbol,
+            EntityKind::CodeFile,
+            EntityKind::CodeModule,
+        ];
+        let mut hits = self.hybrid_search_by_kinds(
             query,
-            max_results * 2, // Over-fetch for filtering
-            None,            // All kinds
-            0.2,             // Min score
+            &all_kinds,
+            max_results * 2,
+            0.2,
         )?;
 
         // Sort by injection priority (lower = more important for context)

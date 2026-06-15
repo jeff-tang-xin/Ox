@@ -106,7 +106,7 @@ impl AstExtractor {
 
         let start_line = node.start_position().row + 1;
         let end_line = node.end_position().row + 1;
-        let signature = self.get_node_text(node, code).trim().to_string();
+        let signature = self.get_declaration_header(node, code);
 
         // Build FQ name
         let fq_name = if let Some(ref p) = parent {
@@ -176,6 +176,46 @@ impl AstExtractor {
 
     fn get_node_text(&self, node: Node, code: &str) -> String {
         node.utf8_text(code.as_bytes()).unwrap_or_default().to_string()
+    }
+
+    /// Declaration header only — excludes class/interface bodies (Java, TS, etc.).
+    fn get_declaration_header(&self, node: Node, code: &str) -> String {
+        let full = self.get_node_text(node, code);
+        let node_start = node.start_byte();
+
+        let body_kinds = [
+            "class_body",
+            "interface_body",
+            "enum_body",
+            "block",
+            "declaration_list",
+            "field_declaration_list",
+            "statement_block",
+            "compound_statement",
+            "function_body",
+            "method_body",
+        ];
+
+        let mut header_end = full.len();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if body_kinds.contains(&child.kind()) {
+                let rel = child.start_byte().saturating_sub(node_start);
+                if rel < header_end {
+                    header_end = rel;
+                }
+            }
+        }
+
+        let header = if header_end < full.len() {
+            full[..header_end].trim()
+        } else if let Some(idx) = full.find('{') {
+            full[..idx].trim()
+        } else {
+            full.trim()
+        };
+
+        collapse_signature(header)
     }
 
     // ── Language-specific extractors ──
@@ -375,10 +415,46 @@ impl AstExtractor {
     }
 }
 
+/// Collapse whitespace; keep generics/annotations on one line for embedding.
+fn collapse_signature(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::entity::EntityMetadata;
+    use crate::knowledge::entity::{EntityMetadata, SymbolType};
+
+    #[test]
+    fn test_declaration_header_excludes_class_body() {
+        let code = r#"
+public class BigService implements Runnable {
+    private final String id;
+    public void run() { }
+    public void other() { }
+}
+"#;
+        let mut extractor = AstExtractor::new();
+        let entities = extractor
+            .extract_entities("BigService.java", code)
+            .unwrap();
+        let class_entity = entities
+            .iter()
+            .find(|e| {
+                matches!(
+                    &e.metadata,
+                    EntityMetadata::CodeSymbol { symbol_type: SymbolType::Class, .. }
+                )
+            })
+            .expect("class entity");
+        if let EntityMetadata::CodeSymbol { signature, .. } = &class_entity.metadata {
+            assert!(signature.contains("class BigService"));
+            assert!(!signature.contains("private final"));
+            assert!(!signature.contains("public void run"));
+        } else {
+            panic!("expected CodeSymbol metadata");
+        }
+    }
 
     #[test]
     fn test_extract_rust_symbols() {

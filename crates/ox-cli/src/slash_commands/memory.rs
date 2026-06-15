@@ -6,7 +6,6 @@ use crate::terminal::output_pane::OutputLine;
 use ox_core::message::Session;
 use ox_core::runtime::RuntimeEnvironment;
 use ox_core::config::OxConfig;
-use ox_core::memory::MemoryManager;
 use ox_core::cost::CostTracker;
 use ox_core::safety::TrustManager;
 use std::sync::Arc;
@@ -38,16 +37,27 @@ pub fn handle_remember(
     _session: &mut Session,
     rt_env: &mut RuntimeEnvironment,
     _config: &OxConfig,
-    memory: &Arc<MemoryManager>,
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
     let content = args.trim();
     if content.is_empty() {
         app.output.push_system("Usage: /remember <content>  (stores as Style memory)");
+        return CommandResult::Success;
+    }
+
+    if let Some(ref ke) = app.knowledge_engine {
+        if let Ok(mut engine) = ke.try_write() {
+            let _ = engine.remember_explicit(content, &rt_env.project_id, &rt_env.project_language);
+            app.output.push_system(&format!(
+                "Remembered: {}",
+                content.chars().take(100).collect::<String>()
+            ));
+        } else {
+            app.output.push_system("Knowledge engine busy — try again.");
+        }
     } else {
-        memory.store_explicit(&content, &rt_env.project_id, &rt_env.project_language);
-        app.output.push_system(&format!("Remembered: {}", content.chars().take(100).collect::<String>()));
+        app.output.push_system("Knowledge engine not available.");
     }
     CommandResult::Success
 }
@@ -56,18 +66,28 @@ pub fn handle_forget(
     app: &mut AppState,
     args: &str,
     _session: &mut Session,
-    rt_env: &mut RuntimeEnvironment,
+    _rt_env: &mut RuntimeEnvironment,
     _config: &OxConfig,
-    memory: &Arc<MemoryManager>,
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
     let keyword = args.trim();
     if keyword.is_empty() {
         app.output.push_system("Usage: /forget <keyword>  (deletes matching memories)");
+        return CommandResult::Success;
+    }
+
+    if let Some(ref ke) = app.knowledge_engine {
+        if let Ok(mut engine) = ke.try_write() {
+            let deleted = engine.forget_matching(keyword);
+            app.output.push_system(&format!(
+                "Forgot {deleted} memory(ies) matching '{keyword}'"
+            ));
+        } else {
+            app.output.push_system("Knowledge engine busy — try again.");
+        }
     } else {
-        let deleted = memory.forget(&keyword, &rt_env.project_id);
-        app.output.push_system(&format!("Forgot {} memory(ies) matching '{}'", deleted, keyword));
+        app.output.push_system("Knowledge engine not available.");
     }
     CommandResult::Success
 }
@@ -78,20 +98,14 @@ pub fn handle_memory(
     _session: &mut Session,
     rt_env: &mut RuntimeEnvironment,
     _config: &OxConfig,
-    memory: &Arc<MemoryManager>,
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
     let subcmd = args.trim();
-    
-    // Handle subcommands
+
     match subcmd {
-        "promote" | "p" => {
-            return handle_promote(app, rt_env, memory);
-        }
-        "stats" | "s" | "" => {
-            // Show statistics (default behavior)
-        }
+        "promote" | "p" => return handle_promote(app, rt_env),
+        "stats" | "s" | "" => {}
         _ => {
             app.output.push_system("Usage: /memory [stats|promote]");
             app.output.push_system("  stats - Show memory statistics (default)");
@@ -99,93 +113,59 @@ pub fn handle_memory(
             return CommandResult::Success;
         }
     }
-    
-    // Default: show statistics
-    let (project_count, overall_count) = memory.stats(&rt_env.project_id);
-    
-    // Get detailed learning statistics
-    let stats = memory.get_learning_stats(&rt_env.project_id);
-    
-    app.output.push_line(OutputLine::System(format!(
-        "📚 Learning Statistics:\n\
-         Project memories: {} | Global memories: {}\n",
-         project_count, overall_count
-    )));
-    
-    // Show breakdown by type
-    if !stats.memories_by_type.is_empty() {
-        app.output.push_system("Memories by type:");
-        let mut sorted_types: Vec<_> = stats.memories_by_type.iter().collect();
-        sorted_types.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count descending
-        
-        for (mem_type, count) in sorted_types {
-            let icon = match *mem_type {
-                "fact" => "📝",
-                "style" => "🎨",
-                "architectural" => "🏗️",
-                "anti_pattern" => "⚠️",
-                "business" => "💼",
-                "best_practice" => "✅",
-                "pattern" => "🔄",
-                "meta_skill" => "🧠",
-                _ => "📌",
-            };
-            app.output.push_line(OutputLine::System(format!(
-                "  {} {}: {}", icon, mem_type.replace('_', " "), count
-            )));
+
+    let Some(ref ke) = app.knowledge_engine else {
+        app.output.push_system("Knowledge engine not available.");
+        return CommandResult::Success;
+    };
+
+    if let Ok(engine) = ke.try_read() {
+        let (l0, l1, l2, l3) = engine.memory_layer_counts();
+        app.output.push_line(OutputLine::System(format!(
+            "📚 Knowledge Engine (unified):\n  L0 working: {l0} | L1 atomic: {l1} | L2 episodic: {l2} | L3 semantic: {l3}"
+        )));
+        let nodes = engine.retrieve_memory_nodes("", Some(&rt_env.project_id), 8);
+        if nodes.is_empty() {
+            app.output.push_system("No memories in knowledge engine yet.");
+        } else {
+            app.output.push_system("Recent knowledge:");
+            for node in &nodes {
+                let preview: String = node.content.chars().take(100).collect();
+                app.output.push_line(OutputLine::System(format!(
+                    "  [L{}] {preview}",
+                    node.depth
+                )));
+            }
         }
-        app.output.push_line(OutputLine::System(String::new()));
+    } else {
+        app.output.push_system("Knowledge engine busy — try again.");
     }
 
-    let nodes = memory.retrieve("", &Some(rt_env.project_id.as_str()), 8);
-    if nodes.is_empty() {
-        app.output.push_system("No memories found yet. Start interacting to build knowledge!");
-    } else {
-        app.output.push_system("Recent memories:");
-        for node in &nodes {
-            let scope = if node.project_id.is_some() { "project" } else { "global" };
-            // 🚨 FIX: Use char-based truncation to avoid UTF-8 boundary errors
-            let content = if node.content.chars().count() > 100 {
-                let truncated: String = node.content.chars().take(100).collect();
-                format!("{}...", truncated)
-            } else {
-                node.content.clone()
-            };
-            app.output.push_line(OutputLine::System(format!(
-                "  [{}] {} (depth: {})", scope, content, node.depth
-            )));
-        }
-    }
     CommandResult::Success
 }
 
-/// Handle /memory promote command
-fn handle_promote(
-    app: &mut AppState,
-    rt_env: &mut RuntimeEnvironment,
-    memory: &Arc<MemoryManager>,
-) -> CommandResult {
+fn handle_promote(app: &mut AppState, rt_env: &mut RuntimeEnvironment) -> CommandResult {
     app.output.push_system("🚀 Starting L0-L3 memory promotion pipeline...");
-    
-    let project_name = rt_env.working_dir.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    
-    if let Some(result) = memory.run_promotion_pipeline(&rt_env.project_id, &project_name) {
-        match result {
-            Ok(report) => {
+
+    let Some(ref ke) = app.knowledge_engine else {
+        app.output.push_system("Knowledge engine not available.");
+        return CommandResult::Success;
+    };
+
+    if let Ok(mut engine) = ke.try_write() {
+        match engine.run_consolidation("current", Some(&rt_env.project_id)) {
+            Ok(n) => {
                 app.output.push_system(&format!(
-                    "\n✅ Memory Promotion Complete:\n{}",
-                    report
+                    "✅ Knowledge consolidation complete — {n} new entities promoted."
                 ));
             }
             Err(e) => {
-                app.output.push_error(&format!("❌ Promotion failed: {}", e));
+                app.output.push_system(&format!("⚠️ Knowledge consolidation failed: {e}"));
             }
         }
     } else {
-        app.output.push_system("⚠️ Hybrid storage not enabled. Promotion pipeline unavailable.");
+        app.output.push_system("Knowledge engine busy — try again.");
     }
-    
+
     CommandResult::Success
 }

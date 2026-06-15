@@ -18,13 +18,13 @@ pub enum SessionAction {
     SwitchNext,
 }
 
-/// Workflow state machine for Spec mode
+/// Workflow state machine (Spec file overlay; agent always runs 4-step pipeline)
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkflowState {
-    /// Free exploration mode (default)
-    Free,
+    /// Default: 4-step pipeline active
+    Pipeline,
 
-    /// Spec mode workflow states
+    /// Spec mode workflow states (legacy UI overlay)
     Spec {
         step: SpecWorkflowStep,
         spec_content: String,
@@ -104,6 +104,13 @@ pub struct PendingConfirmation {
 }
 
 #[derive(Debug, Clone)]
+pub struct PendingSkillDraft {
+    pub skill_id: String,
+    pub content: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionEntry {
     /// Session file name (e.g., "session_001.jsonl")
     pub id: String,
@@ -137,11 +144,17 @@ pub struct App {
     pub dirty: bool,
     pub spinner_frame: u64,
     pub model_name: String,
+    /// Short embedding model label (e.g. `multilingual-e5-small`).
+    pub embedding_model: String,
     pub working_dir: String,
     pub cost_summary: String,
     pub message_count: usize,
     pub user_scrolled: bool,
     pub pending_confirmation: Option<PendingConfirmation>,
+    /// Workflow step index awaiting user confirmation (e.g. Plan review at step 1).
+    pub workflow_awaiting_confirmation: Option<usize>,
+    /// Skill draft awaiting user confirmation before save.
+    pub pending_skill_draft: Option<PendingSkillDraft>,
     pub ui_to_agent_tx:
         Option<tokio::sync::mpsc::UnboundedSender<ox_core::agent::ui_event::UiToAgentEvent>>,
     pub pending_model_switch: Option<String>,
@@ -194,17 +207,40 @@ pub struct App {
     // Indexing progress
     /// Whether background indexing is still in progress
     pub indexing: bool,
+    /// Current index phase: `parsing`, `embedding`, or empty.
+    pub index_phase: String,
     /// Receiver for indexing progress updates: (files_processed, symbols_indexed)
     pub index_progress_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(usize, usize)>>,
-    /// Total source files to index
-    pub index_total_files: usize,
-    /// Files processed so far
-    pub index_files_done: usize,
-    /// Symbols indexed so far
+    /// AST walk: files processed / total
+    pub index_parse_done: usize,
+    pub index_parse_total: usize,
+    /// Symbols extracted so far (AST phase)
     pub index_symbols: usize,
+    /// BERT embed: entities done / total (separate from file counts)
+    pub index_embed_done: usize,
+    pub index_embed_total: usize,
 }
 
 impl App {
+    /// Active phase progress for UI (done, total).
+    pub fn index_progress_counts(&self) -> (usize, usize) {
+        if self.index_phase == "embedding" {
+            let total = self.index_embed_total.max(1);
+            (self.index_embed_done.min(total), total)
+        } else {
+            let total = self.index_parse_total.max(1);
+            (self.index_parse_done.min(total), total)
+        }
+    }
+
+    pub fn index_has_progress(&self) -> bool {
+        if self.index_phase == "embedding" {
+            self.index_embed_total > 0
+        } else {
+            self.index_parse_total > 0
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             output: OutputPane::new(),
@@ -217,11 +253,14 @@ impl App {
             dirty: true,
             spinner_frame: 0,
             model_name: String::new(),
+            embedding_model: String::new(),
             working_dir: String::new(),
             cost_summary: String::new(),
             message_count: 0,
             user_scrolled: false,
             pending_confirmation: None,
+            workflow_awaiting_confirmation: None,
+            pending_skill_draft: None,
             ui_to_agent_tx: None,
             pending_model_switch: None,
             pending_llm_task: None,  // 🆕 Unified LLM task
@@ -242,7 +281,7 @@ impl App {
             good_feedback_count: 0,
 
             // Workflow state machine (default to Free mode)
-            workflow_state: WorkflowState::Free,
+            workflow_state: WorkflowState::Pipeline,
             workflow_display: None,
 
             // Workflow engine (initialized later with session ID)
@@ -261,10 +300,13 @@ impl App {
 
             // Indexing progress
             indexing: false,
+            index_phase: String::new(),
             index_progress_rx: None,
-            index_total_files: 0,
-            index_files_done: 0,
+            index_parse_done: 0,
+            index_parse_total: 0,
             index_symbols: 0,
+            index_embed_done: 0,
+            index_embed_total: 0,
         }
     }
 
@@ -372,9 +414,9 @@ impl App {
         }
     }
 
-    /// Deactivate Spec mode and return to Free mode
+    /// Deactivate Spec overlay and return to default pipeline UI state
     pub fn deactivate_spec_mode(&mut self) {
-        self.workflow_state = WorkflowState::Free;
+        self.workflow_state = WorkflowState::Pipeline;
     }
 
     /// Initialize workflow engine (called after session is created)
@@ -405,24 +447,32 @@ impl App {
         let session_state_arc = Arc::new(tokio::sync::Mutex::new(session_state));
         let mut engine = WorkflowEngine::new(session_state_arc);
 
-        // Activate initial workflow based on current mode
-        if session_meta.workflow_mode == "spec" {
-            if let Err(e) = engine.activate_workflow("spec_workflow") {
-                tracing::warn!("Failed to activate spec workflow: {}", e);
-            } else {
-                // 🚨 Restore step index if we're in Spec Mode
-                if session_meta.workflow_step_index > 0 && session_meta.workflow_step_index < 4 {
-                    // Advance to the saved step
-                    for _ in 0..session_meta.workflow_step_index {
-                        let _ = engine.advance_step();
-                    }
-                    tracing::info!("Advanced to step {}/4", session_meta.workflow_step_index + 1);
-                }
-            }
+        // Always use the 4-step pipeline (migrate legacy "free" sessions)
+        let workflow_id = if session_meta.workflow_id.is_empty()
+            || session_meta.workflow_mode == "free"
+        {
+            ox_core::agent::workflow::DEFAULT_WORKFLOW_ID
         } else {
-            // Default to 5-step pipeline (no free mode anymore)
-            if let Err(e) = engine.activate_workflow("five_step_pipeline") {
-                tracing::warn!("Failed to activate five_step_pipeline: {}", e);
+            session_meta.workflow_id.as_str()
+        };
+        if let Err(e) = engine.activate_workflow(workflow_id) {
+            tracing::warn!("Failed to activate workflow '{}': {}", workflow_id, e);
+        } else if session_meta.workflow_step_index > 0
+            && session_meta.workflow_mode != "free"
+        {
+            let total = engine
+                .current_workflow()
+                .map(|w| w.total_steps())
+                .unwrap_or(0);
+            if session_meta.workflow_step_index < total {
+                for _ in 0..session_meta.workflow_step_index {
+                    let _ = engine.advance_step();
+                }
+                tracing::info!(
+                    "Restored workflow step {}/{}",
+                    session_meta.workflow_step_index + 1,
+                    total
+                );
             }
         }
 
@@ -439,13 +489,7 @@ impl App {
         if let Some(ref engine_arc) = self.workflow_engine {
             // Use try_lock to avoid blocking - if locked, skip this update
             if let Ok(engine) = engine_arc.try_lock() {
-                if let Some(workflow) = engine.current_workflow() {
-                    // Don't display free_workflow (it's a trivial single-step workflow)
-                    if workflow.name == "free_workflow" {
-                        self.workflow_display = None;
-                        return;
-                    }
-                    
+                if engine.current_workflow().is_some() {
                     if let Some(step) = engine.current_step() {
                         if let Some((step_num, total_steps)) = engine.get_progress() {
                             // 🚨 Extract requirement name from workflow engine

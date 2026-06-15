@@ -52,6 +52,11 @@ impl LanguageRegistry {
         self.ext_map.get(ext).copied()
     }
 
+    /// True when the file extension is supported for AST indexing.
+    pub fn is_indexable_path<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.detect_language(path).is_some()
+    }
+
     pub fn get_language(&mut self, lang_name: &str) -> Result<Language> {
         if let Some(lang) = self.languages.get(lang_name) {
             return Ok(lang.clone());

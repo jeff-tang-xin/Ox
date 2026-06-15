@@ -1,41 +1,36 @@
 //! Feedback middleware for implicit and explicit feedback detection.
-//!
-//! Handles override detection, EMA tracking, and satisfaction metrics.
 
-use std::sync::Arc;
-use ox_core::feedback::{ImplicitFeedback, OverrideSignal};
 use crate::terminal::app::App;
 
 /// Process implicit feedback signals from file override detection.
 pub fn process_implicit_feedback(
     app: &mut App,
-    override_signals: &[OverrideSignal],
+    override_signals: &[ox_core::feedback::OverrideSignal],
 ) {
     use ox_core::feedback::map_override_to_feedback;
 
     for signal in override_signals {
         if let Some(feedback) = map_override_to_feedback(signal.change_ratio) {
             match feedback {
-                ImplicitFeedback::WeakNegative => {
+                ox_core::feedback::ImplicitFeedback::WeakNegative => {
                     tracing::debug!(
                         "[IMPLICIT FEEDBACK] Minor change: {:?} ({:.1}%)",
                         signal.path,
                         signal.change_ratio * 100.0
                     );
                 }
-                ImplicitFeedback::StrongNegative => {
+                ox_core::feedback::ImplicitFeedback::StrongNegative => {
                     tracing::info!(
                         "[IMPLICIT FEEDBACK] Major rewrite: {:?} ({:.1}%)",
                         signal.path,
                         signal.change_ratio * 100.0
                     );
                 }
-                ImplicitFeedback::VeryStrongNegative => {
+                ox_core::feedback::ImplicitFeedback::VeryStrongNegative => {
                     tracing::warn!("[IMPLICIT FEEDBACK] File deleted: {:?}", signal.path);
                 }
             }
         } else {
-            // No significant change (<5%) - count as acceptance
             app.accepted_file_writes += 1;
             tracing::debug!(
                 "[IMPLICIT FEEDBACK] Accepted: {:?} (change: {:.1}%)",
@@ -48,7 +43,7 @@ pub fn process_implicit_feedback(
 
 /// Update EMA tracker with current accept rate and persist periodically.
 #[allow(dead_code)]
-pub fn update_feedback_metrics(app: &mut App, memory_arc: &Arc<ox_core::memory::MemoryManager>) {
+pub fn update_feedback_metrics(app: &mut App, metrics_path: &std::path::Path) {
     if app.total_file_writes == 0 {
         return;
     }
@@ -58,14 +53,13 @@ pub fn update_feedback_metrics(app: &mut App, memory_arc: &Arc<ox_core::memory::
         app.accepted_file_writes,
     );
 
-    // Persist EMA state periodically (every 10 writes)
     if app.total_file_writes % 10 == 0 {
-        let store_clone = memory_arc.overall_store().clone();
         let metric_name = "code_accept_rate".to_string();
         let ema_clone = app.ema_manager.clone();
+        let path = metrics_path.to_path_buf();
 
         tokio::spawn(async move {
-            if let Err(e) = ema_clone.persist_to_store(&metric_name, &store_clone) {
+            if let Err(e) = ema_clone.persist_to_file(&metric_name, &path) {
                 tracing::warn!("Failed to persist EMA state: {}", e);
             }
         });

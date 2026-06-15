@@ -19,7 +19,6 @@ pub fn handle_skill_command(
     _session: &mut Session,
     rt_env: &mut RuntimeEnvironment,
     _config: &ox_core::config::OxConfig,
-    _memory: &std::sync::Arc<ox_core::memory::MemoryManager>,
     _cost_tracker: &mut ox_core::cost::CostTracker,
     _trust_manager: &std::sync::Arc<std::sync::Mutex<ox_core::safety::TrustManager>>,
 ) -> crate::slash_commands::CommandResult {

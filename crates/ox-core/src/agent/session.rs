@@ -25,8 +25,8 @@ impl SessionState {
     pub fn new(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
-            current_mode: "free".to_string(),
-            current_workflow: "five_step_pipeline".to_string(),
+            current_mode: "pipeline".to_string(),
+            current_workflow: crate::agent::workflow::DEFAULT_WORKFLOW_ID.to_string(),
             current_step_index: 0,
             awaiting_user_confirmation: false,
             variables: std::collections::HashMap::new(),

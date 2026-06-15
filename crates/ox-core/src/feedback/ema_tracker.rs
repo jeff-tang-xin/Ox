@@ -67,7 +67,13 @@ impl EmatrendTracker {
     }
 }
 
-/// Manages multiple EMA trackers for different metrics
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmaPersisted {
+    value: f64,
+    trend: f64,
+    count: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Emamanager {
     trackers: std::collections::HashMap<String, EmatrendTracker>,
@@ -113,35 +119,51 @@ impl Emamanager {
             .unwrap_or(false)
     }
 
-    /// Load tracker state from persisted data
-    pub fn load_from_store(
+    /// Load tracker state from a JSON metrics file (`~/.ox/ema_metrics.json`).
+    pub fn load_from_file(
         &mut self,
         metric_name: &str,
-        store: &crate::memory::store::MemoryStore,
+        path: &std::path::Path,
     ) -> anyhow::Result<()> {
-        if let Some((value, trend, count)) = store.load_ema_trend(metric_name)? {
+        if !path.exists() {
+            return Ok(());
+        }
+        let data = std::fs::read_to_string(path)?;
+        let map: std::collections::HashMap<String, EmaPersisted> = serde_json::from_str(&data)?;
+        if let Some(p) = map.get(metric_name) {
             let tracker = self.get_tracker(metric_name);
-            tracker.current_value = value;
-            tracker.trend = trend;
-            tracker.sample_count = count;
+            tracker.current_value = p.value;
+            tracker.trend = p.trend;
+            tracker.sample_count = p.count;
         }
         Ok(())
     }
 
-    /// Persist tracker state to store
-    pub fn persist_to_store(
+    /// Persist tracker state to a JSON metrics file.
+    pub fn persist_to_file(
         &self,
         metric_name: &str,
-        store: &crate::memory::store::MemoryStore,
+        path: &std::path::Path,
     ) -> anyhow::Result<()> {
+        let mut map: std::collections::HashMap<String, EmaPersisted> = if path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(path)?).unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
         if let Some(tracker) = self.trackers.get(metric_name) {
-            store.save_ema_trend(
-                metric_name,
-                tracker.current_value,
-                tracker.trend,
-                tracker.sample_count,
-            )?;
+            map.insert(
+                metric_name.to_string(),
+                EmaPersisted {
+                    value: tracker.current_value,
+                    trend: tracker.trend,
+                    count: tracker.sample_count,
+                },
+            );
         }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&map)?)?;
         Ok(())
     }
 

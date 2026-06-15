@@ -18,7 +18,7 @@ pub struct SessionMeta {
     pub message_count: usize,
     
     // 🚨 Workflow state persistence
-    /// Current workflow mode (free/spec/council)
+    /// Current workflow mode (pipeline)
     #[serde(default)]
     pub workflow_mode: String,
     /// Current workflow ID
@@ -65,8 +65,8 @@ impl Session {
             created_at: now.clone(),
             updated_at: now,
             message_count: 0,
-            workflow_mode: String::new(),
-            workflow_id: String::new(),
+            workflow_mode: "pipeline".to_string(),
+            workflow_id: crate::agent::workflow::DEFAULT_WORKFLOW_ID.to_string(),
             workflow_step_index: 0,
             requirement_name: None,
             working_dir: None,

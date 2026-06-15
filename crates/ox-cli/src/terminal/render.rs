@@ -2,9 +2,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::helpers::formatting::short_display_path;
 use super::app::App;
 use super::input_pane::InputPane;
 use super::output_pane::OutputLine;
@@ -27,6 +28,24 @@ const STREAMING: Color = Color::Rgb(78, 201, 176);
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Clamp indexing percent to 0–100 (parsing and embedding share done/total fields per phase).
+fn index_pct(done: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    ((done.min(total)) * 100 / total).min(100)
+}
+
+/// Pad with spaces so fixed-width progress text fully overwrites prior frame (avoids ghost digits).
+fn pad_to_width(text: String, width: u16) -> String {
+    let w = UnicodeWidthStr::width(text.as_str());
+    if w >= width as usize {
+        text
+    } else {
+        format!("{text}{}", " ".repeat(width as usize - w))
+    }
+}
+
 pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
     let area = frame.area();
     if area.width < 20 || area.height < 8 {
@@ -35,11 +54,15 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
 
     // Adaptive layout based on terminal height
     let is_tiny = area.height < 15;
-    let indexing_bar = if app.indexing && app.index_total_files > 0 { 1u16 } else { 0 };
+    let indexing_bar = if app.indexing && app.index_has_progress() { 1u16 } else { 0 };
     let has_workflow = app.workflow_display.is_some() as u16;
     let header_height = if is_tiny { 0 } else { (2u16 + has_workflow + indexing_bar).min(5) };
 
-    let input_height = if app.pending_confirmation.is_some() { 3 } else { 2 };
+    let input_height = if app.pending_confirmation.is_some() || app.workflow_awaiting_confirmation.is_some() {
+        3
+    } else {
+        2
+    };
 
     let chunks = Layout::vertical([
         Constraint::Length(header_height), // Header (hidden on tiny screens)
@@ -59,15 +82,25 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    frame.render_widget(Clear, area);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let max_lines = area.height as usize;
 
-    // Line 1: Title (all owned to satisfy 'static)
-    let title_line = format!(" ◆ Ox  {} ", app.model_name);
-    lines.push(Line::from(vec![
-        Span::styled(title_line, Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
-    ]));
+    // Line 1: LLM model + embedding model
+    let mut title_spans = vec![
+        Span::styled(" ◆ Ox  ".to_string(), Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
+        Span::styled(app.model_name.clone(), Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
+    ];
+    if !app.embedding_model.is_empty() {
+        title_spans.push(Span::styled(" │ embed: ".to_string(), Style::default().fg(TEXT_DIM)));
+        title_spans.push(Span::styled(
+            app.embedding_model.clone(),
+            Style::default().fg(Color::Rgb(140, 200, 255)),
+        ));
+    }
+    title_spans.push(Span::raw(" "));
+    lines.push(Line::from(title_spans));
 
     // Line 2: Workflow step status
     if let Some(ref wf_info) = app.workflow_display && lines.len() < max_lines {
@@ -84,16 +117,32 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let max_lines = area.height as usize;
 
     // Indexing progress bar
-    if app.indexing && app.index_total_files > 0 && lines.len() < max_lines {
-        let pct = (app.index_files_done * 100) / app.index_total_files.max(1);
+    if app.indexing && app.index_has_progress() && lines.len() < max_lines {
+        let (done, total) = app.index_progress_counts();
+        let pct = index_pct(done, total);
         let bar_width = 20u64;
-        let filled = (app.index_files_done as u64 * bar_width) / app.index_total_files.max(1) as u64;
-        let empty = bar_width - filled;
+        let filled = (done as u64 * bar_width) / total.max(1) as u64;
+        let empty = bar_width.saturating_sub(filled);
         let progress_bar = "█".repeat(filled as usize) + &"░".repeat(empty as usize);
+        let phase_label = if app.index_phase == "embedding" {
+            "Embed"
+        } else {
+            "AST"
+        };
+        let detail = if app.index_phase == "embedding" {
+            format!("{:>5}/{:<5} entities", done, total)
+        } else {
+            format!(
+                "{:>5}/{:<5} files, {:>6} sym",
+                done, total, app.index_symbols
+            )
+        };
+        let progress_text = pad_to_width(
+            format!("  ⏳ {phase_label} [{progress_bar}] {pct:>3}% {detail}"),
+            area.width,
+        );
         lines.push(Line::from(vec![
-            Span::styled("  ⏳ ", Style::default().fg(Color::Yellow)),
-            Span::styled(format!("[{progress_bar}] {pct}%"), Style::default().fg(Color::Green)),
-            Span::styled(format!(" {}/{} files", app.index_files_done, app.index_total_files), Style::default().fg(TEXT)),
+            Span::styled(progress_text, Style::default().fg(TEXT).bg(BG)),
         ]));
     }
 
@@ -142,7 +191,23 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     // Enhanced title with better scroll indication
     let title = if app.indexing {
         let s = SPINNER[(spinner_frame as usize) % SPINNER.len()];
-        format!(" {s} Indexing… ")
+        if app.index_has_progress() {
+            let (done, total) = app.index_progress_counts();
+            let pct = index_pct(done, total);
+            if app.index_phase == "embedding" {
+                pad_to_width(
+                    format!(" {s} Embed {pct:>3}% ({done:>5}/{total:<5}) "),
+                    area.width,
+                )
+            } else {
+                pad_to_width(
+                    format!(" {s} AST {pct:>3}% ({done:>5}/{total:<5}) "),
+                    area.width,
+                )
+            }
+        } else {
+            pad_to_width(format!(" {s} Indexing… "), area.width)
+        }
     } else if app.agent_running {
         let s = SPINNER[(spinner_frame as usize) % SPINNER.len()];
         format!(" {s} Ox ")
@@ -395,6 +460,8 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64) {
+    frame.render_widget(Clear, area);
+
     // When indexing or agent running, show progress status prominently
     let (status_style, status_bg) = if app.indexing {
         (Style::default().fg(TEXT_BRIGHT).bg(Color::Rgb(80, 60, 0)), Color::Rgb(80, 60, 0))
@@ -403,13 +470,14 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     };
 
     // Left side: Model and working directory (essential info)
+    let dir_short = short_display_path(&app.working_dir, 28);
     let mut left_parts: Vec<Span> = vec![
         Span::styled(
             format!(" {} ", app.model_name),
             status_style.add_modifier(Modifier::BOLD),
         ),
         Span::styled(" │ ", status_style),
-        Span::styled(format!(" {} ", app.working_dir), status_style),
+        Span::styled(format!(" {dir_short} "), status_style),
     ];
 
     // Show app.status (indexing progress, thinking, etc.)
@@ -467,9 +535,41 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
                 .add_modifier(Modifier::BOLD)
                 .bg(BG_INPUT),
         )
+    } else if app.workflow_awaiting_confirmation == Some(2) {
+        (
+            "❯ 确认/修改 > ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+                .bg(BG_INPUT),
+        )
+    } else if app.workflow_awaiting_confirmation.is_some() {
+        (
+            "❯ 确认 > ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+                .bg(BG_INPUT),
+        )
     } else if app.indexing {
         let s = SPINNER[app.spinner_frame as usize % SPINNER.len()];
-        indexing_prompt = format!("{} indexing > ", s);
+        if app.index_has_progress() {
+            let (done, total) = app.index_progress_counts();
+            let pct = index_pct(done, total);
+            let phase = if app.index_phase == "embedding" {
+                "embed"
+            } else {
+                "ast"
+            };
+            indexing_prompt = format!("{s} {phase} {pct:>3}% > ");
+        } else {
+            let phase = if app.index_phase == "embedding" {
+                "embedding"
+            } else {
+                "indexing"
+            };
+            indexing_prompt = format!("{s} {phase} > ");
+        }
         (&*indexing_prompt as &str, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD).bg(BG_INPUT))
     } else if app.agent_running {
         (
@@ -504,10 +604,32 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
             .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::Yellow))
             .style(Style::default().bg(BG_INPUT))
-            .title(" Confirmation Mode ")
+            .title(" Tool Confirmation ")
             .title_style(
                 Style::default()
                     .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+    } else if app.workflow_awaiting_confirmation == Some(2) {
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(BG_INPUT))
+            .title(" 审阅完成 — ok/继续/确认 开始执行，或输入修改意见 ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+    } else if app.workflow_awaiting_confirmation.is_some() {
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(BG_INPUT))
+            .title(" Workflow Confirmation ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )
     } else {

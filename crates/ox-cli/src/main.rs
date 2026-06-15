@@ -21,6 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use ox_core::agent::{self, AgentToUiEvent};
+use ox_core::agent::workflow::DEFAULT_WORKFLOW_ID;
 use ox_core::agent::interjection::{InterjectionBuffer, InterjectionPriority};
 use ox_core::agent::interrupt::InterruptController;
 use ox_core::agent::ui_event::UiToAgentEvent;
@@ -29,7 +30,6 @@ use ox_core::context::{self, ContextBuilder};
 use ox_core::cost::CostTracker;
 use ox_core::knowledge::KnowledgeEngine;
 use ox_core::llm::{self, LlmProvider, ProviderResolveInfo};
-use ox_core::memory::MemoryManager;
 use ox_core::message::{Message, Session};
 use ox_core::runtime;
 use ox_core::safety::injection;
@@ -45,6 +45,7 @@ use handlers::agent_handler::{self, HandleResult};
 use handlers::key_handler::{self, KeyResult};
 use handlers::pre_turn::TurnVariant;
 use handlers::session_handler;
+use helpers::formatting::short_model_id;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -182,6 +183,7 @@ async fn run_app(
         .map(|p| p.model_name().to_string())
         .unwrap_or_else(|| "echo".to_string());
     app.working_dir = rt_env.working_dir.display().to_string();
+    app.embedding_model = short_model_id(&config.embedding.model_id);
     app.message_count = 0;
 
     // Header
@@ -286,107 +288,97 @@ async fn run_app(
         CostTracker::load_or_create(&std::env::temp_dir()).unwrap()
     });
 
-    // ── Knowledge Engine + Memory: parallel init ──
+    // ── Knowledge Engine init ──
     let db_path = db_dir.join("knowledge.tdb");
     let db_path_str = db_path.to_string_lossy().to_string();
     let config_clone = config.clone();
     let rt_env_clone = rt_env.clone();
-    let ox_home = rt_env.ox_home_dir.clone();
-    let project_id = rt_env.project_id.clone();
-    let mem_config = config.memory.clone();
 
-    let (knowledge_engine, memory_arc) = {
-        let knowledge_fut = tokio::task::spawn_blocking(move || {
-            let embedding_model = ox_core::knowledge::embedding::load_shared(&config_clone.embedding)
-                .unwrap_or_else(|e| {
-                    panic!("Embedding model required for KnowledgeEngine: {e}");
-                });
-            KnowledgeEngine::new(
-                &db_path_str, embedding_model, &config_clone.embedding, &rt_env_clone.working_dir,
-            )
+    app.status = format!("Loading embed: {}…", app.embedding_model);
+    app.dirty = true;
+    terminal.draw(|frame| render::render(frame, &mut app, 0))?;
+
+    let knowledge_engine = tokio::task::spawn_blocking(move || {
+        let embedding_model = ox_core::knowledge::embedding::load_shared(&config_clone.embedding)
             .unwrap_or_else(|e| {
-                tracing::error!("Failed to create KnowledgeEngine: {e}");
-                std::process::exit(1);
-            })
-        });
+                panic!("Embedding model required for KnowledgeEngine: {e}");
+            });
+        KnowledgeEngine::new(
+            &db_path_str,
+            embedding_model,
+            &config_clone.embedding,
+            rt_env_clone
+                .project_root
+                .as_deref()
+                .unwrap_or(&rt_env_clone.working_dir),
+        )
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to create KnowledgeEngine: {e}");
+            std::process::exit(1);
+        })
+    })
+    .await
+    .expect("KnowledgeEngine init panicked");
 
-        let memory_fut = tokio::task::spawn_blocking(move || {
-            MemoryManager::init(&ox_home, &project_id, &mem_config)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("Failed to init memory: {e}");
-                    MemoryManager::init(&std::env::temp_dir(), &project_id, &mem_config)
-                        .unwrap_or_else(|_| panic!("Fatal: cannot init memory"))
-                })
-        });
+    let knowledge_engine = Arc::new(tokio::sync::RwLock::new(knowledge_engine));
 
-        let (knowledge, memory) = tokio::join!(knowledge_fut, memory_fut);
-        let knowledge = knowledge.expect("KnowledgeEngine init panicked");
-        let memory = memory.expect("Memory init panicked");
-
-        (Arc::new(tokio::sync::RwLock::new(knowledge)), Arc::new(memory))
-    };
-
-    KnowledgeEngine::start_file_watcher(Arc::clone(&knowledge_engine));
-
+    let ema_metrics_path = rt_env.ox_home_dir.join("ema_metrics.json");
     if let Err(e) = app
         .ema_manager
-        .load_from_store("code_accept_rate", memory_arc.overall_store())
+        .load_from_file("code_accept_rate", &ema_metrics_path)
     {
         tracing::warn!("Failed to load EMA history: {}", e);
     }
 
-    if rand::random::<f64>() < config.memory.janitor_run_on_startup_prob {
-        memory_arc.run_janitor(0.3, config.memory.max_nodes);
-    }
-
     // ── Background indexing ──
     let knowledge_for_index = Arc::clone(&knowledge_engine);
+    let embed_chunk_size = config.embedding.index_embed_chunk_size.max(1);
+    let embed_progress_step = config.embedding.index_embed_progress_step.max(1);
+    let lazy_index = config.embedding.lazy_index;
+    let background_full_index = config.embedding.background_full_index;
     let (index_progress_tx, mut index_progress_rx) =
-        mpsc::unbounded_channel::<(usize, usize, usize)>();
+        mpsc::unbounded_channel::<ox_core::knowledge::IndexProgress>();
     let (index_phase_tx, mut index_phase_rx) = mpsc::unbounded_channel::<String>();
     let (index_done_tx, mut index_done_rx) = mpsc::unbounded_channel::<usize>();
-    tokio::spawn(async move {
-        let _ = index_phase_tx.send("parsing".to_string());
-        let phase1_result = {
-            let engine = knowledge_for_index.read().await;
-            engine.collect_all_symbols(None)
-        };
-        let all_entities = match phase1_result {
-            Ok((entities, _)) => entities,
-            Err(e) => {
-                tracing::warn!("[INDEXER] Phase 1 failed: {e}");
-                let _ = index_done_tx.send(0);
-                return;
-            }
-        };
-        if all_entities.is_empty() {
-            let _ = index_done_tx.send(0);
-            return;
+
+    if lazy_index {
+        // Chat immediately; embed on-demand per turn + optional background full index.
+        if background_full_index {
+            tokio::spawn(async move {
+                run_full_project_index(
+                    knowledge_for_index,
+                    embed_chunk_size,
+                    embed_progress_step,
+                    index_phase_tx,
+                    index_progress_tx,
+                    index_done_tx,
+                )
+                .await;
+            });
+            app.indexing = true;
+            app.index_phase = "parsing".into();
+            app.status = "后台索引中 — 可立即聊天".to_string();
+        } else {
+            KnowledgeEngine::start_file_watcher(Arc::clone(&knowledge_for_index));
+            app.indexing = false;
+            app.status = "按需索引 — 检索时嵌入相关文件".to_string();
         }
-        let _ = index_phase_tx.send("embedding".to_string());
-        const CHUNK: usize = 30;
-        let total_entities = all_entities.len();
-        let mut embedded = 0;
-        while embedded < total_entities {
-            let count = {
-                let mut engine = knowledge_for_index.write().await;
-                match engine.embed_and_store_chunk(&all_entities, embedded, CHUNK) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("[INDEXER] Embedding chunk failed at {}: {e}", embedded);
-                        0
-                    }
-                }
-            };
-            embedded += count;
-            let _ = index_progress_tx.send((embedded, total_entities, embedded));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        tracing::info!("[INDEXER] ✅ All done: {} entities embedded", total_entities);
-        let _ = index_done_tx.send(total_entities);
-    });
-    app.indexing = true;
-    app.status = "⏳ Background indexing... (chat ready)".to_string();
+    } else {
+        tokio::spawn(async move {
+            run_full_project_index(
+                knowledge_for_index,
+                embed_chunk_size,
+                embed_progress_step,
+                index_phase_tx,
+                index_progress_tx,
+                index_done_tx,
+            )
+            .await;
+        });
+        app.indexing = true;
+        app.index_phase = "parsing".into();
+        app.status = "AST parsing… (chat ready)".to_string();
+    }
 
     // ── Tool context ──
     let mut tool_ctx = Arc::new(ToolContext::new(
@@ -458,14 +450,14 @@ async fn run_app(
     // ========================================================================
     loop {
         // ── Onboarding trigger ──
-        if needs_onboarding && !app.indexing {
+        if needs_onboarding && (!app.indexing || lazy_index) {
             needs_onboarding = false;
             app.output.push_system(
                 "🔍 First time in this project. Scanning codebase to learn conventions...",
             );
             if let Some(ref wf) = app.workflow_engine {
                 if let Ok(mut engine) = wf.try_lock() {
-                    engine.activate_workflow("five_step_pipeline").ok();
+                    engine.activate_workflow(DEFAULT_WORKFLOW_ID).ok();
                     engine.reset_workflow();
                 }
             }
@@ -509,7 +501,7 @@ async fn run_app(
         // ── Implicit feedback ──
         let override_signals = app.override_detector.detect_overrides();
         middleware::feedback::process_implicit_feedback(&mut app, &override_signals);
-        middleware::feedback::update_feedback_metrics(&mut app, &memory_arc);
+        middleware::feedback::update_feedback_metrics(&mut app, &ema_metrics_path);
 
         // ── Drain indexing progress ──
         if app.indexing {
@@ -552,13 +544,14 @@ async fn run_app(
                         for key in keys {
                             process_key_event(
                                 &mut app, key, &mut session, &mut background_session,
-                                &provider, &agent_tx, &memory_arc, &tool_registry,
+                                &provider, &agent_tx, &tool_registry,
                                 &mut tool_ctx, &context_builder, context_window,
                                 &mut cost_tracker, &trust_manager, &mut model_name,
                                 &mut rt_env, &mut interrupt_ctrl,
                                 &mut interjection_buf, &resolve_info,
                                 config, &agent_config, &compressed_ctx_store,
                                 &mut compressed_cache, &command_registry,
+                                &knowledge_engine,
                             );
                         }
 
@@ -567,7 +560,7 @@ async fn run_app(
                             let action = std::mem::replace(&mut app.session_action, SessionAction::None);
                             process_session_action(
                                 &mut app, &mut session, &mut background_session,
-                                action, &mut rt_env, &memory_arc, &sessions_root,
+                                action, &mut rt_env, &knowledge_engine, &sessions_root,
                                 &compressed_ctx_store, &mut compressed_cache,
                                 provider.is_some(),
                             );
@@ -613,7 +606,7 @@ async fn run_app(
                 if let Some(ev) = agent_ev {
                     process_agent_event(
                         &mut app, ev, &mut session, &mut background_session,
-                        &provider, &agent_tx, &memory_arc, &tool_registry,
+                        &provider, &agent_tx, &tool_registry,
                         &mut tool_ctx, &context_builder, context_window,
                         &mut cost_tracker, &trust_manager, &mut model_name,
                         &mut rt_env, &mut interrupt_ctrl,
@@ -626,7 +619,6 @@ async fn run_app(
         }
 
         if app.should_quit {
-            memory_arc.flush();
             break;
         }
     }
@@ -638,29 +630,151 @@ async fn run_app(
 // Event Processing Helpers
 // ============================================================================
 
+/// Full-project AST walk + chunked embedding (blocking startup or background).
+async fn run_full_project_index(
+    knowledge_for_index: Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    embed_chunk_size: usize,
+    progress_step: usize,
+    index_phase_tx: mpsc::UnboundedSender<String>,
+    index_progress_tx: mpsc::UnboundedSender<ox_core::knowledge::IndexProgress>,
+    index_done_tx: mpsc::UnboundedSender<usize>,
+) {
+    let start_watcher = || KnowledgeEngine::start_file_watcher(Arc::clone(&knowledge_for_index));
+
+    let _ = index_phase_tx.send("parsing".to_string());
+    let progress_tx = index_progress_tx.clone();
+    let phase1_result = {
+        let engine = knowledge_for_index.read().await;
+        tokio::task::block_in_place(|| engine.collect_all_symbols(Some(progress_tx)))
+    };
+    let mut all_entities = match phase1_result {
+        Ok((entities, _)) => entities,
+        Err(e) => {
+            tracing::warn!("[INDEXER] Phase 1 failed: {e}");
+            let _ = index_done_tx.send(0);
+            start_watcher();
+            return;
+        }
+    };
+    if all_entities.is_empty() {
+        tracing::info!("[INDEXER] No symbols to embed — indexing complete");
+        let _ = index_done_tx.send(0);
+        start_watcher();
+        return;
+    }
+    KnowledgeEngine::sort_entities_for_startup_index(&mut all_entities);
+    let total_entities = all_entities.len();
+    let _ = index_phase_tx.send(format!("embedding:{total_entities}"));
+    let _ = index_progress_tx.send(ox_core::knowledge::IndexProgress::embedding(
+        0,
+        total_entities,
+    ));
+    tracing::info!("[INDEXER] Phase 2: embedding {total_entities} symbols…");
+    let progress_step = progress_step.min(embed_chunk_size).max(1);
+    let mut offset = 0;
+    while offset < total_entities {
+        let chunk = progress_step.min(total_entities - offset);
+        let _ = index_progress_tx.send(ox_core::knowledge::IndexProgress::embedding(
+            offset,
+            total_entities,
+        ));
+        let result = {
+            let mut engine = knowledge_for_index.write().await;
+            tokio::task::block_in_place(|| {
+                engine.embed_and_store_chunk(&all_entities, offset, chunk)
+            })
+        };
+        match result {
+            Ok(n) => {
+                tracing::debug!("[INDEXER] Embedded chunk at {offset}: {n} stored");
+            }
+            Err(e) => tracing::warn!("[INDEXER] Embedding chunk failed at {offset}: {e}"),
+        }
+        offset += chunk;
+        let _ = index_progress_tx.send(ox_core::knowledge::IndexProgress::embedding(
+            offset,
+            total_entities,
+        ));
+        tokio::task::yield_now().await;
+    }
+    tracing::info!("[INDEXER] ✅ All done: {total_entities} entities embedded");
+    let _ = index_done_tx.send(total_entities);
+    start_watcher();
+}
+
+/// Clamp indexing percent to 0–100 for display.
+fn index_pct(done: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    ((done.min(total)) * 100 / total).min(100)
+}
+
 /// Drain indexing progress channels and update app state.
 fn drain_indexing_progress(
     app: &mut App,
     phase_rx: &mut mpsc::UnboundedReceiver<String>,
-    progress_rx: &mut mpsc::UnboundedReceiver<(usize, usize, usize)>,
+    progress_rx: &mut mpsc::UnboundedReceiver<ox_core::knowledge::IndexProgress>,
     done_rx: &mut mpsc::UnboundedReceiver<usize>,
     tick_count: &mut u64,
 ) {
     if let Ok(phase) = phase_rx.try_recv() {
-        app.status = if phase == "parsing" {
-            "AST parsing…".to_string()
+        if let Some(total_str) = phase.strip_prefix("embedding:") {
+            app.index_phase = "embedding".to_string();
+            // Drop stale parsing progress events queued before embed phase.
+            while progress_rx.try_recv().is_ok() {}
+            if let Ok(total) = total_str.parse::<usize>() {
+                app.index_embed_total = total.max(1);
+                app.index_embed_done = 0;
+                app.status = format!("Embedding {:>5}/{:<5} entities ({:>3}%)", 0, total, 0);
+            } else {
+                app.status = "Embedding vectors…".to_string();
+            }
         } else {
-            "Embedding vectors…".to_string()
-        };
+            app.index_phase = phase.clone();
+            app.status = match phase.as_str() {
+                "parsing" => "AST parsing…".to_string(),
+                "embedding" => "Embedding vectors…".to_string(),
+                other => other.to_string(),
+            };
+        }
         app.dirty = true;
     }
-    while let Ok((a, b, c)) = progress_rx.try_recv() {
-        if app.status.starts_with("Embedding") {
-            let pct = if b > 0 { (a * 100) / b } else { 0 };
-            app.status = format!("Embedding {}/{} entities ({}%)", a, b, pct);
-        } else {
-            let pct = if b > 0 { (a * 100) / b } else { 0 };
-            app.status = format!("AST {}/{} files, {} sym ({}%)", a, b, c, pct);
+    while let Ok(msg) = progress_rx.try_recv() {
+        use ox_core::knowledge::IndexProgress;
+        match msg {
+            IndexProgress::Parsing {
+                files_done,
+                files_total,
+                symbols_so_far,
+            } if app.index_phase != "embedding" => {
+                app.index_phase = "parsing".to_string();
+                app.index_parse_done = files_done;
+                app.index_parse_total = files_total.max(1);
+                app.index_symbols = symbols_so_far;
+                let pct = index_pct(files_done, files_total);
+                app.status = format!(
+                    "AST {:>5}/{:<5} files, {:>6} sym ({:>3}%)",
+                    files_done, files_total, symbols_so_far, pct
+                );
+            }
+            IndexProgress::Embedding {
+                entities_done,
+                entities_total,
+            } => {
+                app.index_phase = "embedding".to_string();
+                let done = entities_done.min(entities_total);
+                app.index_embed_done = done;
+                app.index_embed_total = entities_total.max(1);
+                let pct = index_pct(entities_done, entities_total);
+                app.status = format!(
+                    "Embedding {:>5}/{:<5} entities ({:>3}%)",
+                    done, entities_total, pct
+                );
+            }
+            IndexProgress::Parsing { .. } => {
+                // Ignore parsing events after embed phase started.
+            }
         }
         *tick_count = tick_count.wrapping_add(1);
         app.spinner_frame = *tick_count;
@@ -668,10 +782,12 @@ fn drain_indexing_progress(
     }
     if let Ok(total) = done_rx.try_recv() {
         app.indexing = false;
+        app.index_phase.clear();
         app.index_symbols = total;
+        app.index_embed_done = app.index_embed_total;
         app.status = String::new();
         app.output.push_system(&format!(
-            "✅ Indexing complete: {} symbols indexed. Ready to chat!", total
+            "✅ Indexing complete: {total} symbols embedded. Ready to chat!"
         ));
         app.dirty = true;
     }
@@ -686,7 +802,6 @@ fn process_key_event(
     background_session: &mut Option<Session>,
     provider: &Option<Arc<dyn LlmProvider>>,
     agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    memory: &Arc<MemoryManager>,
     tool_registry: &Arc<ToolRegistry>,
     tool_ctx: &mut Arc<ToolContext>,
     context_builder: &ContextBuilder,
@@ -703,6 +818,7 @@ fn process_key_event(
     _compressed_ctx_store: &Arc<ox_core::context::compressed_store::CompressedContextStore>,
     compressed_cache: &mut Option<(Vec<Message>, usize)>,
     command_registry: &slash_commands::CommandRegistry,
+    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
 ) {
     // Handle Ctrl+C/D — check both with modifiers and without (cross-platform)
     let is_ctrl_c = matches!(key.code, KeyCode::Char('c'))
@@ -732,17 +848,18 @@ fn process_key_event(
                 UserInput::SlashCommand { cmd, args } => {
                     process_slash_command(
                         app, &cmd, &args, session, rt_env, config,
-                        memory, cost_tracker, trust_manager,
+                        cost_tracker, trust_manager,
                         provider, agent_tx, tool_registry, tool_ctx,
                         context_builder, context_window,
                         interrupt_ctrl, agent_config,
                         model_name, command_registry,
+                        compressed_cache, knowledge_engine,
                     );
                 }
                 UserInput::Text(text) => {
                     process_text_input(
                         app, &text, session, background_session,
-                        provider, agent_tx, memory, tool_registry,
+                        provider, agent_tx, tool_registry,
                         tool_ctx, context_builder, context_window,
                         config, agent_config, trust_manager,
                         rt_env, interrupt_ctrl, interjection_buf,
@@ -765,7 +882,6 @@ fn process_slash_command(
     session: &mut Session,
     rt_env: &mut runtime::RuntimeEnvironment,
     config: &OxConfig,
-    memory: &Arc<MemoryManager>,
     cost_tracker: &mut CostTracker,
     trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
     provider: &Option<Arc<dyn LlmProvider>>,
@@ -778,10 +894,12 @@ fn process_slash_command(
     agent_config: &Arc<AgentConfig>,
     _model_name: &str,
     command_registry: &slash_commands::CommandRegistry,
+    compressed_cache: &Option<(Vec<Message>, usize)>,
+    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
 ) {
     if let Some(meta) = command_registry.get_command(cmd) {
         let result = (meta.handler)(
-            app, args, session, rt_env, config, memory,
+            app, args, session, rt_env, config,
             cost_tracker, trust_manager,
         );
         match result {
@@ -799,7 +917,7 @@ fn process_slash_command(
                     provider, agent_tx, tool_registry, tool_ctx,
                     context_builder, context_window,
                     interrupt_ctrl, agent_config, trust_manager,
-                    rt_env, config, memory,
+                    rt_env, config, compressed_cache, knowledge_engine,
                 );
             }
             _ => {}
@@ -821,7 +939,6 @@ fn process_text_input(
     _background_session: &mut Option<Session>,
     provider: &Option<Arc<dyn LlmProvider>>,
     agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    _memory: &Arc<MemoryManager>,
     tool_registry: &Arc<ToolRegistry>,
     tool_ctx: &mut Arc<ToolContext>,
     context_builder: &ContextBuilder,
@@ -836,8 +953,33 @@ fn process_text_input(
     _model_name: &mut String,
     _cost_tracker: &mut CostTracker,
 ) {
-    if app.indexing {
+    if app.indexing && !config.embedding.lazy_index {
         app.output.push_system("⏳ Please wait — indexing in progress...");
+        app.dirty = true;
+        return;
+    }
+
+    // ── Skill draft confirmation ──
+    if let Some(draft) = app.pending_skill_draft.take() {
+        let t = text.trim().to_lowercase();
+        let t = t.strip_prefix('/').unwrap_or(&t);
+        let save = t == "ok" || t == "y" || t == "yes" || t == "保存"
+            || t == "确认" || t == "好" || t == "save";
+        if save {
+            match ox_core::agent::auto_reflect::AutoReflector::save_content_to_project(
+                &rt_env.working_dir,
+                &draft.content,
+            ) {
+                Ok(id) => {
+                    app.output.push_system(&format!("✅ Skill 已保存: {id}"));
+                    app.status.clear();
+                }
+                Err(e) => app.output.push_error(&format!("保存 Skill 失败: {e}")),
+            }
+        } else {
+            app.output.push_system("❌ Skill 草稿已丢弃。");
+            app.status.clear();
+        }
         app.dirty = true;
         return;
     }
@@ -882,7 +1024,11 @@ fn process_text_input(
     let pending_confirmation_step = if let Some(ref wf) = app.workflow_engine {
         if let Ok(engine) = wf.try_lock() {
             if engine.is_current_step_waiting_confirmation() {
-                Some(engine.get_current_step_index())
+                if engine.is_awaiting_execute_confirmation() {
+                    Some(2) // post-review human gate before Execute
+                } else {
+                    Some(engine.get_current_step_index())
+                }
             } else {
                 None
             }
@@ -896,27 +1042,27 @@ fn process_text_input(
     if let Some(step_idx) = pending_confirmation_step {
         let is_confirmation = {
             let t = text.trim().to_lowercase();
+            let t = t.strip_prefix('/').unwrap_or(&t);
             t == "ok" || t == "y" || t == "yes" || t == "go"
-                || t == "继续" || t == "确认" || t == "好" || t == "可以"
-                || t == "行" || t == "是的" || t == "对"
+                || t == "继续" || t == "确认" || t == "好" || t == "好的"
+                || t == "可以" || t == "行" || t == "是的" || t == "对"
+                || t == "没问题" || t == "开始" || t == "执行"
         };
 
-        if step_idx == 1 {
+        if step_idx == 2 {
             if is_confirmation {
-                // ── Plan confirmed: advance and SPAWN NEXT STEP directly ──
-                app.output.push_system("✅ 计划已确认。继续执行...");
+                app.workflow_awaiting_confirmation = None;
+                app.output.push_system("✅ 计划已审阅并确认。开始执行...");
                 if let Some(ref wf) = app.workflow_engine {
                     if let Ok(mut engine) = wf.try_lock() {
-                        engine.clear_confirmation_flag();
-                        let _ = engine.advance_step();
+                        engine.clear_execute_confirmation();
+                        let _ = engine.advance_to_step(Some(3));
                     }
                 }
-                // Record confirmation as system message (not user message)
                 let _ = session.append_message(Message::system(
-                    "User confirmed the plan. Continue to next step."
+                    "User confirmed the reviewed plan. Proceed to Execute."
                 ));
                 app.dirty = true;
-                // ⚡ Directly spawn next workflow step — DON'T fall through to normal text processing
                 spawn_next_workflow_step_if_needed(
                     app, session, provider, agent_tx, tool_registry, tool_ctx,
                     context_builder, context_window, interrupt_ctrl, agent_config,
@@ -924,41 +1070,36 @@ fn process_text_input(
                 );
                 return;
             } else {
-                // ── Plan feedback: rewind and re-run Step 1 with feedback ──
+                app.workflow_awaiting_confirmation = None;
                 app.output.push_system(&format!(
-                    "📝 修改意见已收到。重新生成计划...\n修改意见: {}",
+                    "📝 修改意见已收到。回到规划步骤重新生成...\n修改意见: {}",
                     text
                 ));
                 if let Some(ref wf) = app.workflow_engine {
                     if let Ok(mut engine) = wf.try_lock() {
-                        engine.clear_confirmation_flag();
+                        engine.clear_execute_confirmation();
                         let _ = engine.go_to_step(1);
                     }
                 }
                 let _ = session.append_message(Message::system(&format!(
-                    "📝 User reviewed the plan and gave feedback:\n{}\n\nPlease revise the plan based on this feedback and output the updated JSON.",
+                    "📝 User reviewed plan after safety check and gave feedback:\n{}\n\nPlease revise the plan based on this feedback and output updated JSON.",
                     text
                 )));
-                // Fall through to spawn agent turn with feedback context
             }
-        } else if step_idx == 2 {
-            // Review feedback — treat text as feedback to revise
-            app.output.push_system(&format!(
-                "📝 Feedback on review. Revising...\n{}",
-                text
-            ));
+        } else if step_idx == 1 {
+            // Legacy: should not occur in new flow; treat as replan feedback
+            app.workflow_awaiting_confirmation = None;
             if let Some(ref wf) = app.workflow_engine {
                 if let Ok(mut engine) = wf.try_lock() {
-                    engine.clear_confirmation_flag();
-                    let _ = engine.go_to_step(2);
+                    engine.clear_execute_confirmation();
+                    let _ = engine.go_to_step(1);
                 }
             }
             let _ = session.append_message(Message::system(&format!(
-                "📝 User reviewed the safety check and gave feedback:\n{}\nPlease re-evaluate and output the updated JSON.",
+                "📝 User plan feedback:\n{}\nPlease revise the plan.",
                 text
             )));
         } else {
-            // Other confirmation steps — treat as approve and advance
             if let Some(ref wf) = app.workflow_engine {
                 if let Ok(mut engine) = wf.try_lock() {
                     engine.clear_confirmation_flag();
@@ -968,7 +1109,7 @@ fn process_text_input(
             app.output.push_system("✅ Confirmed. Continuing to next step...");
             let _ = session.append_message(Message::system("User confirmed. Continue to next step."));
         }
-        // Fall through to spawn agent turn with updated state
+        // Fall through to spawn agent turn with updated state (feedback path only)
     }
 
     // Injection scan
@@ -985,6 +1126,15 @@ fn process_text_input(
     } else {
         text.to_string()
     };
+
+    // New user round: archive previous task, reset workflow ephemeral state
+    if pending_confirmation_step.is_none() {
+        if let Some(ref wf) = app.workflow_engine {
+            if let Ok(mut engine) = wf.try_lock() {
+                engine.begin_user_round(&text);
+            }
+        }
+    }
 
     // Save user message
     let _ = session.append_message(Message::user(&text));
@@ -1094,49 +1244,84 @@ fn spawn_agent_turn_from_slash(
     trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
     rt_env: &runtime::RuntimeEnvironment,
     config: &OxConfig,
-    memory: &Arc<MemoryManager>,
+    compressed_cache: &Option<(Vec<Message>, usize)>,
+    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
 ) {
+    if app.indexing && !config.embedding.lazy_index {
+        app.output.push_system("⏳ Please wait — indexing in progress...");
+        app.dirty = true;
+        return;
+    }
+
     app.output.push_system(&format!("🤖 {}", description));
     let _ = session.append_message(Message::user(prompt));
 
-    if let Some(p) = provider {
-        let memory_nodes = memory.retrieve_with_rerank(prompt, &Some(rt_env.project_id.as_str()), 5);
-        let accessed_ids: Vec<&str> = memory_nodes.iter().map(|n| n.id.as_str()).collect();
-        memory.reinforce_accessed(&accessed_ids);
-        let memory_ctx = memory.format_memory_context(&memory_nodes, false);
-
-        let system_prompt = context::build_system_prompt(
-            rt_env, tool_registry, ox_core::context::UserIntent::General,
-            Some(&config.behavior_rules), None, None,
-        );
-        let turn_messages = helpers::build_context_with_option(
-            context_builder, &system_prompt, &memory_ctx,
-            &session.messages, context_window, config.context.use_refined_context,
-        );
-
-        let effort = ox_core::context::estimate_effort(prompt, session.messages.len());
-        let planning = effort == ox_core::context::EffortLevel::High;
-
-        app.agent_running = true;
-        app.status = "Generating...".to_string();
-        let provider = Arc::clone(p);
-        let tx = agent_tx.clone();
-        let registry = Arc::clone(tool_registry);
-        let ctx = Arc::clone(tool_ctx);
-        let cancel_token = interrupt_ctrl.token();
-        let tm = Arc::clone(trust_manager);
-        let ac = Arc::clone(agent_config);
-        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
-        app.ui_to_agent_tx = Some(ui_tx);
-        let wf = app.workflow_engine.clone();
-        tokio::spawn(async move {
-            agent::run_agent_turn(
-                provider, turn_messages, registry, ctx, tx, ui_rx,
-                cancel_token, tm, ac, planning, wf,
-            )
-            .await;
-        });
+    if provider.is_none() {
+        return;
     }
+
+    app.agent_running = true;
+    app.status = "Generating...".to_string();
+
+    let provider = Arc::clone(provider.as_ref().unwrap());
+    let tx = agent_tx.clone();
+    let registry = Arc::clone(tool_registry);
+    let ctx = Arc::clone(tool_ctx);
+    let context_builder = context_builder.clone();
+    let cancel_token = interrupt_ctrl.token();
+    let tm = Arc::clone(trust_manager);
+    let ac = Arc::clone(agent_config);
+    let wf = app.workflow_engine.clone();
+    let config = config.clone();
+    let rt_env = rt_env.clone();
+    let session_messages = session.messages.clone();
+    let session_id = session.meta.id.clone();
+    let knowledge = Arc::clone(knowledge_engine);
+    let compressed_cache = compressed_cache.clone();
+    let prompt = prompt.to_string();
+    let description = description.to_string();
+
+    let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
+    app.ui_to_agent_tx = Some(ui_tx);
+
+    tokio::spawn(async move {
+        let status_tx = tx.clone();
+        let result = handlers::pre_turn::prepare_turn(
+            &config,
+            &rt_env,
+            &registry,
+            &context_builder,
+            context_window,
+            &Some(knowledge),
+            &prompt,
+            &session_messages,
+            &compressed_cache,
+            TurnVariant::SlashCommand {
+                prompt: prompt.clone(),
+                description,
+            },
+            &wf,
+            &session_id,
+            &status_tx,
+        )
+        .await;
+
+        let _ = status_tx.send(AgentToUiEvent::Status("🌐 Calling LLM...".to_string()));
+        agent::run_agent_turn(
+            provider,
+            result.turn_messages,
+            registry,
+            ctx,
+            tx,
+            ui_rx,
+            cancel_token,
+            tm,
+            ac,
+            result.planning,
+            wf,
+        )
+        .await;
+    });
 }
 
 /// Process a session action (New/Resume/SwitchNext).
@@ -1146,7 +1331,7 @@ fn process_session_action(
     background_session: &mut Option<Session>,
     action: SessionAction,
     rt_env: &mut runtime::RuntimeEnvironment,
-    memory: &Arc<MemoryManager>,
+    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
     sessions_root: &std::path::Path,
     compressed_ctx_store: &Arc<ox_core::context::compressed_store::CompressedContextStore>,
     compressed_cache: &mut Option<(Vec<Message>, usize)>,
@@ -1167,7 +1352,7 @@ fn process_session_action(
                 app.init_workflow_engine(&session.meta.id, &session.meta);
                 *compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
             } else {
-                let _ = session_handler::handle_session_new(app, session, rt_env, memory);
+                let _ = session_handler::handle_session_new(app, session, rt_env, knowledge_engine);
                 app.init_workflow_engine(&session.meta.id, &session.meta);
                 *compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
             }
@@ -1255,7 +1440,6 @@ fn process_agent_event(
     background_session: &mut Option<Session>,
     provider: &Option<Arc<dyn LlmProvider>>,
     agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    memory: &Arc<MemoryManager>,
     tool_registry: &Arc<ToolRegistry>,
     tool_ctx: &mut Arc<ToolContext>,
     context_builder: &ContextBuilder,
@@ -1294,7 +1478,7 @@ fn process_agent_event(
                 provider.is_some(), rt_env, tool_registry,
                 knowledge_engine, cost_tracker, model_name,
                 compressed_cache, agent_tx, tool_ctx,
-                config, memory, interrupt_ctrl,
+                config, interrupt_ctrl,
                 interjection_buf, context_builder,
                 context_window, agent_config, trust_manager,
                 provider, system_prompt,
@@ -1372,9 +1556,18 @@ fn process_agent_event(
         }
         AgentToUiEvent::WorkflowCompleted { task_description, execution_summary } => {
             agent_handler::handle_workflow_completed(
-                app, session, provider, rt_env, agent_tx,
+                app, session, provider, rt_env, agent_tx, knowledge_engine,
                 task_description, execution_summary,
             );
+        }
+        AgentToUiEvent::PlanReviewReady { markdown } => {
+            agent_handler::handle_plan_review_ready(app, &markdown);
+        }
+        AgentToUiEvent::WorkflowAwaitingConfirmation { step_idx, message } => {
+            agent_handler::handle_workflow_awaiting_confirmation(app, step_idx, &message);
+        }
+        AgentToUiEvent::SkillDraftReady { skill_id, content, description } => {
+            agent_handler::handle_skill_draft_ready(app, skill_id, content, description);
         }
     }
 }
@@ -1408,7 +1601,8 @@ fn spawn_next_workflow_step_if_needed(
             let prompt = engine.get_step_system_prompt();
             let idx = engine.get_current_step_index();
             let cont = engine.is_workflow_active() && !engine.is_workflow_complete();
-            let waiting = engine.is_current_step_waiting_confirmation();
+            let waiting = engine.is_current_step_waiting_confirmation()
+                || engine.is_awaiting_execute_confirmation();
             (prompt, idx, cont, waiting)
         } else { (None, 0, false, false) }
     } else { (None, 0, false, false) };
@@ -1441,6 +1635,17 @@ fn spawn_next_workflow_step_if_needed(
         context_builder, &system_prompt, "",
         &session.messages, context_window, false,
     );
+
+    // Inject durable workflow memory (replaces partial handoff)
+    let mut turn_messages = turn_messages;
+    if let Some(ref wf) = app.workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            let block = engine.durable_memory_block();
+            if !block.is_empty() {
+                turn_messages.push(Message::system(&block));
+            }
+        }
+    }
 
     app.agent_running = true;
     let p = Arc::clone(provider.as_ref().unwrap());

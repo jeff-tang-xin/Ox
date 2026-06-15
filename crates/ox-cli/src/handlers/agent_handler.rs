@@ -10,9 +10,8 @@ use ox_core::agent::AgentToUiEvent;
 use ox_core::config::OxConfig;
 use ox_core::context::ContextBuilder;
 use ox_core::cost::CostTracker;
-use ox_core::knowledge::KnowledgeEngine;
+use ox_core::knowledge::{format_memory_context, KnowledgeEngine};
 use ox_core::llm::LlmProvider;
-use ox_core::memory::MemoryManager;
 use ox_core::message::{Message, Session};
 use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
@@ -157,7 +156,6 @@ pub fn handle_turn_done(
     _agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
     _tool_ctx: &mut Arc<ToolContext>,
     config: &OxConfig,
-    memory: &Arc<MemoryManager>,
     interrupt_ctrl: &mut ox_core::agent::interrupt::InterruptController,
     interjection_buf: &mut ox_core::agent::interjection::InterjectionBuffer,
     context_builder: &ContextBuilder,
@@ -344,7 +342,25 @@ pub fn handle_turn_done(
     let lang_for_store = rt_env.project_language.clone();
     tokio::spawn(async move {
         let mut engine = knowledge_for_turn.write().await;
-        if let Some(last_user) = new_msgs_for_store.iter().rev().find_map(|m| {
+        if let Some(summary) =
+            ox_core::context::refinement::generate_memory_summary(&new_msgs_for_store)
+        {
+            let _ = engine.record_turn(
+                "current",
+                &summary.format_for_storage(),
+                Some(&summary.topic),
+                Some(&summary.key_insights),
+                summary.tools_used.clone(),
+                summary.has_code_changes,
+            );
+            let _ = engine.record_atomic_fact(
+                &summary.format_for_storage(),
+                "BestPractice",
+                Some(&pid_for_store),
+                &lang_for_store,
+                "RefinedSummary",
+            );
+        } else if let Some(last_user) = new_msgs_for_store.iter().rev().find_map(|m| {
             if let Message::User { content } = m {
                 Some(content.as_str())
             } else {
@@ -361,17 +377,6 @@ pub fn handle_turn_done(
                 None,
                 vec![],
                 false,
-            );
-        }
-        if let Some(summary) =
-            ox_core::context::refinement::generate_memory_summary(&new_msgs_for_store)
-        {
-            let _ = engine.record_atomic_fact(
-                &summary.format_for_storage(),
-                "BestPractice",
-                Some(&pid_for_store),
-                &lang_for_store,
-                "RefinedSummary",
             );
         }
     });
@@ -406,7 +411,9 @@ pub fn handle_turn_done(
 
     // Normal completion
     app.agent_running = false;
-    app.status = String::new();
+    if app.workflow_awaiting_confirmation.is_none() {
+        app.status = String::new();
+    }
     app.pending_confirmation = None;
     app.message_count = session.messages.len();
     app.cost_summary = cost_tracker.summary_short();
@@ -423,13 +430,14 @@ pub fn handle_turn_done(
         if let Some(last) = interjections_vec.last() {
             let _ = session.append_message(Message::user(last));
 
-            // Build context for interjection
-            let memory_nodes =
-                memory.retrieve(last, &Some(rt_env.project_id.as_str()), 5);
-            let accessed_ids: Vec<&str> =
-                memory_nodes.iter().map(|n| n.id.as_str()).collect();
-            memory.reinforce_accessed(&accessed_ids);
-            let memory_ctx = memory.format_memory_context(&memory_nodes, false);
+            // Build context for interjection — prefer unified KnowledgeEngine
+            let memory_nodes = knowledge_engine
+                .try_read()
+                .map(|engine| {
+                    engine.retrieve_memory_nodes(last, Some(rt_env.project_id.as_str()), 5)
+                })
+                .unwrap_or_default();
+            let memory_ctx = format_memory_context(&memory_nodes, false);
 
             let turn_messages = crate::helpers::build_context_with_option(
                 context_builder,
@@ -484,6 +492,34 @@ pub fn handle_error(
 /// Handle Status update event.
 pub fn handle_status(app: &mut App, status: String) {
     app.status = status;
+    app.dirty = true;
+}
+
+/// Handle formatted plan ready for user review.
+pub fn handle_plan_review_ready(app: &mut App, markdown: &str) {
+    app.output.finalize_streaming();
+    app.output.push_line(OutputLine::Markdown(markdown.to_string()));
+    if !app.user_scrolled {
+        app.scroll_to_bottom();
+    }
+    app.dirty = true;
+}
+
+/// Handle workflow paused for user confirmation.
+pub fn handle_workflow_awaiting_confirmation(app: &mut App, step_idx: usize, message: &str) {
+    app.output.finalize_streaming();
+    if !message.is_empty() {
+        app.output.push_line(OutputLine::Markdown(message.to_string()));
+    }
+    app.workflow_awaiting_confirmation = Some(step_idx);
+    app.agent_running = false;
+    app.status = match step_idx {
+        2 => "⏸️ 请确认后开始执行（输入 ok/继续/确认，或输入修改意见）".to_string(),
+        _ => "⏸️ 等待确认".to_string(),
+    };
+    if !app.user_scrolled {
+        app.scroll_to_bottom();
+    }
     app.dirty = true;
 }
 
@@ -619,6 +655,7 @@ pub fn handle_workflow_completed(
     provider: &Option<Arc<dyn LlmProvider>>,
     rt_env: &RuntimeEnvironment,
     agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    knowledge_engine: &Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>,
     task_description: String,
     execution_summary: String,
 ) {
@@ -627,6 +664,24 @@ pub fn handle_workflow_completed(
         task_description,
         execution_summary
     );
+
+    // L2 episode + memory consolidation via KnowledgeEngine
+    let ke = Arc::clone(knowledge_engine);
+    let pid = rt_env.project_id.clone();
+    let task = task_description.clone();
+    let summary = execution_summary.clone();
+    tokio::spawn(async move {
+        let mut engine = ke.write().await;
+        let _ = engine.record_workflow_episode(
+            "current",
+            Some(&pid),
+            &task,
+            &summary,
+        );
+        if let Err(e) = engine.run_consolidation("current", Some(&pid)) {
+            tracing::warn!("[KNOWLEDGE] Consolidation failed: {e}");
+        }
+    });
 
     if let Some(llm_provider) = provider {
         let project_root = rt_env.working_dir.clone();
@@ -649,16 +704,22 @@ pub fn handle_workflow_completed(
                         )
                         .await
                     {
-                        Ok(Some(skill_id)) => {
-                            let _ = tx_clone.send(AgentToUiEvent::Status(format!(
-                                "✅ Skill created: {}",
-                                skill_id
-                            )));
+                        Ok(ox_core::agent::auto_reflect::ReflectOutcome::Draft {
+                            skill_id,
+                            content,
+                            description,
+                        }) => {
+                            let _ = tx_clone.send(AgentToUiEvent::SkillDraftReady {
+                                skill_id,
+                                content,
+                                description,
+                            });
                         }
-                        Ok(None) => {
-                            tracing::debug!(
-                                "[AUTO-REFLECT] No skill generated"
-                            );
+                        Ok(ox_core::agent::auto_reflect::ReflectOutcome::Skipped { reason }) => {
+                            tracing::debug!("[AUTO-REFLECT] Skipped: {reason}");
+                            let _ = tx_clone.send(AgentToUiEvent::Status(format!(
+                                "ℹ️ Skill reflection skipped: {reason}"
+                            )));
                         }
                         Err(e) => {
                             tracing::error!("[AUTO-REFLECT] Reflection failed: {}", e);
@@ -682,4 +743,31 @@ pub fn handle_workflow_completed(
             "⚠️ Auto-reflection unavailable (no LLM provider)".to_string(),
         ));
     }
+}
+
+/// Handle skill draft ready — show preview and wait for user confirmation.
+pub fn handle_skill_draft_ready(
+    app: &mut App,
+    skill_id: String,
+    content: String,
+    description: String,
+) {
+    app.output.finalize_streaming();
+    app.output.push_line(OutputLine::Markdown(format!(
+        "## 🧠 建议保存 Skill: `{skill_id}`\n\n{description}\n\n---\n\n预览（前 800 字）：\n\n{}",
+        content.chars().take(800).collect::<String>()
+    )));
+    app.output.push_line(OutputLine::System(
+        "输入 **ok** / **保存** / **确认** 保存 Skill，或输入修改意见放弃。".into(),
+    ));
+    app.pending_skill_draft = Some(crate::terminal::app::PendingSkillDraft {
+        skill_id,
+        content,
+        description,
+    });
+    app.status = "⏸️ Skill 待确认 — ok/保存/确认".into();
+    if !app.user_scrolled {
+        app.scroll_to_bottom();
+    }
+    app.dirty = true;
 }

@@ -649,8 +649,37 @@ impl Entity {
         signature: &str,
         parent: Option<&str>,
     ) -> Self {
+        Self::code_symbol_with_doc(
+            _name, fq_name, symbol_type, language, file_path,
+            start_line, end_line, signature, parent, None,
+        )
+    }
+
+    /// Code symbol with optional doc comment for richer embedding text.
+    pub fn code_symbol_with_doc(
+        _name: &str,
+        fq_name: &str,
+        symbol_type: SymbolType,
+        language: &str,
+        file_path: &str,
+        start_line: usize,
+        end_line: usize,
+        signature: &str,
+        parent: Option<&str>,
+        doc_comment: Option<&str>,
+    ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let content = format!("[{symbol_type}] {fq_name} :: {signature}", );
+        let sig_one_line: String = signature.lines().next().unwrap_or(signature).chars().take(512).collect();
+        let mut content = format!(
+            "[{symbol_type}] {fq_name} @ {file_path}:{start_line}-{end_line} :: {sig_one_line}"
+        );
+        if let Some(doc) = doc_comment {
+            let doc_trim: String = doc.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).take(3).collect::<Vec<_>>().join(" ");
+            if !doc_trim.is_empty() {
+                let doc_short: String = doc_trim.chars().take(400).collect();
+                content.push_str(&format!(" | {doc_short}"));
+            }
+        }
         Self {
             id,
             kind: EntityKind::CodeSymbol,
@@ -762,6 +791,46 @@ impl Entity {
         }
         true
     }
+
+    /// Text sent to the embedding model — structured per kind, not a blind content chop.
+    pub fn text_for_embedding(&self, max_chars: usize) -> String {
+        let max_chars = max_chars.max(256);
+        match &self.metadata {
+            EntityMetadata::CodeSymbol {
+                fq_name,
+                symbol_type,
+                file_path,
+                start_line,
+                end_line,
+                signature,
+                ..
+            } => {
+                let sig = compact_embed_signature(signature, 768);
+                let text = format!(
+                    "[{symbol_type}] {fq_name} @ {file_path}:{start_line}-{end_line} :: {sig}"
+                );
+                truncate_at_char_boundary(&text, max_chars)
+            }
+            _ => truncate_at_char_boundary(&self.content, max_chars),
+        }
+    }
+}
+
+/// Collapse whitespace and cap signature length for embedding (generics/annotations kept).
+fn compact_embed_signature(signature: &str, max_chars: usize) -> String {
+    let collapsed: String = signature.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_at_char_boundary(&collapsed, max_chars)
+}
+
+fn truncate_at_char_boundary(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let mut end = max_chars;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

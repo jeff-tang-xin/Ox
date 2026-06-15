@@ -334,6 +334,7 @@ mod tests {
                         arguments: "{}".to_string(),
                     }
                 ],
+                reasoning_content: None,
             },
             Message::ToolResult {
                 tool_call_id: "call_1".to_string(),

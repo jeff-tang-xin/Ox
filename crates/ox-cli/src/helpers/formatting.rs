@@ -1,6 +1,61 @@
 //! Formatting helper functions.
 
+use std::path::{Component, Path};
+
 use ox_core::message::Message;
+
+/// Short label for an embedding model id (last path segment).
+pub fn short_model_id(model_id: &str) -> String {
+    model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .to_string()
+}
+
+/// Compact path for status bar: `…/parent/name` or truncated.
+pub fn short_display_path(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    let p = Path::new(path);
+    let file_name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let parent = p
+        .parent()
+        .and_then(|pp| pp.file_name())
+        .map(|s| s.to_string_lossy().to_string());
+    let compact = match parent {
+        Some(parent) => format!("{parent}/{file_name}"),
+        None => file_name.clone(),
+    };
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut parts: Vec<String> = p
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    while parts.len() > 1 {
+        let tail = parts.split_off(parts.len().saturating_sub(2)).join("/");
+        let candidate = format!("…/{tail}");
+        if candidate.chars().count() <= max_chars {
+            return candidate;
+        }
+        parts.pop();
+    }
+    if file_name.chars().count() <= max_chars {
+        file_name
+    } else {
+        let truncated: String = file_name.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
 
 /// Summarize tool result for display.
 pub fn summarize_tool_result(name: &str, output: &str) -> String {

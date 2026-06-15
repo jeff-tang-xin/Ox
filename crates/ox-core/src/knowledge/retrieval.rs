@@ -70,7 +70,8 @@ pub fn run_retrieval(
     let intent = classify_intent(user_query);
 
     // ── Step 2: ALWAYS inject recent L0 WorkingMemory (conversation continuity) ──
-    let recent_turns = engine.get_recent_turns(3);
+    // Cap at 2 turns to reduce overlap with full session history in context_builder.
+    let recent_turns = engine.get_recent_turns(2);
     let mut candidates: HashMap<String, (Entity, f32)> = HashMap::new();
     for turn in &recent_turns {
         candidates
@@ -80,7 +81,7 @@ pub fn run_retrieval(
 
     // ── Step 3: Semantic search for L1-L3 + CodeSymbols (fill remaining budget) ──
     // Exclude WorkingMemory — we already have recent turns above
-    let hits = engine.search_by_kinds(
+    let hits = engine.hybrid_search_by_kinds(
         &intent.search_query,
         &[
             EntityKind::CodeSymbol,
@@ -112,11 +113,17 @@ pub fn run_retrieval(
         }
     }
 
-    // Path C: Named symbol hints — boost entities matching extracted names
+    // Path C: Named symbol hints — boost + exact fq_name match (hybrid retrieval)
     for hint in &intent.symbol_hints {
+        let hint_lower = hint.to_lowercase();
         for (_, (entity, score)) in candidates.iter_mut() {
-            if entity.content.to_lowercase().contains(&hint.to_lowercase()) {
+            if entity.content.to_lowercase().contains(&hint_lower) {
                 *score = (*score + 0.5).min(2.0);
+            }
+            if let EntityMetadata::CodeSymbol { fq_name, .. } = &entity.metadata {
+                if fq_name.eq_ignore_ascii_case(hint) {
+                    *score = (*score + 0.95).min(2.0);
+                }
             }
         }
     }
@@ -170,14 +177,19 @@ pub fn run_retrieval_for_step(
     memory_layers: &[String],
 ) -> Result<ContextInjection> {
     // Parse memory layers to EntityKind
-    let kinds: Vec<EntityKind> = memory_layers.iter()
+    let mut kinds: Vec<EntityKind> = memory_layers.iter()
         .filter_map(|s| EntityKind::from_str(s))
         .collect();
 
+    // Plan/review steps still need code-symbol context even if not listed explicitly
+    if !kinds.iter().any(|k| matches!(k, EntityKind::CodeSymbol | EntityKind::CodeFile | EntityKind::CodeModule)) {
+        kinds.push(EntityKind::CodeSymbol);
+    }
+
     let intent = classify_intent(user_query);
 
-    // Always inject recent L0 turns (conversation continuity)
-    let recent_turns = engine.get_recent_turns(3);
+    // Always inject recent L0 turns (conversation continuity) — max 2 to avoid duplicating session msgs
+    let recent_turns = engine.get_recent_turns(2);
     let mut candidates: HashMap<String, (Entity, f32)> = HashMap::new();
     for turn in &recent_turns {
         candidates.entry(turn.id.clone()).or_insert_with(|| (turn.clone(), 1.0));
@@ -268,7 +280,7 @@ fn classify_intent(query: &str) -> QueryIntent {
 }
 
 /// Extract file paths from a query string using regex.
-fn extract_file_paths(query: &str) -> Vec<String> {
+pub fn extract_file_paths(query: &str) -> Vec<String> {
     let re = regex::Regex::new(
         r"([\w./\\-]+\.(rs|py|js|ts|tsx|jsx|go|java|cpp|c|h|hpp|toml|json|md|yaml|yml|css|html))"
     ).unwrap();
@@ -356,8 +368,9 @@ fn cut_by_budget(entities: &[(Entity, f32)], max_tokens: usize) -> (Vec<Entity>,
 
     // Track per-kind limits
     let max_per_kind = 4;
+    let max_l0 = 2;
 
-    for (entity, _score) in entities {
+    for (entity, score) in entities {
         if selected.len() >= 15 {
             break; // Hard cap at 15 entities total
         }
@@ -369,13 +382,15 @@ fn cut_by_budget(entities: &[(Entity, f32)], max_tokens: usize) -> (Vec<Entity>,
         if kind_items >= max_per_kind {
             continue; // Don't monopolize with one kind
         }
+        if entity.kind == EntityKind::WorkingMemory && kind_items >= max_l0 {
+            continue;
+        }
 
         let formatted = format_entity_for_context(entity);
 
-        // L3 SemanticMemory: only if highly relevant
+        // L3 SemanticMemory: only if highly relevant (score ≥ 0.5 per design doc)
         if entity.kind == EntityKind::SemanticMemory {
-            // L3 is permanent knowledge — only inject if it adds signal
-            if entity.content.len() < 30 {
+            if *score < 0.5 || entity.content.len() < 30 {
                 continue;
             }
         }

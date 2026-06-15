@@ -10,6 +10,8 @@ use ox_core::knowledge::retrieval;
 use ox_core::message::Message;
 use ox_core::runtime::RuntimeEnvironment;
 use ox_core::tools::ToolRegistry;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -65,30 +67,56 @@ pub async fn prepare_turn(
     let (step_memory_layers, step_prompt, step_idx) =
         get_workflow_step_info(workflow_engine);
 
-    // 2. Knowledge retrieval
+    // 1b. Lazy index: embed session-relevant paths before retrieval
+    if config.embedding.lazy_index {
+        if let Some(k_engine) = knowledge_engine {
+            let paths = collect_lazy_index_paths(&effective_text, workflow_engine);
+            if !paths.is_empty() {
+                let max = config.embedding.lazy_index_max_files_per_turn.max(1);
+                let _ = status_tx.send(AgentToUiEvent::Status(format!(
+                    "📇 Indexing {} path(s)…",
+                    paths.len().min(max)
+                )));
+                let mut engine = k_engine.write().await;
+                let result = tokio::task::block_in_place(|| engine.ensure_paths_indexed(&paths, max));
+                if let Ok(n) = result {
+                    if n > 0 {
+                        tracing::info!("[PRE-TURN] Lazy-indexed {n} symbols from {} paths", paths.len().min(max));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Knowledge retrieval (await read lock — don't silently skip during indexing)
     let _ = status_tx.send(AgentToUiEvent::Status(
         "🔍 Retrieving knowledge...".to_string(),
     ));
+    let workflow_active = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|e| e.is_workflow_active())
+        .unwrap_or(false);
+
     let knowledge_context_str = if let Some(k_engine) = knowledge_engine {
-        match k_engine.try_read() {
-            Ok(engine) => {
-                let result = if step_memory_layers.is_empty() {
-                    retrieval::run_retrieval(&engine, &effective_text, session_id, 3000)
-                } else {
-                    retrieval::run_retrieval_for_step(
-                        &engine,
-                        &effective_text,
-                        session_id,
-                        3000,
-                        &step_memory_layers,
-                    )
-                };
-                match result {
-                    Ok(inj) => retrieval::format_context_for_prompt(&inj),
-                    Err(_) => String::new(),
-                }
+        let engine = k_engine.read().await;
+        let result = if step_memory_layers.is_empty() {
+            retrieval::run_retrieval(&engine, &effective_text, session_id, 3000)
+        } else {
+            retrieval::run_retrieval_for_step(
+                &engine,
+                &effective_text,
+                session_id,
+                3000,
+                &step_memory_layers,
+            )
+        };
+        match result {
+            Ok(inj) => retrieval::format_context_for_prompt(&inj),
+            Err(e) => {
+                tracing::warn!("[PRE-TURN] Knowledge retrieval failed: {}", e);
+                String::new()
             }
-            Err(_) => String::new(),
         }
     } else {
         String::new()
@@ -107,7 +135,9 @@ pub async fn prepare_turn(
     let step_prompt_clone = step_prompt.clone();
     let user_text_clone = effective_text.clone();
     let knowledge_ctx = knowledge_context_str;
-    let use_refined = config.context.use_refined_context;
+    let use_refined = config.context.use_refined_context
+        && !workflow_active
+        && session_messages.len() < 40;
     let system_prompt_variant = match &variant {
         TurnVariant::Onboarding { .. } => UserIntent::CodeModification,
         _ => UserIntent::General,
@@ -181,17 +211,30 @@ pub async fn prepare_turn(
             &user_text_clone,
             effective_messages.len(),
         );
-        let planning = effort == ox_core::context::EffortLevel::High;
+        // Workflow steps manage their own tool gating — never use legacy planning mode there
+        let planning = !workflow_active && effort == ox_core::context::EffortLevel::High;
 
         Ok::<_, String>((turn_messages, planning))
     })
     .await;
 
     match blocking_result {
-        Ok(Ok((turn_messages, planning))) => PreTurnResult {
-            turn_messages,
-            planning,
-        },
+        Ok(Ok((mut turn_messages, planning))) => {
+            if workflow_active {
+                if let Some(wf) = workflow_engine {
+                    if let Ok(engine) = wf.try_lock() {
+                        let block = engine.durable_memory_block();
+                        if !block.is_empty() {
+                            turn_messages.push(Message::system(&block));
+                        }
+                    }
+                }
+            }
+            PreTurnResult {
+                turn_messages,
+                planning,
+            }
+        }
         Ok(Err(e)) => {
             tracing::error!("[PRE-TURN] Blocking task failed: {}", e);
             let _ = status_tx.send(AgentToUiEvent::Error(format!(
@@ -227,16 +270,63 @@ fn get_workflow_step_info(
             let layers = step
                 .map(|s| s.memory_layers.clone())
                 .unwrap_or_default();
-            let prompt = step.and_then(|s| {
-                if s.step_prompt.is_empty() {
-                    None
-                } else {
-                    Some(s.step_prompt.clone())
-                }
-            });
+            // Use substituted prompt ({PREVIOUS_OUTPUT} filled in)
+            let prompt = engine.get_step_system_prompt();
             let idx = engine.get_current_step_index();
             return (layers, prompt, idx);
         }
     }
     (Vec::new(), None, 0)
+}
+
+/// Paths to lazy-embed: explicit paths in query + intent files + explored file_read targets.
+fn collect_lazy_index_paths(
+    query: &str,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<ox_core::agent::engine::WorkflowEngine>>>,
+) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+
+    let mut add = |p: String| {
+        let p = p.trim().trim_matches('"').to_string();
+        if p.is_empty() || !seen.insert(p.clone()) {
+            return;
+        }
+        paths.push(PathBuf::from(p));
+    };
+
+    for p in retrieval::extract_file_paths(query) {
+        add(p);
+    }
+
+    if let Some(wf) = workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            if let Some(intent_raw) = engine.get_variable("_step0_output") {
+                if let Some(json) = ox_core::agent::engine::extract_json_block(&intent_raw) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                        if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
+                            for f in files {
+                                if let Some(s) = f.as_str() {
+                                    add(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(explored_json) = engine.get_variable("_explored_paths") {
+                if let Ok(set) = serde_json::from_str::<HashSet<String>>(&explored_json) {
+                    for key in set {
+                        if let Some((_tool, path)) = key.split_once(':') {
+                            if path.contains('.') {
+                                add(path.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    paths
 }

@@ -12,6 +12,7 @@
 /// - Batch insert with chunked embedding (100 entities/chunk)
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use anyhow::Result;
 use serde_json::json;
@@ -31,8 +32,12 @@ pub struct UnifiedVectorStore {
     db: triviumdb::Database<f32>,
     embedding_model: Arc<EmbeddingModel>,
     dimension: usize,
+    embed_batch_size: usize,
+    embed_max_chars: usize,
     /// Track TriviumDB vector IDs by file_path for deduplication on re-index.
     file_ids: HashMap<String, Vec<u64>>,
+    /// entity_id → TriviumDB vector ID for targeted deletion.
+    entity_ids: HashMap<String, u64>,
 }
 
 impl UnifiedVectorStore {
@@ -59,8 +64,20 @@ impl UnifiedVectorStore {
             db,
             embedding_model,
             dimension: dim,
+            embed_batch_size: config.index_embed_chunk_size.max(1),
+            embed_max_chars: config.index_embed_max_chars.max(256),
             file_ids: HashMap::new(),
+            entity_ids: HashMap::new(),
         })
+    }
+
+    /// True when this file path already has stored vectors (resume / incremental skip).
+    pub fn has_file_vectors(&self, file_path: &str) -> bool {
+        self.file_ids.get(file_path).is_some_and(|ids| !ids.is_empty())
+    }
+
+    fn embed_text<'a>(&self, entity: &'a Entity) -> String {
+        entity.text_for_embedding(self.embed_max_chars)
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -70,10 +87,15 @@ impl UnifiedVectorStore {
     /// Insert a single entity into the vector store.
     /// Returns the TriviumDB internal vector ID.
     pub fn insert_entity(&mut self, entity: &Entity) -> Result<u64> {
-        let embedding = self.embedding_model.embed(&entity.content)?;
+        let embed_text = self.embed_text(entity);
+        let embedding = self
+            .embedding_model
+            .embed_passage(&embed_text, entity.kind.is_code_entity())?;
         let payload = entity_to_payload(entity);
         let id = self.db.insert(&embedding, payload)
             .map_err(|e| anyhow::anyhow!("TriviumDB insert error for entity {}: {e}", entity.id))?;
+
+        self.entity_ids.insert(entity.id.clone(), id);
 
         // Track file association for CodeSymbol/CodeFile entities
         if let Some(fp) = entity.file_path() {
@@ -98,20 +120,27 @@ impl UnifiedVectorStore {
         // Delete old vectors for all affected files (dedup)
         self.remove_by_files_from_entities(entities);
 
-        const CHUNK_SIZE: usize = 100;
+        let chunk_size = self.embed_batch_size;
         let mut total_count = 0;
         let mut new_file_ids: HashMap<String, Vec<u64>> = HashMap::new();
         let total = entities.len();
+        let mut embed_texts: Vec<String> = Vec::new();
 
-        for (chunk_idx, chunk) in entities.chunks(CHUNK_SIZE).enumerate() {
-            // Collect texts for this chunk
-            let texts: Vec<&str> = chunk.iter().map(|e| e.content.as_str()).collect();
-            let embeddings = self.embedding_model.embed_batch(&texts)?;
+        for (chunk_idx, chunk) in entities.chunks(chunk_size).enumerate() {
+            embed_texts.clear();
+            embed_texts.extend(chunk.iter().map(|e| self.embed_text(e)));
+            let items: Vec<(&str, bool)> = embed_texts
+                .iter()
+                .zip(chunk.iter())
+                .map(|(text, e)| (text.as_str(), e.kind.is_code_entity()))
+                .collect();
+            let embeddings = self.embedding_model.embed_passages_batch(&items)?;
 
             for (entity, embedding) in chunk.iter().zip(embeddings.iter()) {
                 let payload = entity_to_payload(entity);
                 match self.db.insert(embedding, payload) {
                     Ok(id) => {
+                        self.entity_ids.insert(entity.id.clone(), id);
                         if let Some(fp) = entity.file_path() {
                             new_file_ids.entry(fp.to_string()).or_default().push(id);
                         }
@@ -126,7 +155,7 @@ impl UnifiedVectorStore {
                 }
             }
 
-            let processed = ((chunk_idx + 1) * CHUNK_SIZE).min(total);
+            let processed = ((chunk_idx + 1) * chunk_size).min(total);
             tracing::debug!(
                 "[UNIFIED_VECTOR] Embedding progress: {}/{} entities",
                 processed, total
@@ -150,6 +179,8 @@ impl UnifiedVectorStore {
     /// Remove all vector entries for a given file path (used before re-indexing).
     pub fn remove_by_file(&mut self, file_path: &str) {
         if let Some(old_ids) = self.file_ids.remove(file_path) {
+            let id_set: std::collections::HashSet<u64> = old_ids.iter().copied().collect();
+            self.entity_ids.retain(|_, vid| !id_set.contains(vid));
             let n = old_ids.len();
             for id in old_ids {
                 let _ = self.db.delete(id);
@@ -173,10 +204,50 @@ impl UnifiedVectorStore {
         }
     }
 
+    /// Delete a single entity by its entity_id (payload key).
+    pub fn delete_entity_by_id(&mut self, entity_id: &str) -> Result<bool> {
+        if let Some(id) = self.entity_ids.remove(entity_id) {
+            self.db.delete(id)
+                .map_err(|e| anyhow::anyhow!("TriviumDB delete error for entity {entity_id}: {e}"))?;
+            for ids in self.file_ids.values_mut() {
+                ids.retain(|&vid| vid != id);
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Delete a single entity by its TriviumDB internal ID.
     pub fn delete_by_id(&mut self, id: u64) -> Result<()> {
         self.db.delete(id)
             .map_err(|e| anyhow::anyhow!("TriviumDB delete error for id {id}: {e}"))
+    }
+
+    /// Load file→vector-id map from disk (survives restarts).
+    pub fn load_file_id_map(&mut self, path: &Path) {
+        if !path.exists() {
+            return;
+        }
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<u64>>>(&data) {
+                tracing::info!(
+                    "[UNIFIED_VECTOR] Loaded file_ids map ({} files) from {}",
+                    map.len(),
+                    path.display()
+                );
+                self.file_ids = map;
+            }
+        }
+    }
+
+    /// Persist file→vector-id map to disk.
+    pub fn save_file_id_map(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_string_pretty(&self.file_ids)?;
+        std::fs::write(path, data)?;
+        Ok(())
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -200,7 +271,7 @@ impl UnifiedVectorStore {
         kind_filter: Option<&[EntityKind]>,
         min_score: f32,
     ) -> Result<Vec<SearchHit>> {
-        let query_embedding = self.embedding_model.embed(query)?;
+        let query_embedding = self.embedding_model.embed_query(query)?;
 
         // expand_depth=2: 2-hop graph traversal along entity relations
         let raw_results = self.db.search(
@@ -297,16 +368,20 @@ impl UnifiedVectorStore {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     /// Find CodeSymbol entities in a specific file.
-    /// Note: This is an O(n) scan because TriviumDB doesn't support attribute indexes.
-    /// For large projects, callers should batch and cache.
     pub fn find_symbols_in_file(
         &self,
         file_path: &str,
         query_hint: &str,
     ) -> Result<Vec<Entity>> {
-        // Search with a broad query, then filter by file_path in the payload
+        let normalized_target = normalize_path_key(file_path);
+        let search_query = if query_hint.is_empty() {
+            file_path
+        } else {
+            query_hint
+        };
+
         let hits = self.search_unified(
-            query_hint,
+            search_query,
             100,
             Some(&[EntityKind::CodeSymbol]),
             0.0,
@@ -316,7 +391,7 @@ impl UnifiedVectorStore {
             .into_iter()
             .filter(|h| {
                 if let EntityMetadata::CodeSymbol { file_path: fp, .. } = &h.entity.metadata {
-                    fp == file_path
+                    paths_match(fp, file_path) || normalize_path_key(fp) == normalized_target
                 } else {
                     false
                 }
@@ -540,6 +615,27 @@ fn reconstruct_metadata(kind: EntityKind, payload: &serde_json::Value) -> Entity
             path: s("file_path"),
         },
     }
+}
+
+fn normalize_path_key(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .to_lowercase()
+}
+
+fn paths_match(stored: &str, query: &str) -> bool {
+    if stored == query {
+        return true;
+    }
+    let stored_norm = normalize_path_key(stored);
+    let query_norm = normalize_path_key(query);
+    if stored_norm == query_norm {
+        return true;
+    }
+    stored_norm.ends_with(&query_norm)
+        || query_norm.ends_with(&stored_norm)
+        || stored.ends_with(query)
+        || query.ends_with(stored)
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use regex::Regex;
-use ox_core::memory::semantic::KeywordExtraction;
+use ox_core::knowledge::KeywordExtraction;
 
 /// 从 LLM 响应中提取关键词 JSON 块
 pub fn extract_keywords_from_response(response: &str) -> Option<KeywordExtraction> {

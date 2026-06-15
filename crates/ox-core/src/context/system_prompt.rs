@@ -54,8 +54,8 @@ pub fn build_system_prompt_with_context(
     )
 }
 
-/// Internal: accepts optional `step_index` for step-aware trimming.
-/// Step mapping: 0=Intent, 1=Plan, 2=Params, 3=Safety, 4=Exec.
+    /// Internal: accepts optional `step_index` for step-aware trimming.
+    /// Step mapping: 0=Intent, 1=Plan, 2=Review, 3=Execute.
 pub fn build_system_prompt_with_step(
     rt_env: &RuntimeEnvironment,
     tool_registry: &ToolRegistry,
@@ -160,7 +160,8 @@ const CORE_CODING: &str = "\
 
 【格式】
 - 不改代码：直接回答，无 Plan/Done。
-- 改代码：`## Plan` → 工具调用 → `## Done`。无问候语，无废话。
+- Workflow 模式：按【当前步骤】输出 JSON 或 ## Done。
+- 非 workflow 改代码：`## Plan` → 工具调用 → `## Done`。
 - 引用代码用 `file:line` 格式。
 - Knowledge Context 已预加载在消息中。先用它。只在为空或真需更多细节时才调 memory_search/find_symbol。
 

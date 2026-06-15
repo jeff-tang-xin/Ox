@@ -6,7 +6,6 @@ use crate::terminal::output_pane::OutputLine;
 use ox_core::message::Session;
 use ox_core::runtime::RuntimeEnvironment;
 use ox_core::config::OxConfig;
-use ox_core::memory::MemoryManager;
 use ox_core::cost::CostTracker;
 use ox_core::safety::TrustManager;
 use std::sync::Arc;
@@ -52,7 +51,6 @@ pub fn handle_new(
     _session: &mut Session,
     _rt_env: &mut RuntimeEnvironment,
     _config: &OxConfig,
-    _memory: &Arc<MemoryManager>,
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
@@ -72,7 +70,6 @@ pub fn handle_resume(
     _session: &mut Session,
     _rt_env: &mut RuntimeEnvironment,
     _config: &OxConfig,
-    _memory: &Arc<MemoryManager>,
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
@@ -101,7 +98,6 @@ pub fn handle_sessions(
     session: &mut Session,
     _rt_env: &mut RuntimeEnvironment,
     _config: &OxConfig,
-    _memory: &Arc<MemoryManager>,
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
@@ -135,7 +131,6 @@ pub fn handle_clean(
     session: &mut Session,
     _rt_env: &mut RuntimeEnvironment,
     _config: &OxConfig,
-    _memory: &Arc<MemoryManager>,
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
@@ -156,7 +151,6 @@ pub fn handle_clear_cache(
     _session: &mut Session,
     _rt_env: &mut RuntimeEnvironment,
     _config: &OxConfig,
-    _memory: &Arc<MemoryManager>,
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {

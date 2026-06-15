@@ -8,11 +8,14 @@ use std::process::Command;
 
 use crate::config::EmbeddingConfig;
 
-/// Local embedding model using BERT (all-MiniLM-L6-v2, 384-dim).
+/// Local embedding model (BERT-family, default: multilingual-e5-small, 384-dim).
 pub struct EmbeddingModel {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
+    query_prefix: String,
+    passage_prefix: String,
+    code_passage_prefix: String,
 }
 
 impl EmbeddingModel {
@@ -61,7 +64,14 @@ impl EmbeddingModel {
 
         tracing::info!("[EMBEDDING] Model loaded successfully");
 
-        Ok(Self { model, tokenizer, device })
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+            query_prefix: config.query_prefix.clone(),
+            passage_prefix: config.passage_prefix.clone(),
+            code_passage_prefix: config.code_passage_prefix.clone(),
+        })
     }
 
     /// Load from local directory (model_source = "local").
@@ -162,12 +172,63 @@ impl EmbeddingModel {
         "https://hf-mirror.com".to_string()
     }
 
-    /// Load the model with default settings (hf-mirror.com, all-MiniLM-L6-v2).
+    /// Load the model with default settings (multilingual-e5-small).
     pub fn new() -> Result<Self> {
         Self::with_config(&EmbeddingConfig::default())
     }
 
-    /// Embed a single text into a dimensional f32 vector.
+    /// Embed a search query (E5-style `query:` prefix when configured).
+    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_prefixed(text, &self.query_prefix)
+    }
+
+    /// Embed a document passage (`passage:` or `code:` prefix when configured).
+    pub fn embed_passage(&self, text: &str, is_code: bool) -> Result<Vec<f32>> {
+        let prefix = if is_code && !self.code_passage_prefix.is_empty() {
+            &self.code_passage_prefix
+        } else {
+            &self.passage_prefix
+        };
+        self.embed_prefixed(text, prefix)
+    }
+
+    fn embed_prefixed(&self, text: &str, prefix: &str) -> Result<Vec<f32>> {
+        if prefix.is_empty() {
+            self.embed(text)
+        } else {
+            self.embed(&format!("{prefix}{text}"))
+        }
+    }
+
+    /// Batch-embed passages with per-item code/prose prefix selection.
+    pub fn embed_passages_batch(&self, items: &[(&str, bool)]) -> Result<Vec<Vec<f32>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if items.len() == 1 {
+            let (text, is_code) = items[0];
+            return Ok(vec![self.embed_passage(text, is_code)?]);
+        }
+        let owned: Vec<String> = items
+            .iter()
+            .map(|(text, is_code)| {
+                let prefix = if *is_code && !self.code_passage_prefix.is_empty() {
+                    &self.code_passage_prefix
+                } else {
+                    &self.passage_prefix
+                };
+                if prefix.is_empty() {
+                    text.to_string()
+                } else {
+                    format!("{prefix}{text}")
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        self.embed_batch(&refs)
+    }
+
+    /// Embed a single text into a dimensional f32 vector (no prefix — internal use).
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let tokens = self.tokenizer
             .encode(text, true)

@@ -1,13 +1,11 @@
-/// System commands: /exit, /cd, /init, /debug, /cost, /plan, /reload, /free, /cancel, /clear
+/// System commands: /exit, /cd, /init, /debug, /cost, /plan, /reload, /cancel, /clear
 
 use crate::terminal::app::App as AppState;
 use crate::slash_commands::{CommandMeta, CommandResult};
-use crate::terminal::app::WorkflowState;
 use crate::terminal::output_pane::OutputLine;
 use ox_core::message::Session;
 use ox_core::runtime::{self, DirectoryChangeResult};
 use ox_core::config::OxConfig;
-use ox_core::memory::MemoryManager;
 use ox_core::cost::CostTracker;
 use ox_core::safety::TrustManager;
 use std::sync::Arc;
@@ -33,9 +31,6 @@ pub const PLAN_COMMAND: CommandMeta = CommandMeta {
 pub const RELOAD_COMMAND: CommandMeta = CommandMeta {
     name: "reload", aliases: &[], description: "Reload session from disk", handler: handle_reload,
 };
-pub const FREE_COMMAND: CommandMeta = CommandMeta {
-    name: "free", aliases: &[], description: "Switch to free mode", handler: handle_free,
-};
 pub const CANCEL_COMMAND: CommandMeta = CommandMeta {
     name: "cancel", aliases: &[], description: "Cancel current operation", handler: handle_cancel,
 };
@@ -44,7 +39,7 @@ pub const CLEAR_COMMAND: CommandMeta = CommandMeta {
 };
 
 pub fn handle_exit(app: &mut AppState, _args: &str, _session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+    _config: &OxConfig, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     app.output.push_system("Goodbye.");
     app.should_quit = true;
@@ -52,7 +47,7 @@ pub fn handle_exit(app: &mut AppState, _args: &str, _session: &mut Session, _rt_
 }
 
 pub fn handle_cd(app: &mut AppState, args: &str, session: &mut Session, rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+    _config: &OxConfig, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     let path = args.trim();
     if path.is_empty() {
@@ -119,7 +114,7 @@ pub fn handle_cd(app: &mut AppState, args: &str, session: &mut Session, rt_env: 
 }
 
 pub fn handle_init(app: &mut AppState, _args: &str, _session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+    _config: &OxConfig, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     match OxConfig::init_default_config() {
         Ok(path) => app.output.push_system(&format!("Config created at {}. Edit it to add API keys.", path.display())),
@@ -129,7 +124,7 @@ pub fn handle_init(app: &mut AppState, _args: &str, _session: &mut Session, _rt_
 }
 
 pub fn handle_debug(app: &mut AppState, _args: &str, session: &mut Session, rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+    _config: &OxConfig, _cost_tracker: &mut CostTracker,
     trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     
     app.output.push_line(OutputLine::System(format!("Model: {}", app.model_name)));
@@ -148,7 +143,7 @@ pub fn handle_debug(app: &mut AppState, _args: &str, session: &mut Session, rt_e
 }
 
 pub fn handle_cost(app: &mut AppState, _args: &str, _session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, cost_tracker: &mut CostTracker,
+    _config: &OxConfig, cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     for line in cost_tracker.summary().lines() {
         app.output.push_line(OutputLine::System(line.to_string()));
@@ -157,14 +152,14 @@ pub fn handle_cost(app: &mut AppState, _args: &str, _session: &mut Session, _rt_
 }
 
 pub fn handle_plan(app: &mut AppState, _args: &str, _session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+    _config: &OxConfig, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     app.output.push_system("Task plan: (not yet active)");
     CommandResult::Success
 }
 
 pub fn handle_reload(app: &mut AppState, _args: &str, session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+    _config: &OxConfig, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     match Session::load(&session.dir().to_path_buf()) {
         Ok(Some(loaded)) => {
@@ -181,55 +176,15 @@ pub fn handle_reload(app: &mut AppState, _args: &str, session: &mut Session, _rt
     CommandResult::Success
 }
 
-pub fn handle_free(app: &mut AppState, _args: &str, session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
-    _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
-    let prev = match app.workflow_state {
-        WorkflowState::Spec { .. } => "Spec",
-        WorkflowState::Free => { app.output.push_system("Already in Free mode."); return CommandResult::Success; }
-    };
-    
-    // Switch to free workflow
-    app.workflow_state = WorkflowState::Free;
-    
-    // Update session metadata for persistence
-    session.meta.workflow_mode = "free".to_string();
-    session.meta.workflow_id = String::new();
-    session.meta.workflow_step_index = 0;
-    session.meta.requirement_name = None;
-    
-    // Persist workflow state to disk immediately
-    if let Err(e) = session.persist_workflow_state("free", "", 0, None) {
-        tracing::warn!("Failed to persist workflow state: {}", e);
-    }
-    
-    // Activate free workflow in engine (if engine exists)
-    if let Some(ref engine_arc) = app.workflow_engine {
-        if let Ok(mut engine) = engine_arc.try_lock() {
-            if let Err(e) = engine.activate_workflow("free_workflow") {
-                tracing::warn!("Failed to activate free workflow: {}", e);
-            } else {
-                tracing::info!("Switched to free_workflow");
-            }
-        }
-    }
-    
-    // Force UI refresh to update header immediately
-    app.dirty = true;
-    
-    app.output.push_system(&format!("Switched from {} mode to Free mode", prev));
-    CommandResult::Success
-}
-
 pub fn handle_cancel(app: &mut AppState, _args: &str, _session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+    _config: &OxConfig, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     app.output.push_system("Nothing to cancel.");
     CommandResult::Success
 }
 
 pub fn handle_clear(app: &mut AppState, _args: &str, _session: &mut Session, _rt_env: &mut runtime::RuntimeEnvironment,
-    _config: &OxConfig, _memory: &Arc<MemoryManager>, _cost_tracker: &mut CostTracker,
+    _config: &OxConfig, _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>) -> CommandResult {
     app.output.clear();
     CommandResult::Success

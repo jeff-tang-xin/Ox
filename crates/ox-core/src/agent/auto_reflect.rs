@@ -13,6 +13,21 @@ use crate::message::Message;
 use crate::llm::LlmProvider;
 use crate::context::SKILL_CREATION_PROMPT;
 
+/// Outcome of auto-reflection — draft for user confirmation or skip.
+#[derive(Debug, Clone)]
+pub enum ReflectOutcome {
+    /// Skill generated; awaiting user confirmation before save.
+    Draft {
+        skill_id: String,
+        content: String,
+        description: String,
+    },
+    /// Reflection skipped (quality gate).
+    Skipped { reason: String },
+}
+
+const MIN_TASK_LEN: usize = 12;
+
 /// Analyze a completed workflow and generate reflection insights
 pub struct AutoReflector {
     llm_provider: Arc<dyn LlmProvider>,
@@ -31,52 +46,115 @@ impl AutoReflector {
         })
     }
 
-    /// Perform auto-reflection on a completed workflow
-    /// 
-    /// # Arguments
-    /// * `task_description` - Description of the completed task
-    /// * `execution_summary` - Summary of how the task was executed
-    /// * `conversation_history` - Full conversation history for context
-    /// 
-    /// # Returns
-    /// Generated skill ID if successful
+    /// Perform auto-reflection on a completed workflow.
+    /// Returns a draft for user confirmation (does not save to disk).
     pub async fn reflect_on_workflow(
         &self,
         task_description: &str,
         execution_summary: &str,
         conversation_history: &[Message],
-    ) -> Result<Option<String>> {
+    ) -> Result<ReflectOutcome> {
+        if let Some(reason) = Self::quality_gate(task_description, execution_summary, conversation_history) {
+            tracing::info!("[AUTO-REFLECT] Skipped: {reason}");
+            return Ok(ReflectOutcome::Skipped { reason });
+        }
+
         tracing::info!(
             "[AUTO-REFLECT] Starting reflection for task: {}",
             task_description.chars().take(80).collect::<String>()
         );
 
-        // Step 1: Build reflection prompt with context
         let prompt = self.build_reflection_prompt(task_description, execution_summary, conversation_history);
-        
-        tracing::debug!("[AUTO-REFLECT] Prompt length: {} chars", prompt.len());
-
-        // Step 2: Call LLM to generate skill content
         let skill_content = self.call_llm_for_reflection(&prompt).await?;
-        
+
         if skill_content.trim().is_empty() {
-            tracing::warn!("[AUTO-REFLECT] LLM returned empty content, skipping skill generation");
-            return Ok(None);
+            return Ok(ReflectOutcome::Skipped {
+                reason: "LLM returned empty skill content".into(),
+            });
         }
 
-        tracing::debug!("[AUTO-REFLECT] Generated skill content (first 200 chars):\n{}", 
-            skill_content.chars().take(200).collect::<String>());
+        let (skill_id, description) = self.parse_draft_metadata(&skill_content);
+        if self.skill_exists(&skill_id) {
+            return Ok(ReflectOutcome::Skipped {
+                reason: format!("Skill `{skill_id}` already exists"),
+            });
+        }
 
-        // Step 3: Parse and save the generated skill
-        match self.parse_and_save_skill(&skill_content) {
-            Ok(skill_id) => {
-                tracing::info!("[AUTO-REFLECT] ✅ Successfully created skill: {}", skill_id);
-                Ok(Some(skill_id))
-            }
-            Err(e) => {
-                tracing::error!("[AUTO-REFLECT] ❌ Failed to parse/save skill: {}", e);
-                Err(e)
-            }
+        Ok(ReflectOutcome::Draft {
+            skill_id,
+            content: skill_content,
+            description,
+        })
+    }
+
+    /// Save a confirmed skill draft to `.ox/skills/`.
+    pub fn save_skill_draft(&self, content: &str) -> Result<String> {
+        Self::save_content_to_project(&self.project_root, content)
+    }
+
+    /// Save skill markdown to project `.ox/skills/` (no LLM required).
+    pub fn save_content_to_project(project_root: &Path, content: &str) -> Result<String> {
+        Self::write_skill_file(project_root, content)
+    }
+
+    /// Quality gates — return skip reason if reflection should not run.
+    fn quality_gate(
+        task_description: &str,
+        execution_summary: &str,
+        conversation_history: &[Message],
+    ) -> Option<String> {
+        if task_description.trim().len() < MIN_TASK_LEN {
+            return Some("Task too short for skill extraction".into());
+        }
+        let has_substance = execution_summary.contains("## Done")
+            || execution_summary.contains("modify")
+            || execution_summary.contains("file_write")
+            || execution_summary.contains("edit_file")
+            || conversation_history.iter().any(|m| {
+                matches!(m, Message::ToolResult { content, .. }
+                    if content.contains("Successfully") || content.contains("patched"))
+            });
+        if !has_substance {
+            return Some("No substantive code changes detected".into());
+        }
+        if conversation_history.len() < 4 {
+            return Some("Conversation too short for reliable skill extraction".into());
+        }
+        None
+    }
+
+    fn skill_exists(&self, skill_id: &str) -> bool {
+        let skills_dir = self.project_root.join(".ox").join("skills");
+        skills_dir.join(format!("{skill_id}.md")).exists()
+    }
+
+    fn parse_draft_metadata(&self, content: &str) -> (String, String) {
+        if let Ok((meta, body)) = self.extract_frontmatter(content) {
+            let id = meta.get("id").cloned().or_else(|| {
+                body.lines().next()
+                    .and_then(|l| l.strip_prefix("# "))
+                    .map(|s| s.to_lowercase().replace(' ', "-"))
+            }).unwrap_or_else(|| "generated-skill".into());
+            let desc = meta.get("description").cloned()
+                .unwrap_or_else(|| "AI generated skill".into());
+            return (id, desc);
+        }
+        let title = content.lines().next()
+            .and_then(|l| l.strip_prefix("# "))
+            .unwrap_or("generated-skill");
+        (title.to_lowercase().replace(' ', "-"), "AI generated skill".into())
+    }
+
+    /// Legacy entry — kept for tests; prefer reflect_on_workflow + save_skill_draft.
+    pub async fn reflect_and_save(
+        &self,
+        task_description: &str,
+        execution_summary: &str,
+        conversation_history: &[Message],
+    ) -> Result<Option<String>> {
+        match self.reflect_on_workflow(task_description, execution_summary, conversation_history).await? {
+            ReflectOutcome::Draft { content, .. } => Ok(Some(self.save_skill_draft(&content)?)),
+            ReflectOutcome::Skipped { .. } => Ok(None),
         }
     }
 
@@ -141,11 +219,15 @@ impl AutoReflector {
     }
 
     /// Parse the LLM-generated markdown and save as a skill.
-    /// If frontmatter is missing or malformed, repair it before saving.
     fn parse_and_save_skill(&self, content: &str) -> Result<String> {
-        let default_skills_dir = self.project_root.join(".ox").join("skills");
+        Self::write_skill_file(&self.project_root, content)
+    }
 
-        let (repaired_content, skill_id, scope) = match self.extract_frontmatter(content) {
+    /// Write skill markdown to disk (shared by instance and static callers).
+    fn write_skill_file(project_root: &Path, content: &str) -> Result<String> {
+        let default_skills_dir = project_root.join(".ox").join("skills");
+
+        let (repaired_content, skill_id, scope) = match Self::extract_frontmatter_static(content) {
             Ok((metadata, body)) => {
                 let id = metadata.get("id").cloned().unwrap_or_else(|| {
                     body.lines().next()
@@ -183,7 +265,6 @@ impl AutoReflector {
             }
         };
 
-        // Route to correct directory based on scope
         let skills_dir = if scope == "global" {
             let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
             home.join(".ox").join("skills")
@@ -200,6 +281,10 @@ impl AutoReflector {
 
     /// Extract YAML frontmatter from markdown content
     fn extract_frontmatter(&self, content: &str) -> Result<(std::collections::HashMap<String, String>, String)> {
+        Self::extract_frontmatter_static(content)
+    }
+
+    fn extract_frontmatter_static(content: &str) -> Result<(std::collections::HashMap<String, String>, String)> {
         let content = content.trim();
         
         if !content.starts_with("---") {

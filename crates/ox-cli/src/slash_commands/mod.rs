@@ -7,7 +7,6 @@ use crate::terminal::app::App as AppState;
 use ox_core::message::Session;
 use ox_core::runtime::RuntimeEnvironment;
 use ox_core::config::OxConfig;
-use ox_core::memory::MemoryManager;
 use ox_core::cost::CostTracker;
 use ox_core::safety::TrustManager;
 use std::sync::Arc;
@@ -19,7 +18,6 @@ pub type CommandHandler = fn(
     session: &mut Session,
     rt_env: &mut RuntimeEnvironment,
     config: &OxConfig,
-    memory: &Arc<MemoryManager>,
     cost_tracker: &mut CostTracker,
     trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult;
@@ -132,8 +130,6 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     registry.register(system::COST_COMMAND);
     registry.register(system::PLAN_COMMAND);
     registry.register(system::RELOAD_COMMAND);
-
-    registry.register(system::FREE_COMMAND);
     registry.register(system::CANCEL_COMMAND);
     registry.register(system::CLEAR_COMMAND);
     
