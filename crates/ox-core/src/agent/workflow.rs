@@ -222,12 +222,15 @@ pub fn create_default_workflow() -> Workflow {
 
 【工具使用规则】
 - project_detect — 只调一次
-- file_list <dir> — 只列一层；从根目录逐层向下，直到找到源码目录
+- file_list <dir> — 【只列单层】当前目录的直接子项；要看子目录内容必须再调 file_list(\"子目录路径\")，逐层向下
+- file_search <glob> — 按文件名递归搜索（如 *.rs），不是 file_list
+- file_read — 大文件默认只读 200 行，用 offset/limit 续读
 - file_read — 读入口、配置、或计划将修改的文件
 - find_symbol / code_search / file_search — 确认符号/模块存在
-- load_skill — 按需加载项目 skill
+- load_skill — 加载【按需】skill（内置/全局/项目扩展）；项目规范与业务指导已自动注入正文，无需再 load
 
 【制定计划】
+- **必须先遵守**上方【项目 Skill — 必读】中的规范与业务指导，再起草 plan
 - structure_summary：写明检测到的项目类型、实际目录布局、入口文件位置
 - 每个 plan 步骤的 file 必须是探索中已确认的路径
 - desc / verify 写具体、可执行
@@ -305,12 +308,19 @@ pub fn create_default_workflow() -> Workflow {
 【探索阶段查阅内容】{EXPLORATION_SNAPSHOT}
 
 【规则】
-1. 按照计划中的步骤顺序执行
-2. 修改前用 file_read / find_symbol 确认当前代码；大文件用 offset/limit 分段读取（默认 limit=200）
-3. 探索快照中大文件见 `.ox/exploration/`，预览不够时 file_read 该路径并指定 offset
-4. 用 file_write / edit_file / delete_range 执行修改
-5. 每步修改后按要求验证（cargo check / test / file_read）
-6. 全部完成后输出 ## Done
+1. **必须先遵守**上方【项目 Skill — 必读】中的项目规范与业务指导，再改任何代码
+2. 按照计划中的步骤顺序执行
+3. 修改前用 file_read / find_symbol 确认当前代码；大文件用 offset/limit 分段读取（默认 limit=200）
+4. 探索快照中大文件见 `.ox/exploration/`，预览不够时 file_read 该路径并指定 offset
+5. 用 file_write / edit_file / delete_range 执行修改
+6. 每步修改后按**项目规范 Skill 中的命令**验证（build / test / lint 等），或 file_read 确认结果
+7. 全部完成后输出 ## Done
+
+【file_list 用法 — 极易误用】
+- file_list 只列【当前目录单层】，不会展开子目录里的文件
+- 探索结构：file_list(\".\") → 看到子目录名 → file_list(\"crates\") → file_list(\"crates/ox-core\") 逐层向下
+- 不要指望一次 file_list 看到整个项目；不要对同一 path 重复 file_list
+- 要按文件名模式递归搜索：用 file_search(\"*.rs\")，不是 file_list
 
 不要重复无 offset 的 file_read 同一路径。探索已在计划阶段完成；执行时按需分段读取。")
             .with_allowed_tools(&[
@@ -327,7 +337,6 @@ pub fn create_default_workflow() -> Workflow {
                 "git_diff",
                 "load_skill",
             ])
-            .allow_tools_disallow_code()
             .with_memory_layers(&["WorkingMemory", "AtomicMemory"])
             .with_display_status("⚡ 执行")
     );

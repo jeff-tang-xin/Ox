@@ -33,7 +33,7 @@ impl Tool for CodeSearchTool {
                 },
                 "file_pattern": {
                     "type": "string",
-                    "description": "Glob pattern to filter files (e.g., '*.rs'). Default: all files."
+                    "description": "Filter by filename only (e.g. '*.rs'), NOT a path pattern. Default: all files."
                 },
                 "max_files": {
                     "type": "integer",

@@ -166,7 +166,15 @@ fn handle_skill_create(app: &mut AppState, id: &str, desc: &str, rt_env: &mut Ru
     
     // 检查是否已存在
     if skill_path.exists() {
-        app.output.push_system(&format!("❌ Skill already exists: {}", id));
+        app.output.push_system(&format!(
+            "❌ Skill already exists: {}\n\
+             • 编辑：直接改 {}\n\
+             • 追加：在 Agent 中用 file_write + \"merge\": true\n\
+             • 删除后重建：/skill delete {}",
+            id,
+            skill_path.display(),
+            id
+        ));
         return;
     }
     
@@ -243,6 +251,7 @@ fn handle_skill_create_llm(app: &mut AppState, description: &str, _rt_env: &Runt
     crate::slash_commands::CommandResult::LlmRequest {
         prompt,
         description: format!("Create skill: {}", description),
+        skip_workflow: false,
     }
 }
 

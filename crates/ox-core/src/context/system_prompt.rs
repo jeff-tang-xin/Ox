@@ -100,16 +100,35 @@ fn build_system_prompt_inner(
     let is_wf = workflow_step_prompt.is_some();
     let si = step_index.unwrap_or(5); // 5 = no trim (full)
 
-    // Tools: only Step 3 (Execute)
-    if !is_wf || si >= 3 {
-        parts.push(build_tool_block());
+    // Tools: Plan (explore) and Execute — Intent/Review are JSON-only
+    if !is_wf || si == 1 || si >= 3 {
+        parts.push(if si == 1 {
+            build_explore_tool_block()
+        } else {
+            build_tool_block()
+        });
     }
 
-    // Skills: Step 1 (Plan) and Step 3 (Execute)
+    // Skills: Plan (step 1) and Execute (step 3)
     if !is_wf || si == 1 || si >= 3 {
-        if tool_registry.has_skills() {
+        let skills = tool_registry.get_skills_list();
+        if let Some(dedup) =
+            crate::skill::dedup::skill_dedup_directive(&rt_env.effective_project_root())
+        {
+            parts.push(dedup);
+        }
+        // Plan / Execute: auto-inject mandatory project skills (conventions + business)
+        if is_wf && (si == 1 || si == 3) {
+            if let Some(block) = crate::skill::policy::build_mandatory_injection(&skills) {
+                parts.push(block);
+            }
+        }
+        if let Some(block) = crate::skill::policy::build_on_demand_manifest(&skills) {
+            parts.push(block);
+        } else if !is_wf && tool_registry.has_skills() {
+            // Non-workflow: legacy one-liner when only mandatory skills exist
             let mut s = String::from("【方法】\n");
-            for skill in &tool_registry.get_skills_list() {
+            for skill in &skills {
                 s.push_str(&format!("- `{}` skill loaded. Follow its rules.\n", skill.name));
             }
             parts.push(s);
@@ -174,7 +193,8 @@ const CORE_EXPLORING: &str = "\
 【角色】你是 Ox，一个专家级编码助手。用户正在探索项目。
 
 【规则】
-- 用 file_list/file_search/find_symbol/code_search 探索。
+- file_list(path) 只列单层目录，子目录要分别再调；file_search(glob) 才是递归搜文件名。
+- 用 file_list / file_search / find_symbol / code_search 探索。
 - 清晰解释项目结构、模式、约定。
 - 引用代码用 `file:line` 格式。
 - 简洁，不啰嗦。
@@ -191,21 +211,37 @@ const CORE_GENERAL: &str = "\
 // Tool block
 // ═══════════════════════════════════════════════════════════════════
 
+fn build_explore_tool_block() -> String {
+    "【探索工具 — 必读】\n\
+     project_detect() — 检测项目类型（Plan 第一步，只调一次）\n\
+     file_list(path) — 【单层】列目录，不递归；子目录须分别再调 file_list(path)\n\
+     file_search(pattern) — 按 glob 递归搜文件名（*.rs / Cargo.*）\n\
+     file_read(path, offset?, limit?) — 读文件；大文件默认只读 200 行，用 offset/limit 续读\n\
+     find_symbol(name) — 按名找符号（精确→语义，最多约 20 条）\n\
+     code_search(pattern) — 在文件【内容】里搜文本/正则（默认最多 20 文件×5 行）\n\
+     memory_search(query) — 搜已存知识\n\
+     recall(node_id) — 取之前 offload 的大段工具结果\n\
+     load_skill(name) — 加载 skill 完整手册"
+        .to_string()
+}
+
 fn build_tool_block() -> String {
     format!(
         "【工具】\n\
-         file_read(path) — 读文件\n\
-         find_symbol(name) — 搜索符号(函数/类/结构体)\n\
-         code_search(pattern) — 正则搜索引用\n\
-         file_search(glob) / file_list — 找文件/浏览目录\n\
-         file_write(path,content) — 创建或覆盖文件\n\
-         edit_file(path,search,replace) — 精确编辑(支持模糊/批量)\n\
-         delete_range(path,start,end) — 删除代码块\n\
-         shell_exec(command) — 构建/测试/lint/git\n\
-         git_status / git_diff — 查看git状态\n\
-         memory_search(query) — 搜索已存储知识\n\
-         load_skill(name) — 加载完整skill手册\n\
-         web_fetch(url) — 获取文档"
+         file_read(path, offset?, limit?) — 读文件；默认 limit=200，大文件用 offset 续读\n\
+         file_list(path) — 【单层】列目录，不递归；子目录要分别再调 file_list\n\
+         file_search(pattern) — 按 glob 递归搜文件名（搜 *.rs 用这个）\n\
+         find_symbol(name) — 搜符号名（函数/类/结构体）\n\
+         code_search(pattern, file_pattern?) — 在源码【内容】里搜；file_pattern 只匹配文件名如 *.rs\n\
+         file_write(path,content) — 新建或整文件覆盖\n\
+         edit_file(path, old_string, new_string) — 精确替换；多段用 edits 数组\n\
+         delete_range(path, start_anchor, end_anchor) — 按行锚点删块\n\
+         shell_exec(command) — 构建/测试/git（需确认）\n\
+         git_status() / git_diff(path?) — 比 shell 更安全的 git 查看\n\
+         memory_search(query, scope?) — 搜知识库\n\
+         load_skill(name) — 加载 skill 手册\n\
+         recall(node_id) — 取 offload 结果\n\
+         web_fetch(url) — 拉取网页（非工作流步骤时可用）"
     )
 }
 

@@ -17,7 +17,7 @@ use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
 use ox_core::tools::{ToolContext, ToolRegistry};
 
-use crate::terminal::app::{App, PendingConfirmation};
+use crate::terminal::app::{App, PendingConfirmation, PendingSkillDraft};
 use crate::terminal::output_pane::OutputLine;
 use crate::helpers;
 
@@ -411,7 +411,8 @@ pub fn handle_turn_done(
 
     // Normal completion
     app.agent_running = false;
-    if app.workflow_awaiting_confirmation.is_none() {
+    flush_queued_skill_draft(app);
+    if app.workflow_awaiting_confirmation.is_none() && app.pending_skill_draft.is_none() {
         app.status = String::new();
     }
     app.pending_confirmation = None;
@@ -480,7 +481,10 @@ pub fn handle_error(
         *background_session = None;
     } else {
         app.agent_running = false;
-        app.status = String::new();
+        flush_queued_skill_draft(app);
+        if app.pending_skill_draft.is_none() {
+            app.status = String::new();
+        }
         app.ui_to_agent_tx = None;
     }
     if !app.user_scrolled {
@@ -513,6 +517,7 @@ pub fn handle_workflow_awaiting_confirmation(app: &mut App, step_idx: usize, mes
     }
     app.workflow_awaiting_confirmation = Some(step_idx);
     app.agent_running = false;
+    flush_queued_skill_draft(app);
     app.status = match step_idx {
         2 => "⏸️ 请确认后开始执行（输入 ok/继续/确认，或输入修改意见）".to_string(),
         _ => "⏸️ 等待确认".to_string(),
@@ -658,6 +663,7 @@ pub fn handle_workflow_completed(
     knowledge_engine: &Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>,
     task_description: String,
     execution_summary: String,
+    agent_config: &Arc<ox_core::config::AgentConfig>,
 ) {
     tracing::info!(
         "[AUTO-REFLECT] Workflow completed. Task: {}, Summary: {}",
@@ -665,7 +671,7 @@ pub fn handle_workflow_completed(
         execution_summary
     );
 
-    // L2 episode + memory consolidation via KnowledgeEngine
+    // Memory episode + consolidation
     let ke = Arc::clone(knowledge_engine);
     let pid = rt_env.project_id.clone();
     let task = task_description.clone();
@@ -683,66 +689,195 @@ pub fn handle_workflow_completed(
         }
     });
 
-    if let Some(llm_provider) = provider {
-        let project_root = rt_env.working_dir.clone();
-        match ox_core::agent::auto_reflect::AutoReflector::new(
-            Arc::clone(llm_provider),
+    if !agent_config.skill_reflect_enabled {
+        return;
+    }
+
+    let Some(provider) = provider.clone() else {
+        app.output.push_system("ℹ️ 未配置模型 — 跳过 Skill 反思");
+        return;
+    };
+
+    let threshold =
+        ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clamp_threshold(
+            agent_config.skill_reflect_rounds,
+        );
+    let root = rt_env.effective_project_root();
+    let pending = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::load(&root, threshold);
+    let next_round = pending.round_count() + 1;
+
+    app.output.push_system(&format!(
+        "🧠 任务完成 — 后台提炼 Skill 经验（第 {next_round}/{threshold} 轮，每轮自动存草稿）"
+    ));
+    app.status = format!("🧠 Skill 反思 {next_round}/{threshold}…");
+    app.dirty = true;
+
+    let tx = agent_tx.clone();
+    let messages = session.messages.clone();
+    let task_desc = task_description.clone();
+    let exec_summary = execution_summary.clone();
+    let project_root = root.clone();
+    let reflect_rounds = agent_config.skill_reflect_rounds;
+
+    tokio::spawn(async move {
+        let _ = tx.send(AgentToUiEvent::Status(
+            "🧠 正在分析本次任务经验…".to_string(),
+        ));
+
+        let reflector = match ox_core::agent::auto_reflect::AutoReflector::new(
+            provider,
             &project_root,
         ) {
-            Ok(reflector) => {
-                app.output.push_line(OutputLine::System(
-                    "\n🤖 Auto-reflection in progress...".to_string(),
-                ));
-                let conversation_history = session.messages.clone();
-                let tx_clone = agent_tx.clone();
-                tokio::spawn(async move {
-                    match reflector
-                        .reflect_on_workflow(
-                            &task_description,
-                            &execution_summary,
-                            &conversation_history,
-                        )
-                        .await
-                    {
-                        Ok(ox_core::agent::auto_reflect::ReflectOutcome::Draft {
-                            skill_id,
-                            content,
-                            description,
-                        }) => {
-                            let _ = tx_clone.send(AgentToUiEvent::SkillDraftReady {
-                                skill_id,
-                                content,
-                                description,
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(AgentToUiEvent::Error(format!(
+                    "Skill 反思初始化失败: {e}"
+                )));
+                return;
+            }
+        };
+
+        match reflector
+            .reflect_on_workflow(&task_desc, &exec_summary, &messages)
+            .await
+        {
+            Ok(ox_core::agent::auto_reflect::ReflectOutcome::Draft {
+                skill_id,
+                content,
+                description,
+            }) => {
+                let threshold = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clamp_threshold(
+                    reflect_rounds,
+                );
+                let mut buffer = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::load(
+                    &project_root,
+                    threshold,
+                );
+                match buffer.append_round(
+                    &project_root,
+                    &task_desc,
+                    &skill_id,
+                    &content,
+                    &description,
+                ) {
+                    Ok((round, ready)) => {
+                        let task_summary = task_desc.chars().take(60).collect::<String>();
+                        let _ = tx.send(AgentToUiEvent::SkillReflectRoundSaved {
+                            round,
+                            threshold: buffer.threshold,
+                            task_summary,
+                        });
+                        if ready {
+                            let (merged_id, merged_content, merged_desc) =
+                                buffer.build_merged_draft();
+                            if let Err(e) = buffer.clear(&project_root) {
+                                tracing::warn!("[SKILL-REFLECT] Failed to clear buffer: {e}");
+                            }
+                            let _ = tx.send(AgentToUiEvent::SkillDraftReady {
+                                skill_id: merged_id,
+                                content: merged_content,
+                                description: merged_desc,
                             });
                         }
-                        Ok(ox_core::agent::auto_reflect::ReflectOutcome::Skipped { reason }) => {
-                            tracing::debug!("[AUTO-REFLECT] Skipped: {reason}");
-                            let _ = tx_clone.send(AgentToUiEvent::Status(format!(
-                                "ℹ️ Skill reflection skipped: {reason}"
-                            )));
-                        }
-                        Err(e) => {
-                            tracing::error!("[AUTO-REFLECT] Reflection failed: {}", e);
-                            let _ = tx_clone.send(AgentToUiEvent::Error(format!(
-                                "Auto-reflection failed: {}",
-                                e
-                            )));
-                        }
                     }
-                });
+                    Err(e) => {
+                        let _ = tx.send(AgentToUiEvent::Error(format!(
+                            "保存 Skill 反思草稿失败: {e}"
+                        )));
+                    }
+                }
+            }
+            Ok(ox_core::agent::auto_reflect::ReflectOutcome::Skipped { reason }) => {
+                let _ = tx.send(AgentToUiEvent::Status(format!(
+                    "ℹ️ Skill 反思跳过: {reason}"
+                )));
             }
             Err(e) => {
-                tracing::warn!("[AUTO-REFLECT] Failed to initialize: {}", e);
-                app.output.push_line(OutputLine::System(
-                    "⚠️ Auto-reflection unavailable (initialization failed)".to_string(),
-                ));
+                let _ = tx.send(AgentToUiEvent::Error(format!(
+                    "Skill 反思失败: {e}"
+                )));
             }
         }
-    } else {
+    });
+}
+
+/// Present skill draft for user review (or queue if agent is busy).
+pub fn present_skill_draft(
+    app: &mut App,
+    skill_id: String,
+    content: String,
+    description: String,
+) {
+    let draft = PendingSkillDraft {
+        skill_id,
+        content,
+        description,
+    };
+    if app.agent_running {
+        tracing::info!(
+            "[SKILL-DRAFT] Agent busy — queued review for `{}`",
+            draft.skill_id
+        );
+        app.queued_skill_draft = Some(draft);
         app.output.push_line(OutputLine::System(
-            "⚠️ Auto-reflection unavailable (no LLM provider)".to_string(),
+            "💡 聚合 Skill 草稿已就绪 — 当前任务结束后将提示你确认保存。".into(),
         ));
+        app.status = "💡 Skill 草稿待确认（任务结束后弹出）".into();
+        app.dirty = true;
+        return;
     }
+    show_skill_draft_prompt(app, draft);
+}
+
+/// Flush queued skill draft after agent turn completes.
+pub fn flush_queued_skill_draft(app: &mut App) {
+    if app.agent_running {
+        return;
+    }
+    if let Some(draft) = app.queued_skill_draft.take() {
+        show_skill_draft_prompt(app, draft);
+    }
+}
+
+fn show_skill_draft_prompt(app: &mut App, draft: PendingSkillDraft) {
+    let skill_id = draft.skill_id.clone();
+    app.output.finalize_streaming();
+    app.output.push_line(OutputLine::Markdown(format!(
+        "## 🧠 建议保存 Skill: `{skill_id}`\n\n{}\n\n---\n\n预览（前 800 字）：\n\n{}",
+        draft.description,
+        draft.content.chars().take(800).collect::<String>()
+    )));
+    app.output.push_line(OutputLine::System(
+        "已聚合多轮任务反思。输入 **ok** / **保存** 写入 `.ox/skills/`；**取消** / **忽略** 丢弃。\n\
+         直接输入新任务也会忽略此建议并继续对话。".into(),
+    ));
+    app.pending_skill_draft = Some(draft);
+    app.status = "💡 Skill 聚合草稿 — ok 保存 / 直接输入继续".into();
+    if !app.user_scrolled {
+        app.scroll_to_bottom();
+    }
+    app.dirty = true;
+}
+
+/// Handle one reflection round saved to disk.
+pub fn handle_skill_reflect_round_saved(
+    app: &mut App,
+    round: usize,
+    threshold: usize,
+    task_summary: &str,
+) {
+    app.output.push_line(OutputLine::System(format!(
+        "✅ 第 {round}/{threshold} 轮 Skill 反思已存草稿（`.ox/skills/.drafts/`）— {task_summary}"
+    )));
+    if round < threshold {
+        app.status = format!("🧠 Skill 反思 {round}/{threshold}（草稿已保存）");
+    } else {
+        app.status = "💡 Skill 聚合完成 — 等待确认".into();
+    }
+    if !app.user_scrolled {
+        app.scroll_to_bottom();
+    }
+    app.dirty = true;
 }
 
 /// Handle skill draft ready — show preview and wait for user confirmation.
@@ -752,22 +887,5 @@ pub fn handle_skill_draft_ready(
     content: String,
     description: String,
 ) {
-    app.output.finalize_streaming();
-    app.output.push_line(OutputLine::Markdown(format!(
-        "## 🧠 建议保存 Skill: `{skill_id}`\n\n{description}\n\n---\n\n预览（前 800 字）：\n\n{}",
-        content.chars().take(800).collect::<String>()
-    )));
-    app.output.push_line(OutputLine::System(
-        "输入 **ok** / **保存** / **确认** 保存 Skill，或输入修改意见放弃。".into(),
-    ));
-    app.pending_skill_draft = Some(crate::terminal::app::PendingSkillDraft {
-        skill_id,
-        content,
-        description,
-    });
-    app.status = "⏸️ Skill 待确认 — ok/保存/确认".into();
-    if !app.user_scrolled {
-        app.scroll_to_bottom();
-    }
-    app.dirty = true;
+    present_skill_draft(app, skill_id, content, description);
 }

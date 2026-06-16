@@ -6,13 +6,7 @@ use serde_json;
 
 /// Check if a file path is source code (needs Plan before editing).
 fn is_source_file(path: &str) -> bool {
-    let src_extensions = [
-        ".rs", ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".java", ".kt",
-        ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".scala",
-        ".r", ".m", ".mm", ".vue", ".svelte", ".sql", ".sh", ".bash", ".fish",
-    ];
-    let lower = path.to_lowercase();
-    src_extensions.iter().any(|ext| lower.ends_with(ext))
+    crate::source_paths::is_source_code_path(path)
 }
 
 lazy_static! {

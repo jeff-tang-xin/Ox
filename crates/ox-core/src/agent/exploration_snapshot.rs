@@ -229,15 +229,7 @@ fn head_tail_preview(content: &str, max_chars: usize) -> String {
 fn build_code_preview(content: &str, path: &str, max_chars: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
-    let is_code = path.ends_with(".rs")
-        || path.ends_with(".py")
-        || path.ends_with(".js")
-        || path.ends_with(".ts")
-        || path.ends_with(".go")
-        || path.ends_with(".java")
-        || path.ends_with(".cpp")
-        || path.ends_with(".c")
-        || path.ends_with(".h");
+    let is_code = crate::source_paths::is_source_code_path(path);
 
     let mut parts = vec![format!("({total} lines, {} chars)", content.chars().count())];
 

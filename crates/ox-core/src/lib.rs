@@ -10,5 +10,6 @@ pub mod runtime;
 pub mod safety;
 pub mod skill;
 pub mod slash;
+pub mod source_paths;
 pub mod symbol;
 pub mod tools;

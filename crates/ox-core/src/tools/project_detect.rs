@@ -11,7 +11,8 @@ impl Tool for ProjectDetectTool {
     }
 
     fn description(&self) -> &str {
-        "Detect project type, language, and framework by examining marker files (Cargo.toml, package.json, etc.)."
+        "Detect project type/language by marker files in ONE directory (default: project root). \
+         Does not scan subdirectories — for monorepos, also file_list subdirs. Call once at start of planning."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -52,18 +53,23 @@ impl Tool for ProjectDetectTool {
 
         let markers: &[(&str, &str, &str)] = &[
             ("Cargo.toml", "Rust", "Cargo"),
-            ("package.json", "JavaScript/TypeScript", "npm/yarn"),
+            ("package.json", "JavaScript/TypeScript", "npm/yarn/pnpm"),
+            ("pnpm-workspace.yaml", "JavaScript (monorepo)", "pnpm"),
             ("go.mod", "Go", "Go Modules"),
             ("pyproject.toml", "Python", "pyproject"),
             ("setup.py", "Python", "setuptools"),
             ("requirements.txt", "Python", "pip"),
+            ("Pipfile", "Python", "pipenv"),
             ("pom.xml", "Java", "Maven"),
             ("build.gradle", "Java/Kotlin", "Gradle"),
+            ("build.gradle.kts", "Kotlin/Java", "Gradle"),
+            ("settings.gradle", "Java/Kotlin", "Gradle"),
             ("CMakeLists.txt", "C/C++", "CMake"),
             ("Makefile", "C/C++/Mixed", "Make"),
             ("Gemfile", "Ruby", "Bundler"),
             ("composer.json", "PHP", "Composer"),
             ("*.csproj", "C#", ".NET"),
+            ("global.json", "C#/.NET", ".NET SDK"),
             ("pubspec.yaml", "Dart", "Flutter/Dart"),
         ];
 

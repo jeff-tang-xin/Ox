@@ -69,40 +69,31 @@ pub fn handle_cd(app: &mut AppState, args: &str, session: &mut Session, rt_env: 
                         .map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "(none)".into());
                     app.output.push_system(&format!("Project boundary changed -- {}", name));
                     
-                    // 🧠 Project onboarding: generate TWO skill files if missing
-                    if let Some(ref proj_root) = rt_env.project_root {
-                        let conventions = proj_root.join(".ox").join("skills").join("project-conventions.md");
-                        let architecture = proj_root.join(".ox").join("skills").join("project-architecture.md");
-                        if !conventions.exists() || !architecture.exists() {
-                            let prompt = format!(
-                                "You just entered a new project at `{}`. Generate TWO skill files.\n\n\
-                                 ## File 1: .ox/skills/project-conventions.md\n\
-                                 Run `project_detect` first. Then scan config files and source patterns:\n\
-                                 - Language, framework, build tool (1-2 lines)\n\
-                                 - Naming conventions (files, modules, functions — with real examples)\n\
-                                 - Code style (indent, quotes, line length from linter config)\n\
-                                 - Import ordering and grouping\n\
-                                 - Build/test/lint/run commands\n\n\
-                                 ## File 2: .ox/skills/project-architecture.md\n\
-                                 Scan directory structure and module layout:\n\
-                                 - Directory tree and layer boundaries (handlers/services/repos?)\n\
-                                 - MUST rules (from existing code patterns and linter config)\n\
-                                 - MUST NOT rules (anti-patterns to avoid)\n\
-                                 - Error handling patterns (Result/Option/exception style)\n\
-                                 - Key dependencies and their roles\n\
-                                 - Data flow patterns (request → handler → service → db?)\n\n\
-                                 Keep each file 200-400 words. Use real file names and examples.",
-                                proj_root.display()
+                    // 🧠 Project onboarding: generate project Skills if missing
+                    let proj_root = rt_env.effective_project_root();
+                    if ox_core::agent::onboarding::needs_project_onboarding(&proj_root) {
+                        let _ =
+                            ox_core::agent::onboarding::prepare_project_for_onboarding(&proj_root);
+                        let prompt =
+                            ox_core::agent::onboarding::build_onboarding_user_prompt(&proj_root);
+                        app.output.push_system(
+                            "🔍 首次进入本项目 — 将生成项目规范与业务指导 Skill…",
+                        );
+                        app.output.push_system(
+                            "   → project-conventions.md + project-business-guide.md",
+                        );
+                        if ox_core::agent::onboarding::is_greenfield_project(&proj_root) {
+                            app.output.push_system(
+                                "   ℹ️ 未检测到工程标记（空目录或未初始化）— 将创建初始 Skill 模板",
                             );
-                            app.output.push_system("🔍 First time in this project. Scanning codebase to learn conventions and architecture...");
-                            app.output.push_system("   Will generate .ox/skills/project-conventions.md + project-architecture.md");
-                            return CommandResult::LlmRequest {
-                                prompt,
-                                description: "Generate project conventions and architecture".to_string(),
-                            };
-                        } else {
-                            app.output.push_system("📋 Project skills already exist — loaded from cache.");
                         }
+                        return CommandResult::LlmRequest {
+                            prompt,
+                            description: "生成项目规范与业务指导 Skill".to_string(),
+                            skip_workflow: true,
+                        };
+                    } else {
+                        app.output.push_system("📋 项目 Skill 已存在 — 已从缓存加载。");
                     }
                 }
             }

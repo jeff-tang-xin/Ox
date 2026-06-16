@@ -206,14 +206,13 @@ impl ToolRegistry {
         );
         
         // ⚠️ Cap at 10 skills to prevent context bloat
-        // Keep the most recent skills (sorted by modification time)
+        // Keep the most recently modified skills (created_at = file mtime / frontmatter)
         let mut skills = loader.load_enabled_skills()?;
         const MAX_SKILLS: usize = 10;
         if skills.len() > MAX_SKILLS {
-            // Sort by creation time (newest first) and keep top N
             skills.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             skills.truncate(MAX_SKILLS);
-            tracing::info!("Capped skills at {} (oldest trimmed)", MAX_SKILLS);
+            tracing::info!("Capped skills at {} (oldest by mtime trimmed)", MAX_SKILLS);
         }
         *self.skills.lock().unwrap() = skills;
         

@@ -16,9 +16,9 @@ impl Tool for FindSymbolTool {
     }
 
     fn description(&self) -> &str {
-        "Search for symbols (functions, classes, structs, traits, etc.) by name or semantics. \
-         Uses tree-sitter for exact match (always available), \
-         falls back to semantic vector search for fuzzy queries."
+        "Search for symbols (functions, classes, structs) by name. \
+         Tree-sitter exact/substring match first (up to ~20 hits), then semantic vector fallback. \
+         Not a full-text search — use code_search for text in file contents."
     }
 
     fn parameters_schema(&self) -> Value {

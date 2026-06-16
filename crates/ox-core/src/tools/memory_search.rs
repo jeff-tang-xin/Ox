@@ -91,7 +91,7 @@ impl Tool for MemorySearchTool {
             }
         };
 
-        let _scope = args.get("scope").and_then(|s| s.as_str()).unwrap_or("both");
+        let scope = args.get("scope").and_then(|s| s.as_str()).unwrap_or("both");
 
         let max_results = args
             .get("max_results")
@@ -99,20 +99,44 @@ impl Tool for MemorySearchTool {
             .unwrap_or(5)
             .min(20) as usize;
 
-        // Access knowledge engine — search ALL knowledge including WorkingMemory (L0)
         let knowledge = Arc::clone(&ctx.knowledge);
-        let _project_id = ctx.runtime.project_id.clone();
+        let project_id = ctx.runtime.project_id.clone();
         let query_owned = query.to_string();
+        let scope_owned = scope.to_string();
 
         let nodes = tokio::task::spawn(async move {
             let engine = knowledge.read().await;
-            // Search all entity kinds (including WorkingMemory L0, not just L1-L3)
-            engine.retrieve_for_context(&query_owned, "", max_results)
-                .unwrap_or_default()
-                .into_iter()
+            let hits = match scope_owned.as_str() {
+                "project" => engine
+                    .retrieve_memories(&query_owned, max_results)
+                    .unwrap_or_default(),
+                "global" => engine
+                    .retrieve_memories(&query_owned, max_results)
+                    .unwrap_or_default(),
+                _ => engine
+                    .retrieve_for_context(&query_owned, "", max_results)
+                    .unwrap_or_default(),
+            };
+            hits.into_iter()
+                .filter(|h| match scope_owned.as_str() {
+                    "project" => h
+                        .entity
+                        .project_id()
+                        .map(|pid| pid == project_id.as_str())
+                        .unwrap_or(true),
+                    "global" => h
+                        .entity
+                        .project_id()
+                        .map(|pid| pid != project_id.as_str())
+                        .unwrap_or(true),
+                    _ => true,
+                })
                 .map(|h| h.entity)
+                .take(max_results)
                 .collect::<Vec<_>>()
-        }).await.unwrap_or_default();
+        })
+        .await
+        .unwrap_or_default();
 
         if nodes.is_empty() {
             // With RwLock, reads don't block — just show "no results" without busy message

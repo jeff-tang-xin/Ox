@@ -17,9 +17,9 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Retrieve the full content of an offloaded tool result by its node_id. \
-         Use when a previous large tool output was summarized with a node_id reference. \
-         For searching memory/knowledge, use memory_search instead."
+        "Retrieve the full content of an offloaded tool result by node_id only. \
+         Use when output said 'Result saved to .ox/refs/{node_id}.md'. \
+         To search knowledge by topic, use memory_search — not recall."
     }
 
     fn parameters_schema(&self) -> Value {

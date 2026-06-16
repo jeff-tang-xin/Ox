@@ -13,7 +13,15 @@ use ox_core::tools::ToolRegistry;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Max wait for knowledge read lock (background indexer holds write lock while embedding).
+const KNOWLEDGE_READ_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Max time for hybrid retrieval (query embed + vector search).
+const KNOWLEDGE_RETRIEVAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Max wait for lazy-index write lock before skipping on-demand embed.
+const LAZY_INDEX_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Specifies which kind of turn is being prepared — affects how user input is handled.
 #[derive(Debug, Clone)]
@@ -77,18 +85,32 @@ pub async fn prepare_turn(
                     "📇 Indexing {} path(s)…",
                     paths.len().min(max)
                 )));
-                let mut engine = k_engine.write().await;
-                let result = tokio::task::block_in_place(|| engine.ensure_paths_indexed(&paths, max));
-                if let Ok(n) = result {
-                    if n > 0 {
-                        tracing::info!("[PRE-TURN] Lazy-indexed {n} symbols from {} paths", paths.len().min(max));
+                match tokio::time::timeout(LAZY_INDEX_WRITE_LOCK_TIMEOUT, k_engine.write()).await
+                {
+                    Ok(mut engine) => {
+                        let path_count = paths.len().min(max);
+                        let result = tokio::task::block_in_place(|| {
+                            engine.ensure_paths_indexed(&paths, max)
+                        });
+                        if let Ok(n) = result {
+                            if n > 0 {
+                                tracing::info!(
+                                    "[PRE-TURN] Lazy-indexed {n} symbols from {path_count} paths",
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "[PRE-TURN] Lazy index skipped — knowledge engine busy (background indexing)"
+                        );
                     }
                 }
             }
         }
     }
 
-    // 2. Knowledge retrieval (await read lock — don't silently skip during indexing)
+    // 2. Knowledge retrieval — bounded wait so background embed cannot block the LLM call
     let _ = status_tx.send(AgentToUiEvent::Status(
         "🔍 Retrieving knowledge...".to_string(),
     ));
@@ -99,22 +121,46 @@ pub async fn prepare_turn(
         .unwrap_or(false);
 
     let knowledge_context_str = if let Some(k_engine) = knowledge_engine {
-        let engine = k_engine.read().await;
-        let result = if step_memory_layers.is_empty() {
-            retrieval::run_retrieval(&engine, &effective_text, session_id, 3000)
-        } else {
-            retrieval::run_retrieval_for_step(
-                &engine,
-                &effective_text,
-                session_id,
-                3000,
-                &step_memory_layers,
-            )
-        };
-        match result {
-            Ok(inj) => retrieval::format_context_for_prompt(&inj),
-            Err(e) => {
-                tracing::warn!("[PRE-TURN] Knowledge retrieval failed: {}", e);
+        match tokio::time::timeout(KNOWLEDGE_READ_LOCK_TIMEOUT, k_engine.read()).await {
+            Ok(engine_guard) => {
+                let query = effective_text.clone();
+                let sid = session_id.to_string();
+                let layers = step_memory_layers.clone();
+                let step_layers = !layers.is_empty();
+                match tokio::time::timeout(KNOWLEDGE_RETRIEVAL_TIMEOUT, async {
+                    tokio::task::block_in_place(|| {
+                        if step_layers {
+                            retrieval::run_retrieval_for_step(
+                                &engine_guard,
+                                &query,
+                                &sid,
+                                3000,
+                                &layers,
+                            )
+                        } else {
+                            retrieval::run_retrieval(&engine_guard, &query, &sid, 3000)
+                        }
+                    })
+                })
+                .await
+                {
+                    Ok(Ok(inj)) => retrieval::format_context_for_prompt(&inj),
+                    Ok(Err(e)) => {
+                        tracing::warn!("[PRE-TURN] Knowledge retrieval failed: {}", e);
+                        String::new()
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "[PRE-TURN] Knowledge retrieval timed out — proceeding without RAG context"
+                        );
+                        String::new()
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "[PRE-TURN] Knowledge read lock timeout — skipping retrieval (indexer may be running)"
+                );
                 String::new()
             }
         }
@@ -139,9 +185,11 @@ pub async fn prepare_turn(
         && !workflow_active
         && session_messages.len() < 40;
     let system_prompt_variant = match &variant {
-        TurnVariant::Onboarding { .. } => UserIntent::CodeModification,
+        TurnVariant::Onboarding { .. } => UserIntent::Exploration,
         _ => UserIntent::General,
     };
+    let onboarding_greenfield = matches!(variant, TurnVariant::Onboarding { .. })
+        && ox_core::agent::onboarding::is_greenfield_project(&rt_env.effective_project_root());
 
     let blocking_result = tokio::task::spawn_blocking(move || {
         let git_log = context::gather_git_context(&rt_env_clone.working_dir);
@@ -220,6 +268,14 @@ pub async fn prepare_turn(
 
     match blocking_result {
         Ok(Ok((mut turn_messages, planning))) => {
+            if matches!(variant, TurnVariant::Onboarding { .. }) {
+                turn_messages.insert(
+                    1,
+                    Message::system(&ox_core::agent::onboarding::onboarding_system_directive(
+                        onboarding_greenfield,
+                    )),
+                );
+            }
             if workflow_active {
                 if let Some(wf) = workflow_engine {
                     if let Ok(engine) = wf.try_lock() {

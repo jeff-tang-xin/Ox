@@ -2,7 +2,10 @@ pub mod directory;
 mod project;
 
 pub use directory::{DirectoryChangeResult, change_directory};
-pub use project::{compute_project_id, find_project_root};
+pub use project::{
+    compute_project_id, effective_project_root, ensure_ox_project_scaffold,
+    find_project_root, has_project_markers,
+};
 
 use std::path::PathBuf;
 
@@ -55,6 +58,11 @@ pub struct RuntimeEnvironment {
 }
 
 impl RuntimeEnvironment {
+    /// Directory used for `.ox/skills` and onboarding (detected root, else cwd).
+    pub fn effective_project_root(&self) -> PathBuf {
+        project::effective_project_root(&self.project_root, &self.working_dir)
+    }
+
     /// Format a summary string for the startup banner.
     pub fn banner_summary(&self) -> String {
         let project_name = self

@@ -15,7 +15,8 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Use to inspect code, configs, or docs before editing. Returns formatted output with 1-based line numbers (e.g. '  42→fn main()')."
+        "Read file contents with line numbers. Default: 200 lines from offset 0. \
+         Large files are NOT read in full — use offset/limit to paginate (e.g. offset=200, limit=200 for next page)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -125,10 +126,20 @@ impl Tool for FileReadTool {
                         offset + 1,
                         (offset + shown).min(total_lines)
                     ));
+                    if offset + shown < total_lines {
+                        output.push_str(&format!(
+                            "\n💡 未读完。续读: file_read {{\"path\":\"{}\", \"offset\":{}, \"limit\":{}}}",
+                            path_str, offset + shown, limit
+                        ));
+                    }
                 } else if shown == limit {
                     output.push_str(&format!(
                         "\n\n📄 showing {} lines starting at line {} (large file, total unknown)",
                         shown, offset + 1
+                    ));
+                    output.push_str(&format!(
+                        "\n💡 可能还有更多。续读: file_read {{\"path\":\"{}\", \"offset\":{}, \"limit\":{}}}",
+                        path_str, offset + shown, limit
                     ));
                 }
                 ToolOutput::success(output)

@@ -21,9 +21,9 @@ impl Tool for LoadSkillTool {
     fn name(&self) -> &str { "load_skill" }
 
     fn description(&self) -> &str {
-        "Load the FULL instructions for a skill. Use when you need to follow a skill's \
-         detailed workflow. Only name + description are in the system prompt; call this \
-         to get the complete manual before executing the skill's tasks."
+        "Load the FULL instructions for an on-demand skill (builtin / global / project extension). \
+         Mandatory project skills (project-conventions, project-business-guide) are already injected \
+         in Plan/Execute — do not reload them. Call this for other skills when you need their workflow."
     }
 
     fn parameters_schema(&self) -> Value {

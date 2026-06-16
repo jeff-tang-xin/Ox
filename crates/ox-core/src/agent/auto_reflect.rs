@@ -74,10 +74,14 @@ impl AutoReflector {
         }
 
         let (skill_id, description) = self.parse_draft_metadata(&skill_content);
+        let canonical = crate::skill::dedup::canonical_mandatory_id(&skill_id)
+            .unwrap_or(skill_id.as_str());
+        let skill_id = canonical.to_string();
+
         if self.skill_exists(&skill_id) {
-            return Ok(ReflectOutcome::Skipped {
-                reason: format!("Skill `{skill_id}` already exists"),
-            });
+            tracing::info!(
+                "[AUTO-REFLECT] Skill `{skill_id}` exists — will merge on save"
+            );
         }
 
         Ok(ReflectOutcome::Draft {
@@ -273,10 +277,29 @@ impl AutoReflector {
         };
         fs::create_dir_all(&skills_dir)?;
 
-        let skill_file = skills_dir.join(format!("{}.md", skill_id));
-        fs::write(&skill_file, &repaired_content)?;
-        tracing::info!("[AUTO-REFLECT] Saved {} skill to: {:?}", scope, skill_file);
-        Ok(skill_id)
+        let resolved_id = crate::skill::dedup::canonical_mandatory_id(&skill_id)
+            .unwrap_or(skill_id.as_str())
+            .to_string();
+        let skill_file = skills_dir.join(format!("{}.md", resolved_id));
+        Self::write_skill_to_path(&skill_file, &resolved_id, &repaired_content)
+    }
+
+    fn write_skill_to_path(
+        skill_file: &Path,
+        skill_id: &str,
+        repaired_content: &str,
+    ) -> Result<String> {
+        if skill_file.exists() {
+            if let Ok(existing) = fs::read_to_string(skill_file) {
+                let merged = crate::skill::dedup::merge_skill_markdown(&existing, repaired_content);
+                fs::write(skill_file, &merged)?;
+                tracing::info!("[AUTO-REFLECT] Merged into existing skill: {:?}", skill_file);
+                return Ok(format!("{skill_id} (merged)"));
+            }
+        }
+        fs::write(skill_file, repaired_content)?;
+        tracing::info!("[AUTO-REFLECT] Saved skill to: {:?}", skill_file);
+        Ok(skill_id.to_string())
     }
 
     /// Extract YAML frontmatter from markdown content

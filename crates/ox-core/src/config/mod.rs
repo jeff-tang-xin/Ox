@@ -826,6 +826,10 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     /// Maximum total tokens per turn before requesting user confirmation.
     pub max_per_turn_tokens: u32,
+    /// Auto-reflect after workflow completion (aggregated Skill drafts).
+    pub skill_reflect_enabled: bool,
+    /// Workflow rounds to aggregate before prompting user to save Skill (5–10).
+    pub skill_reflect_rounds: usize,
 }
 
 impl Default for AgentConfig {
@@ -833,6 +837,8 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 50,
             max_per_turn_tokens: 500_000,
+            skill_reflect_enabled: true,
+            skill_reflect_rounds: crate::agent::skill_reflect_buffer::DEFAULT_REFLECT_THRESHOLD,
         }
     }
 }

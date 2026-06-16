@@ -173,11 +173,22 @@ impl WorkflowEngine {
 
     /// Check if code file modification is allowed in current step
     pub fn allows_code_modification(&self) -> bool {
-        if let Some(step) = self.current_step() {
-            step.allow_code_modification
-        } else {
-            false
+        let step = match self.current_step() {
+            Some(s) => s,
+            None => return false,
+        };
+        if !step.allow_code_modification {
+            return false;
         }
+        // Exploring fast-path lands on Execute but must stay read-only.
+        if self.get_current_step_index() == 3
+            && Self::intent_routing_from_text(self.get_variable("_step0_output").as_deref())
+                .map(|r| r.intent == "exploring")
+                .unwrap_or(false)
+        {
+            return false;
+        }
+        true
     }
 
     /// Get allowed tools for current step.
@@ -468,8 +479,8 @@ impl WorkflowEngine {
             }
         }
 
-        // Check if code modification is allowed
-        if !step.allow_code_modification {
+        // Check if code modification is allowed (step + exploring read-only override)
+        if !self.allows_code_modification() {
             // Check if this is a code-modifying tool
             let is_code_tool = matches!(tool_name, "file_write" | "edit_file" | "delete_range");
 
@@ -478,9 +489,10 @@ impl WorkflowEngine {
                 let file_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
                 // Check if it's a source code file
-                if Self::is_source_code_file(file_path) {
+                if crate::source_paths::is_source_code_path(file_path) {
                     return Err(format!(
-                        "Code modification not allowed in current step. You can only create/modify documentation files (.md, .txt, etc.), not source code files (.rs, .py, .js, etc.). Attempted to modify: {}",
+                        "Code modification not allowed in current step. You can only create/modify documentation files (.md, .txt, etc.), not {}. Attempted to modify: {}",
+                        crate::source_paths::source_code_guard_hint(),
                         file_path
                     ));
                 }
@@ -490,15 +502,9 @@ impl WorkflowEngine {
         Ok(())
     }
 
-    /// Check if a file path is a source code file
+    /// Check if a file path is a source code file (delegates to shared registry).
     fn is_source_code_file(file_path: &str) -> bool {
-        let extensions = [
-            ".rs", ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".cpp", ".c", ".h", ".hpp", ".go",
-            ".rb", ".php", ".swift", ".kt", ".scala", ".cs", ".fs", ".r", ".m",
-        ];
-
-        let file_lower = file_path.to_lowercase();
-        extensions.iter().any(|ext| file_lower.ends_with(ext))
+        crate::source_paths::is_source_code_path(file_path)
     }
 
     /// Check if workflow is currently active
@@ -1594,6 +1600,46 @@ mod advance_tests {
             .unwrap();
         session.blocking_lock().current_step_index = 3;
         engine
+    }
+
+    #[test]
+    fn coding_fast_path_execute_allows_source_writes() {
+        let mut engine = test_engine_at_execute_with_workflow();
+        engine.set_variable(
+            "_step0_output",
+            r#"{"intent":"coding","complexity":"simple","files":["src/Foo.java"],"topic":"add validation","pipeline":"fast","routing_reason":"单文件简单改动"}"#.to_string(),
+        );
+        assert!(engine.allows_code_modification());
+        for path in [
+            "src/Foo.java",
+            "lib/main.py",
+            "cmd/app.go",
+            "Program.cs",
+            "components/App.tsx",
+        ] {
+            let args = serde_json::json!({"path": path, "content": "..."});
+            assert!(
+                engine.validate_tool_call("file_write", &args).is_ok(),
+                "should allow write for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn exploring_fast_path_execute_blocks_source_file_write() {
+        let mut engine = test_engine_at_execute_with_workflow();
+        engine.set_variable(
+            "_step0_output",
+            r#"{"intent":"exploring","complexity":"complex","topic":"audit","pipeline":"fast","routing_reason":"只读"}"#.to_string(),
+        );
+        assert!(!engine.allows_code_modification());
+        for path in ["src/Foo.java", "main.py", "app.go", "lib.rs"] {
+            let args = serde_json::json!({"path": path, "content": "..."});
+            assert!(
+                engine.validate_tool_call("file_write", &args).is_err(),
+                "should block write for {path}"
+            );
+        }
     }
 
     #[test]

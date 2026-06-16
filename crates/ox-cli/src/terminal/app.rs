@@ -155,6 +155,8 @@ pub struct App {
     pub workflow_awaiting_confirmation: Option<usize>,
     /// Skill draft awaiting user confirmation before save.
     pub pending_skill_draft: Option<PendingSkillDraft>,
+    /// Skill review queued while agent is still running.
+    pub queued_skill_draft: Option<PendingSkillDraft>,
     pub ui_to_agent_tx:
         Option<tokio::sync::mpsc::UnboundedSender<ox_core::agent::ui_event::UiToAgentEvent>>,
     pub pending_model_switch: Option<String>,
@@ -261,6 +263,7 @@ impl App {
             pending_confirmation: None,
             workflow_awaiting_confirmation: None,
             pending_skill_draft: None,
+            queued_skill_draft: None,
             ui_to_agent_tx: None,
             pending_model_switch: None,
             pending_llm_task: None,  // 🆕 Unified LLM task

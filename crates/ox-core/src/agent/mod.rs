@@ -10,12 +10,14 @@ pub mod ui_event;
 pub mod workflow;
 pub mod context_offloader;
 pub mod auto_reflect;  // 🆕 Auto-reflection for skill generation
+pub mod skill_reflect_buffer;
 pub mod context_injector;  // 🆕 Task anchoring + knowledge re-injection
 pub mod exploration_snapshot; // Plan-step tool results for cross-step handoff
 pub mod plan_tracker; // Execute-step plan progress
 pub mod turn_memory; // In-turn tool log + message compaction
 pub mod memory_bridge; // Cross-turn durable memory injection
 pub mod user_round; // Per-user-message round segmentation
+pub mod onboarding; // First-time project skill generation
 pub mod error_recovery;    // 🆕 Build/test failure auto-fix
 pub mod tool_executor;     // 🆕 Tool detail display + error formatting
 
@@ -111,6 +113,12 @@ pub enum AgentToUiEvent {
         skill_id: String,
         content: String,
         description: String,
+    },
+    /// One workflow reflection round saved to disk (not yet asking user to confirm).
+    SkillReflectRoundSaved {
+        round: usize,
+        threshold: usize,
+        task_summary: String,
     },
 }
 
@@ -603,6 +611,46 @@ pub async fn run_agent_turn(
             _ = &mut stream_handle => {}
             _ = cancel_token.cancelled() => {
                 stream_handle.abort();
+            }
+        }
+
+        // Onboarding: ## Done when both project skill files exist (no workflow).
+        let onboarding_turn =
+            workflow_engine.is_none() && onboarding::is_onboarding_turn(&messages);
+        if onboarding_turn && crate::agent::engine::WorkflowEngine::text_signals_done(&full_text) {
+            let root = tool_ctx
+                .runtime
+                .project_root
+                .clone()
+                .unwrap_or_else(|| tool_ctx.working_dir.clone());
+            if onboarding::onboarding_files_complete(&root) {
+                let msg = Message::Assistant {
+                    content: full_text.clone(),
+                    tool_calls: Vec::new(),
+                    reasoning_content: if reasoning_content.is_empty() {
+                        None
+                    } else {
+                        Some(reasoning_content.clone())
+                    },
+                };
+                new_messages.push(msg.clone());
+                messages.push(msg);
+                let _ = ui_tx.send(AgentToUiEvent::Status(
+                    "✅ 项目规范与业务指导 Skill 已创建".to_string(),
+                ));
+                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                    new_messages,
+                    usage: total_usage,
+                });
+                return;
+            } else {
+                let missing = onboarding::missing_onboarding_files(&root).join("、");
+                messages.push(Message::system(&format!(
+                    "还不能 ## Done：还缺 {missing}。请分别 file_write 后再结束。"
+                )));
+                persist_turn_memory(&workflow_engine, &turn_memory);
+                iteration += 1;
+                continue;
             }
         }
 
@@ -1943,16 +1991,36 @@ pub async fn run_agent_turn(
 
             // 📖 Verify-after-edit: prompt LLM to verify changes
             if matches!(tc.name.as_str(), "edit_file" | "delete_range" | "file_write") && !result.is_error {
+                let is_skill = tc.arguments.contains(".ox/skills/");
+                let onboarding_skill = workflow_engine.is_none()
+                    && onboarding::is_onboarding_turn(&messages)
+                    && is_skill;
+
                 // Execute step skill creation: tell LLM to output ## Done
                 let is_execute_step = workflow_engine.as_ref().map_or(false, |wf| {
                     wf.try_lock().map_or(false, |e| e.get_current_step_index() == 3)
                 });
-                let is_skill = tc.arguments.contains(".ox/skills/");
 
                 if is_execute_step && is_skill {
                     messages.push(Message::system(
                         "✅ 文件已写入。如果所有需要的文件都已完成，输出 `## Done` 结束。"
                     ));
+                } else if onboarding_skill {
+                    let root = tool_ctx
+                        .runtime
+                        .project_root
+                        .clone()
+                        .unwrap_or_else(|| tool_ctx.working_dir.clone());
+                    if onboarding::onboarding_files_complete(&root) {
+                        messages.push(Message::system(
+                            "✅ 两个 Skill 都已写入（项目规范 + 业务指导）。输出 `## Done` 结束，不要再改文件。"
+                        ));
+                    } else {
+                        let missing = onboarding::missing_onboarding_files(&root).join("、");
+                        messages.push(Message::system(&format!(
+                            "✅ 已写入一个 Skill。还缺：{missing}。请继续 file_write 缺失文件。"
+                        )));
+                    }
                 }
             } // verify-after-edit
         } // end for tc
@@ -1972,7 +2040,7 @@ pub async fn run_agent_turn(
         // 🚨 Done reminder + tool loop detection
         if !tool_calls.is_empty() {
             let has_write = tool_calls.iter().any(|tc| matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range"));
-            if has_write {
+            if has_write && !onboarding::is_onboarding_turn(&messages) {
                 messages.push(Message::system(
                     "Files were modified. Output ## Done: list what was created/modified and the verify result. 3 lines max. No extra text."
                 ));

@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use chrono;
 
 pub mod generation;  // 🆕 Skill generation layering
+pub mod policy;      // Loading tiers + mandatory project skills
+pub mod dedup;       // Duplicate prevention + merge
 
 /// Skill 的作用域
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +41,7 @@ pub struct Skill {
     /// 来源层级
     pub scope: SkillScope,
     
-    /// 创建时间
+    /// 文件修改时间（或 frontmatter 中的 updated_at），用于加载排序/截断；不是「本次加载时刻」
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -156,9 +158,28 @@ impl SkillLoader {
             description,
             content: body,
             scope,
-            created_at: chrono::Utc::now(),
+            created_at: skill_timestamp(path, &metadata),
         })
     }
+}
+
+/// File mtime for sort/cap (newest first). Optional frontmatter `updated_at` / `created_at` overrides.
+fn skill_timestamp(
+    path: &Path,
+    metadata: &std::collections::HashMap<String, String>,
+) -> chrono::DateTime<chrono::Utc> {
+    for key in ["updated_at", "created_at"] {
+        if let Some(raw) = metadata.get(key) {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw.trim_matches('"')) {
+                return dt.with_timezone(&chrono::Utc);
+            }
+        }
+    }
+    path.metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .unwrap_or_else(chrono::Utc::now)
 }
 
 /// 获取系统级 Skills（从 builtin 目录加载）
@@ -213,7 +234,7 @@ fn parse_skill_file_static(path: &Path, scope: SkillScope) -> anyhow::Result<Ski
         description,
         content: body,
         scope,
-        created_at: chrono::Utc::now(),
+        created_at: skill_timestamp(path, &metadata),
     })
 }
 
@@ -244,4 +265,28 @@ fn parse_frontmatter(content: &str) -> anyhow::Result<(std::collections::HashMap
     }
     
     Ok((metadata, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn skill_timestamp_uses_file_mtime_not_now() {
+        let tmp = std::env::temp_dir().join(format!("ox_skill_ts_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("a.md");
+        fs::write(&path, "---\nname: a\n---\n\nbody").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let t1 = skill_timestamp(&path, &std::collections::HashMap::new());
+        thread::sleep(Duration::from_millis(50));
+        fs::write(&path, "---\nname: a\n---\n\nbody v2").unwrap();
+        let t2 = skill_timestamp(&path, &std::collections::HashMap::new());
+        assert!(t2 > t1, "mtime should advance after rewrite");
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

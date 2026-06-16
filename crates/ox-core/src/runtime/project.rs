@@ -1,18 +1,62 @@
 use std::path::{Path, PathBuf};
 
 /// Marker files/directories that indicate a project root.
-const PROJECT_MARKERS: &[&str] = &[
+pub const PROJECT_MARKERS: &[&str] = &[
     ".git",
+    ".oxroot",
+    // Rust
     "Cargo.toml",
+    // JS / TS / Node (React, Vue, Angular, etc.)
     "package.json",
+    "pnpm-workspace.yaml",
+    // Go
     "go.mod",
+    // Python
     "pyproject.toml",
     "setup.py",
+    "requirements.txt",
+    "Pipfile",
+    // Java / Kotlin
     "pom.xml",
     "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    // C / C++
     "CMakeLists.txt",
-    ".oxroot", // explicit Ox project marker
+    "Makefile",
+    // Ruby / PHP / Dart
+    "Gemfile",
+    "composer.json",
+    "pubspec.yaml",
+    // .NET
+    "global.json",
 ];
+
+/// True if `dir` contains any known project marker (any language/ecosystem).
+pub fn has_project_markers(dir: &Path) -> bool {
+    PROJECT_MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
+/// Project root for Ox features (skills, onboarding): detected root, else current working dir.
+pub fn effective_project_root(project_root: &Option<PathBuf>, working_dir: &Path) -> PathBuf {
+    project_root
+        .clone()
+        .unwrap_or_else(|| working_dir.to_path_buf())
+}
+
+/// Create `.oxroot` + `.ox/skills/` so empty dirs are treated as Ox projects.
+pub fn ensure_ox_project_scaffold(dir: &Path) -> std::io::Result<()> {
+    let ox = dir.join(".ox");
+    std::fs::create_dir_all(ox.join("skills"))?;
+    let marker = dir.join(".oxroot");
+    if !marker.exists() {
+        std::fs::write(
+            &marker,
+            "# Ox project root marker (any language/stack)\n",
+        )?;
+    }
+    Ok(())
+}
 
 /// Walk up from `start_dir` looking for any project marker.
 /// Returns the first directory containing a marker, or `None`.
@@ -54,6 +98,17 @@ mod tests {
             root.join("Cargo.toml").exists(),
             "Root should contain Cargo.toml"
         );
+    }
+
+    #[test]
+    fn has_project_markers_detects_package_json() {
+        let tmp = std::env::temp_dir().join(format!("ox_marker_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(!has_project_markers(&tmp));
+        std::fs::write(tmp.join("package.json"), "{}").unwrap();
+        assert!(has_project_markers(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

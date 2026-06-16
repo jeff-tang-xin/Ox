@@ -34,6 +34,10 @@ impl Tool for FileWriteTool {
                     "type": "string",
                     "description": "File encoding: 'utf-8' (default), 'gbk', 'gb18030', 'utf-16le', 'utf-16be', 'latin1'.",
                     "enum": ["utf-8", "gbk", "gb18030", "utf-16le", "utf-16be", "latin1"]
+                },
+                "merge": {
+                    "type": "boolean",
+                    "description": "For .ox/skills/*.md only: append to existing skill instead of rejecting duplicate."
                 }
             },
             "required": ["path", "content"]
@@ -57,7 +61,6 @@ impl Tool for FileWriteTool {
         } else {
             ctx.working_dir.join(&path_str)
         };
-        let display_path = resolved_path.clone();
 
         let path =
             match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
@@ -77,7 +80,7 @@ impl Tool for FileWriteTool {
         // 🚨 WORKFLOW VALIDATION: Check if file is being created in correct location during Spec Mode
         // When in workflow mode, files should be in .ox/{requirement_name}/ not directly in .ox/
         let relative_path = path.strip_prefix(&ctx.working_dir).unwrap_or(&path);
-        let rel_str = relative_path.to_string_lossy();
+        let rel_str = relative_path.to_string_lossy().into_owned();
         
         // Check if file is being written directly to .ox/ without subdirectory
         // Pattern: ".ox/something.md" (wrong) vs ".ox/name/something.md" (correct)
@@ -113,7 +116,7 @@ impl Tool for FileWriteTool {
                              📝 Valid example: output.txt\n\
                              ❌ Invalid example: output<1>.txt",
                             c,
-                            display_path.display()
+                            resolved_path.display()
                         ));
                     }
                     ':' => {
@@ -123,7 +126,7 @@ impl Tool for FileWriteTool {
                                 "❌ Invalid Path Character: ':' is not allowed in Windows filenames (except for drive letter)\n\n\
                                  💡 Problem: {} contains ':' at position {}\n\
                                  🔧 Solution: Use a valid path like 'C:\\path\\file.txt'",
-                                display_path.display(),
+                                resolved_path.display(),
                                 i
                             ));
                         }
@@ -139,7 +142,7 @@ impl Tool for FileWriteTool {
             tracing::warn!(
                 "[FILE_WRITE] Deeply nested path ({} levels): {}",
                 depth,
-                display_path.display()
+                path.display()
             );
         }
 
@@ -157,7 +160,11 @@ impl Tool for FileWriteTool {
             }
         };
 
-        // Get encoding parameter and convert content to bytes
+        if let Err(e) = content_validation::validate_content(content) {
+            return ToolOutput::error(e);
+        }
+
+        // Get encoding parameter
         let encoding = args
             .get("encoding")
             .and_then(|e| e.as_str())
@@ -169,10 +176,59 @@ impl Tool for FileWriteTool {
                 "latin1" | "iso-8859-1" => encoding_rs::WINDOWS_1252,
                 _ => encoding_rs::UTF_8,
             });
-        
+
+        // ── Skill dedup: .ox/skills/*.md ──
+        let mut path = path;
+        let mut content = content.to_string();
+        let mut skill_write_notice = String::new();
+        if let Some(skill_id) = crate::skill::dedup::parse_project_skill_rel_path(&rel_str) {
+            let project_root = ctx
+                .runtime
+                .project_root
+                .clone()
+                .unwrap_or_else(|| ctx.working_dir.clone());
+            let allow_merge = args.get("merge").and_then(|v| v.as_bool()).unwrap_or(false);
+            match crate::skill::dedup::plan_skill_write(
+                &project_root,
+                &skill_id,
+                &content,
+                allow_merge,
+                false,
+            ) {
+                crate::skill::dedup::SkillWritePlan::CreateNew
+                | crate::skill::dedup::SkillWritePlan::OverwriteMandatory => {}
+                crate::skill::dedup::SkillWritePlan::RedirectToCanonical {
+                    canonical_id,
+                    reason,
+                } => {
+                    skill_write_notice = format!("\n↪️ {reason} → `.ox/skills/{canonical_id}.md`");
+                    let new_rel = format!(".ox/skills/{canonical_id}.md");
+                    path = ctx.working_dir.join(&new_rel);
+                    if let Err(e) =
+                        crate::safety::validate_path_within_workdir(&path, &ctx.working_dir)
+                    {
+                        return ToolOutput::error(format!("Path validation failed: {e}"));
+                    }
+                }
+                crate::skill::dedup::SkillWritePlan::MergeIntoExisting {
+                    merged_markdown,
+                    ..
+                } => {
+                    content = merged_markdown;
+                    skill_write_notice =
+                        "\n🔀 已合并进已有 Skill（保留原 frontmatter + 追加「更新」章节）".into();
+                }
+                crate::skill::dedup::SkillWritePlan::RejectDuplicate { message } => {
+                    return ToolOutput::error(message);
+                }
+            }
+        }
+
+        let display_path = path.clone();
+
         let content_bytes = match encoding {
             Some(enc) => {
-                let (bytes, _encoding_used, had_errors) = enc.encode(content);
+                let (bytes, _encoding_used, had_errors) = enc.encode(&content);
                 if had_errors {
                     tracing::warn!(
                         "Some characters could not be encoded in {:?}, they will be replaced",
@@ -194,11 +250,6 @@ impl Tool for FileWriteTool {
                 "[FILE_WRITE] Large file detected ({:.2} MB), using chunked write strategy",
                 content_bytes.len() as f64 / 1024.0 / 1024.0
             );
-        }
-
-        // Validate content quality using shared validation logic
-        if let Err(e) = content_validation::validate_content(content) {
-            return ToolOutput::error(e);
         }
 
         // Create parent directories.
@@ -302,11 +353,12 @@ impl Tool for FileWriteTool {
 
                 ToolOutput::success(format!(
                     "✅ Successfully written {} bytes to {}{}\n\
-                     📄 Encoding: {}{}",
+                     📄 Encoding: {}{}{}",
                     bytes_written,
                     display_path.display(),
                     size_info,
                     encoding_name,
+                    skill_write_notice,
                     ast_warning
                 ))
             }

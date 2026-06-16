@@ -31,9 +31,11 @@ pub enum CommandResult {
     AsyncPending,
     /// Command needs LLM to generate content
     /// Contains: (prompt, callback_description)
-    LlmRequest { 
+    LlmRequest {
         prompt: String,
         description: String,
+        /// Skip 4-step workflow (first-time project onboarding).
+        skip_workflow: bool,
     },
     /// Command failed with error message
     Error(String),

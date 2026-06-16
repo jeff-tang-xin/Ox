@@ -281,9 +281,11 @@ fn classify_intent(query: &str) -> QueryIntent {
 
 /// Extract file paths from a query string using regex.
 pub fn extract_file_paths(query: &str) -> Vec<String> {
-    let re = regex::Regex::new(
-        r"([\w./\\-]+\.(rs|py|js|ts|tsx|jsx|go|java|cpp|c|h|hpp|toml|json|md|yaml|yml|css|html))"
-    ).unwrap();
+    let exts = crate::source_paths::query_path_extensions_regex();
+    let re = regex::Regex::new(&format!(
+        r"([\w./\\-]+\.({exts}))\b"
+    ))
+    .unwrap();
 
     let mut paths = Vec::new();
     for cap in re.captures_iter(query) {

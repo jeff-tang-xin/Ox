@@ -423,26 +423,12 @@ async fn run_app(
     // ── Onboarding check ──
     let mut needs_onboarding = false;
     let mut onboarding_prompt_text = String::new();
-    if let Some(ref root) = rt_env.project_root {
-        let conventions = root.join(".ox").join("skills").join("project-conventions.md");
-        let architecture = root.join(".ox").join("skills").join("project-architecture.md");
-        if !conventions.exists() || !architecture.exists() {
-            needs_onboarding = true;
-            onboarding_prompt_text = format!(
-                "You just opened a new project at `{}`. This is the FIRST time Ox has seen this project.\n\n\
-                 Generate TWO skill files by analyzing the codebase:\n\n\
-                 ## File 1: .ox/skills/project-conventions.md\n\
-                 - Language, framework, build tool\n\
-                 - Naming conventions, code style, import ordering\n\n\
-                 ## File 2: .ox/skills/project-architecture.md\n\
-                 - Directory structure and module layout\n\
-                 - Layer boundaries, MUST/MUST NOT rules\n\
-                 - Error handling patterns, key dependencies\n\n\
-                 **Process**: Use project_detect, read config files, scan source dirs, create both files.\n\
-                 When done, output `## Done` — Do NOT rewrite or touch the files again.",
-                root.display()
-            );
-        }
+    let project_root = rt_env.effective_project_root();
+    if ox_core::agent::onboarding::needs_project_onboarding(&project_root) {
+        let _ = ox_core::agent::onboarding::prepare_project_for_onboarding(&project_root);
+        needs_onboarding = true;
+        onboarding_prompt_text =
+            ox_core::agent::onboarding::build_onboarding_user_prompt(&project_root);
     }
 
     // ========================================================================
@@ -453,16 +439,21 @@ async fn run_app(
         if needs_onboarding && (!app.indexing || lazy_index) {
             needs_onboarding = false;
             app.output.push_system(
-                "🔍 First time in this project. Scanning codebase to learn conventions...",
+                "🔍 首次进入本项目 — 将生成项目规范与业务指导 Skill…",
             );
-            if let Some(ref wf) = app.workflow_engine {
-                if let Ok(mut engine) = wf.try_lock() {
-                    engine.activate_workflow(DEFAULT_WORKFLOW_ID).ok();
-                    engine.reset_workflow();
-                }
+            app.output.push_system(
+                "   → .ox/skills/project-conventions.md（项目规范）",
+            );
+            app.output.push_system(
+                "   → .ox/skills/project-business-guide.md（业务指导）",
+            );
+            if ox_core::agent::onboarding::is_greenfield_project(&project_root) {
+                app.output.push_system(
+                    "   ℹ️ 未检测到工程标记 — 将基于当前目录创建初始 Skill（任意语言/stack）",
+                );
             }
             if let Some(p) = &provider {
-                app.status = "Scanning project...".to_string();
+                app.status = "正在分析项目…".to_string();
                 let _ = session.append_message(Message::user(&onboarding_prompt_text));
 
                 let pre_turn_result = handlers::pre_turn::prepare_turn(
@@ -470,7 +461,8 @@ async fn run_app(
                     &Some(Arc::clone(&knowledge_engine)), &onboarding_prompt_text,
                     &session.messages, &compressed_cache,
                     TurnVariant::Onboarding { prompt_text: onboarding_prompt_text.clone() },
-                    &app.workflow_engine, &session.meta.id, &agent_tx,
+                    &None, // 不走 4 步工作流，直接探索 + 写 Skill
+                    &session.meta.id, &agent_tx,
                 )
                 .await;
 
@@ -486,12 +478,11 @@ async fn run_app(
                 let ac = Arc::clone(&agent_config);
                 let (ui_tx, ui_rx) = mpsc::unbounded_channel();
                 app.ui_to_agent_tx = Some(ui_tx);
-                let wf = app.workflow_engine.clone();
                 let p_clone = Arc::clone(p);
                 tokio::spawn(async move {
                     agent::run_agent_turn(
                         p_clone, turn_messages, reg, ctx, tx, ui_rx,
-                        cancel, tm, ac, planning, wf,
+                        cancel, tm, ac, planning, None,
                     )
                     .await;
                 });
@@ -913,9 +904,13 @@ fn process_slash_command(
                     "Unknown command: /{}. Type /help for available commands.", cmd
                 ));
             }
-            slash_commands::CommandResult::LlmRequest { prompt, description } => {
+            slash_commands::CommandResult::LlmRequest {
+                prompt,
+                description,
+                skip_workflow,
+            } => {
                 spawn_agent_turn_from_slash(
-                    app, &prompt, &description, session,
+                    app, &prompt, &description, skip_workflow, session,
                     provider, agent_tx, tool_registry, tool_ctx,
                     context_builder, context_window,
                     interrupt_ctrl, agent_config, trust_manager,
@@ -961,29 +956,42 @@ fn process_text_input(
         return;
     }
 
-    // ── Skill draft confirmation ──
+    // ── Skill draft confirmation (only explicit ok/save/dismiss — never steal normal chat) ──
     if let Some(draft) = app.pending_skill_draft.take() {
         let t = text.trim().to_lowercase();
         let t = t.strip_prefix('/').unwrap_or(&t);
-        let save = t == "ok" || t == "y" || t == "yes" || t == "保存"
-            || t == "确认" || t == "好" || t == "save";
+        let save = matches!(t, "ok" | "y" | "yes" | "保存" | "确认" | "好" | "save");
+        let dismiss = matches!(t, "n" | "no" | "skip" | "取消" | "放弃" | "discard" | "忽略");
+
         if save {
+            let root = rt_env.effective_project_root();
             match ox_core::agent::auto_reflect::AutoReflector::save_content_to_project(
-                &rt_env.working_dir,
+                &root,
                 &draft.content,
             ) {
                 Ok(id) => {
                     app.output.push_system(&format!("✅ Skill 已保存: {id}"));
+                    let _ = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clear_disk(&root);
                     app.status.clear();
                 }
                 Err(e) => app.output.push_error(&format!("保存 Skill 失败: {e}")),
             }
-        } else {
-            app.output.push_system("❌ Skill 草稿已丢弃。");
-            app.status.clear();
+            app.dirty = true;
+            return;
         }
+        if dismiss {
+            let root = rt_env.effective_project_root();
+            let _ = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clear_disk(&root);
+            app.output.push_system("❌ Skill 聚合草稿已丢弃。");
+            app.status.clear();
+            app.dirty = true;
+            return;
+        }
+        // User started a new task — drop the suggestion and continue with their message.
+        app.output.push_system("ℹ️ Skill 建议已忽略，继续处理你的输入。");
+        app.status.clear();
         app.dirty = true;
-        return;
+        // fall through — do not return
     }
 
     if app.agent_running {
@@ -1234,6 +1242,7 @@ fn spawn_agent_turn_from_slash(
     app: &mut App,
     prompt: &str,
     description: &str,
+    skip_workflow: bool,
     session: &mut Session,
     provider: &Option<Arc<dyn LlmProvider>>,
     agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
@@ -1273,7 +1282,11 @@ fn spawn_agent_turn_from_slash(
     let cancel_token = interrupt_ctrl.token();
     let tm = Arc::clone(trust_manager);
     let ac = Arc::clone(agent_config);
-    let wf = app.workflow_engine.clone();
+    let wf = if skip_workflow {
+        None
+    } else {
+        app.workflow_engine.clone()
+    };
     let config = config.clone();
     let rt_env = rt_env.clone();
     let session_messages = session.messages.clone();
@@ -1282,6 +1295,16 @@ fn spawn_agent_turn_from_slash(
     let compressed_cache = compressed_cache.clone();
     let prompt = prompt.to_string();
     let description = description.to_string();
+    let turn_variant = if skip_workflow {
+        TurnVariant::Onboarding {
+            prompt_text: prompt.clone(),
+        }
+    } else {
+        TurnVariant::SlashCommand {
+            prompt: prompt.clone(),
+            description,
+        }
+    };
 
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
     app.ui_to_agent_tx = Some(ui_tx);
@@ -1298,10 +1321,7 @@ fn spawn_agent_turn_from_slash(
             &prompt,
             &session_messages,
             &compressed_cache,
-            TurnVariant::SlashCommand {
-                prompt: prompt.clone(),
-                description,
-            },
+            turn_variant,
             &wf,
             &session_id,
             &status_tx,
@@ -1559,7 +1579,7 @@ fn process_agent_event(
         AgentToUiEvent::WorkflowCompleted { task_description, execution_summary } => {
             agent_handler::handle_workflow_completed(
                 app, session, provider, rt_env, agent_tx, knowledge_engine,
-                task_description, execution_summary,
+                task_description, execution_summary, agent_config,
             );
         }
         AgentToUiEvent::PlanReviewReady { markdown } => {
@@ -1567,6 +1587,11 @@ fn process_agent_event(
         }
         AgentToUiEvent::WorkflowAwaitingConfirmation { step_idx, message } => {
             agent_handler::handle_workflow_awaiting_confirmation(app, step_idx, &message);
+        }
+        AgentToUiEvent::SkillReflectRoundSaved { round, threshold, task_summary } => {
+            agent_handler::handle_skill_reflect_round_saved(
+                app, round, threshold, &task_summary,
+            );
         }
         AgentToUiEvent::SkillDraftReady { skill_id, content, description } => {
             agent_handler::handle_skill_draft_ready(app, skill_id, content, description);
