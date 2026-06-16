@@ -215,6 +215,19 @@ impl PlanTracker {
         true
     }
 
+    /// Mark the current in-progress or first pending step done (shell/git tasks).
+    pub fn mark_current_step_done(&mut self) -> bool {
+        let pos = self.steps.iter().position(|s| {
+            matches!(s.status, StepStatus::InProgress | StepStatus::Pending)
+        });
+        let Some(pos) = pos else {
+            return false;
+        };
+        self.steps[pos].status = StepStatus::Done;
+        self.advance_current();
+        true
+    }
+
     fn advance_current(&mut self) {
         let next_index = self
             .steps

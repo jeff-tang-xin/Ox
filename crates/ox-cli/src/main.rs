@@ -721,6 +721,7 @@ fn drain_indexing_progress(
     if let Ok(phase) = phase_rx.try_recv() {
         if let Some(total_str) = phase.strip_prefix("embedding:") {
             app.index_phase = "embedding".to_string();
+            app.output.invalidate_cache();
             // Drop stale parsing progress events queued before embed phase.
             while progress_rx.try_recv().is_ok() {}
             if let Ok(total) = total_str.parse::<usize>() {
@@ -783,6 +784,7 @@ fn drain_indexing_progress(
     if let Ok(total) = done_rx.try_recv() {
         app.indexing = false;
         app.index_phase.clear();
+        app.output.invalidate_cache();
         app.index_symbols = total;
         app.index_embed_done = app.index_embed_total;
         app.status = String::new();

@@ -638,10 +638,47 @@ pub async fn run_agent_turn(
                         return;
                     }
                     Err(gate_msg) => {
-                        messages.push(Message::system(&gate_msg));
-                        persist_turn_memory(&workflow_engine, &turn_memory);
-                        iteration += 1;
-                        continue;
+                        let blocks = engine.bump_done_gate_block();
+                        if blocks >= 2 {
+                            tracing::warn!(
+                                "[WORKFLOW] ## Done blocked {blocks} times — auto-completing execute"
+                            );
+                            engine.mark_plan_all_done();
+                        }
+                        match engine.try_complete_execute_on_done(&full_text) {
+                            Ok(true) => {
+                                let msg = Message::Assistant {
+                                    content: full_text.clone(),
+                                    tool_calls: Vec::new(),
+                                    reasoning_content: if reasoning_content.is_empty() {
+                                        None
+                                    } else {
+                                        Some(reasoning_content.clone())
+                                    },
+                                };
+                                new_messages.push(msg.clone());
+                                messages.push(msg);
+                                engine.set_previous_output(&full_text);
+                                emit_workflow_completed(
+                                    &ui_tx,
+                                    user_task.as_ref(),
+                                    &engine,
+                                    &full_text,
+                                );
+                                let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
+                                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                                    new_messages,
+                                    usage: total_usage,
+                                });
+                                return;
+                            }
+                            _ => {
+                                messages.push(Message::system(&gate_msg));
+                                persist_turn_memory(&workflow_engine, &turn_memory);
+                                iteration += 1;
+                                continue;
+                            }
+                        }
                     }
                     Ok(false) => {}
                 }
@@ -1874,31 +1911,28 @@ pub async fn run_agent_turn(
                     }
                 }
 
-                // Execute: mark plan step done + verify hint (prompt only, no auto shell)
-                if matches!(tool_name.as_str(), "file_write" | "edit_file" | "delete_range") {
-                    if let Some(ref engine_arc) = workflow_engine {
-                        if let Ok(engine) = engine_arc.try_lock() {
-                            if engine.get_current_step_index() == 3 {
-                                if let Ok(args) =
-                                    serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                                {
-                                    if let Some(path) =
-                                        args.get("path").and_then(|p| p.as_str())
-                                    {
-                                        if engine.try_mark_plan_step_done(path) {
-                                            let summary = engine.plan_progress_summary();
-                                            if !summary.is_empty() {
-                                                messages.push(Message::system(&format!(
-                                                    "{}\n✅ 计划项已完成\n{summary}",
-                                                    crate::agent::context_injector::STEP_MEMORY_TAG
-                                                )));
-                                            }
-                                        }
-                                        if let Some(verify) = engine.verify_hint_for_path(path) {
-                                            messages.push(Message::system(&format!(
-                                                "📋 计划验证: `{verify}` — 请用 shell_exec 执行（需用户确认），验证通过后再继续下一项。"
-                                            )));
-                                        }
+                // Execute: update plan tracker for completing tools
+                if let Some(ref engine_arc) = workflow_engine {
+                    if let Ok(engine) = engine_arc.try_lock() {
+                        if engine.get_current_step_index() == 3
+                            && engine.record_execute_tool_success(&tool_name, &tc.arguments)
+                        {
+                            if let Some(msg) =
+                                engine.plan_progress_message_after_tool(&tool_name)
+                            {
+                                messages.push(Message::system(&msg));
+                            }
+                        }
+                        if matches!(tool_name.as_str(), "file_write" | "edit_file" | "delete_range")
+                        {
+                            if let Ok(args) =
+                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                            {
+                                if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
+                                    if let Some(verify) = engine.verify_hint_for_path(path) {
+                                        messages.push(Message::system(&format!(
+                                            "📋 计划验证: `{verify}` — 请用 shell_exec 执行（需用户确认），验证通过后再继续下一项。"
+                                        )));
                                     }
                                 }
                             }

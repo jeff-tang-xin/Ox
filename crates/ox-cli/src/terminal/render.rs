@@ -51,6 +51,8 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
     if area.width < 20 || area.height < 8 {
         return;
     }
+    // Full-frame clear prevents ghost text when layout height changes (e.g. indexing bar).
+    frame.render_widget(Clear, area);
 
     // Adaptive layout based on terminal height
     let is_tiny = area.height < 15;
@@ -167,6 +169,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
     let has_sidebar_content = !app.sessions.is_empty() || !app.plan_items.is_empty();
     let sidebar_w = if has_sidebar_content {
         (area.width / 5).clamp(18, 35) // Adaptive sidebar width
@@ -185,29 +192,18 @@ fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
     let spinner_frame = app.spinner_frame;
     let scroll_offset = app.scroll_offset;
 
-    // Enhanced title with better scroll indication
+    // Title: spinner only — indexing detail lives in header + status bar (avoid triple overlay).
     let title = if app.indexing {
         let s = SPINNER[(spinner_frame as usize) % SPINNER.len()];
-        if app.index_has_progress() {
-            let (done, total) = app.index_progress_counts();
-            let pct = index_pct(done, total);
-            if app.index_phase == "embedding" {
-                pad_to_width(
-                    format!(" {s} Embed {pct:>3}% ({done:>5}/{total:<5}) "),
-                    area.width,
-                )
-            } else {
-                pad_to_width(
-                    format!(" {s} AST {pct:>3}% ({done:>5}/{total:<5}) "),
-                    area.width,
-                )
-            }
-        } else {
-            pad_to_width(format!(" {s} Indexing… "), area.width)
-        }
+        pad_to_width(format!(" {s} Indexing… "), area.width)
     } else if app.agent_running {
         let s = SPINNER[(spinner_frame as usize) % SPINNER.len()];
         format!(" {s} Ox ")
@@ -242,10 +238,18 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let md = &app.md_renderer;
     let out = &mut app.output;
-    let (lines, _total) =
+    let (mut lines, _total) =
         out.get_visible_lines(output_width, inner_height, scroll_offset, |ol, w| {
             render_single_line(ol, w, md)
         });
+
+    // Pad to inner height so leftover rows don't show previous-frame ghosts.
+    while lines.len() < inner_height {
+        lines.push(Line::from(Span::styled(
+            " ".repeat(output_width.max(1)),
+            Style::default().bg(BG),
+        )));
+    }
 
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -400,6 +404,11 @@ fn render_single_line(
 }
 
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // ── Tasks Section ──
@@ -502,30 +511,23 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     );
     let right_width = UnicodeWidthStr::width(right_text.as_str()) as u16;
 
-    let left_line = Line::from(left_parts);
-    let right_span = Span::styled(right_text, status_style);
+    // Single full-width line — avoids uncovered gap between left/right widgets.
+    let right_text_padded = pad_to_width(right_text, right_width.max(1));
+    left_parts.push(Span::raw(" "));
+    left_parts.push(Span::styled(right_text_padded, status_style));
 
-    let left_area = Rect {
-        width: area.width.saturating_sub(right_width),
-        ..area
-    };
     frame.render_widget(
-        Paragraph::new(left_line).style(Style::default().bg(status_bg)),
-        left_area,
-    );
-
-    let right_area = Rect {
-        x: area.x + area.width.saturating_sub(right_width),
-        width: right_width,
-        ..area
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(right_span)).style(Style::default().bg(status_bg)),
-        right_area,
+        Paragraph::new(Line::from(left_parts)).style(Style::default().bg(status_bg)),
+        area,
     );
 }
 
 fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
     let indexing_prompt: String;
     let (prompt, prompt_style) = if app.pending_confirmation.is_some() {
         (
@@ -553,24 +555,14 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         )
     } else if app.indexing {
         let s = SPINNER[app.spinner_frame as usize % SPINNER.len()];
-        if app.index_has_progress() {
-            let (done, total) = app.index_progress_counts();
-            let pct = index_pct(done, total);
-            let phase = if app.index_phase == "embedding" {
-                "embed"
-            } else {
-                "ast"
-            };
-            indexing_prompt = format!("{s} {phase} {pct:>3}% > ");
-        } else {
-            let phase = if app.index_phase == "embedding" {
-                "embedding"
-            } else {
-                "indexing"
-            };
-            indexing_prompt = format!("{s} {phase} > ");
-        }
-        (&*indexing_prompt as &str, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD).bg(BG_INPUT))
+        indexing_prompt = format!("{s} > ");
+        (
+            &*indexing_prompt as &str,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+                .bg(BG_INPUT),
+        )
     } else if app.agent_running {
         (
             "▸ ox > ",

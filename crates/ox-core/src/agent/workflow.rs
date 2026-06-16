@@ -323,6 +323,8 @@ pub fn create_default_workflow() -> Workflow {
                 "edit_file",
                 "delete_range",
                 "shell_exec",
+                "git_status",
+                "git_diff",
                 "load_skill",
             ])
             .allow_tools_disallow_code()

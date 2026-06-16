@@ -350,6 +350,7 @@ impl WorkflowEngine {
                 session.set_variable("_route_chat", "");
                 session.set_variable("_chat_reply_pending", "");
                 session.set_variable("_chat_reply", "");
+                session.set_variable("_done_gate_blocks", "");
                 session.set_variable("_turn_memory", "");
                 session.set_variable("_await_execute_confirm", "");
                 for key in [
@@ -928,6 +929,94 @@ impl WorkflowEngine {
                 "_plan_tracker",
                 crate::agent::plan_tracker::tracker_to_json(&tracker),
             );
+            return true;
+        }
+        // Plan steps with empty `file` (fast-path / shell tasks) — advance current step.
+        if tracker
+            .current_step()
+            .map(|s| s.file.is_empty())
+            .unwrap_or(false)
+        {
+            return self.try_mark_plan_current_step_done();
+        }
+        false
+    }
+
+    /// Update plan tracker after a successful Execute-step tool call.
+    /// Returns true when plan progress changed.
+    pub fn record_execute_tool_success(&self, tool_name: &str, arguments: &str) -> bool {
+        if self.get_current_step_index() != 3 {
+            return false;
+        }
+        let args: serde_json::Value =
+            serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+
+        match tool_name {
+            "file_write" | "edit_file" | "delete_range" => args
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(|path| self.try_mark_plan_step_done(path))
+                .unwrap_or(false),
+            "file_read" => {
+                let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                if path.is_empty() {
+                    return false;
+                }
+                let is_explain = self
+                    .get_plan_tracker()
+                    .and_then(|t| t.current_step().map(|s| s.action == "explain"))
+                    .unwrap_or(false);
+                if is_explain {
+                    self.try_mark_plan_step_done(path)
+                } else {
+                    false
+                }
+            }
+            "git_diff" => {
+                if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
+                    if self.try_mark_plan_step_done(path) {
+                        return true;
+                    }
+                }
+                self.try_mark_plan_current_step_done()
+            }
+            "shell_exec" | "load_skill" | "git_status" => self.try_mark_plan_current_step_done(),
+            // Read-only exploration / search — do not advance plan steps
+            _ => false,
+        }
+    }
+
+    pub fn plan_progress_message_after_tool(&self, tool_name: &str) -> Option<String> {
+        let summary = self.plan_progress_summary();
+        if summary.is_empty() {
+            return None;
+        }
+        let label = match tool_name {
+            "file_write" | "edit_file" | "delete_range" => "计划项已完成",
+            "shell_exec" => "shell 执行完成，计划项已更新",
+            "load_skill" => "skill 已加载，计划项已更新",
+            "git_status" | "git_diff" => "git 检查完成，计划项已更新",
+            "file_read" => "只读步骤已完成",
+            _ => "计划项已更新",
+        };
+        Some(format!(
+            "{}\n✅ {label}\n{summary}",
+            crate::agent::context_injector::STEP_MEMORY_TAG
+        ))
+    }
+
+    /// Mark the active plan step done (e.g. after shell_exec).
+    pub fn try_mark_plan_current_step_done(&self) -> bool {
+        let mut tracker = match self.get_plan_tracker() {
+            Some(t) => t,
+            None => return false,
+        };
+        let changed = tracker.mark_current_step_done();
+        if changed {
+            self.set_variable(
+                "_plan_tracker",
+                crate::agent::plan_tracker::tracker_to_json(&tracker),
+            );
         }
         changed
     }
@@ -945,11 +1034,25 @@ impl WorkflowEngine {
         text.contains("## Done") || text.contains("【Done】")
     }
 
-    /// Read-only exploring tasks may output ## Done without file edits marking plan steps.
+    /// Fast/exploring paths use synthetic plans — shell/git may not map to file_write markers.
     pub fn should_skip_plan_done_gate(&self) -> bool {
         Self::intent_routing_from_text(self.get_variable("_step0_output").as_deref())
-            .map(|r| r.intent == "exploring")
+            .map(|r| r.intent == "exploring" || r.pipeline == "fast")
             .unwrap_or(false)
+    }
+
+    pub fn bump_done_gate_block(&self) -> u32 {
+        let n = self
+            .get_variable("_done_gate_blocks")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.set_variable("_done_gate_blocks", n.to_string());
+        n
+    }
+
+    pub fn clear_done_gate_blocks(&self) {
+        self.set_variable("_done_gate_blocks", String::new());
     }
 
     pub fn mark_plan_all_done(&self) {
@@ -976,10 +1079,14 @@ impl WorkflowEngine {
             return Err(msg);
         }
         match self.advance_step()? {
-            false => Ok(true),
+            false => {
+                self.clear_done_gate_blocks();
+                Ok(true)
+            }
             true => {
                 tracing::warn!("[WORKFLOW] ## Done on execute but workflow still has steps — forcing complete");
                 self.complete_workflow()?;
+                self.clear_done_gate_blocks();
                 Ok(true)
             }
         }
@@ -1532,11 +1639,89 @@ mod advance_tests {
     }
 
     #[test]
+    fn record_execute_shell_marks_current_step() {
+        let engine = test_engine_at_execute_with_workflow();
+        engine.set_variable(
+            "_plan_tracker",
+            r#"{"steps":[{"index":1,"file":"","action":"modify","target":"","desc":"git commit","status":"pending"}],"current_index":1}"#.to_string(),
+        );
+        assert!(engine.record_execute_tool_success("shell_exec", r#"{"command":"git commit"}"#));
+        let t = engine.get_plan_tracker().unwrap();
+        assert_eq!(t.steps[0].status, crate::agent::plan_tracker::StepStatus::Done);
+    }
+
+    #[test]
+    fn record_execute_load_skill_marks_current_step() {
+        let engine = test_engine_at_execute_with_workflow();
+        engine.set_variable(
+            "_plan_tracker",
+            r#"{"steps":[{"index":1,"file":"","action":"modify","target":"","desc":"load skill","status":"pending"}],"current_index":1}"#.to_string(),
+        );
+        assert!(engine.record_execute_tool_success("load_skill", r#"{"skill_name":"coding-workflow"}"#));
+    }
+
+    #[test]
+    fn record_execute_file_write_empty_plan_file_marks_current() {
+        let engine = test_engine_at_execute_with_workflow();
+        engine.set_variable(
+            "_plan_tracker",
+            r#"{"steps":[{"index":1,"file":"","action":"create","target":"","desc":"new file","status":"pending"}],"current_index":1}"#.to_string(),
+        );
+        assert!(engine.record_execute_tool_success(
+            "file_write",
+            r#"{"path":"docs/new.md","content":"hi"}"#
+        ));
+    }
+
+    #[test]
+    fn record_execute_file_read_explain_marks_matching_path() {
+        let engine = test_engine_at_execute_with_workflow();
+        engine.set_variable(
+            "_plan_tracker",
+            r#"{"steps":[{"index":1,"file":"src/lib.rs","action":"explain","target":"","desc":"review","status":"pending"}],"current_index":1}"#.to_string(),
+        );
+        assert!(engine.record_execute_tool_success(
+            "file_read",
+            r#"{"path":"src/lib.rs"}"#
+        ));
+    }
+
+    #[test]
+    fn record_execute_read_only_search_does_not_mark() {
+        let engine = test_engine_at_execute_with_workflow();
+        engine.set_variable(
+            "_plan_tracker",
+            r#"{"steps":[{"index":1,"file":"src/lib.rs","action":"modify","target":"","desc":"fix","status":"pending"}],"current_index":1}"#.to_string(),
+        );
+        assert!(!engine.record_execute_tool_success("code_search", r#"{"query":"foo"}"#));
+        assert!(!engine.record_execute_tool_success("file_list", r#"{"path":"."}"#));
+    }
+
+    #[test]
+    fn fast_coding_done_completes_despite_pending_plan_steps() {
+        let mut engine = test_engine_at_execute_with_workflow();
+        engine.set_variable(
+            "_step0_output",
+            r#"{"intent":"coding","complexity":"simple","topic":"git commit","pipeline":"fast","routing_reason":"小改"}"#.to_string(),
+        );
+        engine.set_variable(
+            "_plan_tracker",
+            r#"{"steps":[{"index":1,"file":"","action":"modify","target":"","desc":"commit","status":"pending"}],"current_index":1}"#.to_string(),
+        );
+        assert!(!engine.is_workflow_complete());
+        let done = engine
+            .try_complete_execute_on_done("## Done\n\n提交完成。")
+            .unwrap();
+        assert!(done);
+        assert!(engine.is_workflow_complete());
+    }
+
+    #[test]
     fn coding_execute_done_blocked_when_plan_steps_pending() {
         let mut engine = test_engine_at_execute_with_workflow();
         engine.set_variable(
             "_step0_output",
-            r#"{"intent":"coding","complexity":"simple","topic":"fix","pipeline":"fast","routing_reason":"小改"}"#.to_string(),
+            r#"{"intent":"coding","complexity":"complex","topic":"fix","pipeline":"standard","routing_reason":"多文件需全链路"}"#.to_string(),
         );
         engine.set_variable(
             "_plan_tracker",
