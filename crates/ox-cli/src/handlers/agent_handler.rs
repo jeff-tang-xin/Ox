@@ -169,6 +169,35 @@ pub fn handle_turn_done(
 
     app.output.finalize_streaming();
 
+    let interrupt_boundary = if app.workflow_interrupted {
+        let boundary = if let Some(ref wf) = app.workflow_engine {
+            if let Ok(mut engine) = wf.try_lock() {
+                if engine.suspend_on_interrupt() {
+                    let task = engine
+                        .get_variable("_current_user_request")
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "（进行中的任务）".to_string());
+                    Some(ox_core::agent::user_round::format_interrupt_boundary_message(
+                        &task,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        app.clear_workflow_confirmation();
+        app.output.push_system(
+            "⏹️ 已中断 — 本轮未完成（不触发 Skill 反思）。继续任务直接输入；换新任务请用「新任务」或 /new。",
+        );
+        boundary
+    } else {
+        None
+    };
+
     // Determine target session (background or active)
     let target_session = background_session.as_mut().unwrap_or(session);
 
@@ -412,6 +441,11 @@ pub fn handle_turn_done(
     // Normal completion
     app.agent_running = false;
     flush_queued_skill_draft(app);
+
+    if let Some(boundary) = interrupt_boundary {
+        let _ = session.append_message(Message::system(&boundary));
+    }
+
     if app.workflow_awaiting_confirmation.is_none() && app.pending_skill_draft.is_none() {
         app.status = String::new();
     }

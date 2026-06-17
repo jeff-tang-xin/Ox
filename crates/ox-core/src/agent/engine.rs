@@ -379,45 +379,59 @@ impl WorkflowEngine {
         }
     }
 
+    /// Clear per-round ephemeral workflow state (keeps step index and user request).
+    pub fn clear_ephemeral_workflow_state(&mut self) {
+        if self.current_workflow.is_none() {
+            return;
+        }
+        if let Ok(mut session) = self.session_state.try_lock() {
+            session.awaiting_user_confirmation = false;
+            session.set_variable("_explored_paths", "[]");
+            session.set_variable("_exploration_snapshot", "[]");
+            session.set_variable("_plan_tracker", "");
+            session.set_variable("_route_chat", "");
+            session.set_variable("_chat_reply_pending", "");
+            session.set_variable("_chat_reply", "");
+            session.set_variable("_done_gate_blocks", "");
+            session.set_variable("_turn_memory", "");
+            session.set_variable("_await_execute_confirm", "");
+            session.set_variable("_clarification_questions", "");
+            session.set_variable("_await_clarification", "");
+            session.set_variable("_clarification_pending_advance", "");
+            session.set_variable("_clarification_kind", "");
+            session.set_variable("_park_disambiguation_input", "");
+            session.set_variable("_park_follow_up_stage", "");
+            session.set_variable("_park_detail_kind", "");
+            session.set_variable("_workflow_guidance", "[]");
+            session.set_variable("_execute_report_delivered", "");
+            crate::agent::workflow_session::clear_session_flags(self);
+            crate::agent::execute_handoff::ExecuteHandoff::clear(self);
+            crate::agent::perception::clear(self);
+            crate::agent::workflow_phases::clear_phase(self);
+            for key in [
+                "_step0_output",
+                "_step1_output",
+                "_step2_output",
+                "_step3_output",
+                "_prev_output",
+                "_plan_draft",
+                "_review_feedback",
+            ] {
+                session.set_variable(key, "");
+            }
+        } else {
+            tracing::warn!("Failed to acquire session lock for ephemeral workflow clear");
+        }
+    }
+
     /// Reset workflow to first step (clears ephemeral state for a new user round).
     pub fn reset_workflow(&mut self) {
         if self.current_workflow.is_some() {
+            self.clear_ephemeral_workflow_state();
             if let Ok(mut session) = self.session_state.try_lock() {
                 session.current_step_index = 0;
-                session.awaiting_user_confirmation = false;
-                session.set_variable("_explored_paths", "[]");
-                session.set_variable("_exploration_snapshot", "[]");
-                session.set_variable("_plan_tracker", "");
-                session.set_variable("_route_chat", "");
-                session.set_variable("_chat_reply_pending", "");
-                session.set_variable("_chat_reply", "");
-                session.set_variable("_done_gate_blocks", "");
-                session.set_variable("_turn_memory", "");
-                session.set_variable("_await_execute_confirm", "");
-                session.set_variable("_clarification_questions", "");
-                session.set_variable("_await_clarification", "");
-                session.set_variable("_clarification_pending_advance", "");
-                session.set_variable("_clarification_kind", "");
-                session.set_variable("_park_disambiguation_input", "");
-                session.set_variable("_park_follow_up_stage", "");
-                session.set_variable("_park_detail_kind", "");
-                session.set_variable("_workflow_guidance", "[]");
-                session.set_variable("_execute_report_delivered", "");
-                crate::agent::workflow_session::clear_session_flags(self);
-                crate::agent::execute_handoff::ExecuteHandoff::clear(self);
-                crate::agent::perception::clear(self);
-                crate::agent::workflow_phases::clear_phase(self);
-                for key in [
-                    "_step0_output",
-                    "_step1_output",
-                    "_step2_output",
-                    "_step3_output",
-                    "_prev_output",
-                    "_plan_draft",
-                    "_review_feedback",
-                ] {
-                    session.set_variable(key, "");
-                }
+                session.set_variable("_round_finalized", "");
+                session.set_variable("_round_interrupted", "");
             } else {
                 tracing::warn!("Failed to acquire session lock for workflow reset");
             }
@@ -425,12 +439,22 @@ impl WorkflowEngine {
     }
 
     /// Start a new user round: archive previous, reset workflow, set current request.
-    pub fn begin_user_round(&mut self, user_message: &str) {
-        crate::agent::user_round::begin_user_round(self, user_message);
+    pub fn begin_user_round(&mut self, user_message: &str) -> bool {
+        crate::agent::user_round::begin_user_round(self, user_message)
     }
 
     pub fn user_round_memory_block(&self) -> String {
         crate::agent::user_round::format_user_round_block(self)
+    }
+
+    /// Suspend after Ctrl+C — preserves step outputs for resume.
+    pub fn suspend_on_interrupt(&mut self) -> bool {
+        crate::agent::user_round::suspend_on_interrupt(self)
+    }
+
+    /// Archive interrupted work when exiting the program.
+    pub fn finalize_interrupted_on_exit(&mut self) {
+        crate::agent::user_round::finalize_interrupted_on_exit(self);
     }
 
     /// True when a new user message should correct the current workflow, not restart Intent.
@@ -934,9 +958,8 @@ impl WorkflowEngine {
 
     /// Mark workflow finished (e.g. chat intent — skip Plan/Review/Execute).
     pub fn complete_workflow(&mut self) -> Result<(), String> {
-        crate::agent::execute_handoff::ExecuteHandoff::clear(self);
+        crate::agent::user_round::finalize_completed_round(self);
         self.clear_workflow_guidance();
-        crate::agent::workflow_session::clear_session_flags(self);
         let total = self
             .current_workflow
             .as_ref()

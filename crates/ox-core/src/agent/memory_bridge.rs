@@ -10,10 +10,16 @@ pub const DURABLE_MEMORY_TAG: &str = "[DURABLE_MEMORY]";
 
 /// Build a single high-priority memory block from all durable workflow state.
 pub fn format_durable_memory_block(engine: &WorkflowEngine) -> String {
+    if engine.is_workflow_complete() {
+        return String::new();
+    }
+
     let mut parts = vec![
         format!(
             "{DURABLE_MEMORY_TAG}\n\
-             📌 持久记忆（跨步骤/跨迭代保留 — 勿重复以下已完成的工具调用）"
+             ## 本轮 workflow 记忆（CURRENT ROUND ONLY）\n\
+             跨步骤/跨迭代保留的**当前轮次**状态 — 非历史任务；workflow 完成后自动清空。\n\
+             ⚠️ 勿将此处记录当作其它轮次或知识库检索结果的待办。"
         ),
     ];
 
@@ -91,7 +97,7 @@ pub fn format_durable_memory_block(engine: &WorkflowEngine) -> String {
         return String::new();
     }
 
-    parts.push("基于以上**本轮**记忆继续当前 workflow 步骤，勿重复已列出的工具调用。".to_string());
+    parts.push("基于以上**本轮 workflow**记忆继续当前步骤；历史轮次与知识库内容勿重复执行。".to_string());
     parts.join("\n\n")
 }
 

@@ -120,6 +120,12 @@ pub async fn prepare_turn(
         .map(|e| e.is_workflow_active())
         .unwrap_or(false);
 
+    let current_task_anchor = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .and_then(|e| e.get_variable("_current_user_request"))
+        .filter(|s| !s.trim().is_empty());
+
     let knowledge_context_str = if let Some(k_engine) = knowledge_engine {
         match tokio::time::timeout(KNOWLEDGE_READ_LOCK_TIMEOUT, k_engine.read()).await {
             Ok(engine_guard) => {
@@ -127,6 +133,7 @@ pub async fn prepare_turn(
                 let sid = session_id.to_string();
                 let layers = step_memory_layers.clone();
                 let step_layers = !layers.is_empty();
+                let task_anchor = current_task_anchor.clone();
                 match tokio::time::timeout(KNOWLEDGE_RETRIEVAL_TIMEOUT, async {
                     tokio::task::block_in_place(|| {
                         if step_layers {
@@ -144,7 +151,9 @@ pub async fn prepare_turn(
                 })
                 .await
                 {
-                    Ok(Ok(inj)) => retrieval::format_context_for_prompt(&inj),
+                    Ok(Ok(inj)) => {
+                        retrieval::format_context_for_prompt(&inj, task_anchor.as_deref())
+                    }
                     Ok(Err(e)) => {
                         tracing::warn!("[PRE-TURN] Knowledge retrieval failed: {}", e);
                         String::new()

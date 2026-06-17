@@ -68,6 +68,9 @@ pub fn clear_phase(engine: &WorkflowEngine) {
 
 /// Infer phase from workflow step + session flags when not explicitly set.
 pub fn infer_phase(engine: &WorkflowEngine) -> WorkflowPhase {
+    if engine.is_workflow_complete() {
+        return WorkflowPhase::Route;
+    }
     if crate::agent::workflow_session::is_implementation_phase(engine) {
         return WorkflowPhase::Act;
     }
@@ -164,6 +167,9 @@ pub fn allows_midflight_interjection(engine: &WorkflowEngine) -> bool {
 
 /// Whether a user message may start/resume a round during Act (park resume or /new only).
 pub fn accepts_user_round_input(engine: &WorkflowEngine, user_text: &str) -> bool {
+    if engine.is_workflow_complete() {
+        return true;
+    }
     if get_phase(engine) != WorkflowPhase::Act {
         return true;
     }
@@ -265,5 +271,12 @@ mod tests {
         sync_phase(&engine);
         assert!(validate_act_tool(&engine, "file_search").is_err());
         assert!(validate_act_tool(&engine, "edit_file").is_ok());
+    }
+
+    #[test]
+    fn accepts_input_after_workflow_complete() {
+        let engine = test_engine_at(4);
+        assert!(accepts_user_round_input(&engine, "完善 README"));
+        assert_eq!(infer_phase(&engine), WorkflowPhase::Route);
     }
 }

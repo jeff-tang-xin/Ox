@@ -610,6 +610,7 @@ async fn run_app(
         }
 
         if app.should_quit {
+            suspend_workflow_on_exit(&mut app, &mut session);
             break;
         }
     }
@@ -620,6 +621,30 @@ async fn run_app(
 // ============================================================================
 // Event Processing Helpers
 // ============================================================================
+
+/// Archive interrupted workflow state before the process exits.
+fn suspend_workflow_on_exit(app: &mut App, session: &mut Session) {
+    if let Some(ref wf) = app.workflow_engine {
+        if let Ok(mut engine) = wf.try_lock() {
+            let was_active =
+                !engine.is_workflow_complete() && engine.get_variable("_current_user_request").is_some();
+            engine.finalize_interrupted_on_exit();
+            if was_active {
+                if let Some(task) = engine.get_variable("_current_user_request") {
+                    if !task.trim().is_empty()
+                        && !session.messages.iter().any(|m| {
+                            matches!(m, Message::System { content } if ox_core::agent::user_round::is_interrupt_boundary(content))
+                        })
+                    {
+                        let _ = session.append_message(Message::system(
+                            &ox_core::agent::user_round::format_interrupt_boundary_message(&task),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Full-project AST walk + chunked embedding (blocking startup or background).
 async fn run_full_project_index(
@@ -1141,10 +1166,14 @@ fn process_text_input(
                                     "✅ 已根据你的选择继续实施（不重新 Plan）",
                                 );
                             } else if is_new_task {
-                                let _ = session.append_message(Message::system(format!(
-                                    "【新任务】\n{}",
-                                    answer.chars().take(500).collect::<String>()
-                                )));
+                                let task = engine
+                                    .get_variable("_current_user_request")
+                                    .unwrap_or_else(|| answer.clone());
+                                let _ = session.append_message(Message::system(
+                                    ox_core::agent::user_round::format_round_boundary_message(
+                                        &task,
+                                    ),
+                                ));
                                 app.clear_workflow_confirmation();
                                 app.output.push_system("🆕 已开始新任务，从 Intent 重新执行…");
                             }
@@ -1376,7 +1405,15 @@ fn process_text_input(
                         step_name
                     ));
                 }
-                engine.begin_user_round(&text);
+                let new_round = engine.begin_user_round(&text);
+                if new_round {
+                    let task = engine
+                        .get_variable("_current_user_request")
+                        .unwrap_or_else(|| text.clone());
+                    let _ = session.append_message(Message::system(
+                        ox_core::agent::user_round::format_round_boundary_message(&task),
+                    ));
+                }
                 if engine.is_park_disambiguation_awaiting() {
                     let md = engine.clarification_markdown();
                     agent_handler::handle_workflow_awaiting_confirmation(app, 4, &md);
@@ -1934,15 +1971,18 @@ fn spawn_next_workflow_step_if_needed(
     );
 
     // Minimal context: system prompt + session messages (previous step outputs)
-    let turn_messages = crate::helpers::build_context_with_option(
+    let mut turn_messages = crate::helpers::build_context_with_option(
         context_builder, &system_prompt, "",
         &session.messages, context_window, false,
     );
 
-    // Inject durable workflow memory (replaces partial handoff)
-    let mut turn_messages = turn_messages;
+    // Inject user-round anchor + durable memory for workflow spawns (pre_turn skips these).
     if let Some(ref wf) = app.workflow_engine {
         if let Ok(engine) = wf.try_lock() {
+            let ur = engine.user_round_memory_block();
+            if !ur.is_empty() {
+                turn_messages.push(Message::system(&ur));
+            }
             let block = engine.durable_memory_block();
             if !block.is_empty() {
                 turn_messages.push(Message::system(&block));

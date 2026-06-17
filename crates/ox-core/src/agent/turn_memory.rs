@@ -99,18 +99,19 @@ impl TurnMemory {
 
     pub fn format_injection(&self, iteration: u32) -> String {
         let mut out = format!(
-            "[TURN_MEMORY]\n🔄 本轮第 {} 次 LLM 调用（turn iteration {}）",
+            "[TURN_MEMORY — CURRENT ROUND ONLY]\n\
+             🔄 本轮第 {} 次 LLM 调用（iteration {}）",
             iteration + 1,
             self.iterations
         );
         if !self.user_task.is_empty() {
             let task: String = self.user_task.chars().take(300).collect();
-            out.push_str(&format!("\n📋 任务: {task}"));
+            out.push_str(&format!("\n🎯 本轮任务锚点: {task}"));
         }
         if self.entries.is_empty() {
-            out.push_str("\n（尚无工具记录）");
+            out.push_str("\n（本轮尚无工具记录）");
         } else {
-            out.push_str("\n【本轮已完成 — 勿重复】");
+            out.push_str("\n【本轮已执行 — 勿重复】");
             for e in &self.entries {
                 let icon = if e.outcome == "ok" { "✅" } else { "⚠️" };
                 out.push_str(&format!(
@@ -119,7 +120,7 @@ impl TurnMemory {
                 ));
             }
         }
-        out.push_str("\n基于以上记录继续，不要重复相同工具调用。");
+        out.push_str("\n基于以上**本轮**记录继续；历史对话/知识库中的任务勿重复执行。");
         if out.len() > MAX_SUMMARY_CHARS {
             out.chars().take(MAX_SUMMARY_CHARS).collect()
         } else {
