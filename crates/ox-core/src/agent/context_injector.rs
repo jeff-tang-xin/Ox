@@ -192,14 +192,22 @@ fn inject_execute_step_memory(
     )];
 
     if iteration == 0 {
-        let summary = engine.get_all_step_outputs_summary();
-        if summary != "（无上一步输出）" {
-            parts.push(format!("【计划与前序输出】\n{summary}"));
+        if let Some(handoff) = crate::agent::execute_handoff::ExecuteHandoff::load(engine) {
+            parts.push(handoff.format_for_execute());
+        } else {
+            let summary = engine.get_all_step_outputs_summary();
+            if summary != "（无上一步输出）" {
+                parts.push(format!("【计划与前序输出】\n{summary}"));
+            }
+            let exploration = engine.exploration_snapshot_summary();
+            if !exploration.is_empty() {
+                let snippet: String = exploration.chars().take(4000).collect();
+                parts.push(format!("【计划阶段探索摘要】\n{snippet}"));
+            }
         }
-        let exploration = engine.exploration_snapshot_summary();
-        if !exploration.is_empty() {
-            let snippet: String = exploration.chars().take(4000).collect();
-            parts.push(format!("【计划阶段探索摘要】\n{snippet}"));
+    } else if crate::agent::workflow_session::is_implementation_phase(engine) {
+        if let Some(report) = engine.execute_review_report_block(6000) {
+            parts.push(report);
         }
     }
 
@@ -218,8 +226,17 @@ fn inject_execute_step_memory(
     }
 
     parts.push(
-        "执行阶段可 file_read（大文件用 offset/limit 分段读，勿无 offset 重复同一路径）；不要重复 file_list 同一目录。继续下一计划项。".to_string(),
+        "执行阶段：优先使用交接包与 Preflight 快照中的数据；仅执行 plan 中尚未完成的步骤。\
+         勿重复 preflight / 探索命令。"
+            .to_string(),
     );
+    let phase_addon = crate::agent::workflow_phases::phase_prompt_addon(engine);
+    if !phase_addon.is_empty()
+        && crate::agent::workflow_phases::get_phase(engine)
+            == crate::agent::workflow_phases::WorkflowPhase::Act
+    {
+        parts.push(phase_addon);
+    }
     messages.push(Message::system(&parts.join("\n\n")));
 }
 

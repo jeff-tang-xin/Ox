@@ -13,6 +13,29 @@ pub fn handle_interjection(
     text: &str,
     interjection_buf: &mut InterjectionBuffer,
 ) {
+    let parked_resume = app
+        .workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|e| e.is_workflow_parked())
+        .unwrap_or(false);
+
+    if !parked_resume {
+        let blocked = app
+            .workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .map(|e| !e.allows_midflight_interjection())
+            .unwrap_or(false);
+        if blocked {
+            app.output.push_line(OutputLine::System(
+                ox_core::agent::workflow_phases::act_interjection_blocked_message().to_string(),
+            ));
+            app.scroll_to_bottom();
+            return;
+        }
+    }
+
     let priority = if text.starts_with('!') {
         InterjectionPriority::Urgent
     } else {
@@ -20,13 +43,12 @@ pub fn handle_interjection(
     };
     let content = text.trim_start_matches('!').to_string();
 
-    // Send interjection to agent immediately via channel
+    // Send interjection to agent immediately via channel (buffer only if no active channel)
     if let Some(tx) = &app.ui_to_agent_tx {
         let _ = tx.send(UiToAgentEvent::Interjection(content.clone()));
+    } else {
+        interjection_buf.push(content.clone(), priority);
     }
-
-    // Also buffer locally for fallback display
-    interjection_buf.push(content.clone(), priority);
 
     let prefix = if priority == InterjectionPriority::Urgent {
         "(urgent!)"

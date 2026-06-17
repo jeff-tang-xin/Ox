@@ -132,6 +132,13 @@ impl InputPane {
         text
     }
 
+    /// Clear the input buffer without submitting.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+        self.history_index = None;
+    }
+
     /// Navigate to the previous history entry (Up arrow).
     pub fn history_up(&mut self) {
         if self.history.is_empty() {

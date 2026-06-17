@@ -17,7 +17,7 @@ use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
 use ox_core::tools::{ToolContext, ToolRegistry};
 
-use crate::terminal::app::{App, PendingConfirmation, PendingSkillDraft};
+use crate::terminal::app::{App, ParkFollowUpTag, PendingConfirmation, PendingSkillDraft};
 use crate::terminal::output_pane::OutputLine;
 use crate::helpers;
 
@@ -421,29 +421,27 @@ pub fn handle_turn_done(
     interrupt_ctrl.reset();
     app.ui_to_agent_tx = None;
 
-    // Process queued interjections
+    // Queued interjections: buffer is fallback when live channel was unavailable
     let interjections_vec: Vec<String> = interjection_buf.drain();
     if !interjections_vec.is_empty() {
         for inj_text in &interjections_vec {
             app.output
-                .push_line(OutputLine::User(format!("(queued) {}", inj_text)));
+                .push_line(OutputLine::System(format!("💬 (fallback queued) {}", inj_text.trim())));
         }
         if let Some(last) = interjections_vec.last() {
+            if let Some(ref wf) = app.workflow_engine {
+                if let Ok(engine) = wf.try_lock() {
+                    if engine.workflow_preserves_on_user_input() {
+                        engine.append_workflow_guidance(last);
+                    }
+                }
+            }
             let _ = session.append_message(Message::user(last));
-
-            // Build context for interjection — prefer unified KnowledgeEngine
-            let memory_nodes = knowledge_engine
-                .try_read()
-                .map(|engine| {
-                    engine.retrieve_memory_nodes(last, Some(rt_env.project_id.as_str()), 5)
-                })
-                .unwrap_or_default();
-            let memory_ctx = format_memory_context(&memory_nodes, false);
 
             let turn_messages = crate::helpers::build_context_with_option(
                 context_builder,
                 system_prompt,
-                &memory_ctx,
+                "",
                 &session.messages,
                 context_window,
                 config.context.use_refined_context,
@@ -456,7 +454,7 @@ pub fn handle_turn_done(
 
             return HandleResult::InterjectionTriggered {
                 text: last.clone(),
-                memory_ctx,
+                memory_ctx: String::new(),
                 turn_messages,
             };
         }
@@ -516,16 +514,87 @@ pub fn handle_workflow_awaiting_confirmation(app: &mut App, step_idx: usize, mes
         app.output.push_line(OutputLine::Markdown(message.to_string()));
     }
     app.workflow_awaiting_confirmation = Some(step_idx);
+    if step_idx == 4 {
+        app.park_follow_up_tag = None;
+    }
     app.agent_running = false;
     flush_queued_skill_draft(app);
     app.status = match step_idx {
+        0 => "❓ 请具体回答澄清问题（模糊回复会继续追问）".to_string(),
         2 => "⏸️ 请确认后开始执行（输入 ok/继续/确认，或输入修改意见）".to_string(),
+        4 => "⏸️ 按 1/2/3 选择 — [1]继续 [2]意见·只读 [3]新任务".to_string(),
         _ => "⏸️ 等待确认".to_string(),
     };
     if !app.user_scrolled {
         app.scroll_to_bottom();
     }
     app.dirty = true;
+}
+
+/// Map typed menu keywords to input tag (when user types 意见/新任务 instead of 1/2/3).
+pub fn park_tag_from_menu_answer(answer: &str) -> Option<ParkFollowUpTag> {
+    match answer.trim() {
+        "1" | "继续" | "continue" | "resume" | "执行" | "修复" => Some(ParkFollowUpTag::Continue),
+        "2" | "意见" | "反馈" | "澄清" | "说明" | "feedback" => Some(ParkFollowUpTag::Feedback),
+        "3" | "新任务" | "new" | "/new" => Some(ParkFollowUpTag::NewTask),
+        _ => None,
+    }
+}
+
+/// Handle park follow-up menu shortcut (1/2/3).
+pub fn handle_park_menu_shortcut(app: &mut App, choice: char) {
+    let token = choice.to_string();
+    let tag = match choice {
+        '1' => ParkFollowUpTag::Continue,
+        '2' => ParkFollowUpTag::Feedback,
+        '3' => ParkFollowUpTag::NewTask,
+        _ => return,
+    };
+
+    let Some(ref wf) = app.workflow_engine else {
+        return;
+    };
+    let Ok(engine) = wf.try_lock() else {
+        return;
+    };
+    if !engine.is_park_disambiguation_awaiting() {
+        return;
+    }
+
+    match engine.finish_park_disambiguation(&token) {
+        Ok(ox_core::agent::requirement_clarification::ParkFollowUpOutcome::NeedDetail { hint }) => {
+            app.park_follow_up_tag = Some(tag);
+            app.input.clear();
+            app.output.push_system(&hint);
+            app.status = match tag {
+                ParkFollowUpTag::Continue => {
+                    "✏️ [继续] 请说明要修复/执行的范围".to_string()
+                }
+                ParkFollowUpTag::Feedback => {
+                    "💬 [意见·只读] 请说明你的澄清或质疑".to_string()
+                }
+                ParkFollowUpTag::NewTask => "🆕 [新任务] 请描述新任务".to_string(),
+            };
+            if choice == '2' {
+                app.output.push_system(
+                    "💬 意见模式：只讨论审查结论，不会修改代码或进入实施",
+                );
+            }
+            app.dirty = true;
+        }
+        Ok(
+            ox_core::agent::requirement_clarification::ParkFollowUpOutcome::Resolved(
+                _resolution,
+            ),
+        ) => {
+            app.output.push_system("已选择，请按 Enter 提交或重新按 1/2/3");
+            app.dirty = true;
+        }
+        Err(hint) => {
+            app.output.push_system(&hint);
+            app.dirty = true;
+        }
+    }
 }
 
 /// Handle ToolConfirmationRequest event.

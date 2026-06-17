@@ -47,8 +47,40 @@ impl TurnMemory {
     }
 
     pub fn record_tool(&mut self, tool: &str, arguments: &str, ok: bool) {
+        self.record_tool_with_result(tool, arguments, ok, None);
+    }
+
+    pub fn record_tool_with_result(
+        &mut self,
+        tool: &str,
+        arguments: &str,
+        ok: bool,
+        result_content: Option<&str>,
+    ) {
         let target = crate::agent::exploration_snapshot::target_from_tool_args(tool, arguments);
-        self.record(tool, &target, if ok { "ok" } else { "error" });
+        let outcome = Self::outcome_label(tool, ok, result_content);
+        self.record(tool, &target, &outcome);
+    }
+
+    fn outcome_label(tool: &str, ok: bool, result_content: Option<&str>) -> String {
+        if !ok {
+            return "error".to_string();
+        }
+        if matches!(tool, "shell_exec" | "git_status" | "git_diff") {
+            if let Some(raw) = result_content {
+                let content = crate::agent::exploration_snapshot::extract_data_content(raw);
+                let excerpt: String = content.chars().take(160).collect();
+                if excerpt.is_empty() {
+                    "ok".to_string()
+                } else {
+                    format!("ok — {excerpt}")
+                }
+            } else {
+                "ok".to_string()
+            }
+        } else {
+            "ok".to_string()
+        }
     }
 
     pub fn merge_from(&mut self, other: TurnMemory) {

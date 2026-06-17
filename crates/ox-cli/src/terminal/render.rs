@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::helpers::formatting::short_display_path;
-use super::app::App;
+use super::app::{App, ParkFollowUpTag};
 use super::input_pane::InputPane;
 use super::output_pane::OutputLine;
 
@@ -522,6 +522,99 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     );
 }
 
+fn prompt_span(text: &str, fg: Color) -> (Vec<Span<'static>>, usize) {
+    let owned = text.to_string();
+    let len = owned.len();
+    (
+        vec![Span::styled(
+            owned,
+            Style::default()
+                .fg(fg)
+                .add_modifier(Modifier::BOLD)
+                .bg(BG_INPUT),
+        )],
+        len,
+    )
+}
+
+fn park_follow_up_prompt_spans(app: &App) -> (Vec<Span<'static>>, usize) {
+    let base = Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD)
+        .bg(BG_INPUT);
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+        .bg(BG_INPUT);
+    let tag_style = Style::default()
+        .fg(Color::Rgb(255, 200, 80))
+        .add_modifier(Modifier::BOLD)
+        .bg(BG_INPUT);
+    let dim = Style::default().fg(TEXT_DIM).bg(BG_INPUT);
+
+    if let Some(tag) = app.park_follow_up_tag {
+        let (label, hint) = match tag {
+            ParkFollowUpTag::Continue => ("[继续]", "说明修复范围 > "),
+            ParkFollowUpTag::Feedback => ("[意见·只读]", "只讨论不实施 > "),
+            ParkFollowUpTag::NewTask => ("[新任务]", "描述任务 > "),
+        };
+        let spans = vec![
+            Span::styled("❯ ".to_string(), base),
+            Span::styled(label.to_string(), tag_style),
+            Span::styled(format!(" {hint}"), dim),
+        ];
+        let len = format!("❯ {label} {hint}").len();
+        return (spans, len);
+    }
+
+    let spans = vec![
+        Span::styled("❯ 按 ".to_string(), base),
+        Span::styled("1".to_string(), key_style),
+        Span::styled("继续 ".to_string(), base),
+        Span::styled("2".to_string(), key_style),
+        Span::styled("意见 ".to_string(), base),
+        Span::styled("3".to_string(), key_style),
+        Span::styled("新任务 > ".to_string(), base),
+    ];
+    let len = "❯ 按 1继续 2意见 3新任务 > ".len();
+    (spans, len)
+}
+
+fn park_follow_up_block_title(app: &App) -> Line<'static> {
+    if app.park_follow_up_tag.is_some() {
+        return Line::from(Span::styled(
+            " 已选择 — 在下方补充说明后按 Enter ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(vec![
+        Span::styled(" 快捷键 ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[1]",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 继续  ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[2]",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 意见·只读  ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[3]",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 新任务 ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+    ])
+}
+
 fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -529,58 +622,25 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     frame.render_widget(Clear, area);
 
     let indexing_prompt: String;
-    let (prompt, prompt_style) = if app.pending_confirmation.is_some() {
-        (
-            "❯ Y/N/T > ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-                .bg(BG_INPUT),
-        )
+    let (prompt_spans, prompt_len) = if app.pending_confirmation.is_some() {
+        prompt_span("❯ Y/N/T > ", Color::Yellow)
+    } else if app.workflow_awaiting_confirmation == Some(0) {
+        prompt_span("❯ 澄清 > ", Color::Magenta)
+    } else if app.workflow_awaiting_confirmation == Some(4) {
+        park_follow_up_prompt_spans(app)
     } else if app.workflow_awaiting_confirmation == Some(2) {
-        (
-            "❯ 确认/修改 > ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-                .bg(BG_INPUT),
-        )
+        prompt_span("❯ 确认/修改 > ", Color::Cyan)
     } else if app.workflow_awaiting_confirmation.is_some() {
-        (
-            "❯ 确认 > ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-                .bg(BG_INPUT),
-        )
+        prompt_span("❯ 确认 > ", Color::Cyan)
     } else if app.indexing {
         let s = SPINNER[app.spinner_frame as usize % SPINNER.len()];
         indexing_prompt = format!("{s} > ");
-        (
-            &*indexing_prompt as &str,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-                .bg(BG_INPUT),
-        )
+        prompt_span(&indexing_prompt, Color::Yellow)
     } else if app.agent_running {
-        (
-            "▸ ox > ",
-            Style::default()
-                .fg(STREAMING)
-                .add_modifier(Modifier::BOLD)
-                .bg(BG_INPUT),
-        )
+        prompt_span("▸ ox > ", STREAMING)
     } else {
-        (
-            "ox > ",
-            Style::default()
-                .fg(BLUE)
-                .add_modifier(Modifier::BOLD)
-                .bg(BG_INPUT),
-        )
+        prompt_span("ox > ", BLUE)
     };
-    let prompt_len = prompt.len();
 
     let border_color = if app.indexing {
         Color::Yellow
@@ -602,6 +662,24 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )
+    } else if app.workflow_awaiting_confirmation == Some(0) {
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Magenta))
+            .style(Style::default().bg(BG_INPUT))
+            .title(" 需求澄清 — 请直接回答问题 ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )
+    } else if app.workflow_awaiting_confirmation == Some(4) {
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Magenta))
+            .style(Style::default().bg(BG_INPUT))
+            .title(park_follow_up_block_title(app))
+            .title_style(Style::default().fg(Color::Magenta))
     } else if app.workflow_awaiting_confirmation == Some(2) {
         Block::default()
             .borders(Borders::TOP)
@@ -637,11 +715,12 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     // Get visible content based on available width
     let (visible_text, scroll_offset) = app.input.get_visible_content(input_width);
 
-    let paragraph = Paragraph::new(Line::from(vec![
-        Span::styled(prompt.to_string(), prompt_style),
-        Span::styled(visible_text, Style::default().fg(TEXT_BRIGHT).bg(BG_INPUT)),
-    ]))
-    .block(block);
+    let mut line_spans = prompt_spans;
+    line_spans.push(Span::styled(
+        visible_text,
+        Style::default().fg(TEXT_BRIGHT).bg(BG_INPUT),
+    ));
+    let paragraph = Paragraph::new(Line::from(line_spans)).block(block);
 
     frame.render_widget(paragraph, area);
 

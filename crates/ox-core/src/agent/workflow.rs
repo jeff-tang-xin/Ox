@@ -151,6 +151,7 @@ pub fn create_default_workflow() -> Workflow {
 |------------|------------|------------|----------|
 | chat       | 任意       | chat       | 直接自然语言回复，不走工作流 |
 | exploring  | 任意       | fast       | 意图 → **人工确认** → 只读执行（跳过规划/审阅） |
+| ops        | 任意       | ops-fast   | 运维/发布 → **系统 Preflight** → **人工确认** → 执行（跳过规划/审阅） |
 | coding     | simple     | fast       | 意图 → **人工确认** → 执行（跳过规划/审阅） |
 | coding     | complex    | standard   | 意图 → 规划 → 审阅 → **人工确认** → 执行 |
 
@@ -158,6 +159,7 @@ pub fn create_default_workflow() -> Workflow {
 
 【intent 判定】
 - exploring：只读 — 检查/审查/分析代码、理解架构、找问题、给建议，**不修改文件**
+- ops：运维/发布 — git tag、push、release、发版、部署、changelog 等（不改源码）
 - coding：会改代码 — 新增/修改/删除/重构/修 bug/实现功能
 - chat：闲聊、概念问答、与当前项目无关
 
@@ -165,14 +167,27 @@ pub fn create_default_workflow() -> Workflow {
 - simple：单文件或 ≤2 文件、改动行数少、逻辑直观（改文案、修 typo、加一行）
 - complex：多文件、架构级、重构、不确定影响面、需先探索再改
 
+【需求澄清 — needs_clarification】
+在路由前判断用户原话是否**足以开工**。**有疑问必须澄清，禁止猜测或假设用户未说明的对象、范围、约束。**
+以下情况设 needs_clarification=true 并列出 1–3 个**具体、可回答**的问题：
+- 模糊动词无对象（如「加个验证」「优化一下」）
+- 多种合理解释且选择会显著改变方案（改 A 文件 vs 改 B 模块）
+- 缺少关键约束（语言/框架/范围/验收标准）且原文未给出
+- 任何你不确定、需要用户确认才能开工的情况
+以下情况 needs_clarification=false（须原文已明确，不得凭常识补全）：
+- 意图、范围、目标已在用户原话中写清；exploring 全景检查；chat 问答
+- 用户已给出文件路径 + 具体改动描述
+
 【输出格式】只输出 JSON，不要调用工具：
 {
-  \"intent\": \"coding\"|\"exploring\"|\"chat\",
+  \"intent\": \"coding\"|\"exploring\"|\"ops\"|\"chat\",
   \"complexity\": \"simple\"|\"complex\",
   \"files\": [\"用户提到的文件路径\"],
   \"topic\": \"一句话主题\",
-  \"pipeline\": \"fast\"|\"standard\"|\"chat\",
-  \"routing_reason\": \"≥15字：说明为何选此 intent/complexity/pipeline；若 pipeline=fast 须写明跳过规划/审阅但仍需人工确认后执行\"
+  \"pipeline\": \"fast\"|\"ops-fast\"|\"standard\"|\"chat\",
+  \"routing_reason\": \"≥15字：说明为何选此 intent/complexity/pipeline；若 pipeline=fast 须写明跳过规划/审阅但仍需人工确认后执行\",
+  \"needs_clarification\": true|false,
+  \"clarification_questions\": [\"需用户回答的具体问题（needs_clarification=false 时为空数组）\"]
 }
 
 【示例】
@@ -182,12 +197,15 @@ pub fn create_default_workflow() -> Workflow {
 → coding + simple + pipeline=fast
 用户：「重构 agent 模块并拆分 engine.rs」
 → coding + complex + pipeline=standard（必须走规划+审阅）
+用户：「给当前 commit 打 v1.2.0 tag 并 push」
+→ ops + simple + pipeline=ops-fast（系统 Preflight 探测 tag/状态后人工确认再执行）
 用户：「Rust 的所有权是什么」
 → chat + pipeline=chat
 
 【规则】
 - pipeline 必须与上表一致，填错会被要求重试
 - routing_reason 必须写明「跳过规划/审阅」或「需要规划+审阅」的原因；fast 路径须注明「待人工确认后执行」
+- needs_clarification=true 时 routing 字段**仅反映用户原话已明确的信息**；files 不得虚构；routing_reason 须列出「待澄清项」，**禁止最佳推测**
 - 输出 JSON 后立即结束")
             .disallow_tools()
             .with_memory_layers(&["WorkingMemory"])
@@ -203,6 +221,8 @@ pub fn create_default_workflow() -> Workflow {
 【上一步意图】{PREVIOUS_OUTPUT}
 
 【审阅回退意见（如有）】{REVIEW_FEEDBACK}
+
+【用户中途补充（采纳后继续当前 Plan，勿回 Intent）】{USER_GUIDANCE}
 
 【探索阶段查阅内容】{EXPLORATION_SNAPSHOT}
 
@@ -254,7 +274,9 @@ pub fn create_default_workflow() -> Workflow {
 
 【规则】
 - 探索不足时继续调用工具，不要猜测路径
-- 输出 JSON 后立即结束")
+- 输出 JSON 后立即结束
+
+{WORKFLOW_PHASE}")
             .with_allowed_tools(&["file_read", "file_list", "file_search", "code_search",
                                   "find_symbol", "project_detect", "load_skill",
                                   "memory_search", "recall"])
@@ -290,7 +312,9 @@ pub fn create_default_workflow() -> Workflow {
 - 仅依据【上一步计划】和【探索阶段查阅内容】评估，不要猜测
 - 不要使用 file_read / file_list — 探索内容已在 EXPLORATION_SNAPSHOT 中
 - safe=false → 必须列出具体原因
-- complete=false → 必须列出缺少什么")
+- complete=false → 必须列出缺少什么
+
+{WORKFLOW_PHASE}")
             .disallow_tools()
             .with_validator("safety_check")
             .with_memory_layers(&["AtomicMemory"])
@@ -303,26 +327,25 @@ pub fn create_default_workflow() -> Workflow {
             .with_prompt("\
 【任务】按照计划逐步执行。
 
+{WORKFLOW_PHASE}
+
+【执行交接包 — 用户已确认】
+{EXECUTE_HANDOFF}
+
+【用户中途补充（采纳后继续 Execute，勿回 Intent/Plan）】{USER_GUIDANCE}
+
 【全部前序输出】{ALL_PREVIOUS_OUTPUTS}
 
-【探索阶段查阅内容】{EXPLORATION_SNAPSHOT}
+【探索 / Preflight 快照】{EXPLORATION_SNAPSHOT}
 
-【规则】
-1. **必须先遵守**上方【项目 Skill — 必读】中的项目规范与业务指导，再改任何代码
-2. 按照计划中的步骤顺序执行
-3. 修改前用 file_read / find_symbol 确认当前代码；大文件用 offset/limit 分段读取（默认 limit=200）
-4. 探索快照中大文件见 `.ox/exploration/`，预览不够时 file_read 该路径并指定 offset
-5. 用 file_write / edit_file / delete_range 执行修改
-6. 每步修改后按**项目规范 Skill 中的命令**验证（build / test / lint 等），或 file_read 确认结果
-7. 全部完成后输出 ## Done
+【规则 — 按当前阶段执行】
+1. **必须先遵守**上方【项目 Skill — 必读】中的项目规范与业务指导
+2. **感知阶段**：只读探索；结束时输出 findings JSON + 审查报告 + `## Done`
+3. **执行阶段**：消费【计划进度】清单；禁止退回探索；读后即改
+4. 按照计划中的步骤顺序执行（`action: shell` 用 shell_exec）
+5. 全部完成后输出 ## Done
 
-【file_list 用法 — 极易误用】
-- file_list 只列【当前目录单层】，不会展开子目录里的文件
-- 探索结构：file_list(\".\") → 看到子目录名 → file_list(\"crates\") → file_list(\"crates/ox-core\") 逐层向下
-- 不要指望一次 file_list 看到整个项目；不要对同一 path 重复 file_list
-- 要按文件名模式递归搜索：用 file_search(\"*.rs\")，不是 file_list
-
-不要重复无 offset 的 file_read 同一路径。探索已在计划阶段完成；执行时按需分段读取。")
+{FINDINGS_SCHEMA}")
             .with_allowed_tools(&[
                 "file_read",
                 "file_list",

@@ -6,6 +6,82 @@ use std::sync::Arc;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
+/// Read a line slice from a workspace-relative path (shared by tool + exploration cache).
+pub fn read_file_slice(
+    working_dir: &std::path::Path,
+    path_str: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<String, String> {
+    let path_str = path_str.trim().replace('\\', "/");
+    let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
+        std::path::PathBuf::from(&path_str)
+    } else {
+        working_dir.join(&path_str)
+    };
+
+    let path =
+        match crate::safety::validate_path_within_workdir(&resolved_path, working_dir) {
+            Ok(p) => p,
+            Err(e) => return Err(format!("Path validation failed: {e}")),
+        };
+
+    let file_size = match std::fs::metadata(&path) {
+        Ok(m) => m.len(),
+        Err(e) => return Err(format!("Cannot access file: {e}")),
+    };
+
+    const SMALL_FILE_THRESHOLD: u64 = 512 * 1024;
+
+    let (content, total_lines) = if file_size < SMALL_FILE_THRESHOLD {
+        read_full_then_slice(&path, offset, limit)?
+    } else {
+        stream_read_lines(&path, offset, limit)?
+    };
+
+    Ok(format_read_output(&path_str, content, offset, limit, total_lines))
+}
+
+fn format_read_output(
+    path_str: &str,
+    content: String,
+    offset: usize,
+    limit: usize,
+    total_lines: usize,
+) -> String {
+    let shown = content.matches('\n').count() + if content.is_empty() { 0 } else { 1 };
+    let mut output = content;
+    if total_lines > 0 {
+        output.push_str(&format!(
+            "\n\n📄 {} lines total (showing {}-{})",
+            total_lines,
+            offset + 1,
+            (offset + shown).min(total_lines)
+        ));
+        if offset + shown < total_lines {
+            output.push_str(&format!(
+                "\n💡 未读完。续读: file_read {{\"path\":\"{}\", \"offset\":{}, \"limit\":{}}}",
+                path_str,
+                offset + shown,
+                limit
+            ));
+        }
+    } else if shown == limit {
+        output.push_str(&format!(
+            "\n\n📄 showing {} lines starting at line {} (large file, total unknown)",
+            shown,
+            offset + 1
+        ));
+        output.push_str(&format!(
+            "\n💡 可能还有更多。续读: file_read {{\"path\":\"{}\", \"offset\":{}, \"limit\":{}}}",
+            path_str,
+            offset + shown,
+            limit
+        ));
+    }
+    output
+}
+
 pub struct FileReadTool;
 
 #[async_trait::async_trait]
@@ -93,23 +169,18 @@ impl Tool for FileReadTool {
         const SMALL_FILE_THRESHOLD: u64 = 512 * 1024; // 512 KB
 
         let result = if file_size < SMALL_FILE_THRESHOLD && encoding.is_none() {
-            // Small UTF-8 file: read full content, apply offset+limit
             read_full_then_slice(&path, offset, limit)
         } else if encoding.is_some() {
-            // Explicit encoding: must read full bytes for decode
             read_with_encoding_then_slice(&path, encoding, offset, limit)
         } else {
-            // Large UTF-8 file: stream-read only needed lines
             stream_read_lines(&path, offset, limit)
         };
 
         match result {
             Ok((content, total_lines)) => {
-                // Auto-index symbols in background
                 let abs_path = path.to_path_buf();
                 let knowledge = Arc::clone(&ctx.knowledge);
                 tokio::spawn(async move {
-                    // 使用 try_write 以免阻塞 — 后台索引期间跳过
                     if let Ok(mut engine) = knowledge.try_write() {
                         if let Err(e) = engine.index_file(&abs_path) {
                             tracing::debug!("[FILE_READ] Auto-index failed for {}: {e}", abs_path.display());
@@ -117,31 +188,7 @@ impl Tool for FileReadTool {
                     }
                 });
 
-                let shown = content.matches('\n').count() + if content.is_empty() { 0 } else { 1 };
-                let mut output = content;
-                if total_lines > 0 {
-                    output.push_str(&format!(
-                        "\n\n📄 {} lines total (showing {}-{})",
-                        total_lines,
-                        offset + 1,
-                        (offset + shown).min(total_lines)
-                    ));
-                    if offset + shown < total_lines {
-                        output.push_str(&format!(
-                            "\n💡 未读完。续读: file_read {{\"path\":\"{}\", \"offset\":{}, \"limit\":{}}}",
-                            path_str, offset + shown, limit
-                        ));
-                    }
-                } else if shown == limit {
-                    output.push_str(&format!(
-                        "\n\n📄 showing {} lines starting at line {} (large file, total unknown)",
-                        shown, offset + 1
-                    ));
-                    output.push_str(&format!(
-                        "\n💡 可能还有更多。续读: file_read {{\"path\":\"{}\", \"offset\":{}, \"limit\":{}}}",
-                        path_str, offset + shown, limit
-                    ));
-                }
+                let output = format_read_output(&path_str, content, offset, limit, total_lines);
                 ToolOutput::success(output)
             }
             Err(e) => ToolOutput::error(format!("Failed to read {}: {e}", display_path.display())),

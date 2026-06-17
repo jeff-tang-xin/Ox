@@ -28,6 +28,8 @@ pub struct ExplorationEntry {
 const MAX_ENTRIES: usize = 40;
 /// Below this size, keep the full payload inline (no disk ref).
 const INLINE_MAX_CHARS: usize = 6_000;
+/// Source files with at most this many lines stay inline even when char count exceeds INLINE_MAX_CHARS.
+const FULL_FILE_MAX_LINES: usize = 300;
 /// Default preview size for prompt injection.
 const PREVIEW_MAX_CHARS: usize = 3_500;
 /// Total prompt budget for the formatted snapshot block.
@@ -149,6 +151,115 @@ fn inline_threshold(tool: &str) -> usize {
         "file_write" | "edit_file" | "delete_range" => 1_500,
         _ => 8_000,
     }
+}
+
+/// Strip `path@offset+limit` down to `path`.
+pub fn file_path_from_target(target: &str) -> &str {
+    target.split('@').next().unwrap_or(target)
+}
+
+fn persisted_body(stored: &str) -> &str {
+    const SEP: &str = "\n---\n\n";
+    stored.find(SEP).map(|i| &stored[i + SEP.len()..]).unwrap_or(stored)
+}
+
+/// Load full payload previously written under `.ox/exploration/`.
+pub fn load_persisted_full(working_dir: &Path, rel: &str) -> Option<String> {
+    let path = working_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let stored = fs::read_to_string(&path).ok()?;
+    Some(persisted_body(&stored).to_string())
+}
+
+pub fn find_file_read_entry<'a>(
+    entries: &'a [ExplorationEntry],
+    path: &str,
+) -> Option<&'a ExplorationEntry> {
+    let norm = crate::agent::plan_tracker::normalize_path(path);
+    entries.iter().find(|e| {
+        e.tool == "file_read"
+            && crate::agent::plan_tracker::normalize_path(file_path_from_target(&e.target))
+                == norm
+    })
+}
+
+fn file_read_offset_limit(arguments: &str) -> (usize, usize) {
+    let v = serde_json::from_str::<serde_json::Value>(arguments).ok();
+    let offset = v
+        .as_ref()
+        .and_then(|j| j.get("offset").and_then(|o| o.as_u64()))
+        .unwrap_or(0) as usize;
+    let limit = v
+        .as_ref()
+        .and_then(|j| j.get("limit").and_then(|l| l.as_u64()))
+        .unwrap_or(200) as usize;
+    (offset, limit)
+}
+
+/// When exploration cache blocks a duplicate `file_read`, return real file bytes — not a preview.
+pub fn resolve_file_read_cache(
+    working_dir: &Path,
+    entries: &[ExplorationEntry],
+    path: &str,
+    arguments: &str,
+) -> String {
+    let (offset, limit) = file_read_offset_limit(arguments);
+    let entry = find_file_read_entry(entries, path);
+
+    if let Ok(body) = crate::tools::file_read::read_file_slice(working_dir, path, offset, limit) {
+        return format!(
+            "✅ 【快照恢复】`{path}` 已探索过；以下为磁盘完整内容（offset={offset}，非预览）\n\n{body}"
+        );
+    }
+
+    if let Some(e) = entry {
+        if let Some(ref rel) = e.ref_path {
+            if let Some(full) = load_persisted_full(working_dir, rel) {
+                let lines: Vec<&str> = full.lines().collect();
+                let total = lines.len();
+                let start = offset.min(total);
+                let end = (start + limit).min(total);
+                let slice: String = lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| format!("{:>4}\t{line}", start + i + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut body = format!(
+                    "✅ 【快照恢复】`{path}` 来自探索存档 `{rel}`（{} 行全文，非预览）\n\n{slice}",
+                    total
+                );
+                if end < total {
+                    body.push_str(&format!(
+                        "\n\n💡 续读: file_read {{\"path\":\"{path}\", \"offset\":{end}, \"limit\":{limit}}}"
+                    ));
+                }
+                return body;
+            }
+        }
+        if e.full_chars <= e.content.chars().count().saturating_add(80) {
+            return format!(
+                "✅ 【缓存】`{path}` 已探索过\n\n{}",
+                e.content
+            );
+        }
+        return format!(
+            "✅ 【缓存预览】`{path}` 已探索过（中间行已省略）。请用 file_read 并指定 offset 续读，或读 `{}`\n\n{}",
+            e.ref_path.as_deref().unwrap_or("源文件路径"),
+            e.content
+        );
+    }
+
+    format!("✅ 【缓存】`{path}` 已探索过（无快照条目）")
+}
+
+fn should_preview_only(tool: &str, content: &str, threshold: usize) -> bool {
+    if content.chars().count() <= threshold {
+        return false;
+    }
+    if tool == "file_read" && content.lines().count() <= FULL_FILE_MAX_LINES {
+        return false;
+    }
+    true
 }
 
 fn exploration_ref_path(working_dir: &Path, tool: &str, target: &str) -> PathBuf {
@@ -304,7 +415,7 @@ pub fn merge_entry(
 
     let full_chars = trimmed.chars().count();
     let threshold = inline_threshold(tool);
-    let (ref_path, preview) = if full_chars > threshold {
+    let (ref_path, preview) = if should_preview_only(tool, trimmed, threshold) {
         let rel = persist_full_content(working_dir, tool, target, trimmed);
         let preview = build_preview(tool, target, trimmed, PREVIEW_MAX_CHARS);
         (rel, preview)
@@ -485,5 +596,73 @@ mod tests {
             assert!(s.contains(&format!("f{i}.rs")));
         }
         assert!(s.contains(".ox/exploration/"));
+    }
+
+    #[test]
+    fn small_line_count_java_stays_inline() {
+        let dir = temp_dir().join(format!("ox_explore_java_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let body = (0..189)
+            .map(|i| format!("    line {i} content padding to exceed inline char threshold;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.chars().count() > INLINE_MAX_CHARS);
+        assert_eq!(body.lines().count(), 189);
+
+        let mut entries = Vec::new();
+        merge_entry(
+            &mut entries,
+            &dir,
+            "file_read",
+            "CompleteDocumentStrategy.java@0+200",
+            &body,
+        );
+        assert!(entries[0].ref_path.is_none());
+        assert!(entries[0].content.contains("line 26"));
+        assert!(entries[0].content.contains("line 100"));
+        assert!(!entries[0].content.contains("【文件开头】"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_cache_reads_full_file_from_disk() {
+        let dir = temp_dir().join(format!("ox_explore_resolve_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let rel = "src/Middle.java";
+        let full_path = dir.join(rel);
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        let body = (1..=50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&full_path, &body).unwrap();
+
+        let mut entries = Vec::new();
+        merge_entry(
+            &mut entries,
+            &dir,
+            "file_read",
+            "src/Middle.java@0+200",
+            &(body.repeat(200)), // force preview + ref
+        );
+        assert!(entries[0].ref_path.is_some());
+
+        let resolved = resolve_file_read_cache(
+            &dir,
+            &entries,
+            "src/Middle.java",
+            r#"{"path":"src/Middle.java","offset":0,"limit":200}"#,
+        );
+        assert!(resolved.contains("【快照恢复】"));
+        assert!(resolved.contains("line 26"));
+        assert!(resolved.contains("line 40"));
+        assert!(!resolved.contains("【文件开头】"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

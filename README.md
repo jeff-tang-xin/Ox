@@ -1,5 +1,9 @@
 # Ox 🐂
 
+[![Version](https://img.shields.io/badge/version-v2.0.0.02-blue.svg)](https://github.com/nicepkg/ox)
+[![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 > **Terminal AI coding assistant — read first, code second; enforce discipline, ship production-grade output**
 
 Ox is a Rust-built terminal AI coding assistant that understands your codebase before writing a single line. It indexes your project, maintains context across sessions, enforces safety guardrails, and follows structured workflows to deliver reliable, production-quality code.
@@ -9,7 +13,7 @@ Ox is a Rust-built terminal AI coding assistant that understands your codebase b
 ## ✨ Highlights
 
 - **Codebase-aware** — Local BM25 + vector search + entity graph keep your full project in context
-- **Structured workflow** — Intent classification → plan → execute → verify, not free-form chatting
+- **Structured workflow** — Perception → Plan → Execute → Verify, with dedicated phases for each stage
 - **Safety-first** — 3-tier tool safety levels, prompt injection detection, data sanitization, path restrictions
 - **Multi-LLM** — Unified adapter for OpenAI and Anthropic APIs with streaming SSE
 - **Session persistence** — Full conversation history saved to SQLite, resume anytime
@@ -26,7 +30,7 @@ Ox Workspace
 ├── crates/
 │   ├── ox-core/          # Pure library — no TUI dependencies
 │   │   └── src/
-│   │       ├── agent/    # Engine, workflow, plan tracker, enforcer, session
+│   │       ├── agent/    # Engine, workflow, perception, preflight, enforcer, session
 │   │       ├── config/   # OxConfig, AgentConfig, EnforcementRules
 │   │       ├── context/  # Builder, budget, system prompt, skill injection
 │   │       ├── cost/     # CostTracker (token + dollar accounting)
@@ -135,21 +139,28 @@ ox index --full     # Full re-index including embeddings
 
 ## 🧠 Agent Workflow
 
-Ox doesn't free-form chat — it follows a structured pipeline:
+Ox doesn't free-form chat — it follows a structured pipeline with dedicated phases:
 
 ```
-┌─────────────┐    ┌────────────┐    ┌───────────┐    ┌──────────┐
-│  Classify    │───▶│    Plan     │───▶│  Execute  │───▶│  Verify  │
-│  (intent +   │    │ (step list │    │ (tool     │    │ (shell   │
-│   pipeline)  │    │  + targets)│    │  calls)   │    │  checks) │
-└─────────────┘    └────────────┘    └───────────┘    └──────────┘
-      │                                                    │
-      │  fast pipeline: skip plan, go directly to execute │
-      └────────────────────────────────────────────────────┘
+┌─────────────┐   ┌─────────────┐   ┌────────────┐   ┌───────────┐   ┌──────────┐
+│  Perception  │──▶│   Preflight  │──▶│    Plan     │──▶│  Execute  │──▶│  Verify  │
+│  (intent +   │   │ (explore +   │   │ (step list │   │ (tool     │   │ (shell   │
+│   pipeline)  │   │  pre-check)  │   │  + targets)│   │  calls)   │   │  checks) │
+└─────────────┘   └─────────────┘   └────────────┘   └───────────┘   └──────────┘
+      │                                                                   │
+      │  fast pipeline: skip plan, go directly to execute                 │
+      └───────────────────────────────────────────────────────────────────┘
 ```
 
-- **Fast** (simple edits) → skip planning, execute directly
-- **Standard** (multi-file changes) → plan → execute → verify
+- **Perception** — Classify intent (simple/standard/complex) and select pipeline
+- **Preflight** — Explore codebase, gather context, validate assumptions before planning
+- **Plan** — Generate ordered step list with target files and tools
+- **Execute** — Run tool calls with enforcer intercepts and progress tracking
+- **Verify** — Shell checks and result validation
+
+Pipeline shortcuts:
+- **Fast** (simple edits) → perception → execute directly
+- **Standard** (multi-file changes) → full pipeline, skip preflight
 - **Complex** (cross-module refactors) → full pipeline with progress tracking
 
 The enforcer intercepts every tool call before execution, checking path restrictions, pattern blocks, and confirmation gates.

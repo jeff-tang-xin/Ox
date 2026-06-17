@@ -14,12 +14,28 @@ use crate::terminal::app::App;
 /// The heavy lifting (text submission, slash commands, LLM invocation) is handled
 /// by the event loop after this function returns the input.
 pub fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> KeyResult {
+    // Park menu shortcuts: 1/2/3 while awaiting step-4 confirmation (menu stage only).
+    if app.workflow_awaiting_confirmation == Some(4) && app.park_follow_up_tag.is_none() {
+        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+            if let KeyCode::Char(ch @ ('1' | '2' | '3')) = key.code {
+                return KeyResult::ParkMenuShortcut(ch);
+            }
+        }
+    }
+
     // Fast path: simple printable characters go straight to input buffer
     if let KeyCode::Char(ch) = key.code {
         if !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
             if ch != 'y' && ch != 'Y' && ch != 'n' && ch != 'N' && ch != 't' && ch != 'T' {
+                // Don't insert 1/2/3 at park menu — those are shortcuts.
+                if app.workflow_awaiting_confirmation == Some(4)
+                    && app.park_follow_up_tag.is_none()
+                    && matches!(ch, '1' | '2' | '3')
+                {
+                    return KeyResult::ParkMenuShortcut(ch);
+                }
                 app.input.insert_char(ch);
                 app.dirty = true;
                 return KeyResult::Handled;
@@ -101,6 +117,8 @@ pub enum KeyResult {
     Handled,
     /// Ctrl+C or Ctrl+D was pressed — caller should handle interrupt.
     Interrupt,
+    /// User pressed 1/2/3 on the park follow-up menu.
+    ParkMenuShortcut(char),
     /// User pressed Enter with text — caller should process the input.
     InputSubmitted(crate::terminal::app::UserInput),
 }

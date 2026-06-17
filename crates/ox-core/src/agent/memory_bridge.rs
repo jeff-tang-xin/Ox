@@ -44,11 +44,35 @@ pub fn format_durable_memory_block(engine: &WorkflowEngine) -> String {
         let snap = engine.exploration_snapshot_summary();
         if !snap.is_empty() {
             let excerpt: String = snap.chars().take(10_000).collect();
+            let label = if step_idx == 3 {
+                "【Preflight / 探索快照 — 勿重复相同命令】"
+            } else {
+                "【探索快照】"
+            };
             parts.push(format!(
-                "【探索快照】\n{excerpt}\n\
+                "{label}\n{excerpt}\n\
                  （大文件完整内容在 `.ox/exploration/`）"
             ));
         }
+    }
+
+    if step_idx == 3 {
+        if let Some(handoff) = crate::agent::execute_handoff::ExecuteHandoff::load(engine) {
+            let block: String = handoff.format_for_execute().chars().take(12_000).collect();
+            parts.push(block);
+        }
+        let findings = crate::agent::perception::findings_summary_block(engine);
+        if !findings.is_empty() {
+            parts.push(findings);
+        } else if let Some(report) = engine.get_execute_review_report() {
+            let snippet: String = report.chars().take(6000).collect();
+            parts.push(format!("【审查报告 — park 前输出】\n{snippet}"));
+        }
+    }
+
+    let guidance = engine.workflow_guidance_block();
+    if !guidance.is_empty() {
+        parts.push(guidance);
     }
 
     if step_idx >= 1 {

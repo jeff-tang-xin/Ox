@@ -242,6 +242,32 @@ impl PlanTracker {
         }
     }
 
+    /// Match a file path to a plan step (exact, basename, or target keyword).
+    pub fn step_for_path(&self, path: &str) -> Option<&PlanStep> {
+        let norm = normalize_path(path);
+        let basename = norm.rsplit('/').next().unwrap_or(&norm);
+        self.steps
+            .iter()
+            .find(|s| !s.file.is_empty() && normalize_path(&s.file) == norm)
+            .or_else(|| {
+                self.steps.iter().find(|s| {
+                    !s.file.is_empty()
+                        && normalize_path(&s.file)
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|b| b == basename)
+                })
+            })
+            .or_else(|| {
+                self.steps.iter().find(|s| {
+                    !s.target.is_empty()
+                        && (norm.contains(&normalize_path(&s.target))
+                            || basename.contains(&normalize_path(&s.target)))
+                })
+            })
+            .or_else(|| self.current_step())
+    }
+
     pub fn all_done(&self) -> bool {
         self.steps.iter().all(|s| {
             matches!(s.status, StepStatus::Done | StepStatus::Skipped)
@@ -278,6 +304,205 @@ pub fn tracker_from_json(s: &str) -> Option<PlanTracker> {
 
 pub fn tracker_to_json(tracker: &PlanTracker) -> String {
     serde_json::to_string(tracker).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Parse a parked code-review report into an implementation checklist.
+pub fn load_from_review_report(report: &str) -> Option<PlanTracker> {
+    let mut steps = extract_review_items(report);
+    if steps.is_empty() {
+        return None;
+    }
+    steps.sort_by_key(|s| s.index);
+    steps.dedup_by_key(|s| s.index);
+    if let Some(first) = steps.iter_mut().find(|s| s.status == StepStatus::Pending) {
+        first.status = StepStatus::InProgress;
+    }
+    let current_index = steps
+        .iter()
+        .find(|s| s.status == StepStatus::InProgress)
+        .map(|s| s.index)
+        .unwrap_or(1);
+    Some(PlanTracker {
+        steps,
+        current_index,
+    })
+}
+
+fn extract_review_items(report: &str) -> Vec<PlanStep> {
+    let mut steps = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for line in report.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with('|') {
+            let cols: Vec<&str> = line
+                .split('|')
+                .map(str::trim)
+                .filter(|c| !c.is_empty() && *c != "---")
+                .collect();
+            if cols.len() >= 3 {
+                if let Ok(n) = cols[0].parse::<u32>() {
+                    if seen.insert(n) {
+                        let file = cols
+                            .iter()
+                            .find_map(|c| {
+                                let p = extract_path_from_text(c);
+                                if p.is_empty() { None } else { Some(p) }
+                            })
+                            .unwrap_or_else(|| extract_path_from_text(line));
+                        let target = cols
+                            .iter()
+                            .find_map(|c| {
+                                let t = extract_symbol_target(c);
+                                if t.is_empty() { None } else { Some(t) }
+                            })
+                            .unwrap_or_default();
+                        let desc = cols.last().copied().unwrap_or("").to_string();
+                        if desc.chars().count() >= 8 || !file.is_empty() {
+                            steps.push(make_impl_step(n, file, target, desc));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some((n, rest)) = parse_numbered_review_line(line) {
+            if seen.insert(n) {
+                let file = extract_path_from_text(rest);
+                let target = extract_symbol_target(rest);
+                steps.push(make_impl_step(n, file, target, rest.to_string()));
+            }
+        }
+    }
+
+    steps
+}
+
+fn make_impl_step(index: u32, file: String, target: String, desc: String) -> PlanStep {
+    PlanStep {
+        index,
+        file,
+        action: "edit".to_string(),
+        target,
+        desc: desc.trim().to_string(),
+        verify: String::new(),
+        status: StepStatus::Pending,
+    }
+}
+
+fn parse_numbered_review_line(line: &str) -> Option<(u32, &str)> {
+    let trimmed = line.trim_start_matches('#').trim();
+    if let Some(rest) = trimmed.strip_prefix("问题") {
+        let num_part: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = num_part.parse::<u32>() {
+            let after = rest[num_part.len()..]
+                .trim_start_matches(['：', ':', '、', '.', ' '])
+                .trim();
+            if !after.is_empty() {
+                return Some((n, after));
+            }
+        }
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.first()?.is_ascii_digit() {
+        let mut end = 0usize;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        let n: u32 = trimmed[..end].parse().ok()?;
+        let rest = trimmed[end..].trim_start_matches(['.', '、', ')', '）', ':', '：', ' ']);
+        if rest.is_empty() {
+            return None;
+        }
+        Some((n, rest))
+    } else {
+        None
+    }
+}
+
+fn extract_path_from_text(s: &str) -> String {
+    let mut in_tick = false;
+    let mut buf = String::new();
+    for ch in s.chars() {
+        if ch == '`' {
+            if in_tick {
+                if looks_like_source_path(&buf) {
+                    return buf;
+                }
+                buf.clear();
+            }
+            in_tick = !in_tick;
+        } else if in_tick {
+            buf.push(ch);
+        }
+    }
+    for token in s.split(|c: char| c.is_whitespace() || c == '，' || c == ',') {
+        let t = token.trim_matches(|c: char| {
+            matches!(c, '(' | ')' | '（' | '）' | '[' | ']' | '*' | '：' | ':')
+        });
+        if looks_like_source_path(t) {
+            return t.to_string();
+        }
+    }
+    String::new()
+}
+
+fn looks_like_source_path(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let lower = s.to_lowercase();
+    [
+        ".java", ".kt", ".kts", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".cs",
+        ".vue", ".rb", ".php", ".scala", ".xml",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+fn extract_symbol_target(s: &str) -> String {
+    if let Some(start) = s.find("**") {
+        let rest = &s[start + 2..];
+        if let Some(end) = rest.find("**") {
+            return rest[..end].trim().to_string();
+        }
+    }
+    for key in [
+        "Controller",
+        "ServiceImpl",
+        "Service",
+        "RequestDto",
+        "RequestDTO",
+        "Dto",
+        "DTO",
+        "Dao",
+        "Util",
+        "Entity",
+    ] {
+        if let Some(pos) = s.find(key) {
+            let start = s[..pos]
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !c.is_alphanumeric() && *c != '_')
+                .map(|(i, _)| i + 1)
+                .unwrap_or(0);
+            let end = s[pos..]
+                .char_indices()
+                .find(|(_, c)| !c.is_alphanumeric() && *c != '_')
+                .map(|(i, _)| pos + i)
+                .unwrap_or(s.len());
+            let word = s[start..end].trim();
+            if !word.is_empty() {
+                return word.to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 /// Validate plan steps have minimum required fields and exploration depth.
@@ -688,5 +913,27 @@ mod tests {
         explored.insert("file_list:.".into());
         let plan = r#"{"structure_summary":"Node project with source under src/ and entry index.ts at project root layout","plan":[{"step":1,"file":"src/index.ts","action":"explain","target":"main","desc":"read typescript entry module for routing overview","verify":"file_read"}]}"#;
         assert!(validate_plan_paths_known(plan, &entries, &explored).is_err());
+    }
+
+    #[test]
+    fn load_from_review_report_table() {
+        let report = r#"
+## 审查结论
+
+| 1 | 高 | `OmsGlobalOrderController.java` | @Idempotent 缺少 waitTime |
+| 2 | 中 | RequestDTO | 删除 pi 字段 |
+"#;
+        let t = load_from_review_report(report).unwrap();
+        assert_eq!(t.steps.len(), 2);
+        assert_eq!(t.steps[0].action, "edit");
+        assert!(t.steps[0].file.contains("OmsGlobalOrderController.java"));
+    }
+
+    #[test]
+    fn load_from_review_report_numbered() {
+        let report = "1. **Controller** — @Idempotent 加 waitTime\n2. **Request DTO** — 删除 pi 字段";
+        let t = load_from_review_report(report).unwrap();
+        assert_eq!(t.steps.len(), 2);
+        assert_eq!(t.steps[0].target, "Controller");
     }
 }

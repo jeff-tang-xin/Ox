@@ -832,6 +832,11 @@ fn process_key_event(
             // Fallback: key_handler detected interrupt via pattern match
             helpers::handle_interrupt_key(app, &key, interrupt_ctrl);
         }
+        KeyResult::ParkMenuShortcut(ch) => {
+            agent_handler::handle_park_menu_shortcut(app, ch);
+            app.scroll_to_bottom();
+            app.user_scrolled = false;
+        }
         KeyResult::InputSubmitted(input) => {
             match input {
                 UserInput::Exit => {
@@ -995,23 +1000,68 @@ fn process_text_input(
     }
 
     if app.agent_running {
-        // Interjection during agent execution
+        let parked_resume = app
+            .workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .map(|e| e.is_workflow_parked())
+            .unwrap_or(false);
+
+        if !parked_resume {
+            let blocked = app
+                .workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .map(|e| !e.allows_midflight_interjection())
+                .unwrap_or(false);
+            if blocked {
+                app.output.push_system(
+                    ox_core::agent::workflow_phases::act_interjection_blocked_message(),
+                );
+                app.scroll_to_bottom();
+                app.dirty = true;
+                return;
+            }
+        }
+
+        // Interjection during agent execution — live channel only (no local buffer duplicate)
         let priority = if text.starts_with('!') {
             InterjectionPriority::Urgent
         } else {
             InterjectionPriority::Normal
         };
         let content = text.trim_start_matches('!').to_string();
-        if let Some(tx) = &app.ui_to_agent_tx {
-            let _ = tx.send(UiToAgentEvent::Interjection(content.clone()));
+        let delivered = if let Some(tx) = &app.ui_to_agent_tx {
+            tx.send(UiToAgentEvent::Interjection(content.clone())).is_ok()
+        } else {
+            false
+        };
+        if !delivered {
+            interjection_buf.push(content.clone(), priority);
         }
-        interjection_buf.push(content.clone(), priority);
+        let step_hint = if parked_resume {
+            "park-resume".to_string()
+        } else if let Some(name) = app
+            .workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .filter(|e| e.workflow_preserves_on_user_input())
+            .and_then(|e| e.current_step().map(|s| s.name.clone()))
+        {
+            format!("workflow·{name}")
+        } else {
+            "queued".to_string()
+        };
         let prefix = if priority == InterjectionPriority::Urgent {
             "(urgent!)"
         } else {
-            "(queued)"
+            "(介入)"
         };
-        app.output.push_line(OutputLine::System(format!("{} {}", prefix, content.trim())));
+        app.output.push_line(OutputLine::System(format!(
+            "{} [{step_hint}] {}",
+            prefix,
+            content.trim()
+        )));
         app.scroll_to_bottom();
         app.user_scrolled = false;
         app.dirty = true;
@@ -1029,6 +1079,161 @@ fn process_text_input(
 
     // Reset interrupt flag on new user input
     app.workflow_interrupted = false;
+
+    // ── Requirement clarification (after Intent, before Plan / Execute confirm) ──
+    let awaiting_clarification = app
+        .workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|e| e.is_awaiting_clarification())
+        .unwrap_or(false);
+
+    if awaiting_clarification {
+        let answer = if injection::is_suspicious(text) {
+            injection::sanitize(text)
+        } else {
+            text.to_string()
+        };
+        let mut spawn_after_park = false;
+        let wf_clone = app.workflow_engine.clone();
+        if let Some(wf) = wf_clone {
+            if let Ok(mut engine) = wf.try_lock() {
+                if engine.is_park_disambiguation_awaiting() {
+                    match engine.finish_park_disambiguation(&answer) {
+                        Ok(
+                            ox_core::agent::requirement_clarification::ParkFollowUpOutcome::Resolved(
+                                resolution,
+                            ),
+                        ) => {
+                            let is_new_task = matches!(
+                                resolution,
+                                ox_core::agent::requirement_clarification::ParkDisambiguationResolution::NewTask { .. }
+                            );
+                            let is_feedback = matches!(
+                                resolution,
+                                ox_core::agent::requirement_clarification::ParkDisambiguationResolution::Feedback { .. }
+                            );
+                            let is_continue_impl = matches!(
+                                resolution,
+                                ox_core::agent::requirement_clarification::ParkDisambiguationResolution::ContinuePrevious { .. }
+                            );
+                            let user_msg =
+                                engine.apply_park_disambiguation_resolution(resolution);
+                            let _ = session.append_message(Message::user(&answer));
+                            if is_feedback {
+                                if let Some(block) = user_msg {
+                                    let _ = session.append_message(Message::user(&block));
+                                }
+                                app.clear_workflow_confirmation();
+                                app.output.push_system(
+                                    "💬 意见模式 — 只讨论审查结论，不会修改代码或进入实施",
+                                );
+                            } else if is_continue_impl {
+                                if let Some(block) = user_msg {
+                                    let _ = session.append_message(Message::user(&block));
+                                }
+                                app.clear_workflow_confirmation();
+                                app.output.push_system(
+                                    "✅ 已根据你的选择继续实施（不重新 Plan）",
+                                );
+                            } else if is_new_task {
+                                let _ = session.append_message(Message::system(format!(
+                                    "【新任务】\n{}",
+                                    answer.chars().take(500).collect::<String>()
+                                )));
+                                app.clear_workflow_confirmation();
+                                app.output.push_system("🆕 已开始新任务，从 Intent 重新执行…");
+                            }
+                            app.dirty = true;
+                            spawn_after_park = true;
+                        }
+                        Ok(
+                            ox_core::agent::requirement_clarification::ParkFollowUpOutcome::NeedDetail {
+                                hint,
+                            },
+                        ) => {
+                            if let Some(tag) = agent_handler::park_tag_from_menu_answer(&answer) {
+                                app.park_follow_up_tag = Some(tag);
+                            }
+                            app.output.push_system(&hint);
+                            app.workflow_awaiting_confirmation = Some(4);
+                            app.agent_running = false;
+                            app.status = match app.park_follow_up_tag {
+                                Some(crate::terminal::app::ParkFollowUpTag::Continue) => {
+                                    "✏️ [继续] 请说明要修复/执行的范围".to_string()
+                                }
+                                Some(crate::terminal::app::ParkFollowUpTag::Feedback) => {
+                                    app.output.push_system(
+                                        "💬 意见模式：只讨论审查结论，不会修改代码或进入实施",
+                                    );
+                                    "💬 [意见·只读] 请说明你的澄清或质疑".to_string()
+                                }
+                                Some(crate::terminal::app::ParkFollowUpTag::NewTask) => {
+                                    "🆕 [新任务] 请描述新任务".to_string()
+                                }
+                                None => app.status.clone(),
+                            };
+                            app.dirty = true;
+                            return;
+                        }
+                        Err(hint) => {
+                            app.output.push_system(&hint);
+                            app.workflow_awaiting_confirmation = Some(4);
+                            app.dirty = true;
+                            return;
+                        }
+                    }
+                } else {
+                    match engine.finish_clarification_and_advance(&answer) {
+                        Ok(target) => {
+                            let _ = session.append_message(Message::user(&answer));
+                            let _ = session.append_message(Message::system(format!(
+                                "【需求澄清 — 用户已回答】\n{answer}"
+                            )));
+                            if target == 3 {
+                                let md = engine.build_execute_confirmation_markdown("", 0);
+                                engine.arm_execute_confirmation_with_markdown(&md, 0);
+                                app.workflow_awaiting_confirmation = Some(2);
+                                app.output.push_system(&md);
+                                app.dirty = true;
+                                return;
+                            }
+                            app.output.push_system("✅ 需求已澄清，进入规划阶段…");
+                        }
+                        Err(hint) => {
+                            let md = engine.clarification_markdown();
+                            app.output.push_system(&hint);
+                            agent_handler::handle_workflow_awaiting_confirmation(app, 0, &md);
+                            app.dirty = true;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if spawn_after_park {
+            spawn_next_workflow_step_if_needed(
+                app, session, provider, agent_tx, tool_registry, tool_ctx,
+                context_builder, context_window, interrupt_ctrl, agent_config,
+                trust_manager, config, rt_env, "",
+            );
+            return;
+        }
+        if !app
+            .workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .is_some_and(|e| e.is_park_disambiguation_awaiting())
+        {
+            app.dirty = true;
+            spawn_next_workflow_step_if_needed(
+                app, session, provider, agent_tx, tool_registry, tool_ctx,
+                context_builder, context_window, interrupt_ctrl, agent_config,
+                trust_manager, config, rt_env, "",
+            );
+        }
+        return;
+    }
 
     // ── Workflow confirmation handling: user sent text while workflow awaits confirmation ──
     let pending_confirmation_step = if let Some(ref wf) = app.workflow_engine {
@@ -1137,17 +1342,46 @@ fn process_text_input(
         text.to_string()
     };
 
-    // New user round: archive previous task, reset workflow ephemeral state
+    // New user round: archive previous task, or append workflow guidance mid-flight
     if pending_confirmation_step.is_none() {
-        if let Some(ref wf) = app.workflow_engine {
+        let wf_clone = app.workflow_engine.clone();
+        if let Some(wf) = wf_clone {
             if let Ok(mut engine) = wf.try_lock() {
+                if !engine.accepts_user_round_input(&text) {
+                    app.output.push_system(
+                        ox_core::agent::workflow_phases::act_interjection_blocked_message(),
+                    );
+                    app.dirty = true;
+                    return;
+                }
+                if engine.workflow_preserves_on_user_input() {
+                    let step_name = engine
+                        .current_step()
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "当前步骤".to_string());
+                    let step_idx = engine.get_current_step_index();
+                    app.output.push_system(&format!(
+                        "💬 workflow 介入 — 继续步骤 {} ({})，不会从 Intent 重来",
+                        step_idx + 1,
+                        step_name
+                    ));
+                }
                 engine.begin_user_round(&text);
+                if engine.is_park_disambiguation_awaiting() {
+                    let md = engine.clarification_markdown();
+                    agent_handler::handle_workflow_awaiting_confirmation(app, 4, &md);
+                    app.dirty = true;
+                    let _ = session.append_message(Message::user(&text));
+                    return;
+                }
             }
         }
     }
 
-    // Save user message
-    let _ = session.append_message(Message::user(&text));
+    // Save user message (skip if park disambiguation already saved above)
+    if app.workflow_awaiting_confirmation != Some(4) {
+        let _ = session.append_message(Message::user(&text));
+    }
 
     // Workflow feedback detection
     detect_workflow_feedback(app, session, &text);
@@ -1517,8 +1751,8 @@ fn process_agent_event(
                     );
                 }
                 HandleResult::BackgroundDone => {}
-                HandleResult::InterjectionTriggered { text: _, turn_messages, .. } => {
-                    // Spawn new agent turn for interjection
+                HandleResult::InterjectionTriggered { turn_messages, .. } => {
+                    // Fallback when live interjection channel was unavailable — continue current workflow step
                     app.agent_running = true;
                     app.status = "🧠 Thinking...".to_string();
                     let p = Arc::clone(provider.as_ref().unwrap());
@@ -1531,6 +1765,15 @@ fn process_agent_event(
                     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
                     app.ui_to_agent_tx = Some(ui_tx);
                     let wf = app.workflow_engine.clone();
+                    let mut turn_messages = turn_messages;
+                    if let Some(ref wf_engine) = app.workflow_engine {
+                        if let Ok(engine) = wf_engine.try_lock() {
+                            let block = engine.durable_memory_block();
+                            if !block.is_empty() {
+                                turn_messages.push(Message::system(&block));
+                            }
+                        }
+                    }
                     tokio::spawn(async move {
                         agent::run_agent_turn(
                             p, turn_messages, registry, ctx, tx, ui_rx,
@@ -1574,6 +1817,10 @@ fn process_agent_event(
             ) {
                 *tool_ctx = new_ctx;
             }
+            app.dirty = true;
+        }
+        AgentToUiEvent::WorkflowParked { message } => {
+            app.output.push_system(&message);
             app.dirty = true;
         }
         AgentToUiEvent::WorkflowCompleted { task_description, execution_summary } => {
@@ -1623,6 +1870,15 @@ fn spawn_next_workflow_step_if_needed(
         return;
     }
 
+    if let Some(ref wf) = app.workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            if engine.is_workflow_parked() {
+                tracing::info!("[WORKFLOW] Skipping auto-spawn: task session parked for user");
+                return;
+            }
+        }
+    }
+
     let (step_prompt, step_idx, should_continue, awaiting_confirmation) = if let Some(ref wf) = app.workflow_engine {
         if let Ok(engine) = wf.try_lock() {
             let prompt = engine.get_step_system_prompt();
@@ -1636,6 +1892,16 @@ fn spawn_next_workflow_step_if_needed(
 
     if !should_continue || provider.is_none() {
         return;
+    }
+
+    // Parked 会话不 respawn；首次进入 Execute（用户确认后）仍须 spawn
+    if let Some(ref wf) = app.workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            if engine.is_workflow_parked() {
+                tracing::info!("[WORKFLOW] Skipping auto-spawn: task session parked for user");
+                return;
+            }
+        }
     }
 
     // ── Don't auto-spawn if workflow is waiting for user confirmation ──

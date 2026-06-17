@@ -96,6 +96,15 @@ pub enum UserInput {
     Exit,
 }
 
+/// Park follow-up menu choice shown as an input tag after pressing 1/2/3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkFollowUpTag {
+    Continue,
+    /// Read-only discussion — no implementation.
+    Feedback,
+    NewTask,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingConfirmation {
     pub tool_call_id: String,
@@ -153,6 +162,8 @@ pub struct App {
     pub pending_confirmation: Option<PendingConfirmation>,
     /// Workflow step index awaiting user confirmation (e.g. Plan review at step 1).
     pub workflow_awaiting_confirmation: Option<usize>,
+    /// After park menu shortcut 1/2/3 — tag shown in the input pane until submit.
+    pub park_follow_up_tag: Option<ParkFollowUpTag>,
     /// Skill draft awaiting user confirmation before save.
     pub pending_skill_draft: Option<PendingSkillDraft>,
     /// Skill review queued while agent is still running.
@@ -262,6 +273,7 @@ impl App {
             user_scrolled: false,
             pending_confirmation: None,
             workflow_awaiting_confirmation: None,
+            park_follow_up_tag: None,
             pending_skill_draft: None,
             queued_skill_draft: None,
             ui_to_agent_tx: None,
@@ -313,6 +325,11 @@ impl App {
         }
     }
 
+    pub fn clear_workflow_confirmation(&mut self) {
+        self.workflow_awaiting_confirmation = None;
+        self.park_follow_up_tag = None;
+    }
+
     pub fn submit_input(&mut self) -> Option<UserInput> {
         let text = self.input.submit();
         if text.is_empty() {
@@ -320,7 +337,14 @@ impl App {
         }
 
         let trimmed = text.trim();
-        self.output.push_line(OutputLine::User(trimmed.to_string()));
+        let display = match self.park_follow_up_tag {
+            Some(ParkFollowUpTag::Feedback) => format!("[意见] {trimmed}"),
+            Some(ParkFollowUpTag::NewTask) => format!("[新任务] {trimmed}"),
+            Some(ParkFollowUpTag::Continue) => format!("[继续] {trimmed}"),
+            None => trimmed.to_string(),
+        };
+        self.output.push_line(OutputLine::User(display));
+        self.park_follow_up_tag = None;
 
         if let Some(stripped) = trimmed.strip_prefix('/') {
             let mut parts = stripped.splitn(2, char::is_whitespace);
