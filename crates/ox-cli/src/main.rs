@@ -1095,6 +1095,7 @@ fn process_text_input(
             text.to_string()
         };
         let mut spawn_after_park = false;
+        let mut reflect_on_new_task: Option<(String, String)> = None;
         let wf_clone = app.workflow_engine.clone();
         if let Some(wf) = wf_clone {
             if let Ok(mut engine) = wf.try_lock() {
@@ -1117,6 +1118,9 @@ fn process_text_input(
                                 resolution,
                                 ox_core::agent::requirement_clarification::ParkDisambiguationResolution::ContinuePrevious { .. }
                             );
+                            if is_new_task {
+                                reflect_on_new_task = Some(engine.snapshot_for_skill_reflect());
+                            }
                             let user_msg =
                                 engine.apply_park_disambiguation_resolution(resolution);
                             let _ = session.append_message(Message::user(&answer));
@@ -1212,6 +1216,12 @@ fn process_text_input(
             }
         }
         if spawn_after_park {
+            if let Some((task_description, execution_summary)) = reflect_on_new_task {
+                let _ = agent_tx.send(AgentToUiEvent::WorkflowCompleted {
+                    task_description,
+                    execution_summary,
+                });
+            }
             spawn_next_workflow_step_if_needed(
                 app, session, provider, agent_tx, tool_registry, tool_ctx,
                 context_builder, context_window, interrupt_ctrl, agent_config,

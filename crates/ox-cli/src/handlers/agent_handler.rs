@@ -734,6 +734,8 @@ pub fn handle_workflow_completed(
     execution_summary: String,
     agent_config: &Arc<ox_core::config::AgentConfig>,
 ) {
+    app.clear_workflow_confirmation();
+    app.agent_running = false;
     tracing::info!(
         "[AUTO-REFLECT] Workflow completed. Task: {}, Summary: {}",
         task_description,

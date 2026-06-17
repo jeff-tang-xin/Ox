@@ -223,7 +223,8 @@ fn push_interjection_message(
 
 enum SessionResumeAction {
     Continue,
-    NewTask,
+    /// End current workflow; optional `(task, execution_summary)` captured before reset.
+    NewTask(Option<(String, String)>),
 }
 
 /// Block the agent loop until the user sends follow-up (parked task session).
@@ -258,6 +259,11 @@ async fn wait_for_session_resume(
                                             resolution,
                                             crate::agent::requirement_clarification::ParkDisambiguationResolution::NewTask { .. }
                                         );
+                                        let reflect = if is_new_task {
+                                            Some(engine.snapshot_for_skill_reflect())
+                                        } else {
+                                            None
+                                        };
                                         let user_msg =
                                             engine.apply_park_disambiguation_resolution(resolution);
                                         drop(engine);
@@ -273,7 +279,7 @@ async fn wait_for_session_resume(
                                             },
                                         ));
                                         return Ok(if is_new_task {
-                                            SessionResumeAction::NewTask
+                                            SessionResumeAction::NewTask(reflect)
                                         } else {
                                             SessionResumeAction::Continue
                                         });
@@ -306,10 +312,11 @@ async fn wait_for_session_resume(
                                 if crate::agent::engine::WorkflowEngine::looks_like_new_task(
                                     &sanitized,
                                 ) {
+                                    let reflect = Some(engine.snapshot_for_skill_reflect());
                                     let _ = engine.finish_workflow_session();
                                     engine.begin_user_round(&sanitized);
                                     messages.push(Message::user(&sanitized));
-                                    return Ok(SessionResumeAction::NewTask);
+                                    return Ok(SessionResumeAction::NewTask(reflect));
                                 }
                                 engine.arm_park_follow_up_menu();
                                 let md = engine.clarification_markdown();
@@ -938,11 +945,13 @@ pub async fn run_agent_turn(
                                 iteration += 1;
                                 continue;
                             }
-                            Ok(SessionResumeAction::NewTask) => {
-                                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                            Ok(SessionResumeAction::NewTask(reflect)) => {
+                                finish_session_with_new_task(
+                                    &ui_tx,
                                     new_messages,
-                                    usage: total_usage,
-                                });
+                                    total_usage,
+                                    reflect,
+                                );
                                 return;
                             }
                             Err(()) => {
@@ -1007,11 +1016,13 @@ pub async fn run_agent_turn(
                                         iteration += 1;
                                         continue;
                                     }
-                                    Ok(SessionResumeAction::NewTask) => {
-                                        let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                                    Ok(SessionResumeAction::NewTask(reflect)) => {
+                                        finish_session_with_new_task(
+                                            &ui_tx,
                                             new_messages,
-                                            usage: total_usage,
-                                        });
+                                            total_usage,
+                                            reflect,
+                                        );
                                         return;
                                     }
                                     Err(()) => {
@@ -1405,7 +1416,31 @@ pub async fn run_agent_turn(
             }
             // ── Workflow auto-advance END ──
 
-            // Execute 纯文本输出但未走上方 park 分支 → 仍须 park，禁止 TurnDone + spawn_next 再跑一轮
+            // Execute ## Done on standard coding path → complete workflow (no park menu).
+            if pre_llm_step_idx == 3 {
+                if let Some(ref engine_arc) = workflow_engine {
+                    let mut engine = engine_arc.lock().await;
+                    if engine.should_finish_execute_workflow(&step_output_text) {
+                        engine.set_previous_output(&step_output_text);
+                        let _ = engine.complete_workflow();
+                        emit_workflow_completed(
+                            &ui_tx,
+                            user_task.as_ref(),
+                            &engine,
+                            &step_output_text,
+                        );
+                        drop(engine);
+                        let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
+                        let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                            new_messages,
+                            usage: total_usage,
+                        });
+                        return;
+                    }
+                }
+            }
+
+            // Execute 纯文本输出但未走上方 park 分支 → read-only review may park for follow-up
             if pre_llm_step_idx == 3 {
                 if let Some(ref engine_arc) = workflow_engine {
                     let mut engine = engine_arc.lock().await;
@@ -1437,11 +1472,13 @@ pub async fn run_agent_turn(
                                 iteration += 1;
                                 continue;
                             }
-                            Ok(SessionResumeAction::NewTask) => {
-                                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+                            Ok(SessionResumeAction::NewTask(reflect)) => {
+                                finish_session_with_new_task(
+                                    &ui_tx,
                                     new_messages,
-                                    usage: total_usage,
-                                });
+                                    total_usage,
+                                    reflect,
+                                );
                                 return;
                             }
                             Err(()) => {
@@ -3161,6 +3198,25 @@ fn emit_workflow_completed(
         task_description,
         execution_summary,
     });
+}
+
+/// TurnDone first (sync session messages), then WorkflowCompleted for skill reflect.
+fn finish_session_with_new_task(
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    new_messages: Vec<Message>,
+    usage: TokenUsage,
+    reflect: Option<(String, String)>,
+) {
+    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+        new_messages,
+        usage,
+    });
+    if let Some((task_description, execution_summary)) = reflect {
+        let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
+            task_description,
+            execution_summary,
+        });
+    }
 }
 
 /// Dedup key for same-tool loop detection (file_read includes offset/limit).

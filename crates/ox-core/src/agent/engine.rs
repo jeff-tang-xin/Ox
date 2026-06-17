@@ -1724,17 +1724,33 @@ impl WorkflowEngine {
             .unwrap_or(false)
     }
 
+    /// Whether Execute output should park for user follow-up (read-only review only).
     pub fn should_park_execute_output(&self, text: &str) -> bool {
         if self.get_current_step_index() != 3 {
             return false;
         }
-        if crate::agent::workflow_session::is_implementation_phase(self) {
-            return Self::text_signals_done(text);
+        // Standard Intent→Plan→Review→Execute: finish on ## Done — no park menu.
+        if !self.is_perceive_execute() {
+            return false;
         }
         if Self::text_signals_done(text) {
             return true;
         }
         self.is_explaining_execute() && Self::looks_like_review_report(text)
+    }
+
+    /// Standard coding workflow: Execute ## Done → complete workflow (not park).
+    pub fn should_finish_execute_workflow(&self, text: &str) -> bool {
+        if self.get_current_step_index() != 3
+            || !Self::text_signals_done(text)
+            || self.is_perceive_execute()
+        {
+            return false;
+        }
+        if !self.should_skip_plan_done_gate() && self.check_plan_done_gate().is_some() {
+            return false;
+        }
+        true
     }
 
     pub fn mark_execute_report_delivered(&self) {
@@ -2112,6 +2128,21 @@ impl WorkflowEngine {
         } else {
             summaries.join("\n\n")
         }
+    }
+
+    /// Snapshot task + step outputs for skill reflection before workflow reset.
+    pub fn snapshot_for_skill_reflect(&self) -> (String, String) {
+        let task_description = self
+            .get_variable("_current_user_request")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Unknown task".to_string());
+        let summary = self.get_all_step_outputs_summary();
+        let execution_summary = if summary == "（无上一步输出）" {
+            String::new()
+        } else {
+            summary
+        };
+        (task_description, execution_summary)
     }
 
     /// Check if the LLM's response should auto-advance to the next step.
@@ -2511,7 +2542,12 @@ mod advance_tests {
 
     #[test]
     fn looks_like_review_report_detects_table() {
-        let t = "代码审查\n| 优先级 | 问题 |\n| 高 | 并发 |\n| 中 | NPE |\n建议修复并发。完成";
+        let t = "代码审查报告（CompleteDocumentStrategy 与相关 service）\n\n\
+            | 优先级 | 问题 | 文件 |\n| 高 | 并发竞态可能导致重复提交 | Foo.java |\n\
+            | 中 | NPE 风险在 sap 响应解析 | Bar.java |\n| 低 | 命名与注释不一致 | Baz.java |\n\n\
+            建议优先修复并发与空指针问题，并补充集成测试。审查范围覆盖 service 层与 controller 层，\
+            详见上文各条 findings。完成";
+        assert!(t.chars().count() >= 180);
         assert!(WorkflowEngine::looks_like_review_report(t));
     }
 
@@ -2546,6 +2582,22 @@ mod advance_tests {
         assert!(done);
         assert!(engine.is_workflow_parked());
         assert!(!engine.is_workflow_complete());
+    }
+
+    #[test]
+    fn coding_execute_done_completes_without_park() {
+        let mut engine = test_engine_at_execute_with_workflow();
+        engine.set_variable(
+            "_step0_output",
+            r#"{"intent":"coding","complexity":"simple","topic":"update readme","pipeline":"standard","routing_reason":"编码任务"}"#.to_string(),
+        );
+        assert!(!engine.should_park_execute_output("## Done\n\n所有任务已完成。"));
+        assert!(engine.should_finish_execute_workflow("## Done\n\n所有任务已完成。"));
+        let done = engine
+            .try_complete_execute_on_done("## Done\n\n所有任务已完成。")
+            .unwrap();
+        assert!(!done);
+        assert!(!engine.is_workflow_parked());
     }
 
     #[test]
@@ -2630,7 +2682,7 @@ mod advance_tests {
     }
 
     #[test]
-    fn fast_coding_done_parks_despite_pending_plan_steps() {
+    fn fast_coding_done_finishes_without_park() {
         let mut engine = test_engine_at_execute_with_workflow();
         engine.set_variable(
             "_step0_output",
@@ -2641,12 +2693,12 @@ mod advance_tests {
             r#"{"steps":[{"index":1,"file":"","action":"modify","target":"","desc":"commit","status":"pending"}],"current_index":1}"#.to_string(),
         );
         assert!(!engine.is_workflow_complete());
-        let done = engine
-            .try_complete_execute_on_done("## Done\n\n提交完成。")
-            .unwrap();
-        assert!(done);
-        assert!(engine.is_workflow_parked());
-        assert!(!engine.is_workflow_complete());
+        let text = "## Done\n\n提交完成。";
+        assert!(!engine.should_park_execute_output(text));
+        assert!(engine.should_finish_execute_workflow(text));
+        let done = engine.try_complete_execute_on_done(text).unwrap();
+        assert!(!done);
+        assert!(!engine.is_workflow_parked());
     }
 
     #[test]
@@ -2660,10 +2712,11 @@ mod advance_tests {
             "_plan_tracker",
             r#"{"steps":[{"index":1,"file":"main.rs","action":"modify","target":"","desc":"fix","status":"pending"}],"current_index":1}"#.to_string(),
         );
-        let err = engine
-            .try_complete_execute_on_done("## Done")
-            .unwrap_err();
-        assert!(err.contains("计划") || err.contains("plan") || err.contains("Done"));
+        assert!(!engine.should_park_execute_output("## Done"));
+        assert!(!engine.should_finish_execute_workflow("## Done"));
+        let (next, err) = engine.advance_on_output("## Done", false);
+        assert!(next.is_none());
+        assert!(err.is_some());
         assert!(!engine.is_workflow_complete());
     }
 
