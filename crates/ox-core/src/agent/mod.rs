@@ -855,6 +855,13 @@ pub async fn run_agent_turn(
             if crate::agent::engine::WorkflowEngine::looks_like_review_report(&content_for_session) {
                 upsert_review_report_assistant(&mut messages, &msg);
                 upsert_review_report_assistant(&mut new_messages, &msg);
+                if let Some(ref engine_arc) = workflow_engine {
+                    if let Ok(engine) = engine_arc.try_lock() {
+                        if engine.is_single_step() {
+                            engine.mark_execute_report_delivered();
+                        }
+                    }
+                }
             } else if workflow_active
                 && crate::agent::idle_narrative::is_idle_narrative(&content_for_session)
             {

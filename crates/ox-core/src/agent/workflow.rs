@@ -122,7 +122,7 @@ const TASK_PROMPT: &str = "\
 最终 ## Done 时所有项必须是 `- [x]`（门禁校验，未完成会被打回）。
 
 【审查任务 — 输出 findings】
-检查/审查代码时，除文字报告外，附独立 findings JSON 块；之后修复时 ## Done 须带 completion_receipt 对应每条 finding：
+检查/审查代码时，除文字报告外，附独立 findings JSON 块，然后 ## Done 结束（**只审查、不改代码**时到此为止，无需 completion_receipt）：
 ```json
 {
   \"findings_summary\": \"≥30字结论\",
@@ -131,6 +131,7 @@ const TASK_PROMPT: &str = "\
   ]
 }
 ```
+用户要求**修复** findings 时，## Done 才须附 completion_receipt：
 
 {COMPLETION_RECEIPT_SCHEMA}
 
@@ -140,7 +141,7 @@ file_write, edit_file, delete_range, shell_exec, git_status, git_diff, load_skil
 【完成格式】
 ## Done
 <做了什么 + 验证结果，1–3 行>
-（有计划则附最终勾选状态；有 findings 则附 completion_receipt JSON）
+（有计划则附最终勾选状态；**仅修复任务**附 completion_receipt JSON）
 ";
 
 /// Single-step agent workflow — no Intent/Plan/Review pipeline.

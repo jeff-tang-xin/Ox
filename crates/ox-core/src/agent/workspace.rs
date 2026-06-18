@@ -187,7 +187,17 @@ fn infer_mode(engine: &WorkflowEngine) -> WorkspaceMode {
         }
         return WorkspaceMode::ExecuteReview;
     }
-    // Single-step model: default to open task execution.
+    // Single-step: review/explain by default; implementation only when user asks to fix.
+    if engine.is_single_step() {
+        let user = engine
+            .get_variable("_current_user_request")
+            .unwrap_or_default();
+        if crate::agent::workflow_session::looks_like_implementation_request(&user) {
+            return WorkspaceMode::ExecuteImpl;
+        }
+        return WorkspaceMode::ExecuteReview;
+    }
+    // Legacy default
     WorkspaceMode::ExecuteImpl
 }
 

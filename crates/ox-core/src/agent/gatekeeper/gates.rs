@@ -141,6 +141,10 @@ impl Gate for ScopeGate {
         if store.findings.is_empty() {
             return GateOutcome::Pass;
         }
+        // Review-only ## Done: findings reported, no code edited — receipt not required yet.
+        if !ctx.had_code_changes {
+            return GateOutcome::Pass;
+        }
         match completion::extract_from_text(ctx.assistant_text) {
             Some(receipt) => match completion::validate(ctx.engine, &receipt) {
                 Ok(()) => GateOutcome::Pass,
@@ -214,6 +218,19 @@ mod tests {
     fn scope_passes_without_findings() {
         let e = engine();
         assert_eq!(ScopeGate.check(&ctx(&e, "## Done x", false)), GateOutcome::Pass);
+    }
+
+    #[test]
+    fn scope_passes_review_done_without_receipt() {
+        let e = engine();
+        e.set_variable(
+            "_findings_store",
+            r#"{"summary":"ok","findings":[{"index":1,"severity":"high","file":"a.rs","symbol":"","issue":"x","recommendation":"","status":"open","user_notes":[],"dispute":null,"impl_log":[]}],"active_indices":[]}"#.into(),
+        );
+        assert_eq!(
+            ScopeGate.check(&ctx(&e, "## Done\n审查完成，见上文", false)),
+            GateOutcome::Pass
+        );
     }
 
     #[test]

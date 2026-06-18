@@ -123,10 +123,20 @@ pub fn is_step_deliverable(ctx: &IdleContext<'_>, content: &str) -> bool {
         return false;
     }
     match ctx.step_idx {
-        0 => crate::agent::engine::extract_json_block(t)
-            .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
-            .map(|v| v.get("routing").is_some() || v.get("intent").is_some())
-            .unwrap_or(false),
+        0 => {
+            if let Some(engine) = ctx.engine {
+                if engine.is_single_step() {
+                    return WorkflowEngine::text_signals_done(t)
+                        || WorkflowEngine::looks_like_review_report(t)
+                        || crate::agent::perception::extract_from_text(t).is_some()
+                        || (!is_idle_narrative(t) && t.chars().count() >= 80);
+                }
+            }
+            crate::agent::engine::extract_json_block(t)
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                .map(|v| v.get("routing").is_some() || v.get("intent").is_some())
+                .unwrap_or(false)
+        }
         1 => {
             if crate::agent::engine::extract_json_block(t)
                 .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
@@ -178,6 +188,10 @@ pub fn idle_streak_limit(ctx: &IdleContext<'_>) -> u32 {
 }
 
 pub fn directive_for(ctx: &IdleContext<'_>) -> String {
+    if ctx.engine.is_some_and(|e| e.is_single_step()) {
+        return "审查/问答：输出报告 + findings JSON + ## Done 即结束；禁止重复 file_read/shell 读同一文件。"
+            .into();
+    }
     match ctx.step_idx {
         0 => "立即输出 intent JSON（含 routing），不要解释。".into(),
         1 => {
