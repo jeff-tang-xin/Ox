@@ -201,7 +201,9 @@ impl AutoReflector {
         let (tx, mut rx) = mpsc::unbounded_channel::<crate::llm::LlmStreamEvent>();
         
         // Use stream_chat and collect the full response
-        self.llm_provider.stream_chat(&messages, &[], tx).await?;
+        self.llm_provider
+            .stream_chat(&messages, &[], tx, crate::llm::StreamOptions::default())
+            .await?;
         
         let mut full_content = String::new();
         while let Some(event) = rx.recv().await {

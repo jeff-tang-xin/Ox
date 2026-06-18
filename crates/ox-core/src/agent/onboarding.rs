@@ -83,6 +83,48 @@ pub fn is_onboarding_turn(messages: &[Message]) -> bool {
     })
 }
 
+/// True when assistant output in this batch signals onboarding completion.
+pub fn turn_signals_onboarding_done(new_messages: &[Message]) -> bool {
+    new_messages.iter().any(|m| {
+        matches!(m, Message::Assistant { content, .. }
+            if crate::agent::engine::WorkflowEngine::text_signals_done(content))
+    })
+}
+
+/// Task text for skill reflect / round archive after onboarding.
+pub fn extract_onboarding_task(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .find_map(|m| {
+            if let Message::User { content } = m {
+                if content.contains("首次进入") || content.contains("project-conventions") {
+                    Some(content.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "首次进入 — 创建项目 Skill".to_string())
+}
+
+/// Reset CLI workflow engine after onboarding (agent ran without workflow).
+pub fn finalize_cli_workflow_after_onboarding(
+    engine: &mut crate::agent::engine::WorkflowEngine,
+    session: &mut crate::message::Session,
+    task: &str,
+) -> anyhow::Result<()> {
+    engine.reset_workflow();
+    engine.set_variable("_current_user_request", task.to_string());
+    engine.set_variable(crate::agent::user_round::ROUND_FINALIZED_KEY, "1".into());
+    crate::agent::post_edit_verification::clear_verify_state(engine);
+    crate::agent::workflow_phases::clear_phase(engine);
+    let wf_id = crate::agent::workflow::DEFAULT_WORKFLOW_ID;
+    session.persist_workflow_state("pipeline", wf_id, 0, None)?;
+    Ok(())
+}
+
 /// System directive injected before the user onboarding task (no 4-step workflow).
 pub fn onboarding_system_directive(greenfield: bool) -> String {
     let greenfield_note = if greenfield {
@@ -261,5 +303,15 @@ mod tests {
         ];
         assert!(is_onboarding_turn(&msgs));
         assert!(!is_onboarding_turn(&[Message::user("hi")]));
+    }
+
+    #[test]
+    fn turn_signals_onboarding_done_detects_assistant() {
+        let msgs = vec![Message::Assistant {
+            content: "## Done\n\nskills written".into(),
+            tool_calls: vec![],
+            reasoning_content: None,
+        }];
+        assert!(turn_signals_onboarding_done(&msgs));
     }
 }

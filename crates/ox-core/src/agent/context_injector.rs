@@ -25,37 +25,23 @@ pub fn inject_context(
     workflow_engine: &Option<Arc<Mutex<WorkflowEngine>>>,
 ) {
     strip_prior_step_memory(messages);
+    strip_prior_discipline(messages);
 
     if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
-            let step_idx = engine.get_current_step_index();
-
-            // ── Plan step: exploration memory every iteration ──
-            if step_idx == 1 {
-                inject_plan_step_memory(messages, iteration, &engine);
+            if engine.is_workflow_active() && !engine.is_workflow_complete() {
+                // Per-iteration refresh: full body on iter 0, one-liner after.
+                messages.push(Message::system(
+                    &crate::agent::idle_narrative::discipline_for_iteration(iteration),
+                ));
+                crate::agent::workspace::inject_workspace(messages, &engine);
+                inject_task_step_memory(messages, iteration, &engine);
                 return;
-            }
-
-            // ── Execute step: execution progress every iteration ──
-            if step_idx == 3 {
-                inject_execute_step_memory(messages, iteration, &engine);
-                return;
-            }
-
-            // ── Review: one-shot prior outputs on first iteration ──
-            if step_idx == 2 && iteration == 0 {
-                let summary = engine.get_all_step_outputs_summary();
-                if summary != "（无上一步输出）" {
-                    messages.push(Message::system(&format!(
-                        "{STEP_MEMORY_TAG}\n【前序步骤摘要】\n{summary}"
-                    )));
-                    return;
-                }
             }
         }
     }
 
-    // ── Generic fallback (non-workflow or unmatched) ──
+    // ── Generic fallback (non-workflow) ──
     if iteration == 0 {
         return;
     }
@@ -91,133 +77,59 @@ pub fn inject_context(
     }
 }
 
+fn strip_prior_discipline(messages: &mut Vec<Message>) {
+    messages.retain(|m| {
+        !matches!(
+            m,
+            Message::System { content }
+                if content.starts_with("【输出纪律】")
+        )
+    });
+}
+
 fn strip_prior_step_memory(messages: &mut Vec<Message>) {
     messages.retain(|m| {
         !matches!(m, Message::System { content } if content.starts_with(STEP_MEMORY_TAG))
     });
 }
 
-fn inject_plan_step_memory(
+/// Single-step task memory: tool progress + plan tracker + user guidance.
+fn inject_task_step_memory(
     messages: &mut Vec<Message>,
     iteration: u32,
     engine: &WorkflowEngine,
 ) {
-    let progress = build_tool_progress(messages, false);
-    let explored = engine.explored_paths_summary();
-
-    if iteration == 0 {
-        let mut parts = vec![STEP_MEMORY_TAG.to_string()];
-        if let Some(intent) = engine.get_variable("_step0_output") {
-            let snippet: String = intent.chars().take(1200).collect();
-            parts.push(format!("【上一步意图分类】\n{snippet}"));
-        } else if let Some(prev) = engine.get_previous_step_output() {
-            let snippet: String = prev.chars().take(1200).collect();
-            parts.push(format!("【上一步输出】\n{snippet}"));
-        }
-        if !explored.is_empty() {
-            parts.push(format!("【已探索路径（勿重复 file_list）】\n{explored}"));
-        }
-        let exploration = engine.exploration_snapshot_summary();
-        if !exploration.is_empty() {
-            let snippet: String = exploration.chars().take(4000).collect();
-            parts.push(format!("【探索快照】\n{snippet}"));
-        }
-        if let Some(draft) = engine.get_variable("_plan_draft") {
-            if !draft.is_empty() {
-                let snippet: String = draft.chars().take(2000).collect();
-                parts.push(format!("【计划草稿（继续完善）】\n{snippet}"));
-            }
-        }
+    if crate::agent::workspace::uses_workspace_memory(engine) {
+        let progress = build_tool_progress(messages, true);
         if !progress.is_empty() {
-            parts.push(format!("【本轮工具记录】\n{progress}"));
-        }
-        if parts.len() > 1 {
-            parts.push("基于以上信息探索或制定计划。已列过的目录不要再次 file_list。".to_string());
-            messages.push(Message::system(&parts.join("\n\n")));
+            messages.push(Message::system(&format!(
+                "{STEP_MEMORY_TAG}\n【本轮工具（勿重复）】\n{progress}"
+            )));
         }
         return;
     }
 
-    if progress.is_empty() && explored.is_empty() {
-        let exploration = engine.exploration_snapshot_summary();
-        if exploration.is_empty() {
-            return;
-        }
-    }
-
-    let mut body_parts = Vec::new();
-    if !progress.is_empty() {
-        body_parts.push(progress);
-    }
-    if !explored.is_empty() {
-        body_parts.push(format!("【已探索路径】\n{explored}"));
-    }
-    let exploration = engine.exploration_snapshot_summary();
-    if !exploration.is_empty() {
-        let snippet: String = exploration.chars().take(4000).collect();
-        body_parts.push(format!("【探索快照】\n{snippet}"));
-    }
-    if let Some(draft) = engine.get_variable("_plan_draft") {
-        if !draft.is_empty() {
-            let snippet: String = draft.chars().take(2000).collect();
-            body_parts.push(format!("【计划草稿】\n{snippet}"));
-        }
-    }
-    let body = body_parts.join("\n\n");
-
-    let directive = if engine.plan_exploration_satisfied() {
-        format!(
-            "{STEP_MEMORY_TAG}\n✅ 探索门禁已满足。请输出 plan JSON（含 structure_summary），禁止再调工具。\n\n本轮已完成:\n{body}\n\n只输出 JSON。"
-        )
-    } else {
-        let hint = engine.plan_exploration_hint();
-        let checklist = "【探索清单】① project_detect ② 目录探索 ③ file_read 确认文件";
-        format!(
-            "{STEP_MEMORY_TAG}\n📋 第{}轮 — 探索未完成。{hint}\n{checklist}\n\n本轮已完成:\n{body}",
-            iteration + 1
-        )
-    };
-    messages.push(Message::system(&directive));
-}
-
-fn inject_execute_step_memory(
-    messages: &mut Vec<Message>,
-    iteration: u32,
-    engine: &WorkflowEngine,
-) {
     let progress = build_tool_progress(messages, true);
     let mut parts = vec![format!(
-        "{STEP_MEMORY_TAG}\n⚡ 执行第{}轮 — 继续执行计划，不要从头重新探索。",
+        "{STEP_MEMORY_TAG}\n⚡ 第{}轮 — 调工具或交产物（## Done / findings / 直接答），禁止空转。",
         iteration + 1
     )];
 
     if iteration == 0 {
-        if let Some(handoff) = crate::agent::execute_handoff::ExecuteHandoff::load(engine) {
-            parts.push(handoff.format_for_execute());
-        } else {
-            let summary = engine.get_all_step_outputs_summary();
-            if summary != "（无上一步输出）" {
-                parts.push(format!("【计划与前序输出】\n{summary}"));
-            }
-            let exploration = engine.exploration_snapshot_summary();
-            if !exploration.is_empty() {
-                let snippet: String = exploration.chars().take(4000).collect();
-                parts.push(format!("【计划阶段探索摘要】\n{snippet}"));
+        if let Some(req) = engine.get_variable("_current_user_request") {
+            if !req.trim().is_empty() {
+                let snippet: String = req.chars().take(800).collect();
+                parts.push(format!("【用户请求】\n{snippet}"));
             }
         }
-    } else if crate::agent::workflow_session::is_implementation_phase(engine) {
-        if let Some(report) = engine.execute_review_report_block(6000) {
-            parts.push(report);
+        let guidance = engine.workflow_guidance_block();
+        if !guidance.is_empty() {
+            parts.push(guidance);
         }
     }
 
     if !progress.is_empty() {
         parts.push(format!("【本轮已完成（勿重复）】\n{progress}"));
-    } else if iteration > 0 {
-        parts.push(
-            "【本轮已完成（勿重复）】\n（尚无工具调用记录 — 检查上一条 assistant 的 tool_calls 是否已执行）"
-                .to_string(),
-        );
     }
 
     let plan_progress = engine.plan_progress_summary();
@@ -225,18 +137,10 @@ fn inject_execute_step_memory(
         parts.push(plan_progress);
     }
 
-    parts.push(
-        "执行阶段：优先使用交接包与 Preflight 快照中的数据；仅执行 plan 中尚未完成的步骤。\
-         勿重复 preflight / 探索命令。"
-            .to_string(),
-    );
-    let phase_addon = crate::agent::workflow_phases::phase_prompt_addon(engine);
-    if !phase_addon.is_empty()
-        && crate::agent::workflow_phases::get_phase(engine)
-            == crate::agent::workflow_phases::WorkflowPhase::Act
-    {
-        parts.push(phase_addon);
+    if let Some(report) = engine.execute_review_report_block(2000) {
+        parts.push(report);
     }
+
     messages.push(Message::system(&parts.join("\n\n")));
 }
 

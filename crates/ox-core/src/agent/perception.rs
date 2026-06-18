@@ -102,52 +102,111 @@ pub fn extract_from_text(text: &str) -> Option<PerceptionFindings> {
     })
 }
 
-fn extract_json_block(text: &str) -> Option<String> {
-    if let Some(start) = text.find("```json") {
-        let after = start + 7;
-        if let Some(end_off) = text[after..].find("```") {
-            let inner = text[after..after + end_off].trim();
-            if inner.contains("\"findings\"") {
-                return Some(inner.to_string());
+fn matching_close_brace(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, ch) in s.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
             }
+            continue;
         }
-    }
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
-        if end >= start {
-            let slice = &text[start..=end];
-            if slice.contains("\"findings\"") {
-                return Some(slice.to_string());
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
             }
+            _ => {}
         }
     }
     None
 }
 
+/// Locate a findings JSON block (```json fence or bare object anchored on markers).
+fn find_findings_json_range(text: &str) -> Option<(usize, usize)> {
+    let mut search_from = 0;
+    while search_from < text.len() {
+        let Some(rel) = text[search_from..].find("```json") else {
+            break;
+        };
+        let fence_start = search_from + rel;
+        let after = fence_start + 7;
+        let Some(end_off) = text[after..].find("```") else {
+            break;
+        };
+        let fence_end = after + end_off + 3;
+        let inner = text[after..after + end_off].trim();
+        if inner.contains("\"findings\"") {
+            return Some((fence_start, fence_end));
+        }
+        search_from = fence_end;
+    }
+
+    let mut best: Option<(usize, usize)> = None;
+    for marker in ["\"findings_summary\"", "\"findings\""] {
+        let mut from = 0;
+        while let Some(pos) = text[from..].find(marker) {
+            let abs = from + pos;
+            if let Some(open) = text[..abs].rfind('{') {
+                if let Some(close_rel) = matching_close_brace(&text[open..]) {
+                    let end = open + close_rel + 1;
+                    let slice = &text[open..end];
+                    if slice.contains("\"findings\"")
+                        && serde_json::from_str::<serde_json::Value>(slice).is_ok()
+                    {
+                        best = Some((open, end));
+                    }
+                }
+            }
+            from = abs + marker.len();
+        }
+    }
+    best
+}
+
+fn find_incomplete_findings_suffix_start(text: &str) -> Option<usize> {
+    for marker in ["\"findings_summary\"", "\"findings\""] {
+        let Some(pos) = text.rfind(marker) else {
+            continue;
+        };
+        let Some(open) = text[..pos].rfind('{') else {
+            continue;
+        };
+        let tail = &text[open..];
+        if matching_close_brace(tail).is_none() {
+            return Some(open);
+        }
+    }
+    None
+}
+
+fn extract_json_block(text: &str) -> Option<String> {
+    let (start, end) = find_findings_json_range(text)?;
+    let slice = &text[start..end];
+    if slice.starts_with("```json") {
+        let after = start + 7;
+        let end_off = text[after..].find("```")?;
+        Some(text[after..after + end_off].trim().to_string())
+    } else {
+        Some(slice.to_string())
+    }
+}
+
 /// Remove findings ```json``` / bare JSON from user-visible text (machine still gets full output).
 pub fn strip_findings_json_blocks(text: &str) -> String {
     let mut out = text.to_string();
-    loop {
-        let Some(start) = out.find("```json") else {
-            break;
-        };
-        let after = start + 7;
-        let Some(end_off) = out[after..].find("```") else {
-            break;
-        };
-        let end = after + end_off + 3;
-        let block = &out[start..end];
-        if block.contains("\"findings\"") {
-            out.replace_range(start..end, "\n");
-        } else {
-            break;
-        }
-    }
-    if let Some(json_str) = extract_json_block(text) {
-        if out.contains(&json_str) {
-            out = out.replace(&json_str, "");
-        }
-        let fenced = format!("```json\n{json_str}\n```");
-        out = out.replace(&fenced, "");
+    while let Some((start, end)) = find_findings_json_range(&out) {
+        out.replace_range(start..end, "\n");
     }
     out = hide_incomplete_findings_suffix(&out);
     collapse_blank_lines(out.trim())
@@ -155,34 +214,23 @@ pub fn strip_findings_json_blocks(text: &str) -> String {
 
 /// While streaming, hide an unfinished ```json … findings block at the end.
 fn hide_incomplete_findings_suffix(text: &str) -> String {
-    let Some(start) = text.find("```json") else {
-        return hide_incomplete_bare_findings_suffix(text);
-    };
-    let rest = &text[start..];
-    if rest[7..].contains("```") {
-        return hide_incomplete_bare_findings_suffix(text);
-    }
-    if rest.contains("\"findings\"") || rest.contains("\"issue\"") {
-        return text[..start].trim_end().to_string();
+    if let Some(start) = text.find("```json") {
+        let rest = &text[start..];
+        if rest[7..].contains("```") {
+            return hide_incomplete_bare_findings_suffix(text);
+        }
+        if rest.contains("\"findings\"") || rest.contains("\"issue\"") {
+            return text[..start].trim_end().to_string();
+        }
     }
     hide_incomplete_bare_findings_suffix(text)
 }
 
 fn hide_incomplete_bare_findings_suffix(text: &str) -> String {
-    let Some(start) = text.rfind('{') else {
-        return text.to_string();
-    };
-    let tail = &text[start..];
-    if !(tail.contains("\"findings\"") || tail.contains("\"issue\"")) {
-        return text.to_string();
+    if let Some(start) = find_incomplete_findings_suffix_start(text) {
+        return text[..start].trim_end().to_string();
     }
-    let opens = tail.matches('{').count();
-    let closes = tail.matches('}').count();
-    if opens > closes {
-        text[..start].trim_end().to_string()
-    } else {
-        text.to_string()
-    }
+    text.to_string()
 }
 
 /// Incremental filter for Execute perceive streaming — findings JSON never reaches UI.
@@ -356,6 +404,7 @@ pub fn to_plan_tracker(findings: &PerceptionFindings) -> PlanTracker {
                 desc,
                 verify: String::new(),
                 status: StepStatus::Pending,
+                awaiting_verify: false,
             }
         })
         .collect();
@@ -371,10 +420,7 @@ pub fn to_plan_tracker(findings: &PerceptionFindings) -> PlanTracker {
 
 /// Freeze perception from execute output: prefer findings JSON, fallback review parse.
 pub fn freeze_from_output(engine: &super::engine::WorkflowEngine, output: &str) {
-    if let Some(findings) = extract_from_text(output) {
-        save(engine, &findings);
-        return;
-    }
+    crate::agent::findings::ensure_from_review_output(engine, output);
     if let Some(tracker) = plan_tracker::load_from_review_report(output) {
         if let Ok(json) = serde_json::to_string(&tracker) {
             engine.set_variable("_plan_tracker", json);
@@ -503,6 +549,57 @@ F1 - 问题A
         assert!(f.push("```json\n{\"findings\":[").is_none());
         let tail = f.push(r#"{"index":2}]}\n```"#);
         assert!(tail.is_none() || !tail.unwrap().contains("\"index\""));
+    }
+
+    #[test]
+    fn strip_bare_findings_json_after_prose() {
+        let text = r#"## 审查报告
+**发现 6 (LOW)**: expectedDeliveryDate 已废弃
+**需要商量的关键决策点**:
+1. 同一 SKU 多交期是否改为 Map<String, List>
+
+{
+  "findings_summary": "MaintainDeliveryStrategy 未实现拆单",
+  "findings": [
+    {"index":1,"severity":"high","file":"Foo.java","target":"doHandle","issue":"未实现拆单","recommendation":"补全逻辑"}
+  ]
+}"#;
+        let shown = format_for_user_display(text);
+        assert!(!shown.contains("\"findings_summary\""));
+        assert!(!shown.contains("\"findings\""));
+        assert!(shown.contains("审查报告"));
+        assert!(shown.contains("关键决策点"));
+    }
+
+    #[test]
+    fn strip_preserves_unrelated_braces_in_prose() {
+        let text = r#"use foo::{bar, baz};
+
+{
+  "findings_summary": "x",
+  "findings": [{"index":1,"issue":"i","recommendation":"r"}]
+}"#;
+        let shown = strip_findings_json_blocks(text);
+        assert!(shown.contains("use foo::{bar, baz}"));
+        assert!(!shown.contains("findings_summary"));
+    }
+
+    #[test]
+    fn stream_filter_suppresses_bare_findings_json() {
+        let mut f = FindingsStreamFilter::new();
+        assert!(f.push("## 审查\n").unwrap().contains("审查"));
+        assert!(f
+            .push("\n{\n  \"findings_summary\": \"s\",\n  \"findings\": [\n")
+            .is_none());
+        assert!(f
+            .push(r#"{"index":1,"issue":"i","recommendation":"r"}]}
+"#)
+            .is_none());
+        let tail = f.flush_tail();
+        assert!(
+            tail.is_none() || !tail.unwrap().contains("\"findings\""),
+            "completed bare JSON must not reach UI"
+        );
     }
 
     #[test]

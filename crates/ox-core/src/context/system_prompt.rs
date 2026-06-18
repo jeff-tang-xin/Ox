@@ -55,7 +55,7 @@ pub fn build_system_prompt_with_context(
 }
 
     /// Internal: accepts optional `step_index` for step-aware trimming.
-    /// Step mapping: 0=Intent, 1=Plan, 2=Review, 3=Execute.
+    /// Single-step model uses si==0; legacy 4-step used 1=Plan, 3=Execute.
 pub fn build_system_prompt_with_step(
     rt_env: &RuntimeEnvironment,
     tool_registry: &ToolRegistry,
@@ -99,9 +99,12 @@ fn build_system_prompt_inner(
     // ── Step-aware trimming for workflow mode ──
     let is_wf = workflow_step_prompt.is_some();
     let si = step_index.unwrap_or(5); // 5 = no trim (full)
+    // Single-step uses si==0; legacy pipeline uses 1=Plan, 3=Execute.
+    let wants_tools = !is_wf || si == 0 || si == 1 || si >= 3;
+    let wants_project_skills = is_wf && (si == 0 || si == 1 || si == 3);
+    let wants_user_rules = !is_wf || si == 0 || si >= 2;
 
-    // Tools: Plan (explore) and Execute — Intent/Review are JSON-only
-    if !is_wf || si == 1 || si >= 3 {
+    if wants_tools {
         parts.push(if si == 1 {
             build_explore_tool_block()
         } else {
@@ -109,16 +112,14 @@ fn build_system_prompt_inner(
         });
     }
 
-    // Skills: Plan (step 1) and Execute (step 3)
-    if !is_wf || si == 1 || si >= 3 {
+    if wants_tools {
         let skills = tool_registry.get_skills_list();
         if let Some(dedup) =
             crate::skill::dedup::skill_dedup_directive(&rt_env.effective_project_root())
         {
             parts.push(dedup);
         }
-        // Plan / Execute: auto-inject mandatory project skills (conventions + business)
-        if is_wf && (si == 1 || si == 3) {
+        if wants_project_skills {
             if let Some(block) = crate::skill::policy::build_mandatory_injection(&skills) {
                 parts.push(block);
             }
@@ -126,7 +127,6 @@ fn build_system_prompt_inner(
         if let Some(block) = crate::skill::policy::build_on_demand_manifest(&skills) {
             parts.push(block);
         } else if !is_wf && tool_registry.has_skills() {
-            // Non-workflow: legacy one-liner when only mandatory skills exist
             let mut s = String::from("【方法】\n");
             for skill in &skills {
                 s.push_str(&format!("- `{}` skill loaded. Follow its rules.\n", skill.name));
@@ -135,8 +135,13 @@ fn build_system_prompt_inner(
         }
     }
 
-    // Spec: only Step 1 (Plan)
-    if !is_wf || si == 1 {
+    // Output discipline — once per turn in system prompt (per-iteration refresh in context_injector).
+    if is_wf {
+        parts.push(crate::agent::idle_narrative::discipline_for_iteration(0));
+    }
+
+    // Spec: Plan step or single-step task
+    if !is_wf || si == 0 || si == 1 {
         if let Some(spec) = _spec_content {
             if !spec.trim().is_empty() {
                 parts.push(format!("【任务】\n{}\n", spec.trim()));
@@ -144,8 +149,8 @@ fn build_system_prompt_inner(
         }
     }
 
-    // User rules: Step 2 (Review) and Step 3 (Execute)
-    if !is_wf || si >= 2 {
+    // User rules: single-step (0), Review (2+), Execute (3)
+    if wants_user_rules {
         if let Some(rules_md) = load_user_rules(rt_env) {
             parts.push(format!("【用户规则】\n{}\n", rules_md));
         } else if let Some(br) = behavior_rules {

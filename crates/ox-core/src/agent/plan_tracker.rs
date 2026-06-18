@@ -30,6 +30,9 @@ pub struct PlanStep {
     pub verify: String,
     #[serde(default)]
     pub status: StepStatus,
+    /// File edited but step.verify not yet passed (enforce-quality mode).
+    #[serde(default)]
+    pub awaiting_verify: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -38,6 +41,30 @@ pub struct PlanTracker {
     /// 1-based index of the active step.
     #[serde(default = "default_current")]
     pub current_index: u32,
+}
+
+/// Outcome when a write tool succeeds on a plan file path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteCompletionOutcome {
+    MarkedDone,
+    AstIncomplete,
+    AwaitingVerify(String),
+    NoMatchingStep,
+}
+
+fn verify_command_matches(expected: &str, actual: &str) -> bool {
+    let norm = |s: &str| {
+        s.to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let e = norm(expected);
+    let a = norm(actual);
+    if e.is_empty() {
+        return false;
+    }
+    a.contains(&e) || e.contains(&a)
 }
 
 fn default_current() -> u32 {
@@ -111,6 +138,7 @@ pub fn load_from_json(json_str: &str) -> Option<PlanTracker> {
             desc,
             verify,
             status: StepStatus::Pending,
+            awaiting_verify: false,
         });
     }
 
@@ -138,11 +166,15 @@ impl PlanTracker {
         let mut lines = vec![format!("【计划进度】{done}/{total} 完成")];
 
         for step in &self.steps {
-            let icon = match step.status {
-                StepStatus::Done => "✅",
-                StepStatus::InProgress => "▶",
-                StepStatus::Skipped => "⏭",
-                StepStatus::Pending => "⏳",
+            let icon = if step.awaiting_verify {
+                "🔄"
+            } else {
+                match step.status {
+                    StepStatus::Done => "✅",
+                    StepStatus::InProgress => "▶",
+                    StepStatus::Skipped => "⏭",
+                    StepStatus::Pending => "⏳",
+                }
             };
             let file_part = if step.file.is_empty() {
                 String::new()
@@ -160,18 +192,96 @@ impl PlanTracker {
                 step.action.clone()
             };
             lines.push(format!(
-                "  {icon} {}.{action}{target_part}{file_part} — {}",
+                "  {icon} {}.{action}{target_part}{file_part} — {}{}",
                 step.index,
                 if step.desc.is_empty() {
                     "(无描述)".to_string()
                 } else {
                     step.desc.clone()
+                },
+                if step.awaiting_verify {
+                    " (已改文件，待验证)"
+                } else {
+                    ""
                 }
             ));
         }
 
         lines.push("完成当前步骤后再进入下一项；已完成项勿重复。".to_string());
         lines.join("\n")
+    }
+
+    /// Enforce-quality completion: AST clean; optional step.verify via shell before Done.
+    pub fn try_complete_after_write(
+        &mut self,
+        path: &str,
+        ast_clean: bool,
+        enforce_quality: bool,
+        implicit_verify: Option<&str>,
+    ) -> WriteCompletionOutcome {
+        let norm = normalize_path(path);
+        let pos = self.steps.iter().position(|s| {
+            !s.file.is_empty()
+                && normalize_path(&s.file) == norm
+                && s.status != StepStatus::Done
+        });
+        let Some(pos) = pos else {
+            return WriteCompletionOutcome::NoMatchingStep;
+        };
+
+        if enforce_quality && !ast_clean {
+            if self.steps[pos].status == StepStatus::Pending {
+                self.steps[pos].status = StepStatus::InProgress;
+            }
+            self.steps[pos].awaiting_verify = false;
+            return WriteCompletionOutcome::AstIncomplete;
+        }
+
+        let verify = self.steps[pos].verify.trim().to_string();
+        let needs_verify = if !verify.is_empty() {
+            Some(verify)
+        } else if enforce_quality {
+            implicit_verify
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        } else {
+            None
+        };
+
+        if enforce_quality && needs_verify.is_some() {
+            self.steps[pos].status = StepStatus::InProgress;
+            self.steps[pos].awaiting_verify = true;
+            if self.steps[pos].verify.is_empty() {
+                if let Some(ref cmd) = needs_verify {
+                    self.steps[pos].verify = cmd.clone();
+                }
+            }
+            return WriteCompletionOutcome::AwaitingVerify(
+                needs_verify.unwrap_or_default(),
+            );
+        }
+
+        self.steps[pos].status = StepStatus::Done;
+        self.steps[pos].awaiting_verify = false;
+        self.advance_current();
+        WriteCompletionOutcome::MarkedDone
+    }
+
+    /// Mark awaiting-verify step done when shell command matches step.verify and succeeded.
+    pub fn try_confirm_verify(&mut self, command: &str) -> bool {
+        let pos = self.steps.iter().position(|s| {
+            s.awaiting_verify
+                && !s.verify.trim().is_empty()
+                && verify_command_matches(&s.verify, command)
+        });
+        let Some(pos) = pos else {
+            return false;
+        };
+        self.steps[pos].status = StepStatus::Done;
+        self.steps[pos].awaiting_verify = false;
+        self.advance_current();
+        true
     }
 
     pub fn current_step(&self) -> Option<&PlanStep> {
@@ -377,10 +487,51 @@ fn extract_review_items(report: &str) -> Vec<PlanStep> {
                 let target = extract_symbol_target(rest);
                 steps.push(make_impl_step(n, file, target, rest.to_string()));
             }
+            continue;
+        }
+
+        if let Some((n, rest)) = parse_bug_review_line(line) {
+            if seen.insert(n) {
+                let file = extract_path_from_text(rest);
+                let target = extract_symbol_target(rest);
+                steps.push(make_impl_step(n, file, target, rest.to_string()));
+            }
         }
     }
 
     steps
+}
+
+/// `BUG-1（严重）`, `F1 —`, `**BUG-2**` style headings.
+fn parse_bug_review_line(line: &str) -> Option<(u32, &str)> {
+    let mut t = line.trim();
+    while t.starts_with(|c: char| c == '-' || c == '*' || c == ' ') {
+        t = t.trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ');
+    }
+    let upper = t.to_ascii_uppercase();
+    let rest = if let Some(r) = upper.strip_prefix("BUG-") {
+        t.get(4..)?
+    } else if upper.starts_with('F') && t.len() > 1 {
+        let digit_end = t[1..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if digit_end == 0 {
+            return None;
+        }
+        t.get(1 + digit_end..)?
+    } else {
+        return None;
+    };
+    let num_part: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let n: u32 = num_part.parse().ok()?;
+    let after = rest[num_part.len()..]
+        .trim_start_matches(['（', '(', ')', '）', '：', ':', '、', '.', ' ', '-', '—'])
+        .trim();
+    if after.is_empty() {
+        return None;
+    }
+    Some((n, after))
 }
 
 fn make_impl_step(index: u32, file: String, target: String, desc: String) -> PlanStep {
@@ -392,6 +543,7 @@ fn make_impl_step(index: u32, file: String, target: String, desc: String) -> Pla
         desc: desc.trim().to_string(),
         verify: String::new(),
         status: StepStatus::Pending,
+        awaiting_verify: false,
     }
 }
 
@@ -935,5 +1087,17 @@ mod tests {
         let t = load_from_review_report(report).unwrap();
         assert_eq!(t.steps.len(), 2);
         assert_eq!(t.steps[0].target, "Controller");
+    }
+
+    #[test]
+    fn load_from_review_report_bug_lines() {
+        let report = "\
+**BUG-1（严重）**：原订单状态无条件修改
+- **位置**：L117
+**BUG-2（严重）**：场景3未实现拆分";
+        let t = load_from_review_report(report).unwrap();
+        assert_eq!(t.steps.len(), 2);
+        assert_eq!(t.steps[0].index, 1);
+        assert!(t.steps[0].desc.contains("原订单"));
     }
 }

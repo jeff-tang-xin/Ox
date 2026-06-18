@@ -105,6 +105,13 @@ pub enum ParkFollowUpTag {
     NewTask,
 }
 
+/// Interactive findings checklist shown above the input when workflow is parked.
+#[derive(Debug, Clone)]
+pub struct FindingsPanelState {
+    pub summary: String,
+    pub rows: Vec<ox_core::agent::findings::FindingProgressRow>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingConfirmation {
     pub tool_call_id: String,
@@ -164,6 +171,8 @@ pub struct App {
     pub workflow_awaiting_confirmation: Option<usize>,
     /// After park menu shortcut 1/2/3 — tag shown in the input pane until submit.
     pub park_follow_up_tag: Option<ParkFollowUpTag>,
+    /// Findings checklist panel (parked review → scope selection).
+    pub findings_panel: Option<FindingsPanelState>,
     /// Skill draft awaiting user confirmation before save.
     pub pending_skill_draft: Option<PendingSkillDraft>,
     /// Skill review queued while agent is still running.
@@ -208,6 +217,9 @@ pub struct App {
     /// Flag set when user interrupts the agent (Ctrl+C). Prevents auto-spawning
     /// the next workflow step after the interrupted turn completes.
     pub workflow_interrupted: bool,
+
+    /// Skip one auto-spawn after first-time onboarding (workflow was not used in agent).
+    pub suppress_workflow_autospawn: bool,
 
     // Fields needed by slash command handlers
     /// Session action signaled by slash commands, processed in the main event loop.
@@ -274,6 +286,7 @@ impl App {
             pending_confirmation: None,
             workflow_awaiting_confirmation: None,
             park_follow_up_tag: None,
+            findings_panel: None,
             pending_skill_draft: None,
             queued_skill_draft: None,
             ui_to_agent_tx: None,
@@ -307,6 +320,7 @@ impl App {
 
             // Interrupt tracking
             workflow_interrupted: false,
+            suppress_workflow_autospawn: false,
 
             // Slash command context fields
             session_action: SessionAction::None,
@@ -328,6 +342,7 @@ impl App {
     pub fn clear_workflow_confirmation(&mut self) {
         self.workflow_awaiting_confirmation = None;
         self.park_follow_up_tag = None;
+        self.findings_panel = None;
     }
 
     pub fn submit_input(&mut self) -> Option<UserInput> {
@@ -523,10 +538,14 @@ impl App {
                             let requirement_name = engine.get_variable("requirement_name");
                             
                             self.workflow_display = Some(WorkflowDisplayInfo {
-                                workflow_name: if step.display_status.is_empty() { step.name.clone() } else { step.display_status.clone() },
+                                workflow_name: engine
+                                    .current_step_display_label()
+                                    .unwrap_or_else(|| step.name.clone()),
                                 step_num,
                                 total_steps,
-                                step_name: if step.display_status.is_empty() { step.name.clone() } else { step.display_status.clone() },
+                                step_name: engine
+                                    .current_step_display_label()
+                                    .unwrap_or_else(|| step.name.clone()),
                                 step_prompt: engine.get_step_system_prompt(),
                                 allows_code_modification: engine.allows_code_modification(),
                                 requirement_name,

@@ -62,11 +62,16 @@ pub fn summarize_tool_result(name: &str, output: &str) -> String {
     match name {
         "file_write" | "edit_file" | "delete_range" => {
             let first_line = output.lines().next().unwrap_or(output);
-            let truncated: String = first_line.chars().take(120).collect();
-            if first_line.len() > 120 {
-                format!("{truncated}...")
+            let ast_note = if output.contains("⚠️ AST Syntax Check") {
+                " ⚠️ AST errors"
             } else {
-                truncated
+                ""
+            };
+            let truncated: String = first_line.chars().take(100).collect();
+            if first_line.len() > 100 {
+                format!("{truncated}...{ast_note}")
+            } else {
+                format!("{truncated}{ast_note}")
             }
         }
         "file_read" => {

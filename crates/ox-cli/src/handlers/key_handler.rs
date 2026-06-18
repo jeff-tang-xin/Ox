@@ -14,8 +14,33 @@ use crate::terminal::app::App;
 /// The heavy lifting (text submission, slash commands, LLM invocation) is handled
 /// by the event loop after this function returns the input.
 pub fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> KeyResult {
+    // Findings panel shortcuts (parked review): 1-9 toggle, c confirm, d discuss, n new task.
+    if app.findings_panel.is_some()
+        && app.workflow_awaiting_confirmation == Some(4)
+        && app.park_follow_up_tag.is_none()
+    {
+        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+            if let KeyCode::Char(ch @ '1'..='9') = key.code {
+                let n = (ch as u8 - b'0') as u32;
+                return KeyResult::FindingsToggle(n);
+            }
+            if matches!(key.code, KeyCode::Char('c' | 'C')) {
+                return KeyResult::FindingsConfirm;
+            }
+            if matches!(key.code, KeyCode::Char('d' | 'D')) {
+                return KeyResult::FindingsDiscuss;
+            }
+            if matches!(key.code, KeyCode::Char('n' | 'N')) {
+                return KeyResult::ParkMenuShortcut('3');
+            }
+        }
+    }
+
     // Park menu shortcuts: 1/2/3 while awaiting step-4 confirmation (menu stage only).
-    if app.workflow_awaiting_confirmation == Some(4) && app.park_follow_up_tag.is_none() {
+    if app.workflow_awaiting_confirmation == Some(4)
+        && app.park_follow_up_tag.is_none()
+        && app.findings_panel.is_none()
+    {
         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
             if let KeyCode::Char(ch @ ('1' | '2' | '3')) = key.code {
                 return KeyResult::ParkMenuShortcut(ch);
@@ -32,6 +57,7 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> KeyResult {
                 // Don't insert 1/2/3 at park menu — those are shortcuts.
                 if app.workflow_awaiting_confirmation == Some(4)
                     && app.park_follow_up_tag.is_none()
+                    && app.findings_panel.is_none()
                     && matches!(ch, '1' | '2' | '3')
                 {
                     return KeyResult::ParkMenuShortcut(ch);
@@ -119,6 +145,12 @@ pub enum KeyResult {
     Interrupt,
     /// User pressed 1/2/3 on the park follow-up menu.
     ParkMenuShortcut(char),
+    /// Toggle finding #N in the findings panel.
+    FindingsToggle(u32),
+    /// Confirm selected findings scope (same as /confirm).
+    FindingsConfirm,
+    /// Enter read-only discuss mode (same as /discuss).
+    FindingsDiscuss,
     /// User pressed Enter with text — caller should process the input.
     InputSubmitted(crate::terminal::app::UserInput),
 }

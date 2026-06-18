@@ -83,6 +83,7 @@ impl LlmProvider for OpenAiProvider {
         messages: &[Message],
         tools: &[ToolSchema],
         tx: mpsc::UnboundedSender<LlmStreamEvent>,
+        opts: crate::llm::StreamOptions,
     ) -> Result<()> {
         // 🛡️ Auto-fix orphaned tool_call/ToolResult pairs before sending to API.
         // Instead of aborting on errors, we sanitize and proceed.
@@ -211,7 +212,7 @@ impl LlmProvider for OpenAiProvider {
         // Always request usage in streaming mode (supported by OpenAI + most compatible APIs)
         body["stream_options"] = serde_json::json!({ "include_usage": true });
 
-        if let Some(max_tokens) = self.max_tokens {
+        if let Some(max_tokens) = opts.max_tokens.or(self.max_tokens) {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
 

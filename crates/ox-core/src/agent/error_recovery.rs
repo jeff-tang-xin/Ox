@@ -31,12 +31,19 @@ pub fn check_and_recover(
             .unwrap_or("");
 
         let is_build_or_test = cmd.contains("cargo build")
+            || cmd.contains("cargo check")
             || cmd.contains("cargo test")
             || cmd.contains("npm test")
+            || cmd.contains("npm run build")
+            || cmd.contains("npx tsc")
             || cmd.contains("pytest")
+            || cmd.contains("go build")
             || cmd.contains("go test")
             || cmd.contains("cargo clippy")
-            || cmd.contains("npm run lint");
+            || cmd.contains("npm run lint")
+            || cmd.contains("mvn ")
+            || cmd.contains("gradlew")
+            || cmd.contains("compileall");
 
         if !is_build_or_test {
             continue;

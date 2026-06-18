@@ -2,6 +2,16 @@
 
 use super::{Skill, SkillScope};
 
+pub const OUTPUT_DISCIPLINE_SKILL_ID: &str = "ox-output-discipline";
+
+/// System skills always relevant during agent turns (listed first in on-demand manifest).
+pub fn priority_system_skill_ids() -> &'static [&'static str] {
+    &[
+        OUTPUT_DISCIPLINE_SKILL_ID,
+        "concise-direct",
+        "coding-principles",
+    ]
+}
 pub const PROJECT_CONVENTIONS: &str = "project-conventions";
 pub const PROJECT_BUSINESS: &str = "project-business-guide";
 pub const PROJECT_ARCHITECTURE_LEGACY: &str = "project-architecture";

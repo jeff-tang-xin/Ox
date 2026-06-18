@@ -26,6 +26,13 @@ pub enum LlmStreamEvent {
     Error(String),
 }
 
+/// Per-request overrides for `stream_chat` (e.g. workflow Plan JSON step needs more headroom).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamOptions {
+    /// When set, overrides the provider config `max_tokens` for this call only.
+    pub max_tokens: Option<u32>,
+}
+
 /// Trait for LLM providers (OpenAI, Anthropic, etc.).
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -36,6 +43,7 @@ pub trait LlmProvider: Send + Sync {
         messages: &[Message],
         tools: &[ToolSchema],
         tx: tokio::sync::mpsc::UnboundedSender<LlmStreamEvent>,
+        opts: StreamOptions,
     ) -> anyhow::Result<()>;
 
     /// The model identifier string.

@@ -46,6 +46,20 @@ fn pad_to_width(text: String, width: u16) -> String {
     }
 }
 
+fn truncate_display(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        format!(
+            "{}…",
+            text.chars().take(max_chars.saturating_sub(1)).collect::<String>()
+        )
+    }
+}
+
 pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
     let area = frame.area();
     if area.width < 20 || area.height < 8 {
@@ -60,6 +74,12 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
     let has_workflow = app.workflow_display.is_some() as u16;
     let header_height = if is_tiny { 0 } else { (2u16 + has_workflow + indexing_bar).min(5) };
 
+    let findings_panel_height = app
+        .findings_panel
+        .as_ref()
+        .map(|p| (p.rows.len() as u16 + 3).clamp(4, 14))
+        .unwrap_or(0);
+
     let input_height = if app.pending_confirmation.is_some() || app.workflow_awaiting_confirmation.is_some() {
         3
     } else {
@@ -69,6 +89,7 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
     let chunks = Layout::vertical([
         Constraint::Length(header_height), // Header (hidden on tiny screens)
         Constraint::Min(3),                // Main output
+        Constraint::Length(findings_panel_height),
         Constraint::Length(1),             // Status bar
         Constraint::Length(input_height),  // Input pane
     ])
@@ -76,8 +97,11 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
 
     render_header(frame, app, chunks[0]);
     render_main(frame, app, chunks[1]);
-    render_status_bar(frame, app, chunks[2], tick_count);
-    render_input_pane(frame, app, chunks[3], tick_count);
+    if findings_panel_height > 0 {
+        render_findings_panel(frame, app, chunks[2]);
+    }
+    render_status_bar(frame, app, chunks[3], tick_count);
+    render_input_pane(frame, app, chunks[4], tick_count);
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -238,9 +262,13 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let md = &app.md_renderer;
     let out = &mut app.output;
+    if out.has_live_thinking() {
+        out.invalidate_thinking_cache();
+    }
+    let tick = spinner_frame;
     let (mut lines, _total) =
         out.get_visible_lines(output_width, inner_height, scroll_offset, |ol, w| {
-            render_single_line(ol, w, md)
+            render_single_line(ol, w, md, tick)
         });
 
     // Pad to inner height so leftover rows don't show previous-frame ghosts.
@@ -262,6 +290,7 @@ fn render_single_line(
     ol: &OutputLine,
     width: usize,
     md_renderer: &super::markdown::MarkdownRenderer,
+    tick: u64,
 ) -> Vec<Line<'static>> {
     match ol {
         OutputLine::User(s) => {
@@ -307,6 +336,50 @@ fn render_single_line(
                 ));
             }
             vec![Line::from(spans)]
+        }
+        OutputLine::Thinking {
+            text,
+            collapsed,
+            status_hint,
+        } => {
+            const THINK_COLOR: Color = Color::Rgb(160, 140, 220);
+            let hint = status_hint.as_deref();
+            let display = if *collapsed {
+                text.clone()
+            } else {
+                let segments = super::output_pane::thinking_carousel_segments(text, hint);
+                if segments.is_empty() {
+                    hint.unwrap_or("思考中…").to_string()
+                } else {
+                    let idx = ((tick / 12) as usize) % segments.len();
+                    segments[idx].clone()
+                }
+            };
+            let max_chars = width.saturating_sub(8).max(20);
+            let shown = if display.chars().count() > max_chars {
+                format!("{}…", display.chars().take(max_chars.saturating_sub(1)).collect::<String>())
+            } else {
+                display
+            };
+            let spinner = if *collapsed {
+                "🧠"
+            } else {
+                SPINNER[(tick as usize) % SPINNER.len()]
+            };
+            vec![Line::from(vec![
+                Span::styled(
+                    format!(" {spinner} "),
+                    Style::default().fg(THINK_COLOR).bg(Color::Rgb(28, 24, 40)),
+                ),
+                Span::styled(
+                    if *collapsed {
+                        format!("思考 · {shown}")
+                    } else {
+                        shown
+                    },
+                    Style::default().fg(if *collapsed { TEXT_DIM } else { THINK_COLOR }),
+                ),
+            ])]
         }
         OutputLine::ToolResult {
             name: _,
@@ -468,6 +541,86 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+fn render_findings_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(panel) = &app.findings_panel else {
+        return;
+    };
+    if area.width < 10 || area.height < 2 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
+    let inner_w = area.width.saturating_sub(4) as usize;
+    let issue_budget = inner_w.saturating_sub(28).max(24);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if !panel.summary.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("摘要 ", Style::default().fg(TEXT_DIM)),
+            Span::styled(
+                truncate_display(&panel.summary, inner_w.saturating_sub(6)),
+                Style::default().fg(TEXT),
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "1-9 范围 · c 确认 · d 讨论 · n 新任务",
+        Style::default().fg(TEXT_DIM),
+    )));
+    for row in &panel.rows {
+        let mark = if row.in_scope { "☑" } else { "☐" };
+        let status_icon = match row.status {
+            ox_core::agent::findings::FindingStatus::Done => "✅",
+            ox_core::agent::findings::FindingStatus::InProgress
+            | ox_core::agent::findings::FindingStatus::AwaitingVerify => "🔄",
+            ox_core::agent::findings::FindingStatus::Skipped
+            | ox_core::agent::findings::FindingStatus::WontFix => "⏭",
+            ox_core::agent::findings::FindingStatus::Disputed => "⚠️",
+            _ => "📌",
+        };
+        let loc = if row.file.is_empty() {
+            truncate_display(&row.symbol, 32)
+        } else {
+            truncate_display(
+                &short_display_path(&row.file, 36),
+                36,
+            )
+        };
+        let sev = truncate_display(&row.severity, 8);
+        let issue = truncate_display(&row.issue, issue_budget);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{mark} "), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("#{} ", row.index),
+                Style::default()
+                    .fg(TEXT_BRIGHT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("[{sev}] "), Style::default().fg(HEADING_FG)),
+            Span::styled(format!("{status_icon} "), Style::default().fg(TEXT_DIM)),
+            Span::styled(format!("{loc} "), Style::default().fg(TEXT_DIM)),
+            Span::styled(issue, Style::default().fg(TEXT)),
+        ]));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .style(Style::default().bg(BG))
+        .title(" Findings — 选择修复范围 ")
+        .title_style(
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64) {
     frame.render_widget(Clear, area);
 
@@ -552,6 +705,30 @@ fn park_follow_up_prompt_spans(app: &App) -> (Vec<Span<'static>>, usize) {
         .bg(BG_INPUT);
     let dim = Style::default().fg(TEXT_DIM).bg(BG_INPUT);
 
+    if app.findings_panel.is_some() && app.park_follow_up_tag.is_none() {
+        let base = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+            .bg(BG_INPUT);
+        let key_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+            .bg(BG_INPUT);
+        let spans = vec![
+            Span::styled("❯ ".to_string(), base),
+            Span::styled("1-9".to_string(), key_style),
+            Span::styled(" 切换  ".to_string(), base),
+            Span::styled("c".to_string(), key_style),
+            Span::styled(" 确认  ".to_string(), base),
+            Span::styled("d".to_string(), key_style),
+            Span::styled(" 讨论  ".to_string(), base),
+            Span::styled("n".to_string(), key_style),
+            Span::styled(" 新任务 > ".to_string(), base),
+        ];
+        let len = "❯ 1-9 切换  c 确认  d 讨论  n 新任务 > ".len();
+        return (spans, len);
+    }
+
     if let Some(tag) = app.park_follow_up_tag {
         let (label, hint) = match tag {
             ParkFollowUpTag::Continue => ("[继续]", "说明修复范围 > "),
@@ -581,6 +758,14 @@ fn park_follow_up_prompt_spans(app: &App) -> (Vec<Span<'static>>, usize) {
 }
 
 fn park_follow_up_block_title(app: &App) -> Line<'static> {
+    if app.findings_panel.is_some() && app.park_follow_up_tag.is_none() {
+        return Line::from(Span::styled(
+            " 1-9 切换范围 · c 确认实施 · d 讨论 · n 新任务 ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if app.park_follow_up_tag.is_some() {
         return Line::from(Span::styled(
             " 已选择 — 在下方补充说明后按 Enter ",

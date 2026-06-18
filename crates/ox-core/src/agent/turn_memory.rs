@@ -93,6 +93,13 @@ impl TurnMemory {
         }
     }
 
+    pub fn had_code_changes(&self) -> bool {
+        self.entries.iter().any(|e| {
+            matches!(e.tool.as_str(), "file_write" | "edit_file" | "delete_range")
+                && e.outcome != "error"
+        })
+    }
+
     pub fn bump_iteration(&mut self) {
         self.iterations += 1;
     }

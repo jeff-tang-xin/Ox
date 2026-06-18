@@ -24,9 +24,20 @@ pub mod workflow_session; // Park / resume persistent task session
 pub mod workflow_phases; // 感知 → 思考 → 执行 phase state machine
 pub mod requirement_clarification; // Intent 后需求澄清门禁
 pub mod perception; // Structured findings from perceive phase
+pub mod findings; // Canonical findings store (review → park → implement)
+pub mod presentation; // Executive summary formatting for findings
+pub mod workspace; // Single [WORKSPACE] LLM context block
+pub mod completion; // Machine-verifiable completion receipt
+pub mod workflow_command; // /fix /pause /confirm slash commands
+pub mod tool_digest; // Semantic file_read digests
+pub mod verifier; // Post-edit read-only verifier pass
+pub mod git_undo; // Git checkout undo per finding
 pub mod onboarding; // First-time project skill generation
 pub mod error_recovery;    // 🆕 Build/test failure auto-fix
+pub mod post_edit_verification; // AST feedback + language verify gate
 pub mod tool_executor;     // 🆕 Tool detail display + error formatting
+pub mod idle_narrative; // Cross-step idle prose detection + output discipline
+pub mod gatekeeper; // 🆕 Simplified single-step model: one LLM loop + gate pipeline
 
 
 
@@ -50,6 +61,8 @@ use crate::tools::{SafetyLevel, ToolContext, ToolRegistry};
 pub enum AgentToUiEvent {
     /// Streaming text from LLM.
     TextChunk(String),
+    /// Streaming reasoning / thinking content (DeepSeek reasoning_content, etc.).
+    ReasoningChunk(String),
     /// Agent is calling a tool.
     ToolStart {
         name: String,
@@ -119,6 +132,19 @@ pub enum AgentToUiEvent {
         step_idx: usize,
         message: String,
     },
+    /// Findings list after review park — user selects scope via /fix or UI.
+    FindingsPanel {
+        summary: String,
+        rows: Vec<crate::agent::findings::FindingProgressRow>,
+    },
+    /// Awaiting user to confirm implementation scope (/confirm).
+    ScopeConfirmPrompt {
+        summary: String,
+    },
+    /// Workspace mode changed (review / parked / impl / discuss / paused).
+    WorkspaceModeChanged {
+        mode: String,
+    },
     /// Generated skill draft awaiting user confirmation before save.
     SkillDraftReady {
         skill_id: String,
@@ -131,20 +157,6 @@ pub enum AgentToUiEvent {
         threshold: usize,
         task_summary: String,
     },
-}
-
-/// Show workflow gate UI once (no duplicate PlanReviewReady + markdown push).
-fn emit_workflow_gate(
-    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    step_idx: usize,
-    markdown: String,
-    status: impl Into<String>,
-) {
-    let _ = ui_tx.send(AgentToUiEvent::WorkflowAwaitingConfirmation {
-        step_idx,
-        message: markdown,
-    });
-    let _ = ui_tx.send(AgentToUiEvent::Status(status.into()));
 }
 
 /// Persist in-turn tool log to workflow session (survives TurnDone → next spawn).
@@ -169,6 +181,14 @@ fn push_interjection_message(
     if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
             if !engine.allows_midflight_interjection() {
+                if crate::agent::workflow_session::looks_like_fix_continuation(text) {
+                    engine.append_workflow_guidance(text);
+                    let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                        "💬 User (Act 修复介入): {}",
+                        text.trim().chars().take(120).collect::<String>()
+                    )));
+                    return;
+                }
                 tracing::info!("[WORKFLOW] Blocked mid-flight interjection in Act phase");
                 let _ = ui_tx.send(AgentToUiEvent::Status(
                     crate::agent::workflow_phases::act_interjection_blocked_message().to_string(),
@@ -221,134 +241,6 @@ fn push_interjection_message(
     )));
 }
 
-enum SessionResumeAction {
-    Continue,
-    /// End current workflow; optional `(task, execution_summary)` captured before reset.
-    NewTask(Option<(String, String)>),
-}
-
-/// Block the agent loop until the user sends follow-up (parked task session).
-async fn wait_for_session_resume(
-    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
-    messages: &mut Vec<Message>,
-    ui_rx: &mut mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
-    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    cancel_token: &CancellationToken,
-) -> Result<SessionResumeAction, ()> {
-    loop {
-        tokio::select! {
-            ev = ui_rx.recv() => {
-                match ev {
-                    Some(ui_event::UiToAgentEvent::Interjection(text)) => {
-                        let sanitized = if injection::is_suspicious(&text) {
-                            injection::sanitize(&text)
-                        } else {
-                            text
-                        };
-                        if let Some(wf) = workflow_engine {
-                            let mut engine = wf.lock().await;
-
-                            if engine.is_park_disambiguation_awaiting() {
-                                match engine.finish_park_disambiguation(&sanitized) {
-                                    Ok(
-                                        crate::agent::requirement_clarification::ParkFollowUpOutcome::Resolved(
-                                            resolution,
-                                        ),
-                                    ) => {
-                                        let is_new_task = matches!(
-                                            resolution,
-                                            crate::agent::requirement_clarification::ParkDisambiguationResolution::NewTask { .. }
-                                        );
-                                        let reflect = if is_new_task {
-                                            Some(engine.snapshot_for_skill_reflect())
-                                        } else {
-                                            None
-                                        };
-                                        let user_msg =
-                                            engine.apply_park_disambiguation_resolution(resolution);
-                                        drop(engine);
-                                        messages.push(Message::user(&sanitized));
-                                        if let Some(block) = user_msg {
-                                            messages.push(Message::user(&block));
-                                        }
-                                        let _ = ui_tx.send(AgentToUiEvent::Status(
-                                            if is_new_task {
-                                                "🆕 已开始新任务".to_string()
-                                            } else {
-                                                "▶️ 已根据你的选择继续".to_string()
-                                            },
-                                        ));
-                                        return Ok(if is_new_task {
-                                            SessionResumeAction::NewTask(reflect)
-                                        } else {
-                                            SessionResumeAction::Continue
-                                        });
-                                    }
-                                    Ok(
-                                        crate::agent::requirement_clarification::ParkFollowUpOutcome::NeedDetail {
-                                            hint,
-                                        },
-                                    ) => {
-                                        drop(engine);
-                                        messages.push(Message::user(&sanitized));
-                                        messages.push(Message::system(&hint));
-                                        let _ = ui_tx.send(AgentToUiEvent::Status(
-                                            "⏸️ 请补充说明后按 Enter".to_string(),
-                                        ));
-                                        continue;
-                                    }
-                                    Err(hint) => {
-                                        drop(engine);
-                                        messages.push(Message::system(&hint));
-                                        let _ = ui_tx.send(AgentToUiEvent::Status(
-                                            "⏸️ 请选择：继续 / 意见 / 新任务".to_string(),
-                                        ));
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            if engine.is_workflow_parked() {
-                                if crate::agent::engine::WorkflowEngine::looks_like_new_task(
-                                    &sanitized,
-                                ) {
-                                    let reflect = Some(engine.snapshot_for_skill_reflect());
-                                    let _ = engine.finish_workflow_session();
-                                    engine.begin_user_round(&sanitized);
-                                    messages.push(Message::user(&sanitized));
-                                    return Ok(SessionResumeAction::NewTask(reflect));
-                                }
-                                engine.arm_park_follow_up_menu();
-                                let md = engine.clarification_markdown();
-                                drop(engine);
-                                messages.push(Message::user(&sanitized));
-                                messages.push(Message::system(&md));
-                                emit_workflow_gate(
-                                    &ui_tx,
-                                    4,
-                                    md,
-                                    "⏸️ 请选择：继续 / 意见 / 新任务",
-                                );
-                                continue;
-                            }
-                        } else {
-                            messages.push(Message::user(&sanitized));
-                        }
-                        let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                            "▶️ 继续任务会话: {}",
-                            sanitized.trim().chars().take(100).collect::<String>()
-                        )));
-                        return Ok(SessionResumeAction::Continue);
-                    }
-                    Some(ui_event::UiToAgentEvent::ToolConfirmation { .. }) => continue,
-                    None => return Err(()),
-                }
-            }
-            _ = cancel_token.cancelled() => return Err(()),
-        }
-    }
-}
-
 /// Run a complete agent turn: LLM -> tool_calls -> execute -> loop -> text.
 ///
 /// Takes owned data so it can be spawned into a `tokio::spawn` task.
@@ -399,6 +291,7 @@ pub async fn run_agent_turn(
     let mut turn_memory = turn_memory::TurnMemory::new(user_task.as_deref().unwrap_or(""));
     if let Some(wf) = &workflow_engine {
         if let Ok(engine) = wf.try_lock() {
+            crate::agent::gatekeeper::reset_failures(&engine);
             if let Some(saved) = engine.load_turn_memory() {
                 turn_memory.merge_from(saved);
             }
@@ -414,6 +307,7 @@ pub async fn run_agent_turn(
     }
 
     let mut iteration = 0u32;
+    let mut idle_streak = 0u32;
     let mut tools_used_this_turn: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
@@ -506,39 +400,23 @@ pub async fn run_agent_turn(
             }
         }
 
-        // ── STRONG CONFIRMATION CHECK: Block LLM call if waiting for user confirmation ──
-        if let Some(ref engine_arc) = workflow_engine {
-            let engine = engine_arc.lock().await;
-
-            // Check if we're waiting for user confirmation or requirement clarification
-            if engine.is_current_step_waiting_confirmation() {
-                tracing::info!(
-                    "Workflow engine is waiting for user confirmation - blocking LLM call"
-                );
-
-                let status = if engine.is_park_disambiguation_awaiting() {
-                    "⏸️ 请选择：1继续 2意见 3新任务".to_string()
-                } else if engine.is_awaiting_clarification() {
-                    "⏸️ 等待需求澄清 — 请具体回答问题，不要用模糊回复".to_string()
-                } else {
-                    "⏸️ 等待确认 — 输入 ok/继续/确认 执行，或输入修改意见".to_string()
-                };
-                let _ = ui_tx.send(AgentToUiEvent::Status(status));
-
-                // Return early without calling LLM
-                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                    new_messages,
-                    usage: total_usage,
-                });
-                return;
-            }
-        }
-
         turn_memory.bump_iteration();
         persist_turn_memory(&workflow_engine, &turn_memory);
 
         // Compress bloated in-turn history before LLM call
-        if iteration >= COMPACT_MESSAGES_AFTER_ITER && messages.len() > COMPACT_KEEP_TAIL + 6 {
+        let compact_after = workflow_engine.as_ref().is_some_and(|wf| {
+            wf.try_lock()
+                .map(|e| {
+                    e.is_task_step()
+                })
+                .unwrap_or(false)
+        });
+        let compact_threshold = if compact_after {
+            6
+        } else {
+            COMPACT_MESSAGES_AFTER_ITER
+        };
+        if iteration >= compact_threshold && messages.len() > COMPACT_KEEP_TAIL + 6 {
             turn_memory::compact_turn_messages(&mut messages, COMPACT_KEEP_TAIL);
         }
 
@@ -546,17 +424,17 @@ pub async fn run_agent_turn(
         let include_writes = workflow_engine
             .as_ref()
             .and_then(|wf| wf.try_lock().ok())
-            .map(|e| e.get_current_step_index() == 3)
+            .map(|e| e.is_task_step())
             .unwrap_or(true);
         turn_memory.sync_from_messages(&messages, include_writes);
 
-        // Execute: collapse repeated "需要先读取…" spin (keeps LLM context lean)
+        // Workflow: collapse repeated idle narration (keeps LLM context lean)
         if workflow_engine
             .as_ref()
             .and_then(|wf| wf.try_lock().ok())
-            .is_some_and(|e| e.get_current_step_index() == 3)
+            .is_some_and(|e| e.is_workflow_active())
         {
-            collapse_redundant_execute_spin(&mut messages);
+            crate::agent::idle_narrative::collapse_redundant_idle(&mut messages);
         }
 
         // 🎯 Task anchoring + exploration progress + multi-layer memory re-injection
@@ -572,9 +450,17 @@ pub async fn run_agent_turn(
                 let ur = engine.user_round_memory_block();
                 user_round::strip_user_round(&mut messages);
                 user_round::inject_user_round(&mut messages, &ur);
-                let block = engine.durable_memory_block();
-                memory_bridge::strip_durable_memory(&mut messages);
-                memory_bridge::inject_durable_memory(&mut messages, &block);
+                if !crate::agent::workspace::uses_workspace_memory(&engine) {
+                    let block = engine.durable_memory_block();
+                    memory_bridge::strip_durable_memory(&mut messages);
+                    memory_bridge::inject_durable_memory(&mut messages, &block);
+                } else {
+                    memory_bridge::strip_durable_memory(&mut messages);
+                    let block = engine.durable_memory_block();
+                    if !block.is_empty() {
+                        memory_bridge::inject_durable_memory(&mut messages, &block);
+                    }
+                }
             }
         }
 
@@ -583,25 +469,12 @@ pub async fn run_agent_turn(
         // when a tool_call was skipped or only partially executed.
         crate::context::sanitize_tool_pairs(&mut messages);
 
-        // ── Determine if current step is "internal" BEFORE LLM call ──
-        // Steps 0,1,2 (Intent, Plan, Review): suppress raw JSON; Step 3 (Execute): show full output
-        let (is_internal_step, pre_llm_step_idx, filter_execute_findings) =
-            if let Some(ref engine_arc) = workflow_engine {
-                if let Ok(engine) = engine_arc.try_lock() {
-                    let idx = engine.get_current_step_index();
-                    let chat_reply = engine.is_chat_reply_pending();
-                    let filter_findings = idx == 3
-                        && !crate::agent::workflow_session::is_implementation_phase(&engine);
-                    ((!chat_reply && idx != 3), idx, filter_findings)
-                } else {
-                    (false, 5, false)
-                }
-            } else {
-                (false, 5, false)
-            };
-
-        let mut findings_stream =
-            crate::agent::perception::FindingsStreamFilter::new();
+        // Single-step model: always show assistant output to the user.
+        let pre_llm_step_idx = workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .map(|e| e.get_current_step_index())
+            .unwrap_or(0);
 
         // Stream LLM response.
         let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmStreamEvent>();
@@ -635,12 +508,17 @@ pub async fn run_agent_turn(
                     .collect()
             };
 
-            // Intent / Review: never expose tools in schema
-            if matches!(step_idx, 0 | 2) {
+            let single_step = engine
+                .current_workflow()
+                .is_some_and(|w| w.id == crate::agent::workflow::DEFAULT_WORKFLOW_ID);
+
+            // Legacy 4-step only: Intent (0) / Review (2) are JSON-only — no tools in API.
+            // Single-step workflow also uses index 0 but must expose tools (prompt lists them).
+            if !single_step && matches!(step_idx, 0 | 2) {
                 schemas.clear();
             }
-            // Plan: remove project_detect after first use
-            if step_idx == 1 {
+            // Legacy Plan (1) only
+            if !single_step && step_idx == 1 {
                 let has_detect = engine.has_exploration_tool("project_detect")
                     || tools_used_this_turn.contains("project_detect");
                 if has_detect {
@@ -651,8 +529,8 @@ pub async fn run_agent_turn(
                     }
                 }
             }
-            // Plan: JSON-only after exploration gate passes
-            if step_idx == 1 && engine.plan_exploration_satisfied() {
+            // Legacy Plan: JSON-only after exploration gate passes
+            if !single_step && step_idx == 1 && engine.plan_exploration_satisfied() {
                 tracing::info!("[STEP1] Exploration gate passed — JSON-only mode");
                 schemas.clear();
             }
@@ -712,11 +590,13 @@ pub async fn run_agent_turn(
         }
         tracing::info!("Enabled tools: {}", schemas.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
         tracing::info!("{}", "=".repeat(80));
+
+        let llm_opts = crate::llm::StreamOptions::default();
         let cancel_clone = cancel_token.clone();
         let llm_tx_err = llm_tx.clone();
         let mut stream_handle = tokio::spawn(async move {
             tokio::select! {
-                result = provider_clone.stream_chat(&msgs, &schemas, llm_tx) => {
+                result = provider_clone.stream_chat(&msgs, &schemas, llm_tx, llm_opts) => {
                     if let Err(e) = result {
                         tracing::error!("LLM stream error: {e}");
                         // Propagate the error so the agent loop can handle it.
@@ -744,20 +624,12 @@ pub async fn run_agent_turn(
         } {
             match event {
                 LlmStreamEvent::TextDelta(text) => {
-                    // Suppress raw JSON output for internal workflow steps;
-                    // Execute perceive: strip findings JSON while streaming prose report.
-                    if filter_execute_findings {
-                        if let Some(visible) = findings_stream.push(&text) {
-                            let _ = ui_tx.send(AgentToUiEvent::TextChunk(visible));
-                        }
-                    } else if !is_internal_step {
-                        let _ = ui_tx.send(AgentToUiEvent::TextChunk(text.clone()));
-                    }
+                    let _ = ui_tx.send(AgentToUiEvent::TextChunk(text.clone()));
                     full_text.push_str(&text);
                 }
                 LlmStreamEvent::ReasoningDelta(text) => {
-                    // DeepSeek reasoning_content (thinking mode) — accumulate for round-trip
                     reasoning_content.push_str(&text);
+                    let _ = ui_tx.send(AgentToUiEvent::ReasoningChunk(text));
                 }
                 LlmStreamEvent::ToolCallStart { id, name } => {
                     // Don't show ToolStart in UI yet — the tool may be rejected
@@ -849,12 +721,6 @@ pub async fn run_agent_turn(
             }
         }
 
-        if filter_execute_findings {
-            if let Some(tail) = findings_stream.flush_tail() {
-                let _ = ui_tx.send(AgentToUiEvent::TextChunk(tail));
-            }
-        }
-
         // Onboarding: ## Done when both project skill files exist (no workflow).
         let onboarding_turn =
             workflow_engine.is_none() && onboarding::is_onboarding_turn(&messages);
@@ -895,593 +761,167 @@ pub async fn run_agent_turn(
             }
         }
 
-        // Execute: completion report or ## Done — park and wait for user (no more tool loops).
-        if pre_llm_step_idx == 3
-            && tool_calls.is_empty()
-            && workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .is_some_and(|e| e.should_park_execute_output(&full_text))
-        {
-            if let Some(ref engine_arc) = workflow_engine {
-                let mut engine = engine_arc.lock().await;
-                match engine.try_complete_execute_on_done(&full_text) {
-                    Ok(true) => {
-                        let display = execute_user_display(&workflow_engine, 3, &full_text);
-                        let msg = Message::Assistant {
-                            content: display.clone(),
-                            tool_calls: Vec::new(),
-                            reasoning_content: if reasoning_content.is_empty() {
-                                None
-                            } else {
-                                Some(reasoning_content.clone())
-                            },
-                        };
-                        new_messages.push(msg.clone());
-                        messages.push(msg);
-                        engine.set_previous_output(&display);
-                        let menu_md = engine.clarification_markdown();
-                        emit_workflow_gate(
-                            &ui_tx,
-                            4,
-                            menu_md,
-                            "⏸️ 按 1/2/3 选择 — 继续 / 意见 / 新任务",
-                        );
-                        drop(engine);
-                        match wait_for_session_resume(
-                            &workflow_engine,
-                            &mut messages,
-                            &mut ui_rx,
-                            &ui_tx,
-                            &cancel_token,
-                        )
-                        .await
-                        {
-                            Ok(SessionResumeAction::Continue) => {
-                                turn_memory = turn_memory::TurnMemory::new(
-                                    user_task.as_deref().unwrap_or(""),
-                                );
-                                persist_turn_memory(&workflow_engine, &turn_memory);
-                                iteration += 1;
-                                continue;
-                            }
-                            Ok(SessionResumeAction::NewTask(reflect)) => {
-                                finish_session_with_new_task(
-                                    &ui_tx,
-                                    new_messages,
-                                    total_usage,
-                                    reflect,
-                                );
-                                return;
-                            }
-                            Err(()) => {
-                                let _ = ui_tx.send(AgentToUiEvent::Status(
-                                    "Interrupted.".to_string(),
-                                ));
-                                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                                    new_messages,
-                                    usage: total_usage,
-                                });
-                                return;
-                            }
-                        }
-                    }
-                    Err(gate_msg) => {
-                        let blocks = engine.bump_done_gate_block();
-                        if blocks >= 2 {
-                            tracing::warn!(
-                                "[WORKFLOW] ## Done blocked {blocks} times — auto-completing execute"
-                            );
-                            engine.mark_plan_all_done();
-                        }
-                        match engine.try_complete_execute_on_done(&full_text) {
-                            Ok(true) => {
-                                let display =
-                                    execute_user_display(&workflow_engine, 3, &full_text);
-                                let msg = Message::Assistant {
-                                    content: display.clone(),
-                                    tool_calls: Vec::new(),
-                                    reasoning_content: if reasoning_content.is_empty() {
-                                        None
-                                    } else {
-                                        Some(reasoning_content.clone())
-                                    },
-                                };
-                                new_messages.push(msg.clone());
-                                messages.push(msg);
-                                engine.set_previous_output(&display);
-                                let _ = engine.park_workflow_awaiting_user();
-                                let menu_md = engine.clarification_markdown();
-                                emit_workflow_gate(
-                                    &ui_tx,
-                                    4,
-                                    menu_md,
-                                    "⏸️ 按 1/2/3 选择 — 继续 / 意见 / 新任务",
-                                );
-                                drop(engine);
-                                match wait_for_session_resume(
-                                    &workflow_engine,
-                                    &mut messages,
-                                    &mut ui_rx,
-                                    &ui_tx,
-                                    &cancel_token,
-                                )
-                                .await
-                                {
-                                    Ok(SessionResumeAction::Continue) => {
-                                        turn_memory = turn_memory::TurnMemory::new(
-                                            user_task.as_deref().unwrap_or(""),
-                                        );
-                                        persist_turn_memory(&workflow_engine, &turn_memory);
-                                        iteration += 1;
-                                        continue;
-                                    }
-                                    Ok(SessionResumeAction::NewTask(reflect)) => {
-                                        finish_session_with_new_task(
-                                            &ui_tx,
-                                            new_messages,
-                                            total_usage,
-                                            reflect,
-                                        );
-                                        return;
-                                    }
-                                    Err(()) => {
-                                        let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                                            new_messages,
-                                            usage: total_usage,
-                                        });
-                                        return;
-                                    }
-                                }
-                            }
-                            _ => {
-                                messages.push(Message::system(&gate_msg));
-                                persist_turn_memory(&workflow_engine, &turn_memory);
-                                iteration += 1;
-                                continue;
-                            }
-                        }
-                    }
-                    Ok(false) => {}
-                }
-            }
-        }
-
         // If no tool calls, the turn is complete.
         if tool_calls.is_empty() {
-            let step_output_text = workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .map(|engine| {
-                    if pre_llm_step_idx == 0 {
-                        let user = engine
-                            .get_variable("_current_user_request")
-                            .unwrap_or_default();
-                        crate::agent::engine::WorkflowEngine::correct_intent_json_for_user(&user, &full_text)
-                    } else {
-                        full_text.clone()
-                    }
-                })
-                .unwrap_or_else(|| full_text.clone());
-
-            // Format internal step outputs for session storage (same as tool-calls path)
-            let content_for_session = if is_internal_step {
-                let step_status = workflow_engine.as_ref().and_then(|wf| {
-                    wf.try_lock().ok().and_then(|e| {
-                        e.current_step().map(|s| {
-                            if s.display_status.is_empty() {
-                                s.name.clone()
-                            } else {
-                                s.display_status.clone()
-                            }
-                        })
-                    })
-                }).unwrap_or_else(|| String::new());
-                format_step_output(pre_llm_step_idx, &step_output_text, &step_status)
-            } else {
-                execute_user_display(&workflow_engine, pre_llm_step_idx, &step_output_text)
-            };
-
-            let msg = Message::Assistant {
-                content: content_for_session.clone(),
-                tool_calls: Vec::new(),
-                reasoning_content: if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) },
-            };
-            if is_internal_step {
-                upsert_workflow_step_assistant(&mut messages, &msg);
-                upsert_workflow_step_assistant(&mut new_messages, &msg);
-            } else if pre_llm_step_idx == 3 && is_execute_spin_narrative(&content_for_session) {
-                upsert_execute_spin_assistant(&mut messages, &msg);
-                upsert_execute_spin_assistant(&mut new_messages, &msg);
-            } else {
-                new_messages.push(msg.clone());
-                messages.push(msg);
-            }
-
-            // ── Workflow Step Advancement Logic (before returning) ──
-            // Check if we should advance to the next workflow step
-            // ── Workflow auto-advance ──
+            // Cross-step idle detection — break prose↔gate loops before stacking messages.
             if let Some(ref engine_arc) = workflow_engine {
-                let mut engine = engine_arc.lock().await;
-
-                // Chat reply turn: show natural language to user and end
-                if engine.is_chat_reply_pending() && !is_internal_step {
-                    engine.clear_chat_reply_pending();
-                    engine.set_variable("_chat_reply", full_text.clone());
-                    engine.set_previous_output(&full_text);
-                    emit_workflow_completed(
-                        &ui_tx,
-                        user_task.as_ref(),
-                        &engine,
-                        &full_text,
-                    );
-                    let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
-                    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                        new_messages,
-                        usage: total_usage,
-                    });
-                    return;
-                }
-
-                if pre_llm_step_idx == 1 {
-                    if let Some(draft) = extract_plan_draft_section(&full_text) {
-                        engine.set_variable("_plan_draft", draft);
-                    }
-                }
-
-                // If LLM called tools in a no-tool step, those tools were rejected.
-                // Still check if the text contains valid JSON — LLM may have finished correctly.
-                let had_successful_tool_calls = !tool_calls.is_empty() && new_messages.iter().any(|msg| {
-                    matches!(msg, Message::ToolResult { content, .. } if !content.contains("❌") && !content.contains("not allowed"))
-                });
-                let (advance_result, validation_error) = engine.advance_on_output(&step_output_text, had_successful_tool_calls);
-
-                // If validation failed, inject error so LLM can retry
-                if let Some(ref err) = validation_error {
-                    messages.push(Message::system(err));
-                }
-
-                // Intent 后需求澄清 — 暂停 workflow，等待用户回答
-                if pre_llm_step_idx == 0 && engine.is_awaiting_clarification() {
-                    let markdown = engine.clarification_markdown();
-                    emit_workflow_gate(
-                        &ui_tx,
-                        0,
-                        markdown,
-                        "❓ 需求澄清 — 请回答上方问题后继续",
-                    );
-                    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                        new_messages,
-                        usage: total_usage,
-                    });
-                    return;
-                }
-
-                // Review failed → rollback to Plan (第二步) and end turn so UI can auto-spawn Plan
-                if pre_llm_step_idx == 2 {
-                    if let Some(1) = advance_result {
-                        let feedback = validation_error.clone().unwrap_or_else(|| full_text.clone());
-                        if let Err(e) = engine.rollback_review_to_plan(&full_text, &feedback) {
-                            tracing::warn!("Review rollback failed: {e}");
-                        } else {
-                            let _ = ui_tx.send(AgentToUiEvent::Status(
-                                "⚠️ 审阅未通过 — 回到规划修正计划…".to_string(),
-                            ));
-                            engine.clear_turn_memory();
-                            turn_memory = turn_memory::TurnMemory::new(
-                                user_task.as_deref().unwrap_or(""),
-                            );
-                            persist_turn_memory(&workflow_engine, &turn_memory);
-                            if let Some(new_prompt) = engine.get_step_system_prompt() {
-                                let prompt_text =
-                                    format!("【当前步骤 — 审阅回退】\n{new_prompt}");
-                                let step_msg = Message::system(&prompt_text);
-                                new_messages.push(step_msg.clone());
-                                messages.push(step_msg);
-                            }
-                            let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                                new_messages,
-                                usage: total_usage,
-                            });
-                            return;
-                        }
-                    }
-                }
-
-                // Chat intent: finish workflow and re-prompt for natural language reply
-                if engine.consume_chat_route() {
-                    let _ = engine.complete_workflow();
-                    engine.set_chat_reply_pending();
-                    if matches!(messages.last(), Some(Message::Assistant { .. })) {
-                        messages.pop();
-                        if matches!(new_messages.last(), Some(Message::Assistant { .. })) {
-                            new_messages.pop();
-                        }
-                    }
-                    messages.push(Message::system(
-                        "【意图】闲聊。请直接用自然语言回复用户的最后一个问题，不要 JSON，不要调用工具。"
-                    ));
-                    let _ = ui_tx.send(AgentToUiEvent::Status(
-                        "💬 闲聊模式 — 生成回复...".to_string(),
-                    ));
-                    iteration += 1;
-                    continue;
-                }
-
-                match advance_result {
-                    Some(target_idx) => {
-                        engine.set_previous_output(&step_output_text);
-
-                        // Any transition into Execute requires human confirmation first.
-                        let needs_human_before_execute = target_idx == 3;
-                        let skip_execute_confirm =
-                            engine.should_skip_execute_confirmation(pre_llm_step_idx, target_idx);
-
-                        if needs_human_before_execute && !skip_execute_confirm {
-                            let mut markdown = engine.build_execute_confirmation_markdown(
+                if let Ok(engine) = engine_arc.try_lock() {
+                    if engine.is_workflow_active() && pre_llm_step_idx <= 3 {
+                        let ctx = crate::agent::idle_narrative::IdleContext {
+                            step_idx: pre_llm_step_idx,
+                            engine: Some(&*engine),
+                        };
+                        if !crate::agent::idle_narrative::is_step_deliverable(&ctx, &full_text)
+                            && crate::agent::idle_narrative::is_idle_narrative(&full_text)
+                        {
+                            match crate::agent::idle_narrative::handle_empty_response(
+                                &ctx,
                                 &full_text,
-                                pre_llm_step_idx,
-                            );
-                            let mut preflight_done = false;
-                            if let Some(plan) = engine.get_variable("_step1_output") {
-                                preflight_done = crate::agent::preflight::run_and_store(
-                                    &engine,
-                                    &tool_ctx.working_dir,
-                                    &plan,
-                                );
-                                if preflight_done {
-                                    let snap = engine.exploration_snapshot_summary();
-                                    if !snap.is_empty() {
-                                        markdown.push_str(
-                                            "\n\n---\n\n## 系统 Preflight（已自动执行）\n\n",
-                                        );
-                                        markdown
-                                            .push_str(&snap.chars().take(6000).collect::<String>());
-                                    }
-                                }
-                            }
-                            let handoff = crate::agent::execute_handoff::ExecuteHandoff::freeze(
-                                &engine,
-                                &markdown,
-                                pre_llm_step_idx,
-                                preflight_done,
-                            );
-                            handoff.save(&engine);
-                            engine.arm_execute_confirmation();
-                            let _ = ui_tx.send(AgentToUiEvent::PlanReviewReady {
-                                markdown: markdown.clone(),
-                            });
-                            let _ = ui_tx.send(AgentToUiEvent::WorkflowAwaitingConfirmation {
-                                step_idx: 2,
-                                message: String::new(),
-                            });
-                            if let Some(last_assistant) = new_messages.iter_mut().rev()
-                                .find(|m| matches!(m, Message::Assistant { .. }))
-                            {
-                                if let Message::Assistant { content, .. } = last_assistant {
-                                    *content = markdown;
-                                }
-                            }
-                            let status_msg = execute_confirmation_status(pre_llm_step_idx);
-                            let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
-                            let l0_entity = Entity::working_memory(
-                                "current",
-                                &format!(
-                                    "[Review→Confirm] {}",
-                                    full_text.chars().take(500).collect::<String>()
-                                ),
-                                None,
-                                None,
-                                vec![],
+                                &mut idle_streak,
                                 false,
-                            );
-                            {
-                                let knowledge = Arc::clone(&tool_ctx.knowledge);
-                                tokio::spawn(async move {
-                                    if let Ok(mut eng) = knowledge.try_write() {
-                                        eng.push_turn_buffer(l0_entity);
-                                    }
-                                });
-                            }
-                            let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                                new_messages,
-                                usage: total_usage,
-                            });
-                            return;
-                        }
-
-                        if needs_human_before_execute && skip_execute_confirm {
-                            match engine.advance_to_step(Some(target_idx)) {
-                                Ok(true) => {
-                                    engine.clear_turn_memory();
-                                    turn_memory = turn_memory::TurnMemory::new(
-                                        user_task.as_deref().unwrap_or(""),
+                            ) {
+                                crate::agent::idle_narrative::IdleAction::EndTurn {
+                                    user_status,
+                                } => {
+                                    tracing::warn!(
+                                        "[IDLE] step {} streak {} — ending turn",
+                                        pre_llm_step_idx,
+                                        idle_streak
                                     );
+                                    let _ = ui_tx.send(AgentToUiEvent::Status(user_status));
                                     persist_turn_memory(&workflow_engine, &turn_memory);
-                                    if let Some(new_prompt) = engine.get_step_system_prompt() {
-                                        let step_msg = Message::system(&format!(
-                                            "【当前步骤 — 只读执行】\n{new_prompt}"
-                                        ));
-                                        new_messages.push(step_msg.clone());
-                                        messages.push(step_msg);
-                                    }
-                                    let _ = ui_tx.send(AgentToUiEvent::Status(
-                                        "⚡ 只读检查 — 开始执行（已跳过确认门禁）".to_string(),
-                                    ));
-                                    iteration += 1;
-                                    continue;
-                                }
-                                Ok(false) | Err(_) => {
+                                    drop(engine);
                                     let _ = ui_tx.send(AgentToUiEvent::TurnDone {
                                         new_messages,
                                         usage: total_usage,
                                     });
                                     return;
                                 }
-                            }
-                        }
-
-                        let step_name = engine.current_step()
-                            .map(|s| if s.name.is_empty() { format!("step-{}", 0) } else { s.name.clone() })
-                            .unwrap_or_else(|| "step-0".to_string());
-                        let output_snippet: String = full_text.chars().take(500).collect();
-                        let l0_entity = Entity::working_memory(
-                            "current",
-                            &format!("[{}] {}", step_name, output_snippet),
-                            None, None, vec![], false,
-                        );
-                        {
-                            let knowledge = Arc::clone(&tool_ctx.knowledge);
-                            tokio::spawn(async move {
-                                if let Ok(mut eng) = knowledge.try_write() {
-                                    eng.push_turn_buffer(l0_entity);
-                                }
-                            });
-                        }
-
-                        // Advance to target step (supports skip Review for simple coding)
-                        match engine.advance_to_step(Some(target_idx)) {
-                            Ok(true) => {
-                                engine.clear_turn_memory();
-                                turn_memory = turn_memory::TurnMemory::new(
-                                    user_task.as_deref().unwrap_or(""),
-                                );
-                                persist_turn_memory(&workflow_engine, &turn_memory);
-                                let needs_confirmation = engine.requires_user_confirmation();
-                                if needs_confirmation { engine.set_confirmation_flag(); }
-                                let display = engine.current_step()
-                                    .map(|s| if s.display_status.is_empty() { s.name.clone() } else { s.display_status.clone() })
-                                    .unwrap_or_else(|| "处理中".to_string());
-                                let status_msg = if needs_confirmation {
-                                    format!("{} — ⏸️ 等待确认 (/Y)", display)
-                                } else {
-                                    display.clone()
-                                };
-                                let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
-                                // Inject new step's prompt as a system message
-                                if let Some(new_prompt) = engine.get_step_system_prompt() {
-                                    let mut prompt_text = format!("【当前步骤】\n{}", new_prompt);
-                                    if engine.get_current_step_index() == 1 {
-                                        let skills_list = tool_registry.get_skills_list().iter()
-                                            .map(|s| format!("- `{}` ({}) — {}", s.id, s.scope, s.description))
-                                            .collect::<Vec<_>>()
-                                            .join("\n");
-                                        if skills_list.is_empty() {
-                                            prompt_text.push_str("\n\n【可用 Skill】\n（无项目 Skill，使用内置默认）\n\n⚠️ skills 字段填写 `[\"coding-workflow\"]`。");
+                                crate::agent::idle_narrative::IdleAction::Continue { directive } => {
+                                    let msg = Message::Assistant {
+                                        content: full_text.clone(),
+                                        tool_calls: Vec::new(),
+                                        reasoning_content: if reasoning_content.is_empty() {
+                                            None
                                         } else {
-                                            prompt_text.push_str(&format!(
-                                                "\n\n【可用 Skill】\n{}\n\n⚠️ 必须从上面选择至少一个 skill。coding 任务优先选 project 级别的。",
-                                                skills_list
-                                            ));
-                                        }
+                                            Some(reasoning_content.clone())
+                                        },
+                                    };
+                                    crate::agent::idle_narrative::upsert_idle_assistant(
+                                        &mut messages,
+                                        &msg,
+                                    );
+                                    crate::agent::idle_narrative::upsert_idle_assistant(
+                                        &mut new_messages,
+                                        &msg,
+                                    );
+                                    if let Some(d) = directive {
+                                        crate::agent::idle_narrative::upsert_idle_hint(
+                                            &mut messages,
+                                            &d,
+                                        );
                                     }
-                                    // Push to both messages (LLM context) and new_messages (session persistence)
-                                    let step_msg = Message::system(&prompt_text);
-                                    new_messages.push(step_msg.clone());
-                                    messages.push(step_msg);
+                                    persist_turn_memory(&workflow_engine, &turn_memory);
+                                    drop(engine);
+                                    iteration += 1;
+                                    continue;
                                 }
-
-                                // Send formatted status so user sees step progress
-                                let formatted = format_step_output(pre_llm_step_idx, &full_text, &display);
-                                let _ = ui_tx.send(AgentToUiEvent::Status(formatted));
-                                // Continue in the same task session (no TurnDone / respawn)
-                                iteration += 1;
-                                continue;
                             }
-                            Ok(false) => {
-                                let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
+                        }
+                    }
+                }
+            }
+
+            // Single-step model: always show the assistant's text to the user
+            // (perception filter strips machine-only findings JSON when present).
+            let content_for_session =
+                execute_user_display(&workflow_engine, pre_llm_step_idx, &full_text);
+
+            let msg = Message::Assistant {
+                content: content_for_session.clone(),
+                tool_calls: Vec::new(),
+                reasoning_content: if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) },
+            };
+            let workflow_active = workflow_engine.as_ref().is_some_and(|wf| {
+                wf.try_lock()
+                    .map(|e| e.is_workflow_active())
+                    .unwrap_or(false)
+            });
+            if crate::agent::engine::WorkflowEngine::looks_like_review_report(&content_for_session) {
+                upsert_review_report_assistant(&mut messages, &msg);
+                upsert_review_report_assistant(&mut new_messages, &msg);
+            } else if workflow_active
+                && crate::agent::idle_narrative::is_idle_narrative(&content_for_session)
+            {
+                crate::agent::idle_narrative::upsert_idle_assistant(&mut messages, &msg);
+                crate::agent::idle_narrative::upsert_idle_assistant(&mut new_messages, &msg);
+            } else {
+                new_messages.push(msg.clone());
+                messages.push(msg);
+            }
+
+            // ── Findings: capture review findings JSON / prose so ScopeGate can enforce them.
+            if let Some(ref engine_arc) = workflow_engine {
+                if let Ok(engine) = engine_arc.try_lock() {
+                    if crate::agent::engine::WorkflowEngine::looks_like_review_report(&full_text)
+                        || crate::agent::perception::extract_from_text(&full_text).is_some()
+                    {
+                        crate::agent::findings::ensure_from_review_output(&engine, &full_text);
+                    }
+                }
+            }
+
+            // ── ## Done → gatekeeper pipeline (single-step model) ──
+            if crate::agent::engine::WorkflowEngine::text_signals_done(&full_text) {
+                if let Some(ref engine_arc) = workflow_engine {
+                    let mut engine = engine_arc.lock().await;
+                    if engine.is_workflow_active() && !engine.is_workflow_complete() {
+                        let had_code = turn_memory.had_code_changes();
+                        match engine.run_done_gates(&full_text, had_code) {
+                            crate::agent::gatekeeper::GateReport::Pass => {
+                                engine.set_previous_output(&full_text);
+                                if let Some(receipt) =
+                                    crate::agent::completion::extract_from_text(&full_text)
+                                {
+                                    if let Some(mut store) =
+                                        crate::agent::findings::load_or_migrate(&engine)
+                                    {
+                                        crate::agent::completion::apply_receipt(
+                                            &mut store, &receipt,
+                                        );
+                                        crate::agent::findings::save(&engine, &store);
+                                    }
+                                }
+                                let _ = engine.complete_workflow();
                                 emit_workflow_completed(
                                     &ui_tx,
                                     user_task.as_ref(),
                                     &engine,
                                     &full_text,
                                 );
+                                drop(engine);
+                                let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
                                 let _ = ui_tx.send(AgentToUiEvent::TurnDone {
                                     new_messages,
                                     usage: total_usage,
                                 });
                                 return;
                             }
-                            Err(e) => tracing::warn!("Failed to advance: {e}"),
-                        }
-                    }
-                    None => {
-                        // Validation error: retry unless ## Done already handled above
-                        if validation_error.is_some() {
-                            iteration += 1;
-                            continue;
-                        }
-                    }
-                }
-            }
-            // ── Workflow auto-advance END ──
-
-            // Execute ## Done on standard coding path → complete workflow (no park menu).
-            if pre_llm_step_idx == 3 {
-                if let Some(ref engine_arc) = workflow_engine {
-                    let mut engine = engine_arc.lock().await;
-                    if engine.should_finish_execute_workflow(&step_output_text) {
-                        engine.set_previous_output(&step_output_text);
-                        let _ = engine.complete_workflow();
-                        emit_workflow_completed(
-                            &ui_tx,
-                            user_task.as_ref(),
-                            &engine,
-                            &step_output_text,
-                        );
-                        drop(engine);
-                        let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
-                        let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                            new_messages,
-                            usage: total_usage,
-                        });
-                        return;
-                    }
-                }
-            }
-
-            // Execute 纯文本输出但未走上方 park 分支 → read-only review may park for follow-up
-            if pre_llm_step_idx == 3 {
-                if let Some(ref engine_arc) = workflow_engine {
-                    let mut engine = engine_arc.lock().await;
-                    engine.set_previous_output(&step_output_text);
-                    if engine.should_park_execute_output(&step_output_text) {
-                        let _ = engine.park_workflow_awaiting_user();
-                        let menu_md = engine.clarification_markdown();
-                        emit_workflow_gate(
-                            &ui_tx,
-                            4,
-                            menu_md,
-                            "⏸️ 按 1/2/3 选择 — 继续 / 意见 / 新任务",
-                        );
-                        drop(engine);
-                        match wait_for_session_resume(
-                            &workflow_engine,
-                            &mut messages,
-                            &mut ui_rx,
-                            &ui_tx,
-                            &cancel_token,
-                        )
-                        .await
-                        {
-                            Ok(SessionResumeAction::Continue) => {
-                                turn_memory = turn_memory::TurnMemory::new(
-                                    user_task.as_deref().unwrap_or(""),
-                                );
+                            crate::agent::gatekeeper::GateReport::Fail { gate, feedback } => {
+                                messages.push(Message::system(&format!(
+                                    "【门禁·{gate}】{feedback}"
+                                )));
                                 persist_turn_memory(&workflow_engine, &turn_memory);
+                                drop(engine);
                                 iteration += 1;
                                 continue;
                             }
-                            Ok(SessionResumeAction::NewTask(reflect)) => {
-                                finish_session_with_new_task(
-                                    &ui_tx,
-                                    new_messages,
-                                    total_usage,
-                                    reflect,
-                                );
-                                return;
-                            }
-                            Err(()) => {
+                            crate::agent::gatekeeper::GateReport::NeedsUser { gate, prompt } => {
+                                let status = format!("【门禁·{gate}】{prompt}");
+                                let _ = ui_tx.send(AgentToUiEvent::Status(status.clone()));
+                                messages.push(Message::system(&status));
+                                persist_turn_memory(&workflow_engine, &turn_memory);
+                                drop(engine);
                                 let _ = ui_tx.send(AgentToUiEvent::TurnDone {
                                     new_messages,
                                     usage: total_usage,
@@ -1499,6 +939,7 @@ pub async fn run_agent_turn(
             });
             return;
         }
+
 
         // Sanitize tool_call arguments: if the LLM response was truncated
         // (e.g. finish_reason="length"), arguments may be incomplete JSON.
@@ -1548,7 +989,7 @@ pub async fn run_agent_turn(
         let execute_step = workflow_engine
             .as_ref()
             .and_then(|wf| wf.try_lock().ok())
-            .map(|e| e.get_current_step_index() == 3)
+            .map(|e| e.is_task_step())
             .unwrap_or(false);
 
         // Execute: after a full review report, refuse another exploration pass (read-only phase only).
@@ -1565,8 +1006,8 @@ pub async fn run_agent_turn(
                                 Some(reasoning_content.clone())
                             },
                         };
-                        upsert_execute_spin_assistant(&mut messages, &msg);
-                        upsert_system_retry_hint(
+                        crate::agent::idle_narrative::upsert_idle_assistant(&mut messages, &msg);
+                        crate::agent::idle_narrative::upsert_idle_hint(
                             &mut messages,
                             "❌ 审查报告已输出。请直接输出 `## Done` 或 `## 完成` 并等待用户跟进；\
                              禁止再用 file_read / code_search 做「补充探索」。用户说「执行/去改」后再动手。",
@@ -1584,10 +1025,32 @@ pub async fn run_agent_turn(
             tool_loop_keys.insert(tc.id.clone(), loop_key.clone());
             let count = temp_counts.entry(loop_key).or_insert(0);
             *count += 1;
+            let impl_phase = workflow_engine.as_ref().is_some_and(|wf| {
+                wf.try_lock()
+                    .map(|e| {
+                        e.is_task_step()
+                            && crate::agent::workflow_session::is_implementation_phase(&e)
+                    })
+                    .unwrap_or(false)
+            });
             let limit = match tc.name.as_str() {
                 "file_list" => 2,
+                "file_read" if impl_phase => 24,
                 "file_read" if execute_step => 6,
                 "file_read" => 2,
+                "shell_exec" if impl_phase => {
+                    let looks_read = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        .ok()
+                        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
+                        .is_some_and(|cmd| {
+                            crate::agent::engine::WorkflowEngine::shell_looks_like_file_read(&cmd)
+                        });
+                    if looks_read {
+                        1
+                    } else {
+                        MAX_SAME_TOOL_CALLS
+                    }
+                }
                 _ => MAX_SAME_TOOL_CALLS,
             };
             if *count > limit {
@@ -1595,27 +1058,9 @@ pub async fn run_agent_turn(
             }
         }
         
-        // Push assistant message — format internal step JSON as user-readable summary
-        // Step 0 (Intent), Step 1 (Plan), Step 2 (Review): formatted summary
-        // Step 3 (Execute): show full output normally
-        let (is_internal, step_idx, step_status) = if let Some(ref engine_arc) = workflow_engine {
-            if let Ok(engine) = engine_arc.try_lock() {
-                let idx = engine.get_current_step_index();
-                let status = engine.current_step()
-                    .map(|s| if s.display_status.is_empty() { s.name.clone() } else { s.display_status.clone() })
-                    .unwrap_or_else(|| String::new());
-                (idx != 3, idx, status)
-            } else { (false, 5, String::new()) }
-        } else { (false, 5, String::new()) };
-
-        let display = if is_internal {
-            // Try to parse JSON and format a human-readable summary
-            let summary = format_step_output(step_idx, &full_text, &step_status);
-            tracing::debug!("[STEP OUTPUT] step={}, formatted={}", step_idx, summary);
-            summary
-        } else {
-            execute_user_display(&workflow_engine, step_idx, &full_text)
-        };
+        // Single-step model: always show the assistant's text to the user
+        // (perception filter strips machine-only findings JSON when present).
+        let display = execute_user_display(&workflow_engine, pre_llm_step_idx, &full_text);
 
         // Keep ALL tool_calls on the assistant message so every ToolResult has a matching id.
         // (Filtering caused orphaned ToolResults → API auto-fix → context amnesia.)
@@ -1897,7 +1342,7 @@ pub async fn run_agent_turn(
                         continue;
                     }
                 }
-                if step_idx == 3 && tc.name == "file_list" {
+                if (step_idx == 0 || step_idx == 3) && tc.name == "file_list" {
                     let path = args_value
                         .get("path")
                         .and_then(|p| p.as_str())
@@ -1927,18 +1372,34 @@ pub async fn run_agent_turn(
                         continue;
                     }
                 }
-                if step_idx == 3
+                if (step_idx == 0 || step_idx == 3)
                     && matches!(
                         tc.name.as_str(),
                         "file_read" | "code_search" | "find_symbol" | "file_search"
                     )
                     && !crate::agent::workflow_session::is_implementation_phase(&engine)
                 {
-                    if let Some(cached) = engine.lookup_execute_exploration_cache(
-                        &tool_ctx.working_dir,
-                        &tc.name,
-                        &tc.arguments,
-                    ) {
+                    let cached = engine
+                        .lookup_execute_exploration_cache(
+                            &tool_ctx.working_dir,
+                            &tc.name,
+                            &tc.arguments,
+                        )
+                        .or_else(|| {
+                            if tc.name != "file_read" {
+                                return None;
+                            }
+                            let path = args_value.get("path").and_then(|p| p.as_str())?;
+                            if !engine.is_path_explored("file_read", path)
+                                && !engine.has_file_read_snapshot(path)
+                            {
+                                return None;
+                            }
+                            Some(format!(
+                                "✅ `{path}` 已在计划阶段探索。请使用【探索快照】/ 交接包写审查报告，勿重复 file_read。"
+                            ))
+                        });
+                    if let Some(cached) = cached {
                         tracing::info!(
                             "[WORKFLOW] Execute duplicate {} — returning snapshot cache",
                             tc.name
@@ -2423,11 +1884,48 @@ pub async fn run_agent_turn(
                 is_error: result.is_error,
             });
 
-            let result_content = format!(
+            let mut result_content = format!(
                 "── DATA ({}) ──\n{}\n── END DATA ──",
                 tc.name,
                 offloaded.to_context_message()
             );
+
+            if tc.name == "file_read"
+                && !result.is_error
+                && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            {
+                if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
+                    let offset = args
+                        .get("offset")
+                        .and_then(|o| o.as_u64())
+                        .unwrap_or(0) as u32;
+                    if let Some(ref engine_arc) = workflow_engine {
+                        if let Ok(engine) = engine_arc.try_lock() {
+                            if engine.is_task_step()
+                                && !engine.is_perceive_execute()
+                            {
+                                crate::agent::tool_digest::record_read(
+                                    &engine,
+                                    path,
+                                    &sanitized_content,
+                                    offset,
+                                    None,
+                                );
+                                if let Some(digest) =
+                                    crate::agent::tool_digest::get_digest(&engine, path)
+                                {
+                                    result_content =
+                                        crate::agent::tool_digest::format_tool_result_for_history(
+                                            path,
+                                            &sanitized_content,
+                                            &digest,
+                                        );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Snapshot tool results for Plan / Execute step iteration memory
             if !result.is_error {
@@ -2461,9 +1959,37 @@ pub async fn run_agent_turn(
             );
             persist_turn_memory(&workflow_engine, &turn_memory);
 
+            if tc.name == "shell_exec" {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    if let Some(cmd) = args.get("command").and_then(|c| c.as_str()) {
+                        let succeeded = post_edit_verification::shell_result_success(&sanitized_content);
+                        if let Some(ref engine_arc) = workflow_engine {
+                            if let Ok(engine) = engine_arc.try_lock() {
+                                post_edit_verification::note_shell_verify_result(
+                                    &engine, cmd, succeeded,
+                                );
+                                if succeeded {
+                                    if let Some(idx) = engine.get_plan_tracker().and_then(|t| {
+                                        t.steps
+                                            .iter()
+                                            .find(|s| {
+                                                !s.verify.is_empty()
+                                                    && s.awaiting_verify
+                                            })
+                                            .map(|s| s.index)
+                                    }) {
+                                        crate::agent::verifier::after_verify_pass(&engine, idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let result_msg = Message::ToolResult {
                 tool_call_id: tc.id.clone(),
-                content: result_content,
+                content: result_content.clone(),
             };
             new_messages.push(result_msg.clone());
             messages.push(result_msg);
@@ -2477,9 +2003,14 @@ pub async fn run_agent_turn(
                         .map(|p| format!(" → {}", p))
                         .unwrap_or_default()
                 } else { String::new() };
+                let done_label = if matches!(tool_name.as_str(), "file_write" | "edit_file" | "delete_range") {
+                    "工具执行成功（清单是否勾选见下方进度）"
+                } else {
+                    "已完成"
+                };
                 messages.push(Message::system(&format!(
-                    "📋 ✅ {tool_name}{file_info} — 已完成",
-                    tool_name = tool_name, file_info = file_info
+                    "📋 ✅ {tool_name}{file_info} — {done_label}",
+                    tool_name = tool_name, file_info = file_info, done_label = done_label
                 )));
                 tools_used_this_turn.insert(tool_name.clone());
 
@@ -2491,7 +2022,7 @@ pub async fn run_agent_turn(
                             if let Ok(engine) = engine_arc.try_lock() {
                                 if engine.get_current_step_index() == 1 {
                                     engine.record_explored_path(&tool_name, path);
-                                } else if engine.get_current_step_index() == 3
+                                } else if engine.is_task_step()
                                     && tool_name == "file_list"
                                 {
                                     engine.record_explored_path(&tool_name, path);
@@ -2504,25 +2035,64 @@ pub async fn run_agent_turn(
                 // Execute: update plan tracker for completing tools
                 if let Some(ref engine_arc) = workflow_engine {
                     if let Ok(engine) = engine_arc.try_lock() {
-                        if engine.get_current_step_index() == 3 {
+                        if engine.is_task_step() {
                             if tool_name == "file_read" {
                                 if let Ok(args) =
                                     serde_json::from_str::<serde_json::Value>(&tc.arguments)
                                 {
                                     if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
-                                        engine.record_impl_file_read(path);
-                                        if let Some(nudge) = engine.impl_edit_nudge_after_read(path)
-                                        {
+                                        engine.record_impl_file_read(path, &tc.arguments);
+                                        if let Some(nudge) = engine.impl_edit_nudge_after_read(
+                                            path,
+                                            &result_content,
+                                        ) {
                                             messages.push(Message::system(&nudge));
                                         }
                                     }
                                 }
                             }
-                            if engine.record_execute_tool_success(&tool_name, &tc.arguments) {
+                            let (plan_changed, plan_hint) = engine.record_execute_tool_success(
+                                &tool_name,
+                                &tc.arguments,
+                                &result_content,
+                            );
+                            if let Some(hint) = plan_hint {
+                                messages.push(Message::system(&hint));
+                            }
+                            if plan_changed {
                                 if let Some(msg) =
                                     engine.plan_progress_message_after_tool(&tool_name)
                                 {
                                     messages.push(Message::system(&msg));
+                                }
+                            }
+                            if matches!(
+                                tool_name.as_str(),
+                                "edit_file" | "file_write" | "delete_range"
+                            ) && crate::agent::workflow_session::is_implementation_phase(&engine)
+                            {
+                                if let Ok(args) =
+                                    serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                {
+                                    if let Some(path) = args.get("path").and_then(|p| p.as_str())
+                                    {
+                                        let idx = engine
+                                            .get_plan_tracker()
+                                            .and_then(|t| {
+                                                t.current_step().map(|s| s.index)
+                                            })
+                                            .unwrap_or(1);
+                                        if let Some(note) =
+                                            crate::agent::verifier::after_edit_note(
+                                                &engine,
+                                                idx,
+                                                path,
+                                                &result_content,
+                                            )
+                                        {
+                                            messages.push(Message::system(&note));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2553,7 +2123,7 @@ pub async fn run_agent_turn(
 
                 // Execute step skill creation: tell LLM to output ## Done
                 let is_execute_step = workflow_engine.as_ref().map_or(false, |wf| {
-                    wf.try_lock().map_or(false, |e| e.get_current_step_index() == 3)
+                    wf.try_lock().map_or(false, |e| e.is_task_step())
                 });
 
                 if is_execute_step && is_skill {
@@ -2592,13 +2162,71 @@ pub async fn run_agent_turn(
             messages.push(Message::system(&canvas_ctx));
         }
 
-        // 🚨 Done reminder + tool loop detection
+        // 🚨 Done reminder + AST recovery + verify hints
         if !tool_calls.is_empty() {
-            let has_write = tool_calls.iter().any(|tc| matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range"));
-            if has_write && !onboarding::is_onboarding_turn(&messages) {
-                messages.push(Message::system(
-                    "Files were modified. Output ## Done: list what was created/modified and the verify result. 3 lines max. No extra text."
-                ));
+            let has_write = tool_calls.iter().any(|tc| {
+                matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range")
+            });
+            let has_ast =
+                post_edit_verification::tool_batch_has_ast_issues(&new_messages, &tool_calls);
+
+            post_edit_verification::check_ast_and_recover(
+                &mut messages,
+                &new_messages,
+                &tool_calls,
+            );
+
+            let execute_coding = workflow_engine.as_ref().is_some_and(|wf| {
+                wf.try_lock()
+                    .map(|e| e.is_task_step() && !e.is_perceive_execute())
+                    .unwrap_or(false)
+            });
+            if execute_coding {
+                let project_root = tool_ctx
+                    .runtime
+                    .project_root
+                    .clone()
+                    .unwrap_or_else(|| tool_ctx.working_dir.clone());
+                if let Some(ref engine_arc) = workflow_engine {
+                    if let Ok(engine) = engine_arc.try_lock() {
+                        post_edit_verification::track_edits_and_verify_plan(
+                            &engine,
+                            &project_root,
+                            &tool_calls,
+                            &new_messages,
+                            true,
+                        );
+                        if !has_ast {
+                            if let Some(hint) =
+                                post_edit_verification::verify_hint_message(&engine)
+                            {
+                                messages.push(Message::system(&hint));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if has_write
+                && !onboarding::is_onboarding_turn(&messages)
+                && !has_ast
+            {
+                let verify_blocking = workflow_engine.as_ref().and_then(|wf| {
+                    wf.try_lock().ok().and_then(|e| {
+                        post_edit_verification::check_execute_done_gate(&e)
+                    })
+                });
+                let ast_pending = workflow_engine.as_ref().and_then(|wf| {
+                    wf.try_lock()
+                        .ok()
+                        .and_then(|e| e.get_variable("_ast_pending"))
+                        .filter(|s| !s.is_empty())
+                });
+                if verify_blocking.is_none() && ast_pending.is_none() {
+                    messages.push(Message::system(
+                        "Files were modified. Run project verify if not done yet, then output ## Done with what changed and verify result. 3 lines max."
+                    ));
+                }
             }
 
             // 🔄 Auto-fix: if build/test failed, inject error for self-repair
@@ -2698,6 +2326,9 @@ pub async fn run_agent_turn(
         // Loop back to call LLM again with tool results.
         persist_turn_memory(&workflow_engine, &turn_memory);
         iteration += 1;
+        if !tool_calls.is_empty() {
+            idle_streak = 0;
+        }
     }
 
     persist_turn_memory(&workflow_engine, &turn_memory);
@@ -2746,148 +2377,8 @@ fn is_likely_json_truncation(json_str: &str, error: &serde_json::Error) -> bool 
     is_eof_error || has_unclosed_structure
 }
 
-/// Hint shown after Review before human confirms Execute.
-const EXECUTE_CONFIRM_HINT: &str = "\
----\n\n\
-> **审阅已完成 — 请确认后执行**\n\
-> - 输入修改意见 → 回到规划重新生成\n\
-> - 输入 `ok` / `继续` / `确认` → 开始执行";
-
-/// Extract `## 计划草稿` section from Plan-step assistant text (parallel explore+draft).
-fn extract_plan_draft_section(text: &str) -> Option<String> {
-    let marker = "## 计划草稿";
-    let start = text.find(marker)?;
-    let rest = &text[start + marker.len()..];
-    let end = rest.find("\n## ").unwrap_or(rest.len());
-    let draft = rest[..end].trim();
-    if draft.len() < 8 {
-        None
-    } else {
-        Some(format!("{marker}\n{draft}"))
-    }
-}
-
-fn execute_confirmation_status(from_step: usize) -> String {
-    match from_step {
-        0 => "⏸️ 快速路径 — 已跳过规划/审阅，请确认后开始执行".to_string(),
-        1 => "⏸️ 规划完成 — 请确认后开始执行".to_string(),
-        2 => "⏸️ 审阅完成 — 请确认后开始执行".to_string(),
-        _ => "⏸️ 请确认后开始执行".to_string(),
-    }
-}
-
-fn build_execute_confirmation_markdown(
-    engine: &crate::agent::engine::WorkflowEngine,
-    review_text: &str,
-    from_step: usize,
-) -> String {
-    let plan_raw = engine
-        .get_variable("_step1_output")
-        .unwrap_or_else(|| engine.get_previous_step_output().unwrap_or_default());
-    let plan_md = format_step_output(1, &plan_raw, "📋 任务规划");
-    let review_md = if from_step == 2 {
-        format_step_output(2, review_text, "🛡️ 审阅计划")
-    } else if from_step == 0 {
-        let exploring = crate::agent::engine::WorkflowEngine::parse_intent_meta(
-            engine.get_variable("_step0_output").as_deref(),
-        )
-        .map(|(intent, _)| intent == "exploring")
-        .unwrap_or(false);
-        if exploring {
-            "✅ **只读检查快速路径** — 跳过规划/审阅，确认后直接探索并输出分析".to_string()
-        } else {
-            "✅ **快速路径** — 简单改动跳过规划/审阅，直接进入人工确认".to_string()
-        }
-    } else {
-        "✅ **自动审阅已跳过**（只读检查或简单编码任务）".to_string()
-    };
-    format!("{plan_md}\n\n---\n\n{review_md}\n\n{EXECUTE_CONFIRM_HINT}")
-}
-
-/// Replace the latest internal-step assistant bubble (same step retries), keep tool-call assistants.
-fn upsert_workflow_step_assistant(messages: &mut Vec<Message>, new_msg: &Message) {
-    let Message::Assistant {
-        content: _new_content,
-        tool_calls: new_tc,
-        ..
-    } = new_msg
-    else {
-        messages.push(new_msg.clone());
-        return;
-    };
-    if !new_tc.is_empty() {
-        messages.push(new_msg.clone());
-        return;
-    }
-    while let Some(Message::Assistant {
-        content,
-        tool_calls,
-        ..
-    }) = messages.last()
-    {
-        if !tool_calls.is_empty() {
-            break;
-        }
-        if is_internal_formatted_assistant(content) {
-            messages.pop();
-        } else {
-            break;
-        }
-    }
-    messages.push(new_msg.clone());
-}
-
-fn is_internal_formatted_assistant(content: &str) -> bool {
-    content.starts_with("## 执行计划")
-        || content.starts_with('_')
-        || content.contains("路径 `")
-        || content.starts_with("🔍")
-        || content.starts_with("💻")
-        || content.starts_with("💬")
-        || content.starts_with("🤔")
-}
-
-/// Execute 空转：只说「要先读文件」却不调工具 — 不应在记忆里堆叠多条。
-fn is_execute_spin_narrative(content: &str) -> bool {
-    let t = content.trim();
-    if t.is_empty() {
-        return false;
-    }
-    if crate::agent::engine::WorkflowEngine::looks_like_review_report(t) {
-        return false;
-    }
-    if crate::agent::engine::WorkflowEngine::text_signals_done(t) {
-        return false;
-    }
-    let lower = t.to_lowercase();
-    [
-        "需要先读取",
-        "需要先读",
-        "先读取",
-        "先读",
-        "让我先",
-        "我需要先",
-        "before modifying",
-        "before i can",
-        "need to read",
-        "read the full",
-        "read the remaining",
-        "剩余部分",
-        "完整枚举",
-        "import 和字段",
-        "imports and field",
-    ]
-    .iter()
-    .any(|m| t.contains(m) || lower.contains(m))
-}
-
-fn is_execute_spin_system_hint(content: &str) -> bool {
-    content.starts_with("❌ 审查报告已输出")
-        || content.starts_with("❌ Infinite Loop")
-}
-
-/// Replace the latest spin assistant instead of appending another copy.
-fn upsert_execute_spin_assistant(messages: &mut Vec<Message>, new_msg: &Message) {
+/// Replace the latest review report instead of stacking duplicate full reports.
+fn upsert_review_report_assistant(messages: &mut Vec<Message>, new_msg: &Message) {
     let Message::Assistant {
         content: new_content,
         tool_calls: new_tc,
@@ -2901,275 +2392,42 @@ fn upsert_execute_spin_assistant(messages: &mut Vec<Message>, new_msg: &Message)
         messages.push(new_msg.clone());
         return;
     }
-    if !is_execute_spin_narrative(new_content) {
+    if !crate::agent::engine::WorkflowEngine::looks_like_review_report(new_content) {
         messages.push(new_msg.clone());
         return;
     }
-    strip_trailing_spin_retry_hints(messages);
+    crate::agent::idle_narrative::strip_idle_hints(messages);
     if let Some(Message::Assistant {
         content: prev,
         tool_calls: prev_tc,
         ..
     }) = messages.last()
     {
-        if prev_tc.is_empty() && is_execute_spin_narrative(prev) {
+        if prev_tc.is_empty()
+            && crate::agent::engine::WorkflowEngine::looks_like_review_report(prev)
+        {
             messages.pop();
         }
     }
     messages.push(new_msg.clone());
 }
 
-fn upsert_system_retry_hint(messages: &mut Vec<Message>, hint: &str) {
-    if let Some(Message::System { content }) = messages.last() {
-        if is_execute_spin_system_hint(content) {
-            messages.pop();
-        }
-    }
-    messages.push(Message::system(hint));
-}
-
-fn strip_trailing_spin_retry_hints(messages: &mut Vec<Message>) {
-    while let Some(Message::System { content }) = messages.last() {
-        if is_execute_spin_system_hint(content) {
-            messages.pop();
-        } else {
-            break;
-        }
-    }
-}
-
-/// Collapse runs of spin assistant (+ optional system hint) to the latest pair only.
-fn collapse_redundant_execute_spin(messages: &mut Vec<Message>) {
-    let mut i = 0;
-    while i < messages.len() {
-        let Message::Assistant {
-            content,
-            tool_calls,
-            ..
-        } = &messages[i]
-        else {
-            i += 1;
-            continue;
-        };
-        if !tool_calls.is_empty() || !is_execute_spin_narrative(content) {
-            i += 1;
-            continue;
-        }
-
-        let start = i;
-        let mut end = i + 1;
-        while end < messages.len() {
-            match &messages[end] {
-                Message::System { content: s } if is_execute_spin_system_hint(s) => end += 1,
-                Message::Assistant {
-                    content: c,
-                    tool_calls: tc,
-                    ..
-                } if tc.is_empty() && is_execute_spin_narrative(c) => end += 1,
-                _ => break,
-            }
-        }
-
-        if end > start + 1 {
-            let mut keep_assistant = None;
-            let mut keep_system = None;
-            for m in messages[start..end].iter().rev() {
-                match m {
-                    Message::Assistant { .. } if keep_assistant.is_none() => {
-                        keep_assistant = Some(m.clone());
-                    }
-                    Message::System { content: s } if keep_system.is_none() && is_execute_spin_system_hint(s) => {
-                        keep_system = Some(m.clone());
-                    }
-                    _ => {}
-                }
-            }
-            messages.drain(start..end);
-            let mut insert_at = start;
-            if let Some(a) = keep_assistant {
-                messages.insert(insert_at, a);
-                insert_at += 1;
-            }
-            if let Some(s) = keep_system {
-                messages.insert(insert_at, s);
-            }
-            i = start + 1;
-        } else {
-            i += 1;
-        }
-    }
-}
-
-/// Execute step 3: hide machine-only findings JSON; show prose / markdown report.
+/// Hide machine-only findings JSON; show prose / markdown report.
+/// `format_for_user_display` is a no-op when the text has no findings payload.
 fn execute_user_display(
     workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
-    step_idx: usize,
+    _step_idx: usize,
     text: &str,
 ) -> String {
-    if step_idx != 3 {
-        return text.to_string();
-    }
     let filter = workflow_engine
         .as_ref()
         .and_then(|wf| wf.try_lock().ok())
         .map(|e| !crate::agent::workflow_session::is_implementation_phase(&e))
-        .unwrap_or(true);
+        .unwrap_or(false);
     if filter {
         crate::agent::perception::format_for_user_display(text)
     } else {
         text.to_string()
-    }
-}
-
-/// Format JSON output from internal workflow steps into user-readable Markdown.
-fn format_step_output(step_idx: usize, text: &str, fallback: &str) -> String {
-    let json_str = match crate::agent::engine::extract_json_block(text) {
-        Some(s) => s,
-        None => return format!("_{}_", fallback),
-    };
-
-    let parsed: Option<serde_json::Value> = serde_json::from_str(&json_str).ok();
-
-    match step_idx {
-        0 => {
-            // Step 0: Intent Classification + routing
-            if let Some(ref v) = parsed {
-                let intent = v.get("intent").and_then(|s| s.as_str()).unwrap_or("?");
-                let complexity = v.get("complexity").and_then(|s| s.as_str()).unwrap_or("");
-                let topic = v.get("topic").and_then(|s| s.as_str()).unwrap_or("");
-                let pipeline = v.get("pipeline").and_then(|s| s.as_str()).unwrap_or("?");
-                let reason = v.get("routing_reason").and_then(|s| s.as_str()).unwrap_or("");
-                let emoji = match intent {
-                    "coding" => "💻", "exploring" => "🔍", "chat" => "💬", _ => "🤔",
-                };
-                let route = crate::agent::engine::WorkflowEngine::intent_routing_from_text(Some(text))
-                    .map(|r| {
-                        if r.requires_human_confirm {
-                            format!("{}（待人工确认）", r.steps_summary)
-                        } else {
-                            r.steps_summary
-                        }
-                    })
-                    .unwrap_or_else(|| pipeline.to_string());
-                let head = if topic.is_empty() {
-                    format!("{} {}({})", emoji, intent, complexity)
-                } else {
-                    format!("{} {}({}) — {}", emoji, intent, complexity, topic)
-                };
-                let mut lines = vec![head, format!("📍 路径 `{pipeline}`：{route}")];
-                if !reason.is_empty() {
-                    lines.push(format!("💡 {reason}"));
-                }
-                lines.join("\n")
-            } else {
-                format!("_🤔 分析意图_")
-            }
-        }
-        1 => {
-            // Step 1: Task Planning — structured Markdown
-            if let Some(ref v) = parsed {
-                let mut md = String::from("## 执行计划\n");
-                let mut step_count = 0usize;
-                if let Some(plan) = v.get("plan").and_then(|p| p.as_array()) {
-                    for step in plan {
-                        if let Some(obj) = step.as_object() {
-                            step_count += 1;
-                            let num = obj.get("step").and_then(|s| s.as_u64()).unwrap_or(step_count as u64);
-                            let file = obj.get("file").and_then(|s| s.as_str()).unwrap_or("");
-                            let action = obj.get("action").and_then(|s| s.as_str()).unwrap_or("");
-                            let target = obj.get("target").and_then(|s| s.as_str()).unwrap_or("");
-                            let desc = obj.get("desc").and_then(|s| s.as_str()).unwrap_or("");
-                            let verify = obj.get("verify").and_then(|s| s.as_str()).unwrap_or("");
-
-                            let action_label = match action {
-                                "add" | "create" => "新增",
-                                "modify" => "修改",
-                                "delete" => "删除",
-                                "explain" => "说明",
-                                _ if action.is_empty() => "步骤",
-                                _ => action,
-                            };
-
-                            md.push_str(&format!("\n### 步骤 {num} — {action_label}\n"));
-                            if !file.is_empty() {
-                                md.push_str(&format!("- **文件:** `{file}`\n"));
-                            }
-                            if !target.is_empty() {
-                                md.push_str(&format!("- **目标:** `{target}`\n"));
-                            }
-                            if !desc.is_empty() {
-                                md.push_str(&format!("- **说明:** {desc}\n"));
-                            }
-                            if !verify.is_empty() {
-                                md.push_str(&format!("- **验证:** {verify}\n"));
-                            }
-                        } else if let Some(s) = step.as_str() {
-                            step_count += 1;
-                            md.push_str(&format!("\n- {s}\n"));
-                        }
-                    }
-                }
-                if step_count == 0 {
-                    md.push_str("\n> ⚠️ 计划 JSON 已收到，但未解析出可展示的步骤。原始内容：\n\n");
-                    md.push_str("```json\n");
-                    md.push_str(&serde_json::to_string_pretty(v).unwrap_or_else(|_| json_str.clone()));
-                    md.push_str("\n```\n");
-                }
-                if let Some(skills) = v.get("skills").and_then(|s| s.as_array()) {
-                    let skill_names: Vec<&str> = skills
-                        .iter()
-                        .filter_map(|s| s.as_str())
-                        .collect();
-                    if !skill_names.is_empty() {
-                        md.push_str("\n**Skills:** ");
-                        md.push_str(&skill_names.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", "));
-                        md.push('\n');
-                    }
-                }
-                if let Some(files) = v.get("key_files").and_then(|f| f.as_array()) {
-                    let file_names: Vec<&str> = files.iter().filter_map(|f| f.as_str()).collect();
-                    if !file_names.is_empty() {
-                        md.push_str("\n**关键文件:** ");
-                        md.push_str(&file_names.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", "));
-                        md.push('\n');
-                    }
-                }
-                md
-            } else {
-                format!("_📋 任务规划_")
-            }
-        }
-        2 => {
-            // Step 2: Review — safety + completeness check on the plan
-            if let Some(ref v) = parsed {
-                let safe = v.get("safe").and_then(|s| s.as_bool()).unwrap_or(true);
-                let complete = v.get("complete").and_then(|c| c.as_bool()).unwrap_or(true);
-                let issues = v.get("issues").and_then(|i| i.as_array())
-                    .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                let warnings = v.get("warnings").and_then(|w| w.as_array())
-                    .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>())
-                    .unwrap_or_default();
-
-                let mut lines = Vec::new();
-                if safe && complete && issues.is_empty() {
-                    lines.push("✅ 计划通过审阅".to_string());
-                } else {
-                    if !safe { lines.push("⚠️ 安全问题".to_string()); }
-                    if !complete { lines.push("⚠️ 计划不完整".to_string()); }
-                    for issue in &issues {
-                        lines.push(format!("  ❌ {}", issue));
-                    }
-                }
-                for warning in &warnings {
-                    lines.push(format!("  💡 {}", warning));
-                }
-                lines.join("\n")
-            } else {
-                "🛡️ 审阅计划".to_string()
-            }
-        }
-        _ => format!("_{}_", fallback),
     }
 }
 
@@ -3198,25 +2456,6 @@ fn emit_workflow_completed(
         task_description,
         execution_summary,
     });
-}
-
-/// TurnDone first (sync session messages), then WorkflowCompleted for skill reflect.
-fn finish_session_with_new_task(
-    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    new_messages: Vec<Message>,
-    usage: TokenUsage,
-    reflect: Option<(String, String)>,
-) {
-    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-        new_messages,
-        usage,
-    });
-    if let Some((task_description, execution_summary)) = reflect {
-        let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
-            task_description,
-            execution_summary,
-        });
-    }
 }
 
 /// Dedup key for same-tool loop detection (file_read includes offset/limit).

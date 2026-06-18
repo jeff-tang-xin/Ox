@@ -17,7 +17,7 @@ use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
 use ox_core::tools::{ToolContext, ToolRegistry};
 
-use crate::terminal::app::{App, ParkFollowUpTag, PendingConfirmation, PendingSkillDraft};
+use crate::terminal::app::{App, FindingsPanelState, ParkFollowUpTag, PendingConfirmation, PendingSkillDraft};
 use crate::terminal::output_pane::OutputLine;
 use crate::helpers;
 
@@ -37,7 +37,17 @@ pub enum HandleResult {
 
 /// Handle a single TextChunk event.
 pub fn handle_text_chunk(app: &mut App, text: &str) {
+    app.output.collapse_thinking();
     app.output.push_streaming_chunk(text);
+    if !app.user_scrolled {
+        app.scroll_to_bottom();
+    }
+    app.dirty = true;
+}
+
+/// Handle streaming reasoning / thinking tokens.
+pub fn handle_reasoning_chunk(app: &mut App, text: &str) {
+    app.output.push_reasoning_chunk(text);
     if !app.user_scrolled {
         app.scroll_to_bottom();
     }
@@ -46,6 +56,7 @@ pub fn handle_text_chunk(app: &mut App, text: &str) {
 
 /// Handle a single ToolStart event.
 pub fn handle_tool_start(app: &mut App, name: &str, detail: &Option<String>) {
+    app.output.collapse_thinking();
     if detail.is_some() {
         let mut updated = false;
         for line in app.output.lines.iter_mut().rev() {
@@ -198,8 +209,15 @@ pub fn handle_turn_done(
         None
     };
 
+    let project_root = rt_env.effective_project_root();
+    let main_session_msgs = session.messages.clone();
+
     // Determine target session (background or active)
     let target_session = background_session.as_mut().unwrap_or(session);
+
+    let onboarding_completed = ox_core::agent::onboarding::onboarding_files_complete(&project_root)
+        && ox_core::agent::onboarding::is_onboarding_turn(&main_session_msgs)
+        && ox_core::agent::onboarding::turn_signals_onboarding_done(new_messages);
 
     // ── Parse Plan/Done blocks ──
     let mut plan_files: Vec<String> = Vec::new();
@@ -463,34 +481,46 @@ pub fn handle_turn_done(
                 .push_line(OutputLine::System(format!("💬 (fallback queued) {}", inj_text.trim())));
         }
         if let Some(last) = interjections_vec.last() {
+            let mut resume = false;
             if let Some(ref wf) = app.workflow_engine {
-                if let Ok(engine) = wf.try_lock() {
-                    if engine.workflow_preserves_on_user_input() {
+                if let Ok(mut engine) = wf.try_lock() {
+                    if engine.is_workflow_complete() {
+                        resume = engine.reopen_execute_for_fixes(last);
+                    }
+                    if engine.interjection_should_resume_turn(last) {
+                        if !resume {
+                            engine.adopt_execute_interjection(last);
+                        }
+                        resume = true;
+                    } else if engine.workflow_preserves_on_user_input() {
                         engine.append_workflow_guidance(last);
+                        resume = true;
                     }
                 }
             }
-            let _ = session.append_message(Message::user(last));
+            if resume {
+                let _ = session.append_message(Message::user(last));
 
-            let turn_messages = crate::helpers::build_context_with_option(
-                context_builder,
-                system_prompt,
-                "",
-                &session.messages,
-                context_window,
-                config.context.use_refined_context,
-            );
+                let turn_messages = crate::helpers::build_context_with_option(
+                    context_builder,
+                    system_prompt,
+                    "",
+                    &session.messages,
+                    context_window,
+                    config.context.use_refined_context,
+                );
 
-            app.scroll_to_bottom();
-            app.dirty = true;
-            app.message_count = session.messages.len();
-            app.cost_summary = cost_tracker.summary_short();
+                app.scroll_to_bottom();
+                app.dirty = true;
+                app.message_count = session.messages.len();
+                app.cost_summary = cost_tracker.summary_short();
 
-            return HandleResult::InterjectionTriggered {
-                text: last.clone(),
-                memory_ctx: String::new(),
-                turn_messages,
-            };
+                return HandleResult::InterjectionTriggered {
+                    text: last.clone(),
+                    memory_ctx: String::new(),
+                    turn_messages,
+                };
+            }
         }
     }
 
@@ -498,6 +528,42 @@ pub fn handle_turn_done(
         app.scroll_to_bottom();
     }
     app.dirty = true;
+
+    // First-time onboarding: agent ran without workflow — reset CLI engine & skip auto-spawn
+    if onboarding_completed {
+        let task = ox_core::agent::onboarding::extract_onboarding_task(&main_session_msgs);
+        let summary = new_messages
+            .iter()
+            .find_map(|m| {
+                if let Message::Assistant { content, .. } = m {
+                    Some(content.chars().take(1000).collect::<String>())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| task.clone());
+        if let Some(ref wf) = app.workflow_engine {
+            if let Ok(mut engine) = wf.try_lock() {
+                if let Err(e) = ox_core::agent::onboarding::finalize_cli_workflow_after_onboarding(
+                    &mut engine,
+                    session,
+                    &task,
+                ) {
+                    tracing::warn!("Onboarding workflow reset failed: {e}");
+                }
+            }
+        }
+        app.suppress_workflow_autospawn = true;
+        app.workflow_display = None;
+        app.output.push_system(
+            "✅ 首次 Skill 创建完成。下一条消息将从 **Intent（意图识别）** 开始新任务。",
+        );
+        let _ = _agent_tx.send(AgentToUiEvent::WorkflowCompleted {
+            task_description: task,
+            execution_summary: summary,
+        });
+    }
+
     HandleResult::Normal
 }
 
@@ -527,6 +593,7 @@ pub fn handle_error(
 
 /// Handle Status update event.
 pub fn handle_status(app: &mut App, status: String) {
+    // Iteration status belongs in the status bar only — not duplicated per-iteration in the timeline.
     app.status = status;
     app.dirty = true;
 }
@@ -556,7 +623,7 @@ pub fn handle_workflow_awaiting_confirmation(app: &mut App, step_idx: usize, mes
     app.status = match step_idx {
         0 => "❓ 请具体回答澄清问题（模糊回复会继续追问）".to_string(),
         2 => "⏸️ 请确认后开始执行（输入 ok/继续/确认，或输入修改意见）".to_string(),
-        4 => "⏸️ 按 1/2/3 选择 — [1]继续 [2]意见·只读 [3]新任务".to_string(),
+        4 => "⏸️ 1-9 切换 finding · c 确认 · d 讨论 · n 新任务".to_string(),
         _ => "⏸️ 等待确认".to_string(),
     };
     if !app.user_scrolled {
@@ -575,61 +642,110 @@ pub fn park_tag_from_menu_answer(answer: &str) -> Option<ParkFollowUpTag> {
     }
 }
 
-/// Handle park follow-up menu shortcut (1/2/3).
-pub fn handle_park_menu_shortcut(app: &mut App, choice: char) {
-    let token = choice.to_string();
-    let tag = match choice {
-        '1' => ParkFollowUpTag::Continue,
-        '2' => ParkFollowUpTag::Feedback,
-        '3' => ParkFollowUpTag::NewTask,
-        _ => return,
-    };
-
-    let Some(ref wf) = app.workflow_engine else {
-        return;
-    };
-    let Ok(engine) = wf.try_lock() else {
-        return;
-    };
-    if !engine.is_park_disambiguation_awaiting() {
-        return;
-    }
-
-    match engine.finish_park_disambiguation(&token) {
-        Ok(ox_core::agent::requirement_clarification::ParkFollowUpOutcome::NeedDetail { hint }) => {
-            app.park_follow_up_tag = Some(tag);
-            app.input.clear();
-            app.output.push_system(&hint);
-            app.status = match tag {
-                ParkFollowUpTag::Continue => {
-                    "✏️ [继续] 请说明要修复/执行的范围".to_string()
-                }
-                ParkFollowUpTag::Feedback => {
-                    "💬 [意见·只读] 请说明你的澄清或质疑".to_string()
-                }
-                ParkFollowUpTag::NewTask => "🆕 [新任务] 请描述新任务".to_string(),
-            };
-            if choice == '2' {
-                app.output.push_system(
-                    "💬 意见模式：只讨论审查结论，不会修改代码或进入实施",
-                );
-            }
-            app.dirty = true;
-        }
-        Ok(
-            ox_core::agent::requirement_clarification::ParkFollowUpOutcome::Resolved(
-                _resolution,
-            ),
-        ) => {
-            app.output.push_system("已选择，请按 Enter 提交或重新按 1/2/3");
-            app.dirty = true;
-        }
-        Err(hint) => {
-            app.output.push_system(&hint);
-            app.dirty = true;
-        }
-    }
+/// Build panel state from engine (no App borrow).
+fn findings_panel_from_engine(
+    engine: &ox_core::agent::engine::WorkflowEngine,
+) -> Option<FindingsPanelState> {
+    let store = ox_core::agent::findings::load_or_migrate(engine)?;
+    Some(FindingsPanelState {
+        summary: ox_core::agent::presentation::panel_summary(&store),
+        rows: store.progress_rows(),
+    })
 }
+
+/// Refresh the TUI findings panel from engine state.
+pub fn refresh_findings_panel(app: &mut App, engine: &ox_core::agent::engine::WorkflowEngine) {
+    app.findings_panel = findings_panel_from_engine(engine);
+}
+
+/// Toggle finding #N in scope (findings panel shortcut).
+pub fn toggle_finding_in_panel(app: &mut App, n: u32) {
+    let Some(wf) = app.workflow_engine.clone() else {
+        return;
+    };
+    let Ok(mut engine) = wf.try_lock() else {
+        return;
+    };
+    use ox_core::agent::workflow_command::{self, CommandOutcome, WorkflowCommand};
+    let msg = if let CommandOutcome::Applied(msg) =
+        workflow_command::apply_with_cwd(&mut engine, WorkflowCommand::ToggleFinding(n), None)
+    {
+        msg
+    } else {
+        None
+    };
+    let panel = findings_panel_from_engine(&engine);
+    drop(engine);
+    if let Some(text) = msg {
+        app.output.push_system(&text);
+    }
+    app.findings_panel = panel;
+    app.dirty = true;
+}
+
+/// Engine-side gates that should keep the UI in confirmation mode.
+pub fn engine_has_workflow_gate(engine: &ox_core::agent::engine::WorkflowEngine) -> bool {
+    engine.is_current_step_waiting_confirmation()
+}
+
+/// True when free-text input should wait for a gate (single-step: rarely used).
+pub fn workflow_input_blocked_by_gate(
+    _app: &App,
+    engine: &ox_core::agent::engine::WorkflowEngine,
+) -> bool {
+    engine.is_current_step_waiting_confirmation()
+}
+
+/// Apply a workflow slash command from the TUI (returns handled, spawn_workflow).
+pub fn apply_workflow_slash(
+    app: &mut App,
+    text: &str,
+    working_dir: &std::path::Path,
+) -> (bool, bool) {
+    let Some(wf) = app.workflow_engine.clone() else {
+        return (false, false);
+    };
+    let Ok(mut engine) = wf.try_lock() else {
+        return (false, false);
+    };
+    let parsed_cmd = ox_core::agent::workflow_command::parse(text);
+    let Some(outcome) = engine.apply_workflow_command(text, Some(working_dir)) else {
+        return (false, false);
+    };
+    use ox_core::agent::workflow_command::{CommandOutcome, WorkflowCommand};
+    let mut spawn_workflow = false;
+    let mut clear_confirm = false;
+    let mut panel = None;
+    let mut system_msgs: Vec<String> = Vec::new();
+    match outcome {
+        CommandOutcome::Applied(Some(msg)) => {
+            system_msgs.push(msg);
+            spawn_workflow = matches!(parsed_cmd, Some(WorkflowCommand::NewTask(_)));
+            if spawn_workflow {
+                clear_confirm = true;
+            } else {
+                panel = findings_panel_from_engine(&engine);
+            }
+        }
+        CommandOutcome::Applied(None) | CommandOutcome::Ignored => {}
+    }
+    drop(engine);
+    for msg in system_msgs {
+        app.output.push_system(&msg);
+    }
+    if clear_confirm {
+        app.clear_workflow_confirmation();
+    } else if let Some(p) = panel {
+        app.findings_panel = Some(p);
+        app.park_follow_up_tag = None;
+        app.workflow_awaiting_confirmation = Some(4);
+    }
+    app.dirty = true;
+    (true, spawn_workflow)
+}
+
+/// Legacy park menu shortcut — no-op in single-step model.
+pub fn handle_park_menu_shortcut(_app: &mut App, _choice: char) {}
 
 /// Handle ToolConfirmationRequest event.
 pub fn handle_tool_confirmation(

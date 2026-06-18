@@ -325,6 +325,44 @@ pub async fn prepare_turn(
     }
 }
 
+/// Lazy-embed session paths before a workflow auto-spawn (mirrors pre_turn step 1b).
+pub async fn lazy_index_for_workflow_step(
+    config: &ox_core::config::OxConfig,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>>,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<ox_core::agent::engine::WorkflowEngine>>>,
+    query_hint: &str,
+    status_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) {
+    if !config.embedding.lazy_index {
+        return;
+    }
+    let Some(k_engine) = knowledge_engine else {
+        return;
+    };
+    let paths = collect_lazy_index_paths(query_hint, workflow_engine);
+    if paths.is_empty() {
+        return;
+    }
+    let max = config.embedding.lazy_index_max_files_per_turn.max(1);
+    let _ = status_tx.send(AgentToUiEvent::Status(format!(
+        "📇 Indexing {} path(s) for workflow step…",
+        paths.len().min(max)
+    )));
+    match tokio::time::timeout(LAZY_INDEX_WRITE_LOCK_TIMEOUT, k_engine.write()).await {
+        Ok(mut engine) => {
+            if let Ok(n) = tokio::task::block_in_place(|| engine.ensure_paths_indexed(&paths, max))
+            {
+                if n > 0 {
+                    tracing::info!("[WORKFLOW-SPAWN] Lazy-indexed {n} symbols");
+                }
+            }
+        }
+        Err(_) => {
+            tracing::warn!("[WORKFLOW-SPAWN] Lazy index skipped — knowledge engine busy");
+        }
+    }
+}
+
 /// Extract workflow step information (memory layers, step prompt, step index).
 fn get_workflow_step_info(
     workflow_engine: &Option<Arc<tokio::sync::Mutex<ox_core::agent::engine::WorkflowEngine>>>,
@@ -345,7 +383,7 @@ fn get_workflow_step_info(
 }
 
 /// Paths to lazy-embed: explicit paths in query + intent files + explored file_read targets.
-fn collect_lazy_index_paths(
+pub fn collect_lazy_index_paths(
     query: &str,
     workflow_engine: &Option<Arc<tokio::sync::Mutex<ox_core::agent::engine::WorkflowEngine>>>,
 ) -> Vec<PathBuf> {

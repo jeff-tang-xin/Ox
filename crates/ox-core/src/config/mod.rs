@@ -137,7 +137,7 @@ default = "gpt-4o"             # Default model to use
 [models.providers.openai]
 api_key = ""                   # Your OpenAI API key (sk-...)
 # base_url = "https://api.openai.com/v1"       # Custom API endpoint
-# max_tokens = 4096            # Maximum response tokens
+# max_tokens = 8192            # Maximum response tokens (Plan JSON needs ≥8k when model adds prose)
 
 [models.providers.anthropic]
 api_key = ""                   # Your Anthropic API key (sk-ant-...)
@@ -147,7 +147,7 @@ api_key = ""                   # Your Anthropic API key (sk-ant-...)
 [models.providers.deepseek]
 api_key = ""                   # Your DeepSeek API key
 # base_url = "https://api.deepseek.com/v1"     # Custom API endpoint
-# max_tokens = 4096            # Maximum response tokens
+# max_tokens = 8192            # Maximum response tokens (Plan JSON needs ≥8k when model adds prose)
 
 # ── Advanced Model Configuration ─────────────────────────
 # Default provider — overrides automatic model-name prefix detection.

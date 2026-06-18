@@ -38,6 +38,7 @@ impl LlmProvider for AnthropicProvider {
         messages: &[Message],
         tools: &[ToolSchema],
         tx: mpsc::UnboundedSender<LlmStreamEvent>,
+        opts: crate::llm::StreamOptions,
     ) -> Result<()> {
         // Anthropic separates system message from the messages list.
         let mut system_prompt = String::new();
@@ -54,9 +55,10 @@ impl LlmProvider for AnthropicProvider {
             }
         }
 
+        let max_tokens = opts.max_tokens.unwrap_or(self.max_tokens);
         let mut body = serde_json::json!({
             "model": self.model,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens,
             "stream": true,
             "messages": api_messages,
         });

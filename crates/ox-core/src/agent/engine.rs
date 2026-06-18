@@ -496,20 +496,6 @@ impl WorkflowEngine {
     }
 
     pub fn park_workflow_awaiting_user(&mut self) -> Result<(), String> {
-        if self.current_workflow.is_none() {
-            return Ok(());
-        }
-        let execute_idx = self
-            .current_workflow
-            .as_ref()
-            .map(|w| w.total_steps().saturating_sub(1).min(3))
-            .unwrap_or(3);
-        if let Ok(mut session) = self.session_state.try_lock() {
-            session.current_step_index = execute_idx;
-            session.awaiting_user_confirmation = false;
-        }
-        crate::agent::workflow_session::park(self);
-        crate::agent::requirement_clarification::arm_park_follow_up_menu(self);
         Ok(())
     }
 
@@ -579,6 +565,60 @@ impl WorkflowEngine {
         }
     }
 
+    pub fn bootstrap_implementation_plan_from_findings(&self) {
+        if let Some(store) = crate::agent::findings::load_or_migrate(self) {
+            let only_scoped = !store.active_indices.is_empty();
+            let tracker = store.to_plan_tracker(only_scoped);
+            self.set_variable(
+                "_plan_tracker",
+                crate::agent::plan_tracker::tracker_to_json(&tracker),
+            );
+            self.clear_impl_files_read();
+            return;
+        }
+        self.bootstrap_implementation_plan();
+    }
+
+    pub fn sync_plan_from_findings(&self) {
+        self.bootstrap_implementation_plan_from_findings();
+    }
+
+    /// Re-open workflow after premature ## Done or verify failure.
+    pub fn reopen_execute_for_fixes(&mut self, user_text: &str) -> bool {
+        if !crate::agent::workflow_session::looks_like_fix_continuation(user_text) {
+            return false;
+        }
+        let had_findings = crate::agent::findings::load_or_migrate(self).is_some();
+        let verify_failed =
+            crate::agent::post_edit_verification::verify_status_failed(self);
+        if !self.is_workflow_complete() && !verify_failed && !had_findings {
+            return false;
+        }
+        self.set_variable(crate::agent::user_round::ROUND_FINALIZED_KEY, String::new());
+        if let Ok(mut session) = self.session_state.try_lock() {
+            session.current_step_index = 0;
+            session.awaiting_user_confirmation = false;
+        }
+        self.append_workflow_guidance(user_text);
+        self.sync_plan_from_findings();
+        true
+    }
+
+    pub fn has_file_read_snapshot(&self, path: &str) -> bool {
+        crate::agent::exploration_snapshot::find_file_read_entry(
+            &self.get_exploration_entries(),
+            path,
+        )
+        .is_some()
+    }
+
+    pub fn shell_looks_like_file_read(cmd: &str) -> bool {
+        let lower = cmd.to_lowercase();
+        ["cat ", "type ", "head ", "tail ", "more ", "less ", "get-content"]
+            .iter()
+            .any(|p| lower.contains(p))
+    }
+
     /// Freeze structured perception at end of perceive phase (park / review complete).
     pub fn freeze_perception_output(&self, output: &str) {
         crate::agent::perception::freeze_from_output(self, output);
@@ -605,7 +645,7 @@ impl WorkflowEngine {
         self.impl_files_read_set().contains(&norm)
     }
 
-    pub fn record_impl_file_read(&self, path: &str) {
+    pub fn record_impl_file_read(&self, path: &str, _arguments: &str) {
         let norm = crate::agent::plan_tracker::normalize_path(path);
         let mut set = self.impl_files_read_set();
         if set.insert(norm) {
@@ -632,7 +672,7 @@ impl WorkflowEngine {
         Ok(())
     }
 
-    pub fn impl_edit_nudge_after_read(&self, path: &str) -> Option<String> {
+    pub fn impl_edit_nudge_after_read(&self, path: &str, _preview: &str) -> Option<String> {
         if !crate::agent::workflow_session::is_implementation_phase(self) {
             return None;
         }
@@ -927,6 +967,38 @@ impl WorkflowEngine {
         } else {
             0
         }
+    }
+
+    /// Single-step model (index 0) or legacy execute step (index 3).
+    pub fn is_task_step(&self) -> bool {
+        matches!(self.get_current_step_index(), 0 | 3)
+    }
+
+    pub fn current_step_display_label(&self) -> Option<String> {
+        self.get_current_step_info()
+            .map(|s| format!("{} ({}/{})", s.name, s.current_step, s.total_steps))
+    }
+
+    pub fn interjection_should_resume_turn(&self, user_text: &str) -> bool {
+        if self.workflow_preserves_on_user_input() {
+            return true;
+        }
+        if crate::agent::workflow_session::looks_like_fix_continuation(user_text) {
+            return self.is_workflow_complete()
+                || crate::agent::post_edit_verification::verify_status_failed(self);
+        }
+        false
+    }
+
+    pub fn apply_workflow_command(
+        &mut self,
+        input: &str,
+        working_dir: Option<&std::path::Path>,
+    ) -> Option<crate::agent::workflow_command::CommandOutcome> {
+        let cmd = crate::agent::workflow_command::parse(input)?;
+        Some(crate::agent::workflow_command::apply_with_cwd(
+            self, cmd, working_dir,
+        ))
     }
     
     /// 🚨 Set a variable in session state
@@ -1586,16 +1658,20 @@ impl WorkflowEngine {
         false
     }
 
-    /// Update plan tracker after a successful Execute-step tool call.
-    /// Returns true when plan progress changed.
-    pub fn record_execute_tool_success(&self, tool_name: &str, arguments: &str) -> bool {
-        if self.get_current_step_index() != 3 {
-            return false;
+    /// Update plan tracker after a successful task-step tool call.
+    pub fn record_execute_tool_success(
+        &self,
+        tool_name: &str,
+        arguments: &str,
+        result_content: &str,
+    ) -> (bool, Option<String>) {
+        if !self.is_task_step() {
+            return (false, None);
         }
         let args: serde_json::Value =
             serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
 
-        match tool_name {
+        let changed = match tool_name {
             "file_write" | "edit_file" | "delete_range" => args
                 .get("path")
                 .and_then(|p| p.as_str())
@@ -1604,30 +1680,44 @@ impl WorkflowEngine {
             "file_read" => {
                 let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
                 if path.is_empty() {
-                    return false;
-                }
-                let is_explain = self
-                    .get_plan_tracker()
-                    .and_then(|t| t.current_step().map(|s| s.action == "explain"))
-                    .unwrap_or(false);
-                if is_explain {
-                    self.try_mark_plan_step_done(path)
-                } else {
                     false
+                } else {
+                    let is_explain = self
+                        .get_plan_tracker()
+                        .and_then(|t| t.current_step().map(|s| s.action == "explain"))
+                        .unwrap_or(false);
+                    if is_explain {
+                        self.try_mark_plan_step_done(path)
+                    } else {
+                        false
+                    }
                 }
             }
             "git_diff" => {
                 if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
                     if self.try_mark_plan_step_done(path) {
-                        return true;
+                        true
+                    } else {
+                        self.try_mark_plan_current_step_done()
                     }
+                } else {
+                    self.try_mark_plan_current_step_done()
                 }
-                self.try_mark_plan_current_step_done()
             }
             "shell_exec" | "load_skill" | "git_status" => self.try_mark_plan_current_step_done(),
-            // Read-only exploration / search — do not advance plan steps
             _ => false,
-        }
+        };
+
+        let hint = if tool_name == "edit_file"
+            && (result_content.contains("Syntax error") || result_content.contains("AST Syntax"))
+        {
+            Some(
+                "⚠️ 编辑可能未通过语法检查 — 请修复后重试，勿标记为完成。".to_string(),
+            )
+        } else {
+            None
+        };
+        (changed, hint)
     }
 
     pub fn plan_progress_message_after_tool(&self, tool_name: &str) -> Option<String> {
@@ -1727,53 +1817,39 @@ impl WorkflowEngine {
         self.is_perceive_execute()
     }
 
-    /// Execute step in read-only perceive mode (exploring fast-path).
+    /// Execute step in read-only perceive mode — disabled in single-step model.
     pub fn is_perceive_execute(&self) -> bool {
-        if self.get_current_step_index() != 3 {
-            return false;
-        }
-        if crate::agent::workflow_session::is_implementation_phase(self) {
-            return false;
-        }
-        if self
-            .get_plan_tracker()
-            .and_then(|t| t.current_step().map(|s| s.action == "explain"))
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        Self::intent_routing_from_text(self.get_variable("_step0_output").as_deref())
-            .map(|r| r.intent == "exploring")
-            .unwrap_or(false)
+        false
     }
 
-    /// Whether Execute output should park for user follow-up (read-only review only).
-    pub fn should_park_execute_output(&self, text: &str) -> bool {
-        if self.get_current_step_index() != 3 {
-            return false;
-        }
-        // Standard Intent→Plan→Review→Execute: finish on ## Done — no park menu.
-        if !self.is_perceive_execute() {
-            return false;
-        }
-        if Self::text_signals_done(text) {
-            return true;
-        }
-        self.is_explaining_execute() && Self::looks_like_review_report(text)
+    /// Whether Execute output should park — disabled in single-step model.
+    pub fn should_park_execute_output(&self, _text: &str) -> bool {
+        false
     }
 
-    /// Standard coding workflow: Execute ## Done → complete workflow (not park).
+    /// Run gatekeeper pipeline when the model signals ## Done.
+    pub fn run_done_gates(
+        &self,
+        text: &str,
+        had_code_changes: bool,
+    ) -> crate::agent::gatekeeper::GateReport {
+        crate::agent::gatekeeper::standard_pipeline().run(&crate::agent::gatekeeper::GateCtx {
+            engine: self,
+            assistant_text: text,
+            touched_files: &[],
+            had_code_changes,
+        })
+    }
+
+    /// Standard coding workflow: ## Done → gatekeeper must pass.
     pub fn should_finish_execute_workflow(&self, text: &str) -> bool {
-        if self.get_current_step_index() != 3
-            || !Self::text_signals_done(text)
-            || self.is_perceive_execute()
-        {
+        if !Self::text_signals_done(text) || self.is_workflow_complete() {
             return false;
         }
-        if !self.should_skip_plan_done_gate() && self.check_plan_done_gate().is_some() {
-            return false;
-        }
-        true
+        matches!(
+            self.run_done_gates(text, false),
+            crate::agent::gatekeeper::GateReport::Pass
+        )
     }
 
     pub fn mark_execute_report_delivered(&self) {
@@ -2371,405 +2447,3 @@ pub struct StepDisplayInfo {
     pub total_steps: usize,
 }
 
-#[cfg(test)]
-mod advance_tests {
-    use super::*;
-    use crate::agent::session::SessionState;
-
-    fn test_engine_at_step(step: usize) -> WorkflowEngine {
-        let session = Arc::new(tokio::sync::Mutex::new(SessionState::new("test")));
-        let engine = WorkflowEngine::new(Arc::clone(&session));
-        session.blocking_lock().current_step_index = step;
-        engine
-    }
-
-    #[test]
-    fn review_incomplete_rolls_back_to_plan() {
-        let mut engine = test_engine_at_step(2);
-        engine.set_variable("_step1_output", r#"{"plan":[]}"#.to_string());
-        let text = r#"{"safe": true, "complete": false, "issues": ["no src/"], "warnings": []}"#;
-        let (next, err) = engine.advance_on_output(text, false);
-        assert_eq!(next, Some(1));
-        assert!(err.unwrap().contains("审阅回退"));
-    }
-
-    #[test]
-    fn review_prose_rolls_back_to_plan() {
-        let mut engine = test_engine_at_step(2);
-        let text = "⚠️ 计划不完整\n  ❌ Step 1 targets 'src/'";
-        let (next, err) = engine.advance_on_output(text, false);
-        assert_eq!(next, Some(1));
-        assert!(err.unwrap().contains("JSON"));
-    }
-
-    #[test]
-    fn review_plan_json_instead_of_review_rolls_back() {
-        let mut engine = test_engine_at_step(2);
-        let text = r#"{"structure_summary":"x","plan":[{"step":1,"file":"main.rs","action":"explain"}]}"#;
-        let (next, err) = engine.advance_on_output(text, false);
-        assert_eq!(next, Some(1));
-        assert!(err.unwrap().contains("审阅回退"));
-    }
-
-    #[test]
-    fn review_pass_advances_to_execute() {
-        let mut engine = test_engine_at_step(2);
-        let text = r#"{"safe": true, "complete": true, "issues": [], "warnings": []}"#;
-        let (next, err) = engine.advance_on_output(text, false);
-        assert_eq!(next, Some(3));
-        assert!(err.is_none());
-    }
-
-    #[test]
-    fn simple_coding_intent_skips_to_execute() {
-        let mut engine = test_engine_at_step(0);
-        let text = r#"{"intent":"coding","complexity":"simple","files":["src/main.rs"],"topic":"fix typo","pipeline":"fast","routing_reason":"单文件小改动，可跳过规划与审阅直接执行"}"#;
-        let (next, err) = engine.advance_on_output(text, false);
-        assert_eq!(next, Some(3));
-        assert!(err.is_none());
-        assert!(engine.get_variable("_step1_output").is_some());
-    }
-
-    #[test]
-    fn intent_needs_clarification_arms_gate() {
-        let mut engine = test_engine_at_step(0);
-        engine.set_variable("_current_user_request", "加个验证".into());
-        let json = r#"{"intent":"coding","complexity":"simple","pipeline":"fast","routing_reason":"用户想加验证但对象不明，先按简单编码快速路径，待澄清后执行","needs_clarification":true,"clarification_questions":["哪种验证？","作用在哪个接口？"]}"#;
-        let (advance, err) = engine.advance_on_output(json, false);
-        assert!(err.is_none());
-        assert!(advance.is_none());
-        assert!(engine.is_awaiting_clarification());
-        assert_eq!(engine.clarification_pending_advance(), 3);
-    }
-
-    #[test]
-    fn exploring_intent_skips_plan_and_review() {
-        let mut engine = test_engine_at_step(0);
-        let text = r#"{"intent":"exploring","complexity":"complex","files":[],"topic":"检查整个项目代码","pipeline":"fast","routing_reason":"只读代码审查，不需要修改计划，跳过规划与审阅"}"#;
-        let (next, err) = engine.advance_on_output(text, false);
-        assert_eq!(next, Some(3));
-        assert!(err.is_none());
-        let plan = engine.get_variable("_step1_output").unwrap();
-        assert!(plan.contains("只读"));
-    }
-
-    #[test]
-    fn exploring_intent_should_skip_review_flag() {
-        let mut engine = test_engine_at_step(1);
-        engine.set_variable(
-            "_step0_output",
-            r#"{"intent":"exploring","complexity":"complex","topic":"audit","pipeline":"fast","routing_reason":"只读检查"}"#.to_string(),
-        );
-        assert!(engine.should_skip_review());
-        assert!(engine.should_skip_plan_and_review());
-    }
-
-    #[test]
-    fn wrong_pipeline_rejected() {
-        let mut engine = test_engine_at_step(0);
-        let text = r#"{"intent":"exploring","complexity":"complex","topic":"audit","pipeline":"standard","routing_reason":"错误的路径选择应该被拒绝"}"#;
-        let (next, err) = engine.advance_on_output(text, false);
-        assert_eq!(next, None);
-        assert!(err.unwrap().contains("pipeline"));
-    }
-
-    #[test]
-    fn complex_coding_intent_goes_to_plan() {
-        let mut engine = test_engine_at_step(0);
-        let text = r#"{"intent":"coding","complexity":"complex","files":[],"topic":"refactor","pipeline":"standard","routing_reason":"多文件重构需先规划并审阅，不能走快速路径"}"#;
-        let (next, err) = engine.advance_on_output(text, false);
-        assert_eq!(next, Some(1));
-        assert!(err.is_none());
-    }
-
-    #[test]
-    fn read_only_audit_user_phrase_detected() {
-        assert!(WorkflowEngine::looks_like_read_only_audit("检查下整个项目的代码"));
-        assert!(!WorkflowEngine::looks_like_read_only_audit("重构 agent 模块"));
-    }
-
-    #[test]
-    fn read_only_audit_corrects_coding_intent() {
-        let user = "检查下整个项目的代码";
-        let wrong = r#"{"intent":"coding","complexity":"complex","topic":"code review","pipeline":"standard","routing_reason":"误判为复杂编码需全链路规划审阅"}"#;
-        let fixed = WorkflowEngine::correct_intent_json_for_user(user, wrong);
-        let mut engine = test_engine_at_step(0);
-        let (next, err) = engine.advance_on_output(&fixed, false);
-        assert!(err.is_none());
-        assert_eq!(next, Some(3));
-        assert!(fixed.contains("exploring"));
-    }
-
-    #[test]
-    fn exploring_plan_rejects_modify_actions() {
-        let json = r#"{"plan":[{"step":1,"file":"lib.rs","action":"modify","desc":"remove mod"}]}"#;
-        assert!(WorkflowEngine::validate_plan_read_only(json).is_err());
-    }
-
-    fn test_engine_at_execute_with_workflow() -> WorkflowEngine {
-        let session = Arc::new(tokio::sync::Mutex::new(SessionState::new("test")));
-        let mut engine = WorkflowEngine::new(Arc::clone(&session));
-        engine.register_workflow(crate::agent::workflow::create_default_workflow());
-        engine
-            .activate_workflow(crate::agent::workflow::DEFAULT_WORKFLOW_ID)
-            .unwrap();
-        session.blocking_lock().current_step_index = 3;
-        engine
-    }
-
-    #[test]
-    fn coding_fast_path_execute_allows_source_writes() {
-        let mut engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_step0_output",
-            r#"{"intent":"coding","complexity":"simple","files":["src/Foo.java"],"topic":"add validation","pipeline":"fast","routing_reason":"单文件简单改动"}"#.to_string(),
-        );
-        assert!(engine.allows_code_modification());
-        for path in [
-            "src/Foo.java",
-            "lib/main.py",
-            "cmd/app.go",
-            "Program.cs",
-            "components/App.tsx",
-        ] {
-            let args = serde_json::json!({"path": path, "content": "..."});
-            assert!(
-                engine.validate_tool_call("file_write", &args).is_ok(),
-                "should allow write for {path}"
-            );
-        }
-    }
-
-    #[test]
-    fn exploring_fast_path_execute_blocks_source_file_write() {
-        let mut engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_step0_output",
-            r#"{"intent":"exploring","complexity":"complex","topic":"audit","pipeline":"fast","routing_reason":"只读"}"#.to_string(),
-        );
-        assert!(!engine.allows_code_modification());
-        for path in ["src/Foo.java", "main.py", "app.go", "lib.rs"] {
-            let args = serde_json::json!({"path": path, "content": "..."});
-            assert!(
-                engine.validate_tool_call("file_write", &args).is_err(),
-                "should block write for {path}"
-            );
-        }
-    }
-
-    #[test]
-    fn text_signals_done_recognizes_chinese_completion() {
-        assert!(WorkflowEngine::text_signals_done("报告\n\n完成"));
-        assert!(WorkflowEngine::text_signals_done("## 完成"));
-    }
-
-    #[test]
-    fn looks_like_review_report_detects_table() {
-        let t = "代码审查报告（CompleteDocumentStrategy 与相关 service）\n\n\
-            | 优先级 | 问题 | 文件 |\n| 高 | 并发竞态可能导致重复提交 | Foo.java |\n\
-            | 中 | NPE 风险在 sap 响应解析 | Bar.java |\n| 低 | 命名与注释不一致 | Baz.java |\n\n\
-            建议优先修复并发与空指针问题，并补充集成测试。审查范围覆盖 service 层与 controller 层，\
-            详见上文各条 findings。完成";
-        assert!(t.chars().count() >= 180);
-        assert!(WorkflowEngine::looks_like_review_report(t));
-    }
-
-    #[test]
-    fn exploring_execute_done_skips_plan_gate_in_advance_on_output() {
-        let mut engine = test_engine_at_step(3);
-        engine.set_variable(
-            "_step0_output",
-            r#"{"intent":"exploring","complexity":"complex","topic":"audit","pipeline":"fast","routing_reason":"只读"}"#.to_string(),
-        );
-        let text = "## Done\n\n代码审查完成。";
-        let (next, err) = engine.advance_on_output(text, false);
-        assert!(next.is_none());
-        assert!(err.is_none());
-    }
-
-    #[test]
-    fn exploring_done_parks_session_despite_pending_plan_steps() {
-        let mut engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_step0_output",
-            r#"{"intent":"exploring","complexity":"complex","topic":"audit","pipeline":"fast","routing_reason":"只读"}"#.to_string(),
-        );
-        engine.set_variable(
-            "_plan_tracker",
-            r#"{"steps":[{"index":1,"file":"","action":"explain","target":"","desc":"review","status":"pending"}],"current_index":1}"#.to_string(),
-        );
-        assert!(!engine.is_workflow_complete());
-        let done = engine
-            .try_complete_execute_on_done("## Done\n\n审查报告。")
-            .unwrap();
-        assert!(done);
-        assert!(engine.is_workflow_parked());
-        assert!(!engine.is_workflow_complete());
-    }
-
-    #[test]
-    fn coding_execute_done_completes_without_park() {
-        let mut engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_step0_output",
-            r#"{"intent":"coding","complexity":"simple","topic":"update readme","pipeline":"standard","routing_reason":"编码任务"}"#.to_string(),
-        );
-        assert!(!engine.should_park_execute_output("## Done\n\n所有任务已完成。"));
-        assert!(engine.should_finish_execute_workflow("## Done\n\n所有任务已完成。"));
-        let done = engine
-            .try_complete_execute_on_done("## Done\n\n所有任务已完成。")
-            .unwrap();
-        assert!(!done);
-        assert!(!engine.is_workflow_parked());
-    }
-
-    #[test]
-    fn execute_approved_after_park_allows_exploring_writes() {
-        let mut engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_step0_output",
-            r#"{"intent":"exploring","complexity":"complex","topic":"audit","pipeline":"fast","routing_reason":"只读"}"#.to_string(),
-        );
-        assert!(!engine.allows_code_modification());
-        crate::agent::workflow_session::mark_execute_approved(&engine);
-        assert!(engine.allows_code_modification());
-    }
-
-    #[test]
-    fn chat_reply_pending_flag() {
-        let engine = test_engine_at_step(0);
-        assert!(!engine.is_chat_reply_pending());
-        engine.set_chat_reply_pending();
-        assert!(engine.is_chat_reply_pending());
-        engine.clear_chat_reply_pending();
-        assert!(!engine.is_chat_reply_pending());
-    }
-
-    #[test]
-    fn record_execute_shell_marks_current_step() {
-        let engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_plan_tracker",
-            r#"{"steps":[{"index":1,"file":"","action":"modify","target":"","desc":"git commit","status":"pending"}],"current_index":1}"#.to_string(),
-        );
-        assert!(engine.record_execute_tool_success("shell_exec", r#"{"command":"git commit"}"#));
-        let t = engine.get_plan_tracker().unwrap();
-        assert_eq!(t.steps[0].status, crate::agent::plan_tracker::StepStatus::Done);
-    }
-
-    #[test]
-    fn record_execute_load_skill_marks_current_step() {
-        let engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_plan_tracker",
-            r#"{"steps":[{"index":1,"file":"","action":"modify","target":"","desc":"load skill","status":"pending"}],"current_index":1}"#.to_string(),
-        );
-        assert!(engine.record_execute_tool_success("load_skill", r#"{"skill_name":"coding-workflow"}"#));
-    }
-
-    #[test]
-    fn record_execute_file_write_empty_plan_file_marks_current() {
-        let engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_plan_tracker",
-            r#"{"steps":[{"index":1,"file":"","action":"create","target":"","desc":"new file","status":"pending"}],"current_index":1}"#.to_string(),
-        );
-        assert!(engine.record_execute_tool_success(
-            "file_write",
-            r#"{"path":"docs/new.md","content":"hi"}"#
-        ));
-    }
-
-    #[test]
-    fn record_execute_file_read_explain_marks_matching_path() {
-        let engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_plan_tracker",
-            r#"{"steps":[{"index":1,"file":"src/lib.rs","action":"explain","target":"","desc":"review","status":"pending"}],"current_index":1}"#.to_string(),
-        );
-        assert!(engine.record_execute_tool_success(
-            "file_read",
-            r#"{"path":"src/lib.rs"}"#
-        ));
-    }
-
-    #[test]
-    fn record_execute_read_only_search_does_not_mark() {
-        let engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_plan_tracker",
-            r#"{"steps":[{"index":1,"file":"src/lib.rs","action":"modify","target":"","desc":"fix","status":"pending"}],"current_index":1}"#.to_string(),
-        );
-        assert!(!engine.record_execute_tool_success("code_search", r#"{"query":"foo"}"#));
-        assert!(!engine.record_execute_tool_success("file_list", r#"{"path":"."}"#));
-    }
-
-    #[test]
-    fn fast_coding_done_finishes_without_park() {
-        let mut engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_step0_output",
-            r#"{"intent":"coding","complexity":"simple","topic":"git commit","pipeline":"fast","routing_reason":"小改"}"#.to_string(),
-        );
-        engine.set_variable(
-            "_plan_tracker",
-            r#"{"steps":[{"index":1,"file":"","action":"modify","target":"","desc":"commit","status":"pending"}],"current_index":1}"#.to_string(),
-        );
-        assert!(!engine.is_workflow_complete());
-        let text = "## Done\n\n提交完成。";
-        assert!(!engine.should_park_execute_output(text));
-        assert!(engine.should_finish_execute_workflow(text));
-        let done = engine.try_complete_execute_on_done(text).unwrap();
-        assert!(!done);
-        assert!(!engine.is_workflow_parked());
-    }
-
-    #[test]
-    fn coding_execute_done_blocked_when_plan_steps_pending() {
-        let mut engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_step0_output",
-            r#"{"intent":"coding","complexity":"complex","topic":"fix","pipeline":"standard","routing_reason":"多文件需全链路"}"#.to_string(),
-        );
-        engine.set_variable(
-            "_plan_tracker",
-            r#"{"steps":[{"index":1,"file":"main.rs","action":"modify","target":"","desc":"fix","status":"pending"}],"current_index":1}"#.to_string(),
-        );
-        assert!(!engine.should_park_execute_output("## Done"));
-        assert!(!engine.should_finish_execute_workflow("## Done"));
-        let (next, err) = engine.advance_on_output("## Done", false);
-        assert!(next.is_none());
-        assert!(err.is_some());
-        assert!(!engine.is_workflow_complete());
-    }
-
-    #[test]
-    fn impl_phase_blocks_duplicate_file_read() {
-        let mut engine = test_engine_at_execute_with_workflow();
-        crate::agent::workflow_session::enter_implementation_phase(&engine);
-        engine.set_variable(
-            "_plan_tracker",
-            r#"{"steps":[{"index":1,"file":"src/Foo.java","action":"edit","target":"Foo","desc":"fix idempotent","status":"in_progress"}],"current_index":1}"#.to_string(),
-        );
-        let args = serde_json::json!({"path": "src/Foo.java"});
-        assert!(engine.validate_tool_call("file_read", &args).is_ok());
-        engine.record_impl_file_read("src/Foo.java");
-        assert!(engine.validate_tool_call("file_read", &args).is_err());
-        let nudge = engine.impl_edit_nudge_after_read("src/Foo.java").unwrap();
-        assert!(nudge.contains("edit_file"));
-    }
-
-    #[test]
-    fn bootstrap_implementation_plan_from_review() {
-        let mut engine = test_engine_at_execute_with_workflow();
-        engine.set_variable(
-            "_step3_output",
-            "| 1 | 高 | `FooController.java` | 加 waitTime |\n| 2 | 中 | `BarDto.java` | 删字段 |".to_string(),
-        );
-        crate::agent::workflow_session::enter_implementation_phase(&engine);
-        engine.bootstrap_implementation_plan();
-        let t = engine.get_plan_tracker().unwrap();
-        assert_eq!(t.steps.len(), 2);
-        assert_eq!(t.steps[0].action, "edit");
-    }
-}

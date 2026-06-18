@@ -10,7 +10,7 @@ use crate::agent::engine::WorkflowEngine;
 
 pub const USER_ROUND_TAG: &str = "[USER_ROUND]";
 const MAX_HISTORY: usize = 3;
-const ROUND_FINALIZED_KEY: &str = "_round_finalized";
+pub const ROUND_FINALIZED_KEY: &str = "_round_finalized";
 
 /// Session-visible marker written when a new user round starts.
 pub const ROUND_BOUNDARY_TAG: &str = "[ROUND_BOUNDARY]";
@@ -113,24 +113,12 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
         }
     }
 
-    if engine.is_workflow_parked() {
-        if WorkflowEngine::looks_like_new_task(user_message)
-            || crate::agent::requirement_clarification::is_explicit_parked_new_task(user_message)
-        {
-            let _ = engine.finish_workflow_session();
-            // fall through to full new round below
-        } else if engine.is_park_disambiguation_awaiting() {
-            return false;
-        } else {
-            crate::agent::requirement_clarification::arm_park_follow_up_menu(engine);
-            return false;
-        }
-    }
-
-    // Workflow already finished — start a fresh round (no Act-phase gate).
     if engine.is_workflow_complete()
         || engine.get_variable(ROUND_FINALIZED_KEY).as_deref() == Some("1")
     {
+        if engine.reopen_execute_for_fixes(user_message) {
+            return false;
+        }
         if let Some(prev) = engine.get_variable("_current_user_request") {
             if !prev.trim().is_empty()
                 && prev.trim() != user_message.trim()
@@ -359,35 +347,15 @@ pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
     }
 
     let guidance = crate::agent::workflow_guidance::format_block(engine);
-    if engine.is_awaiting_clarification() {
-        if engine.is_park_disambiguation_awaiting() {
-            parts.push(
-                "⏸️ **请选择下一步** — 输入 **1/继续**（执行修复）、**2/意见**（澄清审查结论）、**3/新任务**。"
-                    .to_string(),
-            );
-        } else {
-            parts.push(
-                "❓ **等待需求澄清** — 请回答 Intent 阶段提出的问题后继续。".to_string(),
-            );
-        }
-    } else if engine.is_workflow_parked() {
-        parts.push(
-            "⏸️ **任务会话已暂停** — 请先选 1继续 / 2意见 / 3新任务，或用「意见：…」「继续：…」一次说完。"
-                .to_string(),
-        );
-        if !guidance.is_empty() {
-            parts.push(guidance);
-        }
-    } else if !guidance.is_empty() {
+    if !guidance.is_empty() {
         parts.push(guidance);
         parts.push(
-            "⚠️ workflow 进行中 — 上方补充说明优先；继续**当前步骤**，勿从 Intent 重来。"
+            "⚠️ workflow 进行中 — 上方补充说明优先；继续当前任务，勿重复已完成的工作。"
                 .to_string(),
         );
-    } else {
+    } else if !engine.is_workflow_complete() {
         parts.push(
-            "⚠️ 本轮 workflow 已从 Intent 重新开始；上轮探索/工具记录已清空。"
-                .to_string(),
+            "⚠️ 本轮 workflow 已重置；上轮探索/工具记录已清空。".to_string(),
         );
     }
 
@@ -435,18 +403,6 @@ mod tests {
         assert_eq!(guidance.len(), 1);
         assert_eq!(guidance[0].text, "add feature B");
         assert!(!engine.get_variable("_step1_output").unwrap().is_empty());
-    }
-
-    #[test]
-    fn begin_user_round_parked_arms_menu() {
-        let session = Arc::new(Mutex::new(SessionState::new("t")));
-        let mut engine = WorkflowEngine::new(Arc::clone(&session));
-        crate::agent::workflow_session::park(&engine);
-
-        engine.begin_user_round("问题3其实不是问题，怎么处理？");
-
-        assert!(engine.is_park_disambiguation_awaiting());
-        assert!(crate::agent::workflow_session::is_parked(&engine));
     }
 
     #[test]
@@ -503,25 +459,5 @@ mod tests {
         assert!(msg.contains("CURRENT"));
         assert!(msg.contains("HISTORICAL"));
         assert!(msg.contains("完善 README"));
-    }
-
-    #[test]
-    fn begin_user_round_parked_feedback_via_menu() {
-        let session = Arc::new(Mutex::new(SessionState::new("t")));
-        let mut engine = WorkflowEngine::new(Arc::clone(&session));
-        crate::agent::workflow_session::park(&engine);
-        crate::agent::requirement_clarification::arm_park_follow_up_menu(&engine);
-
-        let outcome = crate::agent::requirement_clarification::resolve_park_follow_up(
-            &engine,
-            "意见：envConfig 有默认值",
-        )
-        .unwrap();
-        assert!(matches!(
-            outcome,
-            crate::agent::requirement_clarification::ParkFollowUpOutcome::Resolved(
-                crate::agent::requirement_clarification::ParkDisambiguationResolution::Feedback { .. }
-            )
-        ));
     }
 }

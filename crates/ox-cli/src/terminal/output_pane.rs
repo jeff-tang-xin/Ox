@@ -8,6 +8,7 @@ pub enum OutputKind {
     Tool,
     ToolResult,
     ToolLog,
+    Thinking,
     System,
     Error,
 }
@@ -33,6 +34,13 @@ pub enum OutputLine {
         message: String,
         timestamp: std::time::Instant,
     },
+    /// LLM reasoning stream — live carousel (one line); collapses to summary when done.
+    Thinking {
+        text: String,
+        collapsed: bool,
+        /// Shown when the model has no separate reasoning channel (status-only).
+        status_hint: Option<String>,
+    },
     System(String),
     Error(String),
     StreamingPartial(String),
@@ -48,6 +56,7 @@ impl OutputLine {
             Self::Tool { .. } => OutputKind::Tool,
             Self::ToolResult { .. } => OutputKind::ToolResult,
             Self::ToolLog { .. } => OutputKind::ToolLog,
+            Self::Thinking { .. } => OutputKind::Thinking,
             Self::System(_) => OutputKind::System,
             Self::Error(_) => OutputKind::Error,
             Self::StreamingPartial(_) => OutputKind::Assistant,
@@ -63,6 +72,7 @@ impl OutputLine {
             Self::Tool { name, .. } => name,
             Self::ToolResult { summary, .. } => summary,
             Self::ToolLog { message, .. } => message,
+            Self::Thinking { text, .. } => text,
             Self::System(s) => s,
             Self::Error(s) => s,
             Self::StreamingPartial(s) => s,
@@ -156,6 +166,7 @@ impl OutputPane {
     }
 
     pub fn finalize_streaming(&mut self) {
+        self.collapse_thinking();
         if let Some(OutputLine::StreamingPartial(_)) = self.lines.last() {
             if let Some(OutputLine::StreamingPartial(s)) = self.lines.pop() {
                 self.lines.push(OutputLine::Markdown(s));
@@ -255,9 +266,237 @@ impl OutputPane {
         self.lines.len()
     }
 
+    /// Index of the last thinking line in the timeline (if any).
+    fn find_last_thinking_index(&self) -> Option<usize> {
+        self.lines
+            .iter()
+            .rposition(|l| matches!(l, OutputLine::Thinking { .. }))
+    }
+
+    /// Append reasoning/thinking tokens to the live thinking line in the timeline.
+    pub fn push_reasoning_chunk(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        if let Some(i) = self.find_last_thinking_index() {
+            if let OutputLine::Thinking {
+                text,
+                collapsed,
+                status_hint,
+            } = &mut self.lines[i]
+            {
+                if *collapsed {
+                    text.clear();
+                    *collapsed = false;
+                }
+                *status_hint = None;
+                text.push_str(chunk);
+                if i < self.rendered_cache.len() {
+                    self.rendered_cache[i] = None;
+                }
+                self.cache_valid = false;
+                self.trim_excess();
+                return;
+            }
+        }
+        self.lines.push(OutputLine::Thinking {
+            text: chunk.to_string(),
+            collapsed: false,
+            status_hint: None,
+        });
+        self.rendered_cache.push(None);
+        self.cache_valid = false;
+        self.trim_excess();
+    }
+
+    /// Keep a live thinking row in sync with agent status when no reasoning channel exists.
+    pub fn touch_thinking_status(&mut self, status: &str) {
+        let hint = status.trim();
+        if hint.is_empty() {
+            return;
+        }
+        if let Some(i) = self.find_last_thinking_index() {
+            if let OutputLine::Thinking {
+                collapsed,
+                status_hint,
+                text,
+            } = &mut self.lines[i]
+            {
+                *status_hint = Some(hint.to_string());
+                if *collapsed && text.is_empty() {
+                    text.push_str(hint);
+                }
+                if i < self.rendered_cache.len() {
+                    self.rendered_cache[i] = None;
+                }
+                self.cache_valid = false;
+                return;
+            }
+        }
+        self.lines.push(OutputLine::Thinking {
+            text: String::new(),
+            collapsed: false,
+            status_hint: Some(hint.to_string()),
+        });
+        self.rendered_cache.push(None);
+        self.cache_valid = false;
+        self.trim_excess();
+    }
+
+    /// Keep at most one collapsed thinking line in the timeline.
+    fn prune_extra_thinking_lines(&mut self) {
+        let Some(keep) = self.find_last_thinking_index() else {
+            return;
+        };
+        let mut new_lines = Vec::with_capacity(self.lines.len());
+        let mut new_cache = Vec::with_capacity(self.rendered_cache.len());
+        for (i, line) in self.lines.iter().enumerate() {
+            if matches!(line, OutputLine::Thinking { .. }) && i != keep {
+                continue;
+            }
+            new_lines.push(line.clone());
+            if i < self.rendered_cache.len() {
+                new_cache.push(self.rendered_cache[i].clone());
+            }
+        }
+        if new_lines.len() != self.lines.len() {
+            self.lines = new_lines;
+            self.rendered_cache = new_cache;
+            self.cache_valid = false;
+        }
+    }
+
+    pub fn has_live_thinking(&self) -> bool {
+        matches!(
+            self.lines.last(),
+            Some(OutputLine::Thinking {
+                collapsed: false,
+                ..
+            })
+        )
+    }
+
+    /// Force re-render of live thinking lines (carousel animation).
+    pub fn invalidate_thinking_cache(&mut self) {
+        for (i, line) in self.lines.iter().enumerate() {
+            if matches!(
+                line,
+                OutputLine::Thinking {
+                    collapsed: false,
+                    ..
+                }
+            ) && i < self.rendered_cache.len()
+            {
+                self.rendered_cache[i] = None;
+            }
+        }
+        self.cache_valid = false;
+    }
+
+    /// Collapse the active thinking line to a one-line summary in the timeline.
+    pub fn collapse_thinking(&mut self) {
+        let Some(OutputLine::Thinking {
+            text,
+            collapsed,
+            status_hint,
+        }) = self.lines.last_mut()
+        else {
+            return;
+        };
+        if *collapsed {
+            return;
+        }
+        let summary = thinking_summary_line(text, status_hint.as_deref());
+        if summary.is_empty() {
+            self.lines.pop();
+            if !self.rendered_cache.is_empty() {
+                self.rendered_cache.pop();
+            }
+        } else {
+            *text = summary;
+            *collapsed = true;
+            *status_hint = None;
+            if let Some(c) = self.rendered_cache.last_mut() {
+                *c = None;
+            }
+        }
+        self.prune_extra_thinking_lines();
+        self.cache_valid = false;
+    }
+
     pub fn clear(&mut self) {
         self.lines.clear();
         self.rendered_cache.clear();
         self.cache_valid = true;
+    }
+}
+
+fn thinking_summary_line(text: &str, status_hint: Option<&str>) -> String {
+    let t = text.trim();
+    if !t.is_empty() {
+        if let Some(last) = t.lines().filter(|l| !l.trim().is_empty()).last() {
+            let line = last.trim();
+            if line.chars().count() > 120 {
+                return format!("{}…", line.chars().take(119).collect::<String>());
+            }
+            return line.to_string();
+        }
+        if t.chars().count() > 120 {
+            return format!("{}…", t.chars().take(119).collect::<String>());
+        }
+        return t.to_string();
+    }
+    status_hint
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
+/// Segments for live thinking carousel (one line shown at a time).
+pub fn thinking_carousel_segments(text: &str, status_hint: Option<&str>) -> Vec<String> {
+    let mut segments: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    if segments.is_empty() {
+        if let Some(h) = status_hint.filter(|s| !s.trim().is_empty()) {
+            segments.push(h.trim().to_string());
+        }
+        return segments;
+    }
+    let mut out = Vec::new();
+    for seg in segments {
+        if seg.chars().count() <= 72 {
+            out.push(seg);
+        } else {
+            let chars: Vec<char> = seg.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let end = (i + 72).min(chars.len());
+                out.push(chars[i..end].iter().collect());
+                i = end;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_collapses_to_last_line() {
+        let s = thinking_summary_line("line1\nline2\nfinal thought", None);
+        assert_eq!(s, "final thought");
+    }
+
+    #[test]
+    fn carousel_splits_long_lines() {
+        let long = "a".repeat(100);
+        let segs = thinking_carousel_segments(&long, None);
+        assert!(segs.len() >= 2);
     }
 }

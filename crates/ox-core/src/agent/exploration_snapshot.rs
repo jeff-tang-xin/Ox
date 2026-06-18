@@ -472,7 +472,7 @@ pub fn format_summary(entries: &[ExplorationEntry], max_chars: usize) -> String 
         };
         let meta = if let Some(ref path) = entry.ref_path {
             format!(
-                "💾 完整内容: `{path}`（{} 字符）— 预览如下，细节缺失时用 file_read 读取\n",
+                "💾 完整内容: `{path}`（{} 字符）— 计划阶段已读取，审查/执行勿重复 file_read\n",
                 entry.full_chars
             )
         } else if entry.full_chars > entry.content.chars().count() {
@@ -505,7 +505,7 @@ pub fn format_summary(entries: &[ExplorationEntry], max_chars: usize) -> String 
         };
         let meta = if let Some(ref path) = entry.ref_path {
             format!(
-                "💾 完整内容: `{path}`（{} 字符）— 用 file_read 读取全文\n",
+                "💾 完整内容: `{path}`（{} 字符）— 计划阶段已读取，审查勿重复 file_read\n",
                 entry.full_chars
             )
         } else {
