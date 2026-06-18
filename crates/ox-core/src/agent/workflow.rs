@@ -149,23 +149,7 @@ pub fn create_default_workflow() -> Workflow {
     workflow.add_step(
         WorkflowStep::new("task", "Task", "Complete the user's request")
             .with_prompt(TASK_PROMPT)
-            .with_allowed_tools(&[
-                "file_read",
-                "file_list",
-                "file_search",
-                "code_search",
-                "find_symbol",
-                "project_detect",
-                "file_write",
-                "edit_file",
-                "delete_range",
-                "shell_exec",
-                "git_status",
-                "git_diff",
-                "load_skill",
-                "memory_search",
-                "recall",
-            ])
+            // allowed_tools left empty → registry exposes all built-in tools (no whitelist filter)
             .with_memory_layers(&[
                 "WorkingMemory",
                 "AtomicMemory",

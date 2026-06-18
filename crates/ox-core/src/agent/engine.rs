@@ -217,6 +217,12 @@ impl WorkflowEngine {
         true
     }
 
+    /// True when running the default single-step agent workflow (no step/tool gating).
+    pub fn is_single_step(&self) -> bool {
+        self.current_workflow()
+            .is_some_and(|w| w.id == crate::agent::workflow::DEFAULT_WORKFLOW_ID)
+    }
+
     /// Get allowed tools for current step.
     /// Returns empty when tools are disabled for this step.
     pub fn get_allowed_tools(&self) -> Vec<String> {
@@ -839,6 +845,11 @@ impl WorkflowEngine {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Result<(), String> {
+        // Single-step: registry tools only — no whitelist, phase, or legacy step gates.
+        if self.is_single_step() {
+            return Ok(());
+        }
+
         let step = match self.current_step() {
             Some(s) => s,
             None => return Ok(()), // No active workflow — allow all tools

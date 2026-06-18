@@ -18,7 +18,8 @@ pub fn validate_feedback_discuss_tool(_: &WorkflowEngine, _: &str) -> Result<(),
 }
 pub fn compact_discuss_session(_: &mut Vec<crate::message::Message>) {}
 pub fn is_implementation_phase(_: &WorkflowEngine) -> bool {
-    true
+    // Single-step model: no separate implementation phase; legacy per-file read limits are off.
+    false
 }
 pub fn enter_implementation_phase(_: &WorkflowEngine) {}
 pub fn mark_execute_approved(_: &WorkflowEngine) {}

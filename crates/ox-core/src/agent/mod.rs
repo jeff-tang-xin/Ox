@@ -493,47 +493,52 @@ pub async fn run_agent_turn(
             vec![] // Legacy planning mode: no tools in first iteration (not used during workflow)
         } else if let Some(ref engine_arc) = workflow_engine {
             let engine = engine_arc.lock().await;
-            let allowed_tools = engine.get_allowed_tools();
-            let step_idx = engine.get_current_step_index();
 
-            let mut schemas: Vec<_> = if !engine.allows_tool_execution() {
-                Vec::new()
-            } else if allowed_tools.is_empty() {
-                tool_schemas.clone()
+            let mut schemas: Vec<_> = if engine.is_single_step() {
+                if engine.allows_tool_execution() {
+                    tool_schemas.clone()
+                } else {
+                    Vec::new()
+                }
             } else {
-                tool_schemas
-                    .iter()
-                    .filter(|schema| allowed_tools.contains(&schema.name))
-                    .cloned()
-                    .collect()
-            };
+                let allowed_tools = engine.get_allowed_tools();
+                let step_idx = engine.get_current_step_index();
 
-            let single_step = engine
-                .current_workflow()
-                .is_some_and(|w| w.id == crate::agent::workflow::DEFAULT_WORKFLOW_ID);
+                let mut s: Vec<_> = if !engine.allows_tool_execution() {
+                    Vec::new()
+                } else if allowed_tools.is_empty() {
+                    tool_schemas.clone()
+                } else {
+                    tool_schemas
+                        .iter()
+                        .filter(|schema| allowed_tools.contains(&schema.name))
+                        .cloned()
+                        .collect()
+                };
 
-            // Legacy 4-step only: Intent (0) / Review (2) are JSON-only — no tools in API.
-            // Single-step workflow also uses index 0 but must expose tools (prompt lists them).
-            if !single_step && matches!(step_idx, 0 | 2) {
-                schemas.clear();
-            }
-            // Legacy Plan (1) only
-            if !single_step && step_idx == 1 {
-                let has_detect = engine.has_exploration_tool("project_detect")
-                    || tools_used_this_turn.contains("project_detect");
-                if has_detect {
-                    let before = schemas.len();
-                    schemas.retain(|s| s.name != "project_detect");
-                    if schemas.len() < before {
-                        tracing::info!("[STEP1] Removed project_detect from schema (already used, iter {})", iteration);
+                // Legacy 4-step only: Intent (0) / Review (2) are JSON-only — no tools in API.
+                if matches!(step_idx, 0 | 2) {
+                    s.clear();
+                }
+                // Legacy Plan (1) only
+                if step_idx == 1 {
+                    let has_detect = engine.has_exploration_tool("project_detect")
+                        || tools_used_this_turn.contains("project_detect");
+                    if has_detect {
+                        let before = s.len();
+                        s.retain(|schema| schema.name != "project_detect");
+                        if s.len() < before {
+                            tracing::info!("[STEP1] Removed project_detect from schema (already used, iter {})", iteration);
+                        }
                     }
                 }
-            }
-            // Legacy Plan: JSON-only after exploration gate passes
-            if !single_step && step_idx == 1 && engine.plan_exploration_satisfied() {
-                tracing::info!("[STEP1] Exploration gate passed — JSON-only mode");
-                schemas.clear();
-            }
+                // Legacy Plan: JSON-only after exploration gate passes
+                if step_idx == 1 && engine.plan_exploration_satisfied() {
+                    tracing::info!("[STEP1] Exploration gate passed — JSON-only mode");
+                    s.clear();
+                }
+                s
+            };
             schemas
         } else {
             tool_schemas.clone()
@@ -992,11 +997,13 @@ pub async fn run_agent_turn(
             .map(|e| e.is_task_step())
             .unwrap_or(false);
 
-        // Execute: after a full review report, refuse another exploration pass (read-only phase only).
+        // Execute (legacy 4-step only): after review report, block another exploration pass.
         if execute_step && !tool_calls.is_empty() {
             if let Some(ref wf) = workflow_engine {
                 if let Ok(engine) = wf.try_lock() {
-                    if engine.should_block_execute_reexplore(&tool_calls, &full_text) {
+                    if !engine.is_single_step()
+                        && engine.should_block_execute_reexplore(&tool_calls, &full_text)
+                    {
                         let msg = Message::Assistant {
                             content: execute_user_display(&workflow_engine, 3, &full_text),
                             tool_calls: Vec::new(),
@@ -1025,15 +1032,22 @@ pub async fn run_agent_turn(
             tool_loop_keys.insert(tc.id.clone(), loop_key.clone());
             let count = temp_counts.entry(loop_key).or_insert(0);
             *count += 1;
-            let impl_phase = workflow_engine.as_ref().is_some_and(|wf| {
-                wf.try_lock()
-                    .map(|e| {
-                        e.is_task_step()
-                            && crate::agent::workflow_session::is_implementation_phase(&e)
-                    })
-                    .unwrap_or(false)
+            let single_step = workflow_engine.as_ref().is_some_and(|wf| {
+                wf.try_lock().map(|e| e.is_single_step()).unwrap_or(false)
             });
-            let limit = match tc.name.as_str() {
+            let impl_phase = !single_step
+                && workflow_engine.as_ref().is_some_and(|wf| {
+                    wf.try_lock()
+                        .map(|e| {
+                            e.is_task_step()
+                                && crate::agent::workflow_session::is_implementation_phase(&e)
+                        })
+                        .unwrap_or(false)
+                });
+            let limit = if single_step {
+                MAX_SAME_TOOL_CALLS
+            } else {
+                match tc.name.as_str() {
                 "file_list" => 2,
                 "file_read" if impl_phase => 24,
                 "file_read" if execute_step => 6,
@@ -1052,6 +1066,7 @@ pub async fn run_agent_turn(
                     }
                 }
                 _ => MAX_SAME_TOOL_CALLS,
+            }
             };
             if *count > limit {
                 exceeded_loop_limit_ids.insert(tc.id.clone());
@@ -1276,14 +1291,18 @@ pub async fn run_agent_turn(
                 if let Err(e) = engine.validate_tool_call(&tc.name, &args_value) {
                     tracing::warn!("Workflow validation failed for tool '{}': {}", tc.name, e);
 
-                    // Directive message: tell LLM what to do instead
+                    let single_step = engine.is_single_step();
                     let step_idx = engine.get_current_step_index();
-                    let directive = match step_idx {
-                        0 => "\n\n⚡ You are in Step 1 (Intent). Tools are BLOCKED here. \nOutput ONLY the JSON: {\"intent\": \"...\", \"complexity\": \"...\", \"files\": [...], \"topic\": \"...\"}",
-                        1 => "\n\n⚡ You are in Step 2 (Plan). Only read/search tools are allowed. \nOutput ONLY the JSON: {\"plan\": [...], \"skills\": [...], \"key_files\": [...]}",
-                        2 => "\n\n⚡ You are in Step 3 (Review). No tools allowed. \nOutput ONLY the JSON: {\"safe\": true|false, \"complete\": true|false, \"issues\": [...], \"warnings\": [...]}",
-                        3 => "\n\n⚡ You are in Step 4 (Execute). Follow the plan and use file/shell tools as needed. \nWhen finished, output ## Done with a brief summary.",
-                        _ => "\n\n💡 Please follow the current step requirements.",
+                    let directive = if single_step {
+                        "\n\n💡 该工具当前不可用。请改用 prompt 中列出的工具，或完成时输出 ## Done。"
+                    } else {
+                        match step_idx {
+                            0 => "\n\n⚡ You are in Step 1 (Intent). Tools are BLOCKED here. \nOutput ONLY the JSON: {\"intent\": \"...\", \"complexity\": \"...\", \"files\": [...], \"topic\": \"...\"}",
+                            1 => "\n\n⚡ You are in Step 2 (Plan). Only read/search tools are allowed. \nOutput ONLY the JSON: {\"plan\": [...], \"skills\": [...], \"key_files\": [...]}",
+                            2 => "\n\n⚡ You are in Step 3 (Review). No tools allowed. \nOutput ONLY the JSON: {\"safe\": true|false, \"complete\": true|false, \"issues\": [...], \"warnings\": [...]}",
+                            3 => "\n\n⚡ You are in Step 4 (Execute). Follow the plan and use file/shell tools as needed. \nWhen finished, output ## Done with a brief summary.",
+                            _ => "\n\n💡 Please follow the current step requirements.",
+                        }
                     };
                     let result_msg = Message::ToolResult {
                         tool_call_id: tc.id.clone(),
@@ -1299,9 +1318,11 @@ pub async fn run_agent_turn(
                     continue; // Skip this tool call
                 }
 
-                // Plan: block duplicate exploration; return cache so LLM stops looping
+                // Legacy 4-step only: duplicate exploration cache
+                let single_step = engine.is_single_step();
                 let step_idx = engine.get_current_step_index();
-                if step_idx == 1
+                if !single_step
+                    && step_idx == 1
                     && matches!(tc.name.as_str(), "file_list" | "file_read")
                 {
                     let path = args_value
@@ -1342,7 +1363,7 @@ pub async fn run_agent_turn(
                         continue;
                     }
                 }
-                if (step_idx == 0 || step_idx == 3) && tc.name == "file_list" {
+                if !single_step && (step_idx == 0 || step_idx == 3) && tc.name == "file_list" {
                     let path = args_value
                         .get("path")
                         .and_then(|p| p.as_str())
@@ -1372,7 +1393,8 @@ pub async fn run_agent_turn(
                         continue;
                     }
                 }
-                if (step_idx == 0 || step_idx == 3)
+                if !single_step
+                    && (step_idx == 0 || step_idx == 3)
                     && matches!(
                         tc.name.as_str(),
                         "file_read" | "code_search" | "find_symbol" | "file_search"
@@ -1479,7 +1501,10 @@ pub async fn run_agent_turn(
             // In pipeline mode, Steps 0-2 handle planning/review. Rule enforcement
             // (plan_before_edit, read_before_edit) is bypassed for Step 3 (Execute).
             let skip_plan_rules = matches!(&workflow_engine, Some(wf) if {
-                wf.try_lock().map_or(false, |e| e.is_workflow_active() && e.get_current_step_index() >= 3)
+                wf.try_lock().map_or(false, |e| {
+                    e.is_single_step()
+                        || (e.is_workflow_active() && e.get_current_step_index() >= 3)
+                })
             });
 
             if !skip_plan_rules {
@@ -2036,7 +2061,9 @@ pub async fn run_agent_turn(
                 if let Some(ref engine_arc) = workflow_engine {
                     if let Ok(engine) = engine_arc.try_lock() {
                         if engine.is_task_step() {
-                            if tool_name == "file_read" {
+                            if tool_name == "file_read"
+                                && crate::agent::workflow_session::is_implementation_phase(&engine)
+                            {
                                 if let Ok(args) =
                                     serde_json::from_str::<serde_json::Value>(&tc.arguments)
                                 {
