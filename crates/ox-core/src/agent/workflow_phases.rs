@@ -10,12 +10,16 @@ pub enum WorkflowPhase {
 }
 
 pub fn set_phase(_: &WorkflowEngine, _: WorkflowPhase) {}
-pub fn get_phase(_: &WorkflowEngine) -> WorkflowPhase {
-    WorkflowPhase::Act
+pub fn get_phase(engine: &WorkflowEngine) -> WorkflowPhase {
+    if engine.is_single_step() {
+        WorkflowPhase::Perceive
+    } else {
+        WorkflowPhase::Act
+    }
 }
 pub fn sync_phase(_: &WorkflowEngine) {}
-pub fn infer_phase(_: &WorkflowEngine) -> WorkflowPhase {
-    WorkflowPhase::Act
+pub fn infer_phase(engine: &WorkflowEngine) -> WorkflowPhase {
+    get_phase(engine)
 }
 
 pub fn allows_midflight_interjection(_: &WorkflowEngine) -> bool {

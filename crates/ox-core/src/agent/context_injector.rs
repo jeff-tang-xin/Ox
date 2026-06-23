@@ -7,7 +7,7 @@
 
 use crate::agent::engine::WorkflowEngine;
 use crate::message::Message;
-use crate::tools::ToolContext;
+use crate::tools::{ToolContext, ToolRegistry};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -23,19 +23,50 @@ pub fn inject_context(
     iteration: u32,
     tool_ctx: &Arc<ToolContext>,
     workflow_engine: &Option<Arc<Mutex<WorkflowEngine>>>,
+    tool_registry: &ToolRegistry,
 ) {
     strip_prior_step_memory(messages);
     strip_prior_discipline(messages);
+    strip_prior_phase(messages);
+    strip_prior_phase_switch(messages);
+    strip_prior_scope_gate(messages);
+    strip_prior_tool_route(messages);
+    strip_prior_skill_route(messages);
 
     if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
-            if engine.is_workflow_active() && !engine.is_workflow_complete() {
-                // Per-iteration refresh: full body on iter 0, one-liner after.
-                messages.push(Message::system(
-                    &crate::agent::idle_narrative::discipline_for_iteration(iteration),
-                ));
+            if let Some(notice) = crate::agent::phase::consume_transition_notice(&engine) {
+                messages.push(Message::system(&notice));
+            }
+        }
+    }
+
+    if let Some(wf) = workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            if crate::agent::phase::should_inject_workspace(&engine) {
+                let slim = crate::agent::context_slim::is_slim_phase(&engine);
+                if !slim {
+                    if iteration == 0 {
+                        messages.push(Message::system(
+                            &crate::agent::idle_narrative::discipline_for_iteration(iteration),
+                        ));
+                    } else if engine.get_task_intent() != crate::agent::task_intent::TaskIntent::Fix
+                    {
+                        messages.push(Message::system(
+                            &crate::agent::idle_narrative::discipline_for_iteration(iteration),
+                        ));
+                    }
+                } else if iteration == 0 {
+                    messages.push(Message::system(
+                        crate::agent::idle_narrative::RESPONSE_DISCIPLINE,
+                    ));
+                }
                 crate::agent::workspace::inject_workspace(messages, &engine);
+                if let Some(gate) = crate::agent::phase::format_scope_gate_directive(&engine) {
+                    messages.push(Message::system(&gate));
+                }
                 inject_task_step_memory(messages, iteration, &engine);
+                inject_atlas_routes(messages, &engine, tool_registry);
                 return;
             }
         }
@@ -93,55 +124,98 @@ fn strip_prior_step_memory(messages: &mut Vec<Message>) {
     });
 }
 
-/// Single-step task memory: tool progress + plan tracker + user guidance.
-fn inject_task_step_memory(
-    messages: &mut Vec<Message>,
-    iteration: u32,
-    engine: &WorkflowEngine,
-) {
-    if crate::agent::workspace::uses_workspace_memory(engine) {
-        let progress = build_tool_progress(messages, true);
-        if !progress.is_empty() {
-            messages.push(Message::system(&format!(
-                "{STEP_MEMORY_TAG}\n【本轮工具（勿重复）】\n{progress}"
-            )));
+fn strip_prior_phase(messages: &mut Vec<Message>) {
+    messages.retain(|m| {
+        !matches!(
+            m,
+            Message::System { content }
+                if content.starts_with(crate::agent::phase::PHASE_TAG)
+        )
+    });
+}
+
+fn strip_prior_phase_switch(messages: &mut Vec<Message>) {
+    messages.retain(|m| {
+        !matches!(
+            m,
+            Message::System { content }
+                if content.starts_with(crate::agent::phase::PHASE_SWITCH_TAG)
+        )
+    });
+}
+
+fn strip_prior_scope_gate(messages: &mut Vec<Message>) {
+    crate::agent::phase::strip_scope_gate(messages);
+}
+
+fn strip_prior_tool_route(messages: &mut Vec<Message>) {
+    messages.retain(|m| {
+        !matches!(
+            m,
+            Message::System { content }
+                if content.starts_with(crate::agent::tool_graph::TOOL_ROUTE_TAG)
+        )
+    });
+}
+
+fn strip_prior_skill_route(messages: &mut Vec<Message>) {
+    messages.retain(|m| {
+        !matches!(
+            m,
+            Message::System { content }
+                if content.starts_with(crate::skill::policy::SKILL_ROUTE_TAG)
+        )
+    });
+}
+
+fn inject_atlas_routes(messages: &mut Vec<Message>, engine: &WorkflowEngine, tool_registry: &ToolRegistry) {
+    messages.push(Message::system(&crate::agent::tool_graph::build_tool_route(engine)));
+    let phase = crate::agent::phase::get(engine).as_str().to_string();
+    let skills = tool_registry.get_skills_list();
+    if let Some(block) = crate::skill::policy::build_skill_route(&skills, &phase) {
+        messages.push(Message::system(&block));
+    }
+}
+
+/// Single-step task memory: tool progress + digest paths in fix mode.
+fn inject_task_step_memory(messages: &mut Vec<Message>, _iteration: u32, engine: &WorkflowEngine) {
+    let slim = crate::agent::context_slim::is_slim_phase(engine);
+    let progress = if slim {
+        crate::agent::context_slim::build_recent_tool_progress(messages, true, 10)
+    } else {
+        build_tool_progress(messages, true)
+    };
+    let mut body = String::new();
+    if !progress.is_empty() {
+        body.push_str(&format!("【本轮工具（勿重复）】\n{progress}"));
+    }
+    if engine.get_task_intent() == crate::agent::task_intent::TaskIntent::Fix
+        || crate::agent::context_slim::is_slim_phase(engine)
+    {
+        let needs_impl_read = crate::agent::workspace::WorkflowWorkspace::build(engine)
+            .is_some_and(|ws| matches!(ws.required_action, crate::agent::workspace::RequiredAction::ReadFile { .. }));
+        let digests: Vec<String> = crate::agent::tool_digest::all_digests(engine)
+            .into_iter()
+            .map(|d| format!("  digest: {}", d.path))
+            .collect();
+        if !digests.is_empty() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            if needs_impl_read {
+                body.push_str("【审查期 digest — 实施须再 file_read 一次】\n");
+            } else {
+                body.push_str("【已读文件 — 实施阶段直接 edit_file】\n");
+            }
+            body.push_str(&digests.join("\n"));
         }
+    }
+    if body.is_empty() {
         return;
     }
-
-    let progress = build_tool_progress(messages, true);
-    let mut parts = vec![format!(
-        "{STEP_MEMORY_TAG}\n⚡ 第{}轮 — 调工具或交产物（## Done / findings / 直接答），禁止空转。",
-        iteration + 1
-    )];
-
-    if iteration == 0 {
-        if let Some(req) = engine.get_variable("_current_user_request") {
-            if !req.trim().is_empty() {
-                let snippet: String = req.chars().take(800).collect();
-                parts.push(format!("【用户请求】\n{snippet}"));
-            }
-        }
-        let guidance = engine.workflow_guidance_block();
-        if !guidance.is_empty() {
-            parts.push(guidance);
-        }
-    }
-
-    if !progress.is_empty() {
-        parts.push(format!("【本轮已完成（勿重复）】\n{progress}"));
-    }
-
-    let plan_progress = engine.plan_progress_summary();
-    if !plan_progress.is_empty() {
-        parts.push(plan_progress);
-    }
-
-    if let Some(report) = engine.execute_review_report_block(2000) {
-        parts.push(report);
-    }
-
-    messages.push(Message::system(&parts.join("\n\n")));
+    messages.push(Message::system(&format!(
+        "{STEP_MEMORY_TAG}\n{body}"
+    )));
 }
 
 pub fn build_tool_progress(messages: &[Message], include_writes: bool) -> String {
@@ -310,7 +384,7 @@ mod tests {
             reasoning_content: None,
         }];
         let p = build_tool_progress(&msgs, true);
-        assert!(p.contains("file_read(src/a.rs)"));
+        assert!(p.contains("file_read(src/a.rs@"));
         assert!(p.contains("edit_file(src/a.rs)"));
     }
 

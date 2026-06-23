@@ -245,6 +245,23 @@ impl RuleBasedClassifier {
             }
         }
 
+        // Chinese/multi-char phrases: substring match (whole-sentence tokens miss these).
+        for verb in &self.action_verbs.debug_verbs {
+            if msg_lower.contains(verb) {
+                *scores.get_mut(&QuestionType::Debugging).unwrap() += 1;
+            }
+        }
+        for verb in &self.action_verbs.write_verbs {
+            if msg_lower.contains(verb) {
+                *scores.get_mut(&QuestionType::CodeWriting).unwrap() += 1;
+            }
+        }
+        for verb in &self.action_verbs.read_verbs {
+            if msg_lower.contains(verb) {
+                *scores.get_mut(&QuestionType::CodeReading).unwrap() += 1;
+            }
+        }
+
         // 找到最高分的意图
         let (best_intent, best_score) = scores
             .into_iter()

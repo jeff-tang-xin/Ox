@@ -67,7 +67,7 @@ impl Tool for FindSymbolTool {
 
             // ── Step 2: knowledge engine semantic fallback ──
             match engine.retrieve_code(&name_owned, top_k) {
-                Ok(hits) if !hits.is_empty() => Ok(format_vector_results(&name_owned, &hits)),
+                Ok(hits) if !hits.is_empty() => Ok(format_vector_results(&name_owned, &hits, &engine)),
                 Ok(_) => Ok(format!(
                     "🔍 No symbols found for '{}'.\n\
                      💡 Try a more specific name, or use file_read + code_search.",
@@ -186,7 +186,7 @@ fn format_treesitter_results(name: &str, hits: &[TsSymbol]) -> String {
     output
 }
 
-fn format_vector_results(name: &str, hits: &[crate::knowledge::vector_store::SearchHit]) -> String {
+fn format_vector_results(name: &str, hits: &[crate::knowledge::vector_store::SearchHit], engine: &crate::knowledge::KnowledgeEngine) -> String {
     let mut output = format!(
         "🔍 [semantic] Found {} symbol(s) for '{}':\n\n",
         hits.len(), name
@@ -209,8 +209,48 @@ fn format_vector_results(name: &str, hits: &[crate::knowledge::vector_store::Sea
                 let sig: String = signature.chars().take(100).collect();
                 output.push_str(&format!("       └ {}\n", sig));
             }
+            output.push_str(&format_graph_edges(engine, &entity.id));
         }
     }
     output.push_str("\n💡 Use file_read to view full source. Use edit_file to modify.");
     output
+}
+
+fn format_graph_edges(engine: &crate::knowledge::KnowledgeEngine, symbol_id: &str) -> String {
+    let callers = engine.graph_callers(symbol_id, 3);
+    let callees = engine.graph_callees(symbol_id, 3);
+    if callers.is_empty() && callees.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("       📎 graph:");
+    if !callers.is_empty() {
+        let names: Vec<String> = callers
+            .iter()
+            .filter_map(|e| match &e.metadata {
+                crate::knowledge::entity::EntityMetadata::CodeSymbol { fq_name, .. } => {
+                    Some(fq_name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if !names.is_empty() {
+            out.push_str(&format!(" callers=[{}]", names.join(", ")));
+        }
+    }
+    if !callees.is_empty() {
+        let names: Vec<String> = callees
+            .iter()
+            .filter_map(|e| match &e.metadata {
+                crate::knowledge::entity::EntityMetadata::CodeSymbol { fq_name, .. } => {
+                    Some(fq_name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if !names.is_empty() {
+            out.push_str(&format!(" calls=[{}]", names.join(", ")));
+        }
+    }
+    out.push('\n');
+    out
 }

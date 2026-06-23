@@ -4,17 +4,17 @@ use serde::{Deserialize, Serialize};
 
 use super::engine::WorkflowEngine;
 use super::findings::{self, FindingStatus, FindingsStore};
+use super::task_intent::TaskIntent;
 
 pub const WORKSPACE_TAG: &str = "[WORKSPACE]";
 
 /// When true, skip legacy DURABLE_MEMORY / heavy STEP_MEMORY (workspace is canonical).
 pub fn uses_workspace_memory(engine: &WorkflowEngine) -> bool {
-    if !engine.is_workflow_active() || engine.is_workflow_complete() {
+    if !crate::agent::phase::should_inject_workspace(engine) {
         return false;
     }
     let step = engine.get_current_step_index();
-    // Single-step (0) and legacy execute step (3).
-    step == 0 || step == 3
+    step == 0 || step == 3 || crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::Implement
 }
 
 /// Minimal addon when workspace mode is active (skills only).
@@ -31,11 +31,9 @@ pub fn minimal_durable_addon(engine: &WorkflowEngine) -> String {
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceMode {
     ExecuteReview,
-    Parked,
     FeedbackDiscuss,
     ScopeConfirm,
     ExecuteImpl,
-    Paused,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,6 +71,9 @@ pub struct ReadSlot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowWorkspace {
+    pub task_intent: TaskIntent,
+    pub tool_hints: String,
+    pub authority_note: String,
     pub mode: WorkspaceMode,
     pub user_request: String,
     pub findings_summary: String,
@@ -85,6 +86,11 @@ pub struct WorkflowWorkspace {
     pub required_action: RequiredAction,
     pub forbidden: Vec<String>,
     pub phase_notes: String,
+    /// Canonical single-flow phase (from phase state machine).
+    pub single_flow_phase: String,
+    /// Recent user directives (from workflow guidance — no separate block in Implement).
+    #[serde(default)]
+    pub user_directives: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,7 +106,8 @@ pub struct WorkspaceFinding {
 
 impl WorkflowWorkspace {
     pub fn build(engine: &WorkflowEngine) -> Option<Self> {
-        let mode = infer_mode(engine);
+        let task_intent = engine.get_task_intent();
+        let mode = crate::agent::phase::workspace_mode(engine);
         let user_request = engine
             .get_variable("_current_user_request")
             .unwrap_or_default();
@@ -118,13 +125,7 @@ impl WorkflowWorkspace {
             (String::new(), Vec::new(), Vec::new())
         };
 
-        let files_read: Vec<ReadSlot> = engine
-            .get_variable("_impl_files_read")
-            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|slot| parse_read_slot(&slot))
-            .collect();
+        let files_read: Vec<ReadSlot> = build_files_read(engine);
 
         let file_digests: Vec<crate::agent::tool_digest::FileDigest> =
             crate::agent::tool_digest::all_digests(engine);
@@ -137,8 +138,12 @@ impl WorkflowWorkspace {
         let required_action = compute_required_action(engine, mode, &store, &files_read, &files_edited);
         let forbidden = forbidden_for_mode(mode);
         let phase_notes = phase_notes_for_mode(mode);
+        let user_directives = recent_user_directives(engine);
 
         Some(Self {
+            task_intent,
+            tool_hints: task_intent.tool_hint().to_string(),
+            authority_note: task_intent.authority_note().to_string(),
             mode,
             user_request,
             findings_summary,
@@ -150,55 +155,265 @@ impl WorkflowWorkspace {
             required_action,
             forbidden,
             phase_notes,
+            single_flow_phase: crate::agent::phase::get(engine).as_str().to_string(),
+            user_directives,
         })
     }
 
     pub fn format_for_llm(&self) -> String {
-        let json = serde_json::to_string_pretty(self).unwrap_or_default();
-        format!(
+        let mut out = format!(
             "{WORKSPACE_TAG}\n\
-             ## 当前工作区（唯一真相 — 按 mode 与 required_action 执行）\n\
-             ```json\n{json}\n```"
-        )
+             ## 当前工作区（**工具动作以「本轮唯一动作」为准**）\n\n\
+             **阶段:** {} · **模式:** {}\n\
+             **任务:** {}\n",
+            self.single_flow_phase,
+            phase_mode_label(&self.single_flow_phase, self.mode),
+            truncate_line(&self.user_request, 400),
+        );
+        if !self.findings_summary.is_empty() {
+            out.push_str(&format!("\n**摘要:** {}\n", self.findings_summary));
+        }
+        out.push_str("\n### 本轮唯一动作\n");
+        out.push_str(&format_required_action(&self.required_action));
+        if let RequiredAction::EditFile { path, finding_index } = &self.required_action {
+            let norm = plan_tracker_normalize(path);
+            if let Some(d) = self
+                .file_digests
+                .iter()
+                .find(|d| plan_tracker_normalize(&d.path) == norm)
+            {
+                out.push_str(&format!(
+                    "\n**edit 参考 digest (#{finding_index}):** {}\n",
+                    truncate_line(&d.summary, 600)
+                ));
+            } else {
+                out.push_str(
+                    "\n**edit 提示:** 尚无文件内容 — 先 `file_read` 该文件（实施阶段每文件可读 1 次），再 `edit_file`。\n",
+                );
+            }
+        }
+        if !self.forbidden.is_empty() {
+            out.push_str("\n**禁止:** ");
+            out.push_str(&self.forbidden.join(" · "));
+            out.push('\n');
+        }
+        if !self.phase_notes.is_empty() {
+            out.push_str(&format!("\n_{}_\n", self.phase_notes));
+        }
+        if !self.findings.is_empty() {
+            use std::collections::BTreeMap;
+            let mut by_file: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+            for f in &self.findings {
+                let key = if f.file.is_empty() {
+                    "(无文件)".to_string()
+                } else {
+                    f.file.clone()
+                };
+                by_file.entry(key).or_default().push(f.index);
+            }
+            if by_file.len() > 1 || by_file.values().any(|v| v.len() > 1) {
+                out.push_str("\n### 问题关联（同文件）\n");
+                for (file, indices) in &by_file {
+                    let ids: Vec<String> = indices.iter().map(|i| format!("#{i}")).collect();
+                    out.push_str(&format!("- `{file}` → {}\n", ids.join(", ")));
+                }
+            }
+            out.push_str("\n### Findings\n");
+            let mut last_file: Option<String> = None;
+            for f in &self.findings {
+                let file_key = if f.file.is_empty() {
+                    "(无文件)".to_string()
+                } else {
+                    f.file.clone()
+                };
+                if last_file.as_ref() != Some(&file_key) {
+                    if f.file.is_empty() {
+                        out.push_str(&format!("\n#### {}\n", file_key));
+                    } else {
+                        out.push_str(&format!("\n#### `{}`\n", f.file));
+                    }
+                    last_file = Some(file_key);
+                }
+                let loc = if f.file.is_empty() {
+                    f.symbol.clone()
+                } else if f.symbol.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", f.symbol)
+                };
+                let in_scope = if self.active_indices.is_empty()
+                    || self.active_indices.contains(&f.index)
+                {
+                    ""
+                } else {
+                    " (范围外)"
+                };
+                out.push_str(&format!(
+                    "- **#{}** [{}]{loc}{in_scope}\n  问题: {}\n",
+                    f.index, f.severity, f.issue
+                ));
+                if !f.recommendation.is_empty() {
+                    out.push_str(&format!("  建议: {}\n", f.recommendation));
+                }
+            }
+        }
+        if !self.file_digests.is_empty() {
+            let header = if self.mode == WorkspaceMode::ExecuteImpl {
+                if matches!(self.required_action, RequiredAction::ReadFile { .. }) {
+                    "### 审查期 digest（**不等于实施已读** — 须先执行上方 ReadFile）"
+                } else {
+                    "### 审查期 digest（参考行号；实施已读后请 edit_file）"
+                }
+            } else {
+                "### 已读文件 digest"
+            };
+            out.push_str(&format!("\n{header}\n"));
+            for d in &self.file_digests {
+                let syms = if d.symbols.is_empty() {
+                    String::new()
+                } else {
+                    d.symbols
+                        .iter()
+                        .take(4)
+                        .map(|s| format!("{}@L{}-{}", s.name, s.line_start, s.line_end))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                out.push_str(&format!("- `{}`", d.path));
+                if !syms.is_empty() {
+                    out.push_str(&format!(" — {syms}"));
+                }
+                out.push('\n');
+            }
+        }
+        if !self.user_directives.is_empty() {
+            out.push_str("\n### 用户补充\n");
+            for d in &self.user_directives {
+                out.push_str(&format!("- {d}\n"));
+            }
+        }
+        out.trim_end().to_string()
     }
 }
 
-fn infer_mode(engine: &WorkflowEngine) -> WorkspaceMode {
-    if crate::agent::workflow_session::is_paused(engine) {
-        return WorkspaceMode::Paused;
+fn mode_label(mode: WorkspaceMode) -> &'static str {
+    match mode {
+        WorkspaceMode::ExecuteReview => "审查(只读)",
+        WorkspaceMode::ExecuteImpl => "实施(可改代码)",
+        WorkspaceMode::ScopeConfirm => "确认范围",
+        WorkspaceMode::FeedbackDiscuss => "讨论",
     }
-    if crate::agent::workflow_session::is_scope_confirm(engine) {
-        return WorkspaceMode::ScopeConfirm;
+}
+
+fn phase_mode_label(phase: &str, mode: WorkspaceMode) -> String {
+    match phase {
+        "await_user" => "待用户确认".to_string(),
+        "implement" => "实施".to_string(),
+        "complete" => "已完成".to_string(),
+        _ => mode_label(mode).to_string(),
     }
-    if crate::agent::workflow_session::is_feedback_discuss(engine) {
-        return WorkspaceMode::FeedbackDiscuss;
+}
+
+fn truncate_line(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
     }
-    if crate::agent::workflow_session::is_implementation_phase(engine) {
-        return WorkspaceMode::ExecuteImpl;
+}
+
+fn format_required_action(action: &RequiredAction) -> String {
+    match action {
+        RequiredAction::Explore { hint } => {
+            format!("🔍 **探索** — 调工具收集信息\n→ {hint}")
+        }
+        RequiredAction::ReadFile {
+            path,
+            finding_index,
+            offset,
+            limit,
+            ..
+        } => {
+            if *offset > 0 {
+                format!(
+                    "📖 **读取** finding #{finding_index}\n\
+                     → 工具: `file_read` path=`{path}` offset={offset} limit={limit}\n\
+                     → 下一 tool **必须**是 `edit_file`（从返回内容复制 old_string）"
+                )
+            } else {
+                format!(
+                    "📖 **读取** finding #{finding_index}\n\
+                     → 工具: `file_read` path=`{path}` offset={offset} limit={limit}\n\
+                     → 下一 tool **必须**是 `edit_file`（同一文件）"
+                )
+            }
+        }
+        RequiredAction::EditFile {
+            path,
+            finding_index,
+        } => {
+            format!(
+                "✏️ **编辑** finding #{finding_index}\n\
+                 → 工具: `edit_file` path=`{path}`\n\
+                 → 按上方 findings 的「建议」修改；不确定关联代码时可 `find_symbol` / `recall`"
+            )
+        }
+        RequiredAction::Verify {
+            command,
+            finding_index,
+        } => {
+            format!(
+                "✅ **验证** finding #{finding_index}\n\
+                 → 工具: `shell_exec` 运行: `{command}`\n\
+                 → exit 0 后继续下一项"
+            )
+        }
+        RequiredAction::EmitFindingsAndDone => {
+            "📋 **审查交付**\n\
+             → 1) 用 prose 写审查结论\n\
+             → 2) 附 findings JSON 代码块（机器解析，UI 不展示 JSON）\n\
+             → 3) 输出 `## Done`"
+                .to_string()
+        }
+        RequiredAction::EmitCompletionReceipt => {
+            "🏁 **修复完成**\n\
+             → 全部 in-scope finding 已 edit + verify\n\
+             → 输出 completion_receipt JSON + `## Done`"
+                .to_string()
+        }
+        RequiredAction::AwaitUser => {
+            "⏸️ **门禁暂停**（同一会话，非新对话）\n\
+             → 审查 findings 已入库 — **禁止调任何工具**\n\
+             → 用户在面板选范围并按 c /confirm 后自动切入实施\n\
+             → 若用户输入讨论：仅文字回应，勿重出 findings / ## Done"
+                .to_string()
+        }
+        RequiredAction::DiscussOnly => {
+            "💬 **讨论** — 直接文字回应用户；禁止工具、禁止重出 findings / ## Done".to_string()
+        }
     }
-    if crate::agent::workflow_session::is_parked(engine) {
-        return WorkspaceMode::Parked;
-    }
-    if engine.get_current_step_index() == 3 && engine.is_perceive_execute() {
-        if crate::agent::workflow_session::is_parked(engine)
-            || engine.execute_report_already_delivered()
+}
+
+fn build_files_read(engine: &WorkflowEngine) -> Vec<ReadSlot> {
+    let mut slots: Vec<ReadSlot> = crate::agent::read_guard::paths_read(engine)
+        .into_iter()
+        .map(|path| ReadSlot {
+            path,
+            offset: 0,
+            limit: 200,
+        })
+        .collect();
+    for d in crate::agent::tool_digest::all_digests(engine) {
+        if !slots.iter().any(|s| plan_tracker_normalize(&s.path) == plan_tracker_normalize(&d.path))
         {
-            return WorkspaceMode::Parked;
+            slots.push(ReadSlot {
+                path: d.path.clone(),
+                offset: 0,
+                limit: d.line_count.min(200) as u32,
+            });
         }
-        return WorkspaceMode::ExecuteReview;
     }
-    // Single-step: review/explain by default; implementation only when user asks to fix.
-    if engine.is_single_step() {
-        let user = engine
-            .get_variable("_current_user_request")
-            .unwrap_or_default();
-        if crate::agent::workflow_session::looks_like_implementation_request(&user) {
-            return WorkspaceMode::ExecuteImpl;
-        }
-        return WorkspaceMode::ExecuteReview;
-    }
-    // Legacy default
-    WorkspaceMode::ExecuteImpl
+    slots
 }
 
 fn compute_required_action(
@@ -210,20 +425,18 @@ fn compute_required_action(
 ) -> RequiredAction {
     match mode {
         WorkspaceMode::ExecuteReview => {
-            if store
-                .as_ref()
-                .is_some_and(|s| !s.findings.is_empty())
-            {
-                return RequiredAction::AwaitUser;
+            if matches!(engine.get_task_intent(), TaskIntent::Qa) {
+                return RequiredAction::Explore {
+                    hint: "问答模式：直接回答；需核对代码时单次 file_read/find_symbol".to_string(),
+                };
             }
-            if engine.execute_report_already_delivered() {
+            if crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::AwaitUser {
                 return RequiredAction::AwaitUser;
             }
             RequiredAction::EmitFindingsAndDone
         }
-        WorkspaceMode::Parked | WorkspaceMode::ScopeConfirm => RequiredAction::AwaitUser,
+        WorkspaceMode::ScopeConfirm => RequiredAction::AwaitUser,
         WorkspaceMode::FeedbackDiscuss => RequiredAction::DiscussOnly,
-        WorkspaceMode::Paused => RequiredAction::AwaitUser,
         WorkspaceMode::ExecuteImpl => {
             let Some(store) = store else {
                 return RequiredAction::Explore {
@@ -259,15 +472,17 @@ fn compute_required_action(
                     continue;
                 }
                 let norm_path = plan_tracker_normalize(&f.file);
+                // Implement: review digest ≠ implement read — require one fresh file_read.
                 let has_read = !f.file.is_empty()
-                    && files_read.iter().any(|r| plan_tracker_normalize(&r.path) == norm_path);
+                    && engine.impl_file_already_read(&f.file);
                 let has_edit = !f.file.is_empty()
                     && files_edited.iter().any(|p| plan_tracker_normalize(p) == norm_path);
                 if !f.file.is_empty() && !has_read {
+                    let (offset, limit) = read_offset_for_finding(engine, f);
                     return RequiredAction::ReadFile {
                         path: f.file.clone(),
-                        offset: 0,
-                        limit: 200,
+                        offset,
+                        limit,
                         finding_index: idx,
                     };
                 }
@@ -301,7 +516,9 @@ fn forbidden_for_mode(mode: WorkspaceMode) -> Vec<String> {
             "edit_file".into(),
             "file_write".into(),
             "delete_range".into(),
-            "复述已完成探索".into(),
+            "shell_exec type".into(),
+            "shell_exec cat".into(),
+            "重复 file_read 同一路径".into(),
         ],
         WorkspaceMode::FeedbackDiscuss => vec![
             "edit_file".into(),
@@ -312,28 +529,27 @@ fn forbidden_for_mode(mode: WorkspaceMode) -> Vec<String> {
             "code_search".into(),
             "file_list".into(),
             "file_search".into(),
-            "find_symbol".into(),
             "shell_exec cat".into(),
             "复述审查报告".into(),
         ],
-        WorkspaceMode::Parked | WorkspaceMode::ScopeConfirm | WorkspaceMode::Paused => {
-            vec!["工具调用".into()]
-        }
+        WorkspaceMode::ScopeConfirm => vec!["工具调用".into()],
     }
 }
 
 fn phase_notes_for_mode(mode: WorkspaceMode) -> String {
     match mode {
         WorkspaceMode::ExecuteReview => {
-            "只读审查：输出报告 + findings JSON + ## Done（报告已出则等待用户 /fix /discuss）".into()
+            "只读：报告 + findings JSON + ## Done（问答模式可直接回答）".into()
         }
-        WorkspaceMode::Parked => "已 Park — 用户将选择范围或讨论".into(),
-        WorkspaceMode::ScopeConfirm => "等待用户确认实施范围".into(),
+        WorkspaceMode::ScopeConfirm => {
+            "门禁：用户确认范围前禁止工具；讨论时仅文字回应".into()
+        }
         WorkspaceMode::FeedbackDiscuss => {
             "讨论模式：直接回应用户；禁止重出审查报告 / findings JSON / ## Done".into()
         }
-        WorkspaceMode::ExecuteImpl => "实施：一次推进一个 finding，遵守 required_action".into(),
-        WorkspaceMode::Paused => "已暂停 — /resume 继续".into(),
+        WorkspaceMode::ExecuteImpl => {
+            "实施：遵守 required_action；代码用 file_read/find_symbol；架构/约定可用 memory_search；禁止 code_search 漫游".into()
+        }
     }
 }
 
@@ -349,38 +565,56 @@ fn workspace_finding_from(f: &findings::Finding) -> WorkspaceFinding {
     }
 }
 
-fn parse_read_slot(slot: &str) -> Option<ReadSlot> {
-    let (path, rest) = slot.split_once('@')?;
-    let (offset, limit) = rest.split_once('+')?;
-    Some(ReadSlot {
-        path: path.to_string(),
-        offset: offset.parse().ok()?,
-        limit: limit.parse().ok()?,
-    })
-}
-
 fn plan_tracker_normalize(path: &str) -> String {
     crate::agent::plan_tracker::normalize_path(path)
 }
 
+/// Suggest file_read offset near the finding's symbol (from digest or name).
+fn read_offset_for_finding(engine: &WorkflowEngine, f: &findings::Finding) -> (u32, u32) {
+    const LIMIT: u32 = 200;
+    let Some(digest) = crate::agent::tool_digest::get_digest(engine, &f.file) else {
+        return (0, LIMIT);
+    };
+    let sym = f.symbol.trim();
+    if sym.is_empty() {
+        return (0, LIMIT);
+    }
+    let sym_lower = sym.to_lowercase();
+    if let Some(s) = digest.symbols.iter().find(|s| {
+        s.name.eq_ignore_ascii_case(sym)
+            || sym_lower.contains(&s.name.to_lowercase())
+            || s.name.to_lowercase().contains(&sym_lower)
+    }) {
+        let offset = s.line_start.saturating_sub(8);
+        return (offset, LIMIT);
+    }
+    (0, LIMIT)
+}
+
+fn recent_user_directives(engine: &WorkflowEngine) -> Vec<String> {
+    crate::agent::workflow_guidance::load(engine)
+        .into_iter()
+        .rev()
+        .take(4)
+        .map(|e| {
+            let snip: String = e.text.chars().take(200).collect();
+            format!("[{}] {snip}", e.step_name)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
 pub fn inject_workspace(messages: &mut Vec<crate::message::Message>, engine: &WorkflowEngine) {
+    if !crate::agent::phase::should_inject_workspace(engine) {
+        return;
+    }
     let Some(ws) = WorkflowWorkspace::build(engine) else {
         return;
     };
-    let step = engine.get_current_step_index();
-    let inject = step == 0
-        || step == 3
-        || matches!(
-            ws.mode,
-            WorkspaceMode::Parked
-                | WorkspaceMode::ScopeConfirm
-                | WorkspaceMode::FeedbackDiscuss
-                | WorkspaceMode::Paused
-        );
-    if inject {
-        strip_workspace(messages);
-        messages.push(crate::message::Message::system(&ws.format_for_llm()));
-    }
+    strip_workspace(messages);
+    messages.push(crate::message::Message::system(&ws.format_for_llm()));
 }
 
 pub fn strip_workspace(messages: &mut Vec<crate::message::Message>) {
@@ -398,10 +632,50 @@ mod tests {
     use crate::agent::session::SessionState;
 
     #[test]
-    fn build_review_mode() {
+    fn format_includes_action_card() {
         let engine = WorkflowEngine::new(Arc::new(Mutex::new(SessionState::new("t"))));
         engine.set_variable("_current_user_request", "review".into());
-        // step 0 default — no workspace for non-step3
-        assert!(WorkflowWorkspace::build(&engine).is_some());
+        let ws = WorkflowWorkspace::build(&engine).unwrap();
+        let text = ws.format_for_llm();
+        assert!(text.contains("本轮唯一动作"));
+        assert!(!text.contains("```json"));
+    }
+
+    #[test]
+    fn implement_requires_fresh_read_not_review_digest() {
+        use crate::agent::findings::{Finding, FindingStatus, FindingsStore, Severity};
+        use crate::agent::phase::{self, SingleFlowPhase};
+
+        let engine = WorkflowEngine::new(Arc::new(Mutex::new(SessionState::new("t"))));
+        engine.set_variable(phase::PHASE_STATE_KEY, SingleFlowPhase::Implement.as_str().to_string());
+        let store = FindingsStore {
+            summary: "s".into(),
+            findings: vec![Finding {
+                index: 1,
+                severity: Severity::High,
+                file: "src/Foo.java".into(),
+                symbol: "doHandle".into(),
+                issue: "bug".into(),
+                recommendation: "fix".into(),
+                status: FindingStatus::Scoped,
+                user_notes: vec![],
+                dispute: None,
+                impl_log: vec![],
+            }],
+            active_indices: vec![1],
+        };
+        findings::save(&engine, &store);
+        crate::agent::tool_digest::record_read(
+            &engine,
+            "src/Foo.java",
+            "class Foo {}",
+            0,
+            Some(1),
+        );
+        let ws = WorkflowWorkspace::build(&engine).unwrap();
+        assert!(matches!(
+            ws.required_action,
+            RequiredAction::ReadFile { finding_index: 1, .. }
+        ));
     }
 }

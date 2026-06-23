@@ -509,7 +509,7 @@ fn parse_bug_review_line(line: &str) -> Option<(u32, &str)> {
         t = t.trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ');
     }
     let upper = t.to_ascii_uppercase();
-    let rest = if let Some(r) = upper.strip_prefix("BUG-") {
+    let rest = if upper.strip_prefix("BUG-").is_some() {
         t.get(4..)?
     } else if upper.starts_with('F') && t.len() > 1 {
         let digit_end = t[1..]

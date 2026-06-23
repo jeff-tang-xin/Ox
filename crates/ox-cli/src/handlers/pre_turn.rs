@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Max wait for knowledge read lock (background indexer holds write lock while embedding).
-const KNOWLEDGE_READ_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Max wait for knowledge read lock (poll while background embed holds write between chunks).
+const KNOWLEDGE_READ_LOCK_TIMEOUT: Duration = Duration::from_secs(8);
 /// Max time for hybrid retrieval (query embed + vector search).
 const KNOWLEDGE_RETRIEVAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Max wait for lazy-index write lock before skipping on-demand embed.
@@ -75,7 +75,85 @@ pub async fn prepare_turn(
     let (step_memory_layers, step_prompt, step_idx) =
         get_workflow_step_info(workflow_engine);
 
-    // 1b. Lazy index: embed session-relevant paths before retrieval
+    let workflow_active = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|e| e.is_workflow_active())
+        .unwrap_or(false);
+
+    // 1b. L0→L3 promotion when workflow phase changes (before retrieval).
+    if let (Some(k_engine), Some(wf)) = (knowledge_engine, workflow_engine) {
+        if let Ok(engine) = wf.try_lock() {
+            ox_core::knowledge::consolidation::maybe_on_phase_change(k_engine, &engine).await;
+        }
+    }
+
+    let current_task_anchor = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .and_then(|e| {
+            ox_core::agent::user_round::get_turn_user_input(&e).or_else(|| {
+                e.get_variable("_current_user_request")
+                    .filter(|s| !s.trim().is_empty())
+            })
+        });
+
+    // 2. Knowledge retrieval FIRST — use already-indexed subset even if lazy embed pending.
+    let _ = status_tx.send(AgentToUiEvent::Status(
+        "🔍 Retrieving knowledge...".to_string(),
+    ));
+
+    let knowledge_context_str = if let Some(k_engine) = knowledge_engine {
+        if let Some(engine_guard) =
+            ox_core::knowledge::acquire_read_with_backoff(k_engine, KNOWLEDGE_READ_LOCK_TIMEOUT).await
+        {
+            let query = effective_text.clone();
+            let sid = session_id.to_string();
+            let layers = step_memory_layers.clone();
+            let step_layers = !layers.is_empty();
+            let task_anchor = current_task_anchor.clone();
+            match tokio::time::timeout(KNOWLEDGE_RETRIEVAL_TIMEOUT, async {
+                tokio::task::block_in_place(|| {
+                    if step_layers {
+                        retrieval::run_retrieval_for_step(
+                            &engine_guard,
+                            &query,
+                            &sid,
+                            3000,
+                            &layers,
+                        )
+                    } else {
+                        retrieval::run_retrieval(&engine_guard, &query, &sid, 3000)
+                    }
+                })
+            })
+            .await
+            {
+                Ok(Ok(inj)) => {
+                    retrieval::format_context_for_prompt(&inj, task_anchor.as_deref())
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("[PRE-TURN] Knowledge retrieval failed: {}", e);
+                    String::new()
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "[PRE-TURN] Knowledge retrieval timed out — proceeding without RAG context"
+                    );
+                    String::new()
+                }
+            }
+        } else {
+            tracing::warn!(
+                "[PRE-TURN] Knowledge read lock busy — skipping retrieval (indexer may be embedding)"
+            );
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // 2b. Lazy index after retrieval — findings paths first, then query/explored paths.
     if config.embedding.lazy_index {
         if let Some(k_engine) = knowledge_engine {
             let paths = collect_lazy_index_paths(&effective_text, workflow_engine);
@@ -109,73 +187,6 @@ pub async fn prepare_turn(
             }
         }
     }
-
-    // 2. Knowledge retrieval — bounded wait so background embed cannot block the LLM call
-    let _ = status_tx.send(AgentToUiEvent::Status(
-        "🔍 Retrieving knowledge...".to_string(),
-    ));
-    let workflow_active = workflow_engine
-        .as_ref()
-        .and_then(|wf| wf.try_lock().ok())
-        .map(|e| e.is_workflow_active())
-        .unwrap_or(false);
-
-    let current_task_anchor = workflow_engine
-        .as_ref()
-        .and_then(|wf| wf.try_lock().ok())
-        .and_then(|e| e.get_variable("_current_user_request"))
-        .filter(|s| !s.trim().is_empty());
-
-    let knowledge_context_str = if let Some(k_engine) = knowledge_engine {
-        match tokio::time::timeout(KNOWLEDGE_READ_LOCK_TIMEOUT, k_engine.read()).await {
-            Ok(engine_guard) => {
-                let query = effective_text.clone();
-                let sid = session_id.to_string();
-                let layers = step_memory_layers.clone();
-                let step_layers = !layers.is_empty();
-                let task_anchor = current_task_anchor.clone();
-                match tokio::time::timeout(KNOWLEDGE_RETRIEVAL_TIMEOUT, async {
-                    tokio::task::block_in_place(|| {
-                        if step_layers {
-                            retrieval::run_retrieval_for_step(
-                                &engine_guard,
-                                &query,
-                                &sid,
-                                3000,
-                                &layers,
-                            )
-                        } else {
-                            retrieval::run_retrieval(&engine_guard, &query, &sid, 3000)
-                        }
-                    })
-                })
-                .await
-                {
-                    Ok(Ok(inj)) => {
-                        retrieval::format_context_for_prompt(&inj, task_anchor.as_deref())
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("[PRE-TURN] Knowledge retrieval failed: {}", e);
-                        String::new()
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "[PRE-TURN] Knowledge retrieval timed out — proceeding without RAG context"
-                        );
-                        String::new()
-                    }
-                }
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "[PRE-TURN] Knowledge read lock timeout — skipping retrieval (indexer may be running)"
-                );
-                String::new()
-            }
-        }
-    } else {
-        String::new()
-    };
 
     // 3. Git + Dir context + System prompt + Context builder (spawn_blocking for I/O)
     let _ = status_tx.send(AgentToUiEvent::Status(
@@ -382,7 +393,7 @@ fn get_workflow_step_info(
     (Vec::new(), None, 0)
 }
 
-/// Paths to lazy-embed: explicit paths in query + intent files + explored file_read targets.
+/// Paths to lazy-embed: findings files first, then query paths + explored file_read targets.
 pub fn collect_lazy_index_paths(
     query: &str,
     workflow_engine: &Option<Arc<tokio::sync::Mutex<ox_core::agent::engine::WorkflowEngine>>>,
@@ -397,6 +408,25 @@ pub fn collect_lazy_index_paths(
         }
         paths.push(PathBuf::from(p));
     };
+
+    if let Some(wf) = workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            if let Some(store) = ox_core::agent::findings::load_or_migrate(&engine) {
+                for idx in &store.active_indices {
+                    if let Some(f) = store.get(*idx) {
+                        if !f.file.is_empty() {
+                            add(f.file.clone());
+                        }
+                    }
+                }
+                for f in &store.findings {
+                    if !f.file.is_empty() {
+                        add(f.file.clone());
+                    }
+                }
+            }
+        }
+    }
 
     for p in retrieval::extract_file_paths(query) {
         add(p);

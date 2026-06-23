@@ -25,8 +25,10 @@ pub fn standard_pipeline() -> GateRunner {
         vec![
             Box::new(gates::FormatGate),
             Box::new(gates::PlanGate),
+            Box::new(gates::CitationGate),
             Box::new(gates::SyntaxGate),
             Box::new(gates::VerifyGate),
+            Box::new(gates::ProvenanceGate),
             Box::new(gates::ScopeGate),
         ],
         DEFAULT_GATE_BUDGET,

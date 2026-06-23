@@ -30,7 +30,7 @@ Ox Workspace
 ├── crates/
 │   ├── ox-core/          # Pure library — no TUI dependencies
 │   │   └── src/
-│   │       ├── agent/    # Engine, workflow, perception, preflight, enforcer, session
+│   │       ├── agent/    # Engine, workflow, gatekeeper, enforcer, session
 │   │       ├── config/   # OxConfig, AgentConfig, EnforcementRules
 │   │       ├── context/  # Builder, budget, system prompt, skill injection
 │   │       ├── cost/     # CostTracker (token + dollar accounting)
@@ -160,7 +160,7 @@ Ox doesn't free-form chat — it follows a structured pipeline with dedicated ph
 
 Pipeline shortcuts:
 - **Fast** (simple edits) → perception → execute directly
-- **Standard** (multi-file changes) → full pipeline, skip preflight
+- **Standard** (multi-file changes) → single-step agent + gatekeeper pipeline
 - **Complex** (cross-module refactors) → full pipeline with progress tracking
 
 The enforcer intercepts every tool call before execution, checking path restrictions, pattern blocks, and confirmation gates.

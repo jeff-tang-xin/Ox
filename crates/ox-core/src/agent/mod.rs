@@ -12,17 +12,14 @@ pub mod context_offloader;
 pub mod auto_reflect;  // 🆕 Auto-reflection for skill generation
 pub mod skill_reflect_buffer;
 pub mod context_injector;  // 🆕 Task anchoring + knowledge re-injection
-pub mod execute_handoff;
 pub mod exploration_snapshot; // Plan-step tool results for cross-step handoff
 pub mod plan_tracker; // Execute-step plan progress
-pub mod preflight;
 pub mod turn_memory; // In-turn tool log + message compaction
 pub mod memory_bridge; // Cross-turn durable memory injection
 pub mod user_round; // Per-user-message round segmentation
 pub mod workflow_guidance; // Mid-workflow user corrections without restart
 pub mod workflow_session; // Park / resume persistent task session
 pub mod workflow_phases; // 感知 → 思考 → 执行 phase state machine
-pub mod requirement_clarification; // Intent 后需求澄清门禁
 pub mod perception; // Structured findings from perceive phase
 pub mod findings; // Canonical findings store (review → park → implement)
 pub mod presentation; // Executive summary formatting for findings
@@ -37,7 +34,20 @@ pub mod error_recovery;    // 🆕 Build/test failure auto-fix
 pub mod post_edit_verification; // AST feedback + language verify gate
 pub mod tool_executor;     // 🆕 Tool detail display + error formatting
 pub mod idle_narrative; // Cross-step idle prose detection + output discipline
-pub mod gatekeeper; // 🆕 Simplified single-step model: one LLM loop + gate pipeline
+pub mod collaboration;
+pub mod intent_routing;
+pub mod task_intent;
+pub mod read_guard;
+pub mod tool_result;
+pub mod gatekeeper; // ## Done validation pipeline (not user business gate)
+pub mod business_gate; // User confirms outputs (findings scope)
+pub mod safety_gate; // User confirms dangerous tool execution
+pub mod phase; // Review → Fix → Done phase transitions
+pub mod tool_graph; // Phase-aware [TOOL_ROUTE] injection
+pub mod context_slim; // Implement-phase context diet
+pub mod think_stream; // Route  / reasoning_content to Think pane
+#[cfg(test)]
+mod flow_e2e; // Single-flow E2E integration tests
 
 
 
@@ -49,7 +59,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AgentConfig;
-use crate::knowledge::entity::Entity;
 use crate::llm::{LlmProvider, LlmStreamEvent};
 use crate::message::{Message, TokenUsage, ToolCall};
 use crate::safety::injection;
@@ -77,6 +86,8 @@ pub enum AgentToUiEvent {
     },
     /// Agent turn completed — carries new messages and accumulated token usage.
     TurnDone {
+        /// Monotonic id from UI spawn; stale turns are ignored.
+        turn_id: u64,
         new_messages: Vec<Message>,
         usage: TokenUsage,
     },
@@ -144,6 +155,8 @@ pub enum AgentToUiEvent {
     /// Workspace mode changed (review / parked / impl / discuss / paused).
     WorkspaceModeChanged {
         mode: String,
+        /// Banner for output pane (empty if unchanged / no transition).
+        banner: String,
     },
     /// Generated skill draft awaiting user confirmation before save.
     SkillDraftReady {
@@ -181,8 +194,12 @@ fn push_interjection_message(
     if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
             if !engine.allows_midflight_interjection() {
-                if crate::agent::workflow_session::looks_like_fix_continuation(text) {
-                    engine.append_workflow_guidance(text);
+                if crate::agent::workflow_session::looks_like_fix_continuation(text)
+                    || text.trim().starts_with("/fix")
+                {
+                    let result = crate::agent::phase::on_user_message(&engine, text);
+                    notify_workspace_state_if_changed(ui_tx, &engine, &result);
+                    user_round::set_turn_user_input(&engine, text);
                     let _ = ui_tx.send(AgentToUiEvent::Status(format!(
                         "💬 User (Act 修复介入): {}",
                         text.trim().chars().take(120).collect::<String>()
@@ -221,8 +238,12 @@ fn push_interjection_message(
     let sanitized_for_user = sanitized.clone();
     let formatted = if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
-            if engine.workflow_preserves_on_user_input() {
-                engine.append_workflow_guidance(&sanitized);
+            if engine.workflow_preserves_on_user_input(&sanitized)
+                || crate::agent::phase::can_pivot_to_fix(&engine, &sanitized)
+            {
+                let result = crate::agent::phase::on_user_message(&engine, &sanitized);
+                notify_workspace_state_if_changed(ui_tx, &engine, &result);
+                user_round::set_turn_user_input(&engine, &sanitized);
                 crate::agent::workflow_guidance::format_interjection_message(&engine, &sanitized)
             } else {
                 sanitized
@@ -234,6 +255,12 @@ fn push_interjection_message(
         sanitized
     };
 
+    if let Some(wf) = workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            user_round::set_turn_user_input(&engine, &sanitized_for_user);
+        }
+    }
+
     messages.push(Message::user(&formatted));
     let _ = ui_tx.send(AgentToUiEvent::Status(format!(
         "💬 User (workflow 介入): {}",
@@ -241,12 +268,133 @@ fn push_interjection_message(
     )));
 }
 
+fn notify_workspace_state(
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    engine: &crate::agent::engine::WorkflowEngine,
+    result: &crate::agent::phase::TransitionResult,
+) {
+    let line = crate::agent::phase::workspace_status_line(engine);
+    let banner = if result.changed {
+        crate::agent::phase::take_pending_user_banner(engine)
+    } else {
+        String::new()
+    };
+    let _ = ui_tx.send(AgentToUiEvent::WorkspaceModeChanged {
+        mode: line,
+        banner,
+    });
+}
+
+fn notify_workspace_state_if_changed(
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    engine: &crate::agent::engine::WorkflowEngine,
+    result: &crate::agent::phase::TransitionResult,
+) {
+    if result.changed {
+        notify_workspace_state(ui_tx, engine, result);
+    }
+}
+
 /// Run a complete agent turn: LLM -> tool_calls -> execute -> loop -> text.
 ///
 /// Takes owned data so it can be spawned into a `tokio::spawn` task.
 /// New messages produced during the turn are returned via `TurnDone`.
+fn emit_turn_done(
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    turn_id: u64,
+    new_messages: Vec<Message>,
+    usage: TokenUsage,
+) {
+    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
+        turn_id,
+        new_messages,
+        usage,
+    });
+}
+
+/// Capture review findings and transition to AwaitUser.
+/// Returns true when the agent should suspend at the scope-confirm gate (same turn, no TurnDone).
+fn try_capture_review_findings(
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    full_text: &str,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> bool {
+    let Some(engine_arc) = workflow_engine else {
+        return false;
+    };
+    let Ok(engine) = engine_arc.try_lock() else {
+        return false;
+    };
+    let phase = crate::agent::phase::get(&engine);
+    let review_capture = matches!(
+        phase,
+        crate::agent::phase::SingleFlowPhase::Receive | crate::agent::phase::SingleFlowPhase::Review
+    );
+    if !review_capture {
+        return false;
+    }
+    if !crate::agent::engine::WorkflowEngine::looks_like_review_report(full_text)
+        && crate::agent::perception::extract_from_text(full_text).is_none()
+    {
+        return false;
+    }
+    crate::agent::findings::ensure_from_review_output(&engine, full_text);
+    let result = crate::agent::phase::transition(
+        &engine,
+        crate::agent::phase::PhaseEvent::FindingsStored,
+    );
+    notify_workspace_state_if_changed(ui_tx, &engine, &result);
+    if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
+        if !store.findings.is_empty() {
+            let _ = ui_tx.send(AgentToUiEvent::FindingsPanel {
+                summary: crate::agent::presentation::panel_summary(&store),
+                rows: store.progress_rows(),
+            });
+        }
+    }
+    if result.phase == crate::agent::phase::SingleFlowPhase::AwaitUser {
+        crate::agent::business_gate::arm_findings_scope(&engine);
+        if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
+            let summary = store.scope_confirm_summary();
+            let _ = ui_tx.send(AgentToUiEvent::ScopeConfirmPrompt {
+                summary: summary.clone(),
+            });
+            let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                "✅ 审查 findings 已记录 — {summary}\n请在面板选择范围后按 c 或 /confirm"
+            )));
+        } else {
+            let _ = ui_tx.send(AgentToUiEvent::Status(
+                "✅ 审查 findings 已记录 — 请在面板选择范围后按 c 或 /confirm".to_string(),
+            ));
+        }
+        return true;
+    }
+    false
+}
+
+fn refresh_turn_memory_for_implement(
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    turn_memory: &mut turn_memory::TurnMemory,
+) {
+    let Some(wf) = workflow_engine else {
+        return;
+    };
+    let Ok(engine) = wf.try_lock() else {
+        return;
+    };
+    let task = user_round::get_turn_user_input(&engine)
+        .or_else(|| engine.get_variable("_current_user_request"))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "实施修复".to_string());
+    *turn_memory = turn_memory::TurnMemory::new(&task);
+    if let Some(saved) = engine.load_turn_memory() {
+        turn_memory.merge_from(saved);
+    }
+}
+
 pub async fn run_agent_turn(
     provider: Arc<dyn LlmProvider>,
+    role_providers: collaboration::RoleProviders,
     mut messages: Vec<Message>,
     tool_registry: Arc<ToolRegistry>,
     tool_ctx: Arc<ToolContext>,
@@ -257,6 +405,7 @@ pub async fn run_agent_turn(
     agent_config: Arc<AgentConfig>,
     planning_mode: bool,
     workflow_engine: Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    turn_id: u64,
 ) {
     let tool_schemas = tool_registry.schemas();
     let max_iterations = agent_config.max_iterations;
@@ -267,17 +416,30 @@ pub async fn run_agent_turn(
     let mut total_usage = TokenUsage::default();
 
     const MAX_SAME_TOOL_CALLS: u32 = 5; // Maximum times the same tool can be called in one turn
-    /// Hard cap per agent turn even when workflow is active (prevents 39+ iteration runaway).
-    const MAX_ITERATIONS_PER_TURN: u32 = 35;
+    /// Hard cap per agent turn (single-step workflow).
+    const MAX_ITERATIONS_PER_TURN: u32 = 15;
     const COMPACT_MESSAGES_AFTER_ITER: u32 = 10;
     const COMPACT_KEEP_TAIL: usize = 36;
 
-    // 🎯 Anchor to the **current** user round (not the first message in session history)
+    // Fresh symbol-search dedup each agent spawn (workflow vars may survive across sessions).
+    if let Some(wf) = &workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            crate::agent::read_guard::clear_symbol_queries(&engine);
+        }
+    }
+
+    // 🎯 Anchor to the **current turn user input** (not session history)
     let user_task: Option<String> = workflow_engine
         .as_ref()
         .and_then(|wf| wf.try_lock().ok())
-        .and_then(|e| e.get_variable("_current_user_request"))
-        .filter(|s| !s.trim().is_empty())
+        .and_then(|e| user_round::get_turn_user_input(&e))
+        .or_else(|| {
+            workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .and_then(|e| e.get_variable("_current_user_request"))
+                .filter(|s| !s.trim().is_empty())
+        })
         .or_else(|| {
             messages.iter().rev().find_map(|m| {
                 if let Message::User { content } = m {
@@ -295,6 +457,7 @@ pub async fn run_agent_turn(
             if let Some(saved) = engine.load_turn_memory() {
                 turn_memory.merge_from(saved);
             }
+            // Intent is set at user-round boundary; do not re-classify each LLM iteration.
             let block = engine.user_round_memory_block();
             if !block.is_empty() {
                 user_round::inject_user_round(&mut messages, &block);
@@ -311,12 +474,26 @@ pub async fn run_agent_turn(
     let mut tools_used_this_turn: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    // Hide findings JSON from UI stream during review-phase single-step turns.
+    fn review_stream_filter(
+        workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    ) -> bool {
+        workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .is_some_and(|e| {
+                e.is_single_step()
+                    && !crate::agent::workflow_session::is_implementation_phase(&e)
+            })
+    }
+
     loop {
         // Check cancellation before each LLM call.
         if cancel_token.is_cancelled() {
             let _ = ui_tx.send(AgentToUiEvent::Status("Interrupted.".to_string()));
             break;
         }
+
 
         // When iteration limit is reached, ask user whether to continue.
         // SKIP this check when workflow is active (workflow has its own confirmation mechanism)
@@ -346,11 +523,7 @@ pub async fn run_agent_turn(
                             Some(ui_event::UiToAgentEvent::ToolConfirmation { tool_call_id, decision })
                                 if tool_call_id == "__iteration_limit__" =>
                             {
-                                break matches!(
-                                    decision,
-                                    ui_event::ConfirmationDecision::Allow
-                                        | ui_event::ConfirmationDecision::TrustAlways
-                                );
+                                break matches!(decision, ui_event::ConfirmationDecision::Allow);
                             }
                             Some(ui_event::UiToAgentEvent::Interjection(text)) => {
                                 push_interjection_message(
@@ -411,13 +584,23 @@ pub async fn run_agent_turn(
                 })
                 .unwrap_or(false)
         });
-        let compact_threshold = if compact_after {
-            6
-        } else {
-            COMPACT_MESSAGES_AFTER_ITER
-        };
-        if iteration >= compact_threshold && messages.len() > COMPACT_KEEP_TAIL + 6 {
-            turn_memory::compact_turn_messages(&mut messages, COMPACT_KEEP_TAIL);
+        let compact_threshold = if compact_after { 4 } else { COMPACT_MESSAGES_AFTER_ITER };
+        let keep_tail = workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .filter(|e| crate::agent::context_slim::is_slim_phase(e))
+            .map(|_| crate::agent::context_slim::compact_keep_tail())
+            .unwrap_or(COMPACT_KEEP_TAIL);
+        if iteration >= compact_threshold && messages.len() > keep_tail + 6 {
+            turn_memory::compact_turn_messages(&mut messages, keep_tail);
+        }
+
+        if let Some(wf) = &workflow_engine {
+            if let Ok(engine) = wf.try_lock() {
+                if crate::agent::context_slim::is_slim_phase(&engine) {
+                    crate::agent::context_slim::fold_review_exploration(&mut messages, &engine);
+                }
+            }
         }
 
         // Sync turn memory from full message scan (survives compaction)
@@ -427,6 +610,13 @@ pub async fn run_agent_turn(
             .map(|e| e.is_task_step())
             .unwrap_or(true);
         turn_memory.sync_from_messages(&messages, include_writes);
+        if let Some(wf) = &workflow_engine {
+            if let Ok(engine) = wf.try_lock() {
+                if let Some(ti) = user_round::get_turn_user_input(&engine) {
+                    turn_memory.user_task = ti;
+                }
+            }
+        }
 
         // Workflow: collapse repeated idle narration (keeps LLM context lean)
         if workflow_engine
@@ -438,36 +628,69 @@ pub async fn run_agent_turn(
         }
 
         // 🎯 Task anchoring + exploration progress + multi-layer memory re-injection
-        context_injector::inject_context(&mut messages, &user_task, iteration, &tool_ctx, &workflow_engine);
+        context_injector::inject_context(&mut messages, &user_task, iteration, &tool_ctx, &workflow_engine, &tool_registry);
 
         // In-turn tool log (always — not only workflow steps)
         turn_memory::strip_turn_memory(&mut messages);
-        messages.push(Message::system(&turn_memory.format_injection(iteration)));
+        let turn_block = if let Some(wf) = &workflow_engine {
+            wf.try_lock()
+                .ok()
+                .filter(|e| crate::agent::context_slim::is_slim_phase(e))
+                .map(|_| turn_memory.format_injection_slim(iteration))
+                .unwrap_or_else(|| turn_memory.format_injection(iteration))
+        } else {
+            turn_memory.format_injection(iteration)
+        };
+        messages.push(Message::system(&turn_block));
 
         // Refresh user-round + durable memory every iteration (last = strongest attention)
         if let Some(wf) = &workflow_engine {
             if let Ok(engine) = wf.try_lock() {
-                let ur = engine.user_round_memory_block();
+                let ur = if crate::agent::context_slim::is_slim_phase(&engine) {
+                    crate::agent::user_round::format_impl_anchor(&engine)
+                } else {
+                    engine.user_round_memory_block()
+                };
                 user_round::strip_user_round(&mut messages);
                 user_round::inject_user_round(&mut messages, &ur);
                 if !crate::agent::workspace::uses_workspace_memory(&engine) {
                     let block = engine.durable_memory_block();
                     memory_bridge::strip_durable_memory(&mut messages);
                     memory_bridge::inject_durable_memory(&mut messages, &block);
-                } else {
+                } else if !crate::agent::context_slim::is_slim_phase(&engine) {
                     memory_bridge::strip_durable_memory(&mut messages);
                     let block = engine.durable_memory_block();
                     if !block.is_empty() {
                         memory_bridge::inject_durable_memory(&mut messages, &block);
                     }
+                } else {
+                    memory_bridge::strip_durable_memory(&mut messages);
                 }
             }
         }
+
+        // ✉️ Current-turn user input — last injection = strongest attention
+        user_round::strip_turn_input(&mut messages);
+        let turn_input_block = if let Some(wf) = &workflow_engine {
+            wf.try_lock()
+                .ok()
+                .map(|e| user_round::format_turn_input_block(&e))
+                .unwrap_or_default()
+        } else {
+            user_round::format_turn_input_text(
+                user_task.as_deref().unwrap_or(""),
+                None,
+            )
+        };
+        user_round::inject_turn_input(&mut messages, &turn_input_block);
 
         // 🚨 Sanitize tool pairs before EVERY LLM call within the agent turn.
         // This prevents OpenAI API errors like "ToolResult references non-existent tool call"
         // when a tool_call was skipped or only partially executed.
         crate::context::sanitize_tool_pairs(&mut messages);
+
+        // Think/reasoning is display-only — strip before context assembly & LLM call.
+        crate::agent::think_stream::prepare_messages_for_llm(&mut messages);
 
         // Single-step model: always show assistant output to the user.
         let pre_llm_step_idx = workflow_engine
@@ -479,7 +702,24 @@ pub async fn run_agent_turn(
         // Stream LLM response.
         let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmStreamEvent>();
 
-        let provider_clone = Arc::clone(&provider);
+        let active_provider = if let Some(ref engine_arc) = workflow_engine {
+            let engine = engine_arc.lock().await;
+            let picked = role_providers.pick(&provider, &engine);
+            if role_providers.enabled {
+                let role = role_providers.role_label(&engine);
+                let name = picked.model_name();
+                if name != provider.model_name() {
+                    let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                        "🤝 协作模型 [{role}]: {name}"
+                    )));
+                }
+            }
+            picked
+        } else {
+            provider.clone()
+        };
+
+        let provider_clone = Arc::clone(&active_provider);
         let msgs = messages.clone();
 
         // Filter tool schemas based on current workflow step
@@ -490,56 +730,17 @@ pub async fn run_agent_turn(
         };
 
         let schemas: Vec<_> = if planning_mode && iteration == 0 && !workflow_blocks_planning {
-            vec![] // Legacy planning mode: no tools in first iteration (not used during workflow)
+            vec![]
         } else if let Some(ref engine_arc) = workflow_engine {
             let engine = engine_arc.lock().await;
-
-            let mut schemas: Vec<_> = if engine.is_single_step() {
-                if engine.allows_tool_execution() {
-                    tool_schemas.clone()
-                } else {
-                    Vec::new()
-                }
+            if !engine.allows_tool_execution() {
+                Vec::new()
+            } else if engine.is_single_step() {
+                let allowed = crate::agent::tool_graph::allowed_tool_names(&engine);
+                crate::agent::tool_graph::filter_tool_schemas(&tool_schemas, &allowed)
             } else {
-                let allowed_tools = engine.get_allowed_tools();
-                let step_idx = engine.get_current_step_index();
-
-                let mut s: Vec<_> = if !engine.allows_tool_execution() {
-                    Vec::new()
-                } else if allowed_tools.is_empty() {
-                    tool_schemas.clone()
-                } else {
-                    tool_schemas
-                        .iter()
-                        .filter(|schema| allowed_tools.contains(&schema.name))
-                        .cloned()
-                        .collect()
-                };
-
-                // Legacy 4-step only: Intent (0) / Review (2) are JSON-only — no tools in API.
-                if matches!(step_idx, 0 | 2) {
-                    s.clear();
-                }
-                // Legacy Plan (1) only
-                if step_idx == 1 {
-                    let has_detect = engine.has_exploration_tool("project_detect")
-                        || tools_used_this_turn.contains("project_detect");
-                    if has_detect {
-                        let before = s.len();
-                        s.retain(|schema| schema.name != "project_detect");
-                        if s.len() < before {
-                            tracing::info!("[STEP1] Removed project_detect from schema (already used, iter {})", iteration);
-                        }
-                    }
-                }
-                // Legacy Plan: JSON-only after exploration gate passes
-                if step_idx == 1 && engine.plan_exploration_satisfied() {
-                    tracing::info!("[STEP1] Exploration gate passed — JSON-only mode");
-                    s.clear();
-                }
-                s
-            };
-            schemas
+                tool_schemas.clone()
+            }
         } else {
             tool_schemas.clone()
         };
@@ -618,6 +819,11 @@ pub async fn run_agent_turn(
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut current_tool_args: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let use_findings_stream = review_stream_filter(&workflow_engine);
+        let mut findings_stream = use_findings_stream
+            .then(crate::agent::perception::FindingsStreamFilter::new);
+        let mut think_stream = crate::agent::think_stream::ThinkTagStreamFilter::new();
+        let mut last_stream_completion_tokens = 0u32;
 
         while let Some(event) = tokio::select! {
             ev = llm_rx.recv() => ev,
@@ -629,7 +835,21 @@ pub async fn run_agent_turn(
         } {
             match event {
                 LlmStreamEvent::TextDelta(text) => {
-                    let _ = ui_tx.send(AgentToUiEvent::TextChunk(text.clone()));
+                    let (reasoning_delta, visible_delta) = think_stream.push(&text);
+                    if let Some(r) = reasoning_delta.filter(|s| !s.is_empty()) {
+                        reasoning_content.push_str(&r);
+                        let _ = ui_tx.send(AgentToUiEvent::ReasoningChunk(r));
+                    }
+                    let visible_piece = visible_delta.unwrap_or_default();
+                    if let Some(ref mut filter) = findings_stream {
+                        if let Some(visible) = filter.push(&visible_piece) {
+                            if !visible.is_empty() {
+                                let _ = ui_tx.send(AgentToUiEvent::TextChunk(visible));
+                            }
+                        }
+                    } else if !visible_piece.is_empty() {
+                        let _ = ui_tx.send(AgentToUiEvent::TextChunk(visible_piece));
+                    }
                     full_text.push_str(&text);
                 }
                 LlmStreamEvent::ReasoningDelta(text) => {
@@ -657,6 +877,7 @@ pub async fn run_agent_turn(
                 }
                 LlmStreamEvent::ToolCallEnd { .. } => {}
                 LlmStreamEvent::Done { usage } => {
+                    last_stream_completion_tokens = usage.completion_tokens;
                     tracing::info!(
                         "[AGENT] ✅ LLM stream completed (prompt: {}, completion: {}, total: {})",
                         usage.prompt_tokens,
@@ -708,10 +929,7 @@ pub async fn run_agent_turn(
                     let _ = ui_tx.send(AgentToUiEvent::Error(err));
                     // Abort the stream task if still running, don't block on it.
                     stream_handle.abort();
-                    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                        new_messages,
-                        usage: total_usage,
-                    });
+                    emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                     return;
                 }
             }
@@ -726,6 +944,12 @@ pub async fn run_agent_turn(
             }
         }
 
+        if let Some(ref mut filter) = findings_stream {
+            if let Some(tail) = filter.flush_tail() {
+                let _ = ui_tx.send(AgentToUiEvent::TextChunk(tail));
+            }
+        }
+
         // Onboarding: ## Done when both project skill files exist (no workflow).
         let onboarding_turn =
             workflow_engine.is_none() && onboarding::is_onboarding_turn(&messages);
@@ -737,23 +961,16 @@ pub async fn run_agent_turn(
                 .unwrap_or_else(|| tool_ctx.working_dir.clone());
             if onboarding::onboarding_files_complete(&root) {
                 let msg = Message::Assistant {
-                    content: full_text.clone(),
+                    content: crate::agent::think_stream::visible_only(&full_text),
                     tool_calls: Vec::new(),
-                    reasoning_content: if reasoning_content.is_empty() {
-                        None
-                    } else {
-                        Some(reasoning_content.clone())
-                    },
+                    reasoning_content: None,
                 };
                 new_messages.push(msg.clone());
                 messages.push(msg);
                 let _ = ui_tx.send(AgentToUiEvent::Status(
                     "✅ 项目规范与业务指导 Skill 已创建".to_string(),
                 ));
-                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                    new_messages,
-                    usage: total_usage,
-                });
+                emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                 return;
             } else {
                 let missing = onboarding::missing_onboarding_files(&root).join("、");
@@ -763,6 +980,45 @@ pub async fn run_agent_turn(
                 persist_turn_memory(&workflow_engine, &turn_memory);
                 iteration += 1;
                 continue;
+            }
+        }
+
+        if try_capture_review_findings(&workflow_engine, &full_text, &ui_tx) {
+            let visible = crate::agent::think_stream::visible_only(&full_text);
+            let content_for_session =
+                execute_user_display(&workflow_engine, pre_llm_step_idx, &visible);
+            let msg = Message::Assistant {
+                content: content_for_session,
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            };
+            upsert_review_report_assistant(&mut messages, &msg);
+            upsert_review_report_assistant(&mut new_messages, &msg);
+
+            match business_gate::await_findings_scope_gate(
+                &mut ui_rx,
+                &cancel_token,
+                &workflow_engine,
+                &mut messages,
+                &ui_tx,
+                push_interjection_message,
+            )
+            .await
+            {
+                business_gate::BusinessGateResume::Cancelled => break,
+                business_gate::BusinessGateResume::Acknowledged => {
+                    refresh_turn_memory_for_implement(&workflow_engine, &mut turn_memory);
+                    tools_used_this_turn.clear();
+                    idle_streak = 0;
+                    persist_turn_memory(&workflow_engine, &turn_memory);
+                    iteration += 1;
+                    continue;
+                }
+                business_gate::BusinessGateResume::Discuss => {
+                    persist_turn_memory(&workflow_engine, &turn_memory);
+                    iteration += 1;
+                    continue;
+                }
             }
         }
 
@@ -776,14 +1032,17 @@ pub async fn run_agent_turn(
                             step_idx: pre_llm_step_idx,
                             engine: Some(&*engine),
                         };
-                        if !crate::agent::idle_narrative::is_step_deliverable(&ctx, &full_text)
-                            && crate::agent::idle_narrative::is_idle_narrative(&full_text)
+                        let visible_for_idle =
+                            crate::agent::think_stream::visible_only(&full_text);
+                        if !crate::agent::idle_narrative::is_step_deliverable(&ctx, &visible_for_idle)
+                            && crate::agent::idle_narrative::is_idle_narrative(&visible_for_idle)
                         {
                             match crate::agent::idle_narrative::handle_empty_response(
                                 &ctx,
-                                &full_text,
+                                &visible_for_idle,
                                 &mut idle_streak,
                                 false,
+                                Some(last_stream_completion_tokens),
                             ) {
                                 crate::agent::idle_narrative::IdleAction::EndTurn {
                                     user_status,
@@ -796,21 +1055,14 @@ pub async fn run_agent_turn(
                                     let _ = ui_tx.send(AgentToUiEvent::Status(user_status));
                                     persist_turn_memory(&workflow_engine, &turn_memory);
                                     drop(engine);
-                                    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                                        new_messages,
-                                        usage: total_usage,
-                                    });
+                                    emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                                     return;
                                 }
                                 crate::agent::idle_narrative::IdleAction::Continue { directive } => {
                                     let msg = Message::Assistant {
-                                        content: full_text.clone(),
+                                        content: crate::agent::think_stream::visible_only(&full_text),
                                         tool_calls: Vec::new(),
-                                        reasoning_content: if reasoning_content.is_empty() {
-                                            None
-                                        } else {
-                                            Some(reasoning_content.clone())
-                                        },
+                                        reasoning_content: None,
                                     };
                                     crate::agent::idle_narrative::upsert_idle_assistant(
                                         &mut messages,
@@ -839,13 +1091,16 @@ pub async fn run_agent_turn(
 
             // Single-step model: always show the assistant's text to the user
             // (perception filter strips machine-only findings JSON when present).
-            let content_for_session =
-                execute_user_display(&workflow_engine, pre_llm_step_idx, &full_text);
+            let content_for_session = execute_user_display(
+                &workflow_engine,
+                pre_llm_step_idx,
+                &crate::agent::think_stream::visible_only(&full_text),
+            );
 
             let msg = Message::Assistant {
                 content: content_for_session.clone(),
                 tool_calls: Vec::new(),
-                reasoning_content: if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) },
+                reasoning_content: None,
             };
             let workflow_active = workflow_engine.as_ref().is_some_and(|wf| {
                 wf.try_lock()
@@ -858,7 +1113,18 @@ pub async fn run_agent_turn(
                 if let Some(ref engine_arc) = workflow_engine {
                     if let Ok(engine) = engine_arc.try_lock() {
                         if engine.is_single_step() {
-                            engine.mark_execute_report_delivered();
+                            let phase = crate::agent::phase::get(&engine);
+                            if matches!(
+                                phase,
+                                crate::agent::phase::SingleFlowPhase::Receive
+                                    | crate::agent::phase::SingleFlowPhase::Review
+                            ) {
+                                let result = crate::agent::phase::transition(
+                                    &engine,
+                                    crate::agent::phase::PhaseEvent::ReviewReportDelivered,
+                                );
+                                notify_workspace_state_if_changed(&ui_tx, &engine, &result);
+                            }
                         }
                     }
                 }
@@ -872,13 +1138,24 @@ pub async fn run_agent_turn(
                 messages.push(msg);
             }
 
-            // ── Findings: capture review findings JSON / prose so ScopeGate can enforce them.
+            // ── Implement: block re-emitting review findings instead of editing ──
             if let Some(ref engine_arc) = workflow_engine {
                 if let Ok(engine) = engine_arc.try_lock() {
-                    if crate::agent::engine::WorkflowEngine::looks_like_review_report(&full_text)
-                        || crate::agent::perception::extract_from_text(&full_text).is_some()
+                    if crate::agent::phase::get(&engine)
+                        == crate::agent::phase::SingleFlowPhase::Implement
+                        && !crate::agent::engine::WorkflowEngine::text_signals_done(&full_text)
+                        && (crate::agent::engine::WorkflowEngine::looks_like_review_report(
+                            &full_text,
+                        )
+                            || crate::agent::perception::extract_from_text(&full_text).is_some())
                     {
-                        crate::agent::findings::ensure_from_review_output(&engine, &full_text);
+                        messages.push(Message::system(
+                            "【实施轮】禁止重新输出 findings / 审查报告。\
+                             读 [WORKSPACE]「本轮唯一动作」，执行 file_read → edit_file。",
+                        ));
+                        persist_turn_memory(&workflow_engine, &turn_memory);
+                        iteration += 1;
+                        continue;
                     }
                 }
             }
@@ -892,6 +1169,8 @@ pub async fn run_agent_turn(
                         match engine.run_done_gates(&full_text, had_code) {
                             crate::agent::gatekeeper::GateReport::Pass => {
                                 engine.set_previous_output(&full_text);
+                                let had_receipt = crate::agent::completion::extract_from_text(&full_text)
+                                    .is_some();
                                 if let Some(receipt) =
                                     crate::agent::completion::extract_from_text(&full_text)
                                 {
@@ -904,24 +1183,47 @@ pub async fn run_agent_turn(
                                         crate::agent::findings::save(&engine, &store);
                                     }
                                 }
-                                let _ = engine.complete_workflow();
-                                emit_workflow_completed(
-                                    &ui_tx,
-                                    user_task.as_ref(),
+                                let result = crate::agent::phase::transition(
                                     &engine,
-                                    &full_text,
+                                    crate::agent::phase::PhaseEvent::DoneGatePassed {
+                                        had_completion_receipt: had_receipt,
+                                    },
                                 );
+                                notify_workspace_state_if_changed(&ui_tx, &engine, &result);
+                                if result.phase
+                                    == crate::agent::phase::SingleFlowPhase::Complete
+                                {
+                                    let _ = engine.complete_workflow();
+                                    emit_workflow_completed(
+                                        &ui_tx,
+                                        user_task.as_ref(),
+                                        &engine,
+                                        &full_text,
+                                    );
+                                    let _ = ui_tx.send(AgentToUiEvent::Status(
+                                        "✅ 完成".to_string(),
+                                    ));
+                                } else if result.phase
+                                    == crate::agent::phase::SingleFlowPhase::AwaitUser
+                                {
+                                    let _ = ui_tx.send(AgentToUiEvent::Status(
+                                        "✅ 审查完成 — 门禁暂停，待用户在面板确认范围（c /confirm）"
+                                            .to_string(),
+                                    ));
+                                } else {
+                                    let _ = ui_tx.send(AgentToUiEvent::Status(
+                                        "✅ 完成".to_string(),
+                                    ));
+                                }
                                 drop(engine);
-                                let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
-                                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                                    new_messages,
-                                    usage: total_usage,
-                                });
+                                emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                                 return;
                             }
                             crate::agent::gatekeeper::GateReport::Fail { gate, feedback } => {
+                                let recovery = gate_recovery_hint(&gate);
                                 messages.push(Message::system(&format!(
-                                    "【门禁·{gate}】{feedback}"
+                                    "【门禁·{gate}】{feedback}\n\n\
+                                     👉 **恢复：** 读 [WORKSPACE]「本轮唯一动作」，只做那一件事；{recovery}"
                                 )));
                                 persist_turn_memory(&workflow_engine, &turn_memory);
                                 drop(engine);
@@ -934,10 +1236,7 @@ pub async fn run_agent_turn(
                                 messages.push(Message::system(&status));
                                 persist_turn_memory(&workflow_engine, &turn_memory);
                                 drop(engine);
-                                let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                                    new_messages,
-                                    usage: total_usage,
-                                });
+                                emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                                 return;
                             }
                         }
@@ -945,10 +1244,7 @@ pub async fn run_agent_turn(
                 }
             }
 
-            let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                new_messages,
-                usage: total_usage,
-            });
+            emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
             return;
         }
 
@@ -1004,77 +1300,12 @@ pub async fn run_agent_turn(
             .map(|e| e.is_task_step())
             .unwrap_or(false);
 
-        // Execute (legacy 4-step only): after review report, block another exploration pass.
-        if execute_step && !tool_calls.is_empty() {
-            if let Some(ref wf) = workflow_engine {
-                if let Ok(engine) = wf.try_lock() {
-                    if !engine.is_single_step()
-                        && engine.should_block_execute_reexplore(&tool_calls, &full_text)
-                    {
-                        let msg = Message::Assistant {
-                            content: execute_user_display(&workflow_engine, 3, &full_text),
-                            tool_calls: Vec::new(),
-                            reasoning_content: if reasoning_content.is_empty() {
-                                None
-                            } else {
-                                Some(reasoning_content.clone())
-                            },
-                        };
-                        crate::agent::idle_narrative::upsert_idle_assistant(&mut messages, &msg);
-                        crate::agent::idle_narrative::upsert_idle_hint(
-                            &mut messages,
-                            "❌ 审查报告已输出。请直接输出 `## Done` 或 `## 完成` 并等待用户跟进；\
-                             禁止再用 file_read / code_search 做「补充探索」。用户说「执行/去改」后再动手。",
-                        );
-                        persist_turn_memory(&workflow_engine, &turn_memory);
-                        iteration += 1;
-                        continue;
-                    }
-                }
-            }
-        }
-
         for tc in &tool_calls {
             let loop_key = tool_loop_key(&tc.name, &tc.arguments);
             tool_loop_keys.insert(tc.id.clone(), loop_key.clone());
             let count = temp_counts.entry(loop_key).or_insert(0);
             *count += 1;
-            let single_step = workflow_engine.as_ref().is_some_and(|wf| {
-                wf.try_lock().map(|e| e.is_single_step()).unwrap_or(false)
-            });
-            let impl_phase = !single_step
-                && workflow_engine.as_ref().is_some_and(|wf| {
-                    wf.try_lock()
-                        .map(|e| {
-                            e.is_task_step()
-                                && crate::agent::workflow_session::is_implementation_phase(&e)
-                        })
-                        .unwrap_or(false)
-                });
-            let limit = if single_step {
-                MAX_SAME_TOOL_CALLS
-            } else {
-                match tc.name.as_str() {
-                "file_list" => 2,
-                "file_read" if impl_phase => 24,
-                "file_read" if execute_step => 6,
-                "file_read" => 2,
-                "shell_exec" if impl_phase => {
-                    let looks_read = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                        .ok()
-                        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
-                        .is_some_and(|cmd| {
-                            crate::agent::engine::WorkflowEngine::shell_looks_like_file_read(&cmd)
-                        });
-                    if looks_read {
-                        1
-                    } else {
-                        MAX_SAME_TOOL_CALLS
-                    }
-                }
-                _ => MAX_SAME_TOOL_CALLS,
-            }
-            };
+            let limit = MAX_SAME_TOOL_CALLS;
             if *count > limit {
                 exceeded_loop_limit_ids.insert(tc.id.clone());
             }
@@ -1082,14 +1313,18 @@ pub async fn run_agent_turn(
         
         // Single-step model: always show the assistant's text to the user
         // (perception filter strips machine-only findings JSON when present).
-        let display = execute_user_display(&workflow_engine, pre_llm_step_idx, &full_text);
+        let display = execute_user_display(
+            &workflow_engine,
+            pre_llm_step_idx,
+            &crate::agent::think_stream::visible_only(&full_text),
+        );
 
         // Keep ALL tool_calls on the assistant message so every ToolResult has a matching id.
         // (Filtering caused orphaned ToolResults → API auto-fix → context amnesia.)
         let assistant_msg = Message::Assistant {
             content: display,
             tool_calls: tool_calls.clone(),
-            reasoning_content: if reasoning_content.is_empty() { None } else { Some(reasoning_content.clone()) },
+            reasoning_content: None,
         };
         new_messages.push(assistant_msg.clone());
         messages.push(assistant_msg);
@@ -1118,6 +1353,10 @@ pub async fn run_agent_turn(
             &tool_ctx.working_dir,
             &format!("session_{}", iteration),
         );
+
+        // System notes during tool batch — deferred until all ToolResults are appended
+        // (OpenAI requires Assistant.tool_calls → ToolResults with no messages between).
+        let mut deferred_tool_system: Vec<String> = Vec::new();
 
         // Execute each tool call.
         for tc in &tool_calls {
@@ -1294,23 +1533,48 @@ pub async fn run_agent_turn(
                     serde_json::json!({})
                 };
 
+                // Read guard: duplicate file_read / shell-as-read
+                if let Err(e) = crate::agent::read_guard::check(&tc.name, &args_value, &engine) {
+                    if tc.name == "file_read" {
+                        if let Some(path) = args_value.get("path").and_then(|p| p.as_str()) {
+                            if let Some(cached) =
+                                crate::agent::read_guard::cached_file_read_response(&engine, path)
+                            {
+                                let result_msg = Message::ToolResult {
+                                    tool_call_id: tc.id.clone(),
+                                    content: cached.clone(),
+                                };
+                                new_messages.push(result_msg.clone());
+                                messages.push(result_msg);
+                                turn_memory.record_tool(&tc.name, &tc.arguments, true);
+                                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                                    name: tc.name.clone(),
+                                    output: cached,
+                                    is_error: false,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    let result_msg = Message::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: format!("❌ {e}"),
+                    };
+                    new_messages.push(result_msg.clone());
+                    messages.push(result_msg);
+                    turn_memory.record_tool(&tc.name, &tc.arguments, false);
+                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                        name: tc.name.clone(),
+                        output: e.clone(),
+                        is_error: true,
+                    });
+                    continue;
+                }
+
                 // Validate tool call against current workflow step
                 if let Err(e) = engine.validate_tool_call(&tc.name, &args_value) {
                     tracing::warn!("Workflow validation failed for tool '{}': {}", tc.name, e);
-
-                    let single_step = engine.is_single_step();
-                    let step_idx = engine.get_current_step_index();
-                    let directive = if single_step {
-                        "\n\n💡 该工具当前不可用。请改用 prompt 中列出的工具，或完成时输出 ## Done。"
-                    } else {
-                        match step_idx {
-                            0 => "\n\n⚡ You are in Step 1 (Intent). Tools are BLOCKED here. \nOutput ONLY the JSON: {\"intent\": \"...\", \"complexity\": \"...\", \"files\": [...], \"topic\": \"...\"}",
-                            1 => "\n\n⚡ You are in Step 2 (Plan). Only read/search tools are allowed. \nOutput ONLY the JSON: {\"plan\": [...], \"skills\": [...], \"key_files\": [...]}",
-                            2 => "\n\n⚡ You are in Step 3 (Review). No tools allowed. \nOutput ONLY the JSON: {\"safe\": true|false, \"complete\": true|false, \"issues\": [...], \"warnings\": [...]}",
-                            3 => "\n\n⚡ You are in Step 4 (Execute). Follow the plan and use file/shell tools as needed. \nWhen finished, output ## Done with a brief summary.",
-                            _ => "\n\n💡 Please follow the current step requirements.",
-                        }
-                    };
+                    let directive = "\n\n💡 该工具当前不可用。请改用其它工具，或完成时输出 ## Done。";
                     let result_msg = Message::ToolResult {
                         tool_call_id: tc.id.clone(),
                         content: format!("❌ {}\n{}", e, directive),
@@ -1323,130 +1587,6 @@ pub async fn run_agent_turn(
                         is_error: true,
                     });
                     continue; // Skip this tool call
-                }
-
-                // Legacy 4-step only: duplicate exploration cache
-                let single_step = engine.is_single_step();
-                let step_idx = engine.get_current_step_index();
-                if !single_step
-                    && step_idx == 1
-                    && matches!(tc.name.as_str(), "file_list" | "file_read")
-                {
-                    let path = args_value
-                        .get("path")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or(".");
-                    if engine.is_path_explored(tc.name.as_str(), path) {
-                        let cached = engine
-                            .lookup_exploration_cache(
-                                &tool_ctx.working_dir,
-                                tc.name.as_str(),
-                                path,
-                            )
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "✅ 已探索过 `{path}`。勿重复 {}。见 [STEP_MEMORY] / [TURN_MEMORY]。\n{}",
-                                    tc.name,
-                                    engine.plan_exploration_hint()
-                                )
-                            });
-                        tracing::info!(
-                            "[WORKFLOW] Duplicate {} on {} — returning cache (step 1)",
-                            tc.name,
-                            path
-                        );
-                        let result_msg = Message::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: cached.clone(),
-                        };
-                        new_messages.push(result_msg.clone());
-                        messages.push(result_msg);
-                        turn_memory.record_tool(&tc.name, &tc.arguments, true);
-                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                            name: tc.name.clone(),
-                            output: cached,
-                            is_error: false,
-                        });
-                        continue;
-                    }
-                }
-                if !single_step && (step_idx == 0 || step_idx == 3) && tc.name == "file_list" {
-                    let path = args_value
-                        .get("path")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or(".");
-                    if engine.is_path_explored("file_list", path) {
-                        let cached = engine
-                            .lookup_exploration_cache(
-                                &tool_ctx.working_dir,
-                                "file_list",
-                                path,
-                            )
-                            .unwrap_or_else(|| {
-                                format!("✅ 已列出过 `{path}`。执行阶段勿重复 file_list，直接 file_read 或修改。")
-                            });
-                        let result_msg = Message::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: cached.clone(),
-                        };
-                        new_messages.push(result_msg.clone());
-                        messages.push(result_msg);
-                        turn_memory.record_tool(&tc.name, &tc.arguments, true);
-                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                            name: tc.name.clone(),
-                            output: cached,
-                            is_error: false,
-                        });
-                        continue;
-                    }
-                }
-                if !single_step
-                    && (step_idx == 0 || step_idx == 3)
-                    && matches!(
-                        tc.name.as_str(),
-                        "file_read" | "code_search" | "find_symbol" | "file_search"
-                    )
-                    && !crate::agent::workflow_session::is_implementation_phase(&engine)
-                {
-                    let cached = engine
-                        .lookup_execute_exploration_cache(
-                            &tool_ctx.working_dir,
-                            &tc.name,
-                            &tc.arguments,
-                        )
-                        .or_else(|| {
-                            if tc.name != "file_read" {
-                                return None;
-                            }
-                            let path = args_value.get("path").and_then(|p| p.as_str())?;
-                            if !engine.is_path_explored("file_read", path)
-                                && !engine.has_file_read_snapshot(path)
-                            {
-                                return None;
-                            }
-                            Some(format!(
-                                "✅ `{path}` 已在计划阶段探索。请使用【探索快照】/ 交接包写审查报告，勿重复 file_read。"
-                            ))
-                        });
-                    if let Some(cached) = cached {
-                        tracing::info!(
-                            "[WORKFLOW] Execute duplicate {} — returning snapshot cache",
-                            tc.name
-                        );
-                        let result_msg = Message::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: cached.clone(),
-                        };
-                        new_messages.push(result_msg.clone());
-                        messages.push(result_msg);
-                        turn_memory.record_tool(&tc.name, &tc.arguments, true);
-                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                            name: tc.name.clone(),
-                            output: cached,
-                            is_error: false,
-                        });
-                        continue;
-                    }
                 }
             }
 
@@ -1539,64 +1679,40 @@ pub async fn run_agent_turn(
                 }
             }
 
-            let should_confirm = if path_outside {
-                true // Path outside workdir always requires confirmation.
-            } else {
-                match safety_level {
-                    SafetyLevel::Safe => false,
-                    SafetyLevel::RequiresConfirmation | SafetyLevel::Dangerous => {
-                        let tm = trust_manager.lock().unwrap();
-                        !tm.can_skip_confirmation(&tc.name, safety_level)
-                    }
-                }
-            };
-
-            // Blacklist override: even if the tool is trusted, blacklisted
-            // commands within shell_exec still require confirmation.
             let mut blacklist_warning: Option<String> = None;
-            if !should_confirm && tc.name == "shell_exec" {
+            if tc.name == "shell_exec" {
                 if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                     if let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
-                        let tm = trust_manager.lock().unwrap();
-                        if let Some(pattern) = tm.is_command_blacklisted(cmd) {
-                            blacklist_warning = Some(format!("BLOCKED COMMAND (matches blacklist pattern: \"{}\")", pattern));
-                            drop(tm);
-                            // Force confirmation even though tool is trusted.
-                        }
+                        blacklist_warning =
+                            safety_gate::shell_blacklist_warning(&trust_manager, cmd);
                     }
                 }
             }
-            let should_confirm = should_confirm || blacklist_warning.is_some();
+
+            let should_confirm = safety_gate::needs_confirmation(
+                &trust_manager,
+                &tc.name,
+                safety_level,
+                path_outside,
+                blacklist_warning.is_some(),
+            );
 
             if should_confirm {
-                tracing::info!("[AGENT] Tool {} requires confirmation", tc.name);
-                // Build args_summary (truncated, sanitized).
-                let args_summary = if tc.arguments.len() > 200 {
-                    let end = tc
-                        .arguments
-                        .char_indices()
-                        .take_while(|(i, _)| *i < 200)
-                        .last()
-                        .map(|(i, c)| i + c.len_utf8())
-                        .unwrap_or(0);
-                    format!("{}...(truncated)", tc.arguments.get(..end).unwrap_or(&tc.arguments))
-                } else {
-                    tc.arguments.clone()
-                };
-
-                // Check for high-risk command (shell_exec only).
+                tracing::info!("[SAFETY_GATE] Tool {} requires confirmation", tc.name);
                 let high_risk_warning = if tc.name == "shell_exec" {
-                    // Try to extract command from args JSON.
                     if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                         if let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
                             let mut warning = None;
                             if crate::safety::is_high_risk_command(cmd) {
                                 warning = Some("HIGH RISK COMMAND".to_string());
                             }
-                            // Merge blacklist warning if present.
                             if let Some(ref bw) = blacklist_warning {
                                 warning = Some(match warning {
-                                    Some(mut w) => { w.push_str(" + "); w.push_str(bw); w }
+                                    Some(mut w) => {
+                                        w.push_str(" + ");
+                                        w.push_str(bw);
+                                        w
+                                    }
                                     None => bw.clone(),
                                 });
                             }
@@ -1611,45 +1727,31 @@ pub async fn run_agent_turn(
                     None
                 };
 
-                // Send confirmation request to UI.
-                let _ = ui_tx.send(AgentToUiEvent::ToolConfirmationRequest {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    args_summary,
+                let req = safety_gate::build_request(
+                    tc.id.clone(),
+                    tc.name.clone(),
+                    &tc.arguments,
                     safety_level,
                     high_risk_warning,
-                });
+                );
+                safety_gate::emit_request(&ui_tx, &req);
 
-                // Wait for user response.
-                let decision = loop {
-                    tokio::select! {
-                        ev = ui_rx.recv() => {
-                            match ev {
-                                Some(ui_event::UiToAgentEvent::ToolConfirmation { tool_call_id, decision })
-                                    if tool_call_id == tc.id => {
-                                    break decision;
-                                }
-                                Some(ui_event::UiToAgentEvent::Interjection(text)) => {
-                                    push_interjection_message(
-                                        &workflow_engine,
-                                        &mut messages,
-                                        &text,
-                                        &ui_tx,
-                                    );
-                                }
-                                _ => continue,
-                            }
-                        }
-                        _ = cancel_token.cancelled() => {
-                            // Cancelled while waiting for confirmation.
-                            let _ = ui_tx.send(AgentToUiEvent::Status("Interrupted.".to_string()));
-                            // Return early with what we have.
-                            let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                                new_messages,
-                                usage: total_usage,
-                            });
-                            return;
-                        }
+                let decision = match safety_gate::await_decision(
+                    &mut ui_rx,
+                    &cancel_token,
+                    &tc.id,
+                    &workflow_engine,
+                    &mut messages,
+                    &ui_tx,
+                    push_interjection_message,
+                )
+                .await
+                {
+                    Ok(d) => d,
+                    Err(safety_gate::SafetyGateCancelled) => {
+                        let _ = ui_tx.send(AgentToUiEvent::Status("Interrupted.".to_string()));
+                        emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
+                        return;
                     }
                 };
 
@@ -1672,8 +1774,7 @@ pub async fn run_agent_turn(
                     }
                     ui_event::ConfirmationDecision::TrustAlways => {
                         tracing::info!("[AGENT] User trusted all tools");
-                        let mut tm = trust_manager.lock().unwrap();
-                        tm.trust_all();
+                        safety_gate::apply_trust_all(&trust_manager);
                     }
                     ui_event::ConfirmationDecision::Allow => {
                         tracing::info!("[AGENT] User allowed tool: {}", tc.name);
@@ -1845,6 +1946,17 @@ pub async fn run_agent_turn(
             }
             tracing::info!("[AGENT] Tool execution completed: {}, is_error: {}", tc.name, result.is_error);
 
+            record_tool_live_update(
+                &tool_ctx,
+                &workflow_engine,
+                &user_task,
+                &tc.name,
+                &tc.arguments,
+                &result.content,
+                result.is_error,
+            )
+            .await;
+
             // Send completion progress event only if tool executed successfully
             if !result.is_error {
                 let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
@@ -1866,23 +1978,15 @@ pub async fn run_agent_turn(
                 let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
             }
 
-            // 🛡️ Scan web_fetch and file_read results for prompt injection before
-            // they reach the LLM context. Untrusted external content may contain
-            // injection attacks like "ignore previous instructions".
-            let sanitized_content = if matches!(tc.name.as_str(), "web_fetch" | "file_read") && !result.is_error {
-                let injection_result = injection::detect(&result.content);
-                if injection_result.has_injection {
-                    let categories: Vec<String> = injection_result.matches.iter()
-                        .map(|m| format!("{:?}", m.category))
-                        .collect();
-                    tracing::warn!(
-                        "🛡️ Prompt injection detected in {} output: categories={:?}",
-                        tc.name, categories
-                    );
-                    injection::sanitize(&result.content)
-                } else {
-                    result.content.clone()
-                }
+            // 🛡️ Untrusted tool output: injection scan + data banner
+            let sanitized_content = if matches!(
+                tc.name.as_str(),
+                "web_fetch" | "file_read" | "shell_exec" | "git_diff" | "code_search"
+            ) && !result.is_error
+            {
+                crate::agent::tool_result::wrap_for_llm(&tc.name, &result.content, false)
+            } else if result.is_error {
+                crate::agent::tool_result::wrap_for_llm(&tc.name, &result.content, true)
             } else {
                 result.content.clone()
             };
@@ -1933,29 +2037,36 @@ pub async fn run_agent_turn(
                         .unwrap_or(0) as u32;
                     if let Some(ref engine_arc) = workflow_engine {
                         if let Ok(engine) = engine_arc.try_lock() {
-                            if engine.is_task_step()
-                                && !engine.is_perceive_execute()
+                            crate::agent::read_guard::record_file_read(&engine, path);
+                            crate::agent::tool_digest::record_read(
+                                &engine,
+                                path,
+                                &result.content,
+                                offset,
+                                None,
+                            );
+                            if let Some(digest) =
+                                crate::agent::tool_digest::get_digest(&engine, path)
                             {
-                                crate::agent::tool_digest::record_read(
-                                    &engine,
-                                    path,
-                                    &sanitized_content,
-                                    offset,
-                                    None,
-                                );
-                                if let Some(digest) =
-                                    crate::agent::tool_digest::get_digest(&engine, path)
-                                {
+                                if !crate::agent::phase::fix_impl_session(&engine) {
                                     result_content =
                                         crate::agent::tool_digest::format_tool_result_for_history(
                                             path,
-                                            &sanitized_content,
+                                            &result.content,
                                             &digest,
                                         );
                                 }
                             }
                         }
                     }
+                }
+            } else if matches!(tc.name.as_str(), "find_symbol" | "code_search")
+                && !result.is_error
+                && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                && let Some(ref engine_arc) = workflow_engine
+            {
+                if let Ok(engine) = engine_arc.try_lock() {
+                    crate::agent::read_guard::record_symbol_query(&engine, &tc.name, &args);
                 }
             }
 
@@ -2019,6 +2130,32 @@ pub async fn run_agent_turn(
                 }
             }
 
+            if result.is_error && tc.name == "edit_file" {
+                if let Some(ref engine_arc) = workflow_engine {
+                    if let Ok(engine) = engine_arc.try_lock() {
+                        if crate::agent::workflow_session::is_implementation_phase(&engine) {
+                            if let Ok(args) =
+                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                            {
+                                if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
+                                    let hint = if engine.impl_file_already_read(path) {
+                                        "\n\n💡 **edit 恢复：** old_string 须与上条 file_read 内容**逐字一致**（含空格/缩进）。\
+                                         缩小到 3–8 行唯一片段重试；可用 recall 取历史，勿 code_search。"
+                                            .to_string()
+                                    } else {
+                                        format!(
+                                            "\n\n💡 **edit 恢复：** 先 `file_read` `{path}`（实施每文件 1 次），\
+                                             从返回内容复制 old_string，再 edit_file。"
+                                        )
+                                    };
+                                    result_content.push_str(&hint);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let result_msg = Message::ToolResult {
                 tool_call_id: tc.id.clone(),
                 content: result_content.clone(),
@@ -2040,10 +2177,10 @@ pub async fn run_agent_turn(
                 } else {
                     "已完成"
                 };
-                messages.push(Message::system(&format!(
+                deferred_tool_system.push(format!(
                     "📋 ✅ {tool_name}{file_info} — {done_label}",
                     tool_name = tool_name, file_info = file_info, done_label = done_label
-                )));
+                ));
                 tools_used_this_turn.insert(tool_name.clone());
 
                 // Track explored paths during Plan only (Execute may re-read files)
@@ -2052,11 +2189,11 @@ pub async fn run_agent_turn(
                         let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
                         if let Some(ref engine_arc) = workflow_engine {
                             if let Ok(engine) = engine_arc.try_lock() {
-                                if engine.get_current_step_index() == 1 {
-                                    engine.record_explored_path(&tool_name, path);
-                                } else if engine.is_task_step()
-                                    && tool_name == "file_list"
+                                if crate::agent::phase::get(&engine)
+                                    == crate::agent::phase::SingleFlowPhase::Review
                                 {
+                                    engine.record_explored_path(&tool_name, path);
+                                } else if engine.is_task_step() && tool_name == "file_list" {
                                     engine.record_explored_path(&tool_name, path);
                                 }
                             }
@@ -2080,7 +2217,7 @@ pub async fn run_agent_turn(
                                             path,
                                             &result_content,
                                         ) {
-                                            messages.push(Message::system(&nudge));
+                                            deferred_tool_system.push(nudge);
                                         }
                                     }
                                 }
@@ -2091,13 +2228,13 @@ pub async fn run_agent_turn(
                                 &result_content,
                             );
                             if let Some(hint) = plan_hint {
-                                messages.push(Message::system(&hint));
+                                deferred_tool_system.push(hint);
                             }
                             if plan_changed {
                                 if let Some(msg) =
                                     engine.plan_progress_message_after_tool(&tool_name)
                                 {
-                                    messages.push(Message::system(&msg));
+                                    deferred_tool_system.push(msg);
                                 }
                             }
                             if matches!(
@@ -2124,7 +2261,7 @@ pub async fn run_agent_turn(
                                                 &result_content,
                                             )
                                         {
-                                            messages.push(Message::system(&note));
+                                            deferred_tool_system.push(note);
                                         }
                                     }
                                 }
@@ -2137,9 +2274,9 @@ pub async fn run_agent_turn(
                             {
                                 if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
                                     if let Some(verify) = engine.verify_hint_for_path(path) {
-                                        messages.push(Message::system(&format!(
+                                        deferred_tool_system.push(format!(
                                             "📋 计划验证: `{verify}` — 请用 shell_exec 执行（需用户确认），验证通过后再继续下一项。"
-                                        )));
+                                        ));
                                     }
                                 }
                             }
@@ -2161,9 +2298,9 @@ pub async fn run_agent_turn(
                 });
 
                 if is_execute_step && is_skill {
-                    messages.push(Message::system(
-                        "✅ 文件已写入。如果所有需要的文件都已完成，输出 `## Done` 结束。"
-                    ));
+                    deferred_tool_system.push(
+                        "✅ 文件已写入。如果所有需要的文件都已完成，输出 `## Done` 结束。".to_string(),
+                    );
                 } else if onboarding_skill {
                     let root = tool_ctx
                         .runtime
@@ -2171,24 +2308,22 @@ pub async fn run_agent_turn(
                         .clone()
                         .unwrap_or_else(|| tool_ctx.working_dir.clone());
                     if onboarding::onboarding_files_complete(&root) {
-                        messages.push(Message::system(
+                        deferred_tool_system.push(
                             "✅ 两个 Skill 都已写入（项目规范 + 业务指导）。输出 `## Done` 结束，不要再改文件。"
-                        ));
+                                .to_string(),
+                        );
                     } else {
                         let missing = onboarding::missing_onboarding_files(&root).join("、");
-                        messages.push(Message::system(&format!(
+                        deferred_tool_system.push(format!(
                             "✅ 已写入一个 Skill。还缺：{missing}。请继续 file_write 缺失文件。"
-                        )));
+                        ));
                     }
                 }
             } // verify-after-edit
         } // end for tc
 
-        // Plan step: remind not to repeat immutable exploration
-        if pre_llm_step_idx == 1 && tools_used_this_turn.contains("project_detect") {
-            messages.push(Message::system(
-                "⚡ project_detect 已调用过。不要重复 file_list 相同目录 — 换子目录或 file_read 具体文件。"
-            ));
+        for note in deferred_tool_system {
+            messages.push(Message::system(&note));
         }
 
         // 🗺️ Inject task canvas if any results were offloaded
@@ -2267,91 +2402,6 @@ pub async fn run_agent_turn(
             error_recovery::check_and_recover(&mut messages, &new_messages, &tool_calls);
         }
 
-        // ── Workflow Step Advancement Logic (after tool execution) ──
-        // Check if we should advance to the next workflow step
-        // This handles cases where tools were executed in this iteration
-        if let Some(ref engine_arc) = workflow_engine {
-            let mut engine = engine_arc.lock().await;
-
-            // Check completion signals
-            let ai_signaled_complete = full_text.contains("[STEP_COMPLETE]");
-            let phase_complete = full_text.contains("✅ Phase") &&
-                (full_text.contains("Complete") || full_text.contains("complete"));
-
-            let should_advance = ai_signaled_complete || phase_complete;
-            
-            if should_advance && !engine.is_workflow_complete() {
-                tracing::info!(
-                    "Advancing workflow step after tool execution (AI signaled: {}, Phase complete: {})",
-                    ai_signaled_complete,
-                    phase_complete
-                );
-
-                // Check if CURRENT step requires confirmation BEFORE advancing
-                let current_step_requires_confirmation = engine.requires_user_confirmation();
-                
-                if current_step_requires_confirmation {
-                    tracing::info!("Current step requires user confirmation - setting flag and blocking next LLM call");
-                    
-                    engine.set_confirmation_flag();
-                    
-                    if let Some(step_name) = get_current_step_name(&engine) {
-                        let status_msg = format!(
-                            "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
-                            step_name
-                        );
-                        let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
-                    }
-                    
-                    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-                        new_messages,
-                        usage: total_usage,
-                    });
-                    return;
-                }
-
-                // No confirmation needed, advance normally
-                match engine.advance_step() {
-                    Ok(has_next_step) => {
-                        if has_next_step {
-                            let needs_confirmation = engine.requires_user_confirmation();
-
-                            if needs_confirmation {
-                                engine.set_confirmation_flag();
-                                tracing::info!("New step requires user confirmation - setting flag");
-                            }
-
-                            if let Some(step_name) = get_current_step_name(&engine) {
-                                let status_msg = if needs_confirmation {
-                                    format!(
-                                        "✅ {} completed. ⏸️ Waiting for your confirmation (/Y, /N, /O)",
-                                        step_name
-                                    )
-                                } else {
-                                    format!("✅ Step completed. Moving to: {}", step_name)
-                                };
-
-                                let _ = ui_tx.send(AgentToUiEvent::Status(status_msg));
-                            }
-                        } else {
-                            let _ = ui_tx.send(AgentToUiEvent::Status(
-                                "🎉 Workflow completed!".to_string(),
-                            ));
-                            emit_workflow_completed(
-                                &ui_tx,
-                                user_task.as_ref(),
-                                &engine,
-                                &full_text,
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to advance workflow step: {}", e);
-                    }
-                }
-            }
-        }
-
         // Clean up old offloaded refs, keeping at most the 50 most recent ones.
         if let Err(e) = offloader.cleanup_old_refs(50) {
             tracing::warn!("Failed to clean up old refs: {}", e);
@@ -2367,11 +2417,7 @@ pub async fn run_agent_turn(
 
     persist_turn_memory(&workflow_engine, &turn_memory);
     // Loop exited via break (cancellation or user declined to continue).
-    // Send TurnDone so the UI can persist collected messages.
-    let _ = ui_tx.send(AgentToUiEvent::TurnDone {
-        new_messages,
-        usage: total_usage,
-    });
+    emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
 }
 
 /// Heuristically determine if a JSON parse error is likely due to truncation.
@@ -2465,11 +2511,6 @@ fn execute_user_display(
     }
 }
 
-/// Helper function to get current step name from workflow engine.
-fn get_current_step_name(engine: &crate::agent::engine::WorkflowEngine) -> Option<String> {
-    engine.current_step().map(|step| step.name.clone())
-}
-
 /// Emit WorkflowCompleted so the CLI can trigger auto-reflection.
 fn emit_workflow_completed(
     ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
@@ -2490,6 +2531,16 @@ fn emit_workflow_completed(
         task_description,
         execution_summary,
     });
+}
+
+fn gate_recovery_hint(gate: &str) -> &'static str {
+    match gate {
+        "verify" | "syntax" => "运行验证命令或修正语法后再 ## Done。",
+        "citation" | "provenance" => "先 file_read 相关文件再断言。",
+        "plan" => "补全 ## Plan 勾选或调整 findings。",
+        "scope" => "只处理 in-scope findings。",
+        _ => "禁止 code_search / 空转 prose。",
+    }
 }
 
 /// Dedup key for same-tool loop detection (file_read includes offset/limit).
@@ -2526,7 +2577,51 @@ pub fn tool_loop_key(name: &str, arguments: &str) -> String {
                 limit
             )
         }
-        other => other.to_string(),
+        other => {
+            let path = serde_json::from_str::<serde_json::Value>(arguments)
+                .ok()
+                .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()));
+            if let Some(path) = path {
+                format!(
+                    "{}:{}",
+                    other,
+                    crate::agent::engine::WorkflowEngine::normalize_explore_path(&path)
+                )
+            } else {
+                other.to_string()
+            }
+        }
+    }
+}
+
+/// Push L0 working-memory + symbol relations into the knowledge graph after each tool call.
+async fn record_tool_live_update(
+    tool_ctx: &Arc<ToolContext>,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    user_task: &Option<String>,
+    tool_name: &str,
+    tool_args: &str,
+    tool_result: &str,
+    is_error: bool,
+) {
+    let session_id = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|e| e.session_id())
+        .unwrap_or_else(|| "default".to_string());
+    let ctx = crate::knowledge::live_update::ToolExecutionContext {
+        session_id,
+        user_message: user_task.clone().unwrap_or_default(),
+        tool_name: tool_name.to_string(),
+        tool_args: tool_args.to_string(),
+        tool_result: tool_result.chars().take(4000).collect(),
+        is_error,
+        project_root: tool_ctx.working_dir.to_string_lossy().to_string(),
+    };
+    if let Ok(mut engine) = tool_ctx.knowledge.try_write() {
+        if let Err(e) = engine.process_tool_execution(&ctx) {
+            tracing::warn!("[LIVE_UPDATE] apply failed: {e}");
+        }
     }
 }
 

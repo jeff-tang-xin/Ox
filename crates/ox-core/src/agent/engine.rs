@@ -4,90 +4,7 @@ use crate::agent::workflow::{Workflow, WorkflowStep};
 use crate::message::ToolCall;
 use std::sync::Arc;
 
-/// Canonical workflow routing derived from intent + complexity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IntentRouting {
-    pub intent: String,
-    pub complexity: String,
-    pub pipeline: String,
-    pub skip_plan: bool,
-    pub skip_review: bool,
-    /// Entering Execute always requires human confirmation first.
-    pub requires_human_confirm: bool,
-    pub steps_summary: String,
-}
-
-impl IntentRouting {
-    pub fn compute(intent: &str, complexity: &str) -> Self {
-        let complexity = if complexity.is_empty() {
-            "complex"
-        } else {
-            complexity
-        };
-        match intent {
-            "chat" => Self {
-                intent: intent.to_string(),
-                complexity: complexity.to_string(),
-                pipeline: "chat".to_string(),
-                skip_plan: true,
-                skip_review: true,
-                requires_human_confirm: false,
-                steps_summary: "闲聊 → 直接回复".to_string(),
-            },
-            "exploring" => Self {
-                intent: intent.to_string(),
-                complexity: complexity.to_string(),
-                pipeline: "fast".to_string(),
-                skip_plan: true,
-                skip_review: true,
-                requires_human_confirm: true,
-                steps_summary: "意图 → 人工确认 → 只读执行（跳过规划/审阅）".to_string(),
-            },
-            "coding" if complexity == "simple" => Self {
-                intent: intent.to_string(),
-                complexity: complexity.to_string(),
-                pipeline: "fast".to_string(),
-                skip_plan: true,
-                skip_review: true,
-                requires_human_confirm: true,
-                steps_summary: "意图 → 人工确认 → 执行（跳过规划/审阅）".to_string(),
-            },
-            "ops" => Self::ops_fast(intent, complexity),
-            "coding" => Self {
-                intent: intent.to_string(),
-                complexity: complexity.to_string(),
-                pipeline: "standard".to_string(),
-                skip_plan: false,
-                skip_review: false,
-                requires_human_confirm: true,
-                steps_summary: "意图 → 规划 → 审阅 → 人工确认 → 执行".to_string(),
-            },
-            _ => Self::compute("coding", "complex"),
-        }
-    }
-
-    pub fn ops_fast(intent: &str, complexity: &str) -> Self {
-        Self {
-            intent: intent.to_string(),
-            complexity: complexity.to_string(),
-            pipeline: "ops-fast".to_string(),
-            skip_plan: true,
-            skip_review: true,
-            requires_human_confirm: true,
-            steps_summary: "运维/发布 → 系统 Preflight → 人工确认 → 执行".to_string(),
-        }
-    }
-
-    pub fn compute_for_request(user_text: &str, intent: &str, complexity: &str) -> Self {
-        if WorkflowEngine::looks_like_ops_task(user_text) {
-            Self::ops_fast(intent, complexity)
-        } else {
-            Self::compute(intent, complexity)
-        }
-    }
-}
-
-/// Workflow Engine - enforces step-by-step execution with validation
+/// Workflow Engine — single-step agent + gatekeeper
 pub struct WorkflowEngine {
     /// Registered workflows
     workflows: std::collections::HashMap<String, Workflow>,
@@ -123,9 +40,10 @@ impl WorkflowEngine {
 
     /// Activate a workflow by ID
     pub fn activate_workflow(&mut self, workflow_id: &str) -> Result<(), String> {
-        let resolved_id = match workflow_id {
-            crate::agent::workflow::LEGACY_WORKFLOW_ID => crate::agent::workflow::DEFAULT_WORKFLOW_ID,
-            other => other,
+        let resolved_id = if workflow_id == "four_step_pipeline" {
+            crate::agent::workflow::DEFAULT_WORKFLOW_ID
+        } else {
+            workflow_id
         };
         if let Some(workflow) = self.workflows.get(resolved_id).cloned() {
             tracing::info!("Activating workflow: {}", workflow.name);
@@ -149,6 +67,14 @@ impl WorkflowEngine {
     /// Get current workflow
     pub fn current_workflow(&self) -> Option<&Workflow> {
         self.current_workflow.as_ref()
+    }
+
+    /// Session id for L0 working-memory anchoring.
+    pub fn session_id(&self) -> String {
+        self.session_state
+            .try_lock()
+            .map(|s| s.session_id.clone())
+            .unwrap_or_else(|_| "default".to_string())
     }
 
     /// Get current step
@@ -186,6 +112,20 @@ impl WorkflowEngine {
 
     /// Check if tool execution is allowed in current step
     pub fn allows_tool_execution(&self) -> bool {
+        if self.is_single_step() {
+            if crate::agent::business_gate::is_pending_scope(self)
+                && !crate::agent::business_gate::scope_implementation_unlocked(self)
+            {
+                return false;
+            }
+            return matches!(
+                crate::agent::phase::get(self),
+                crate::agent::phase::SingleFlowPhase::Receive
+                    | crate::agent::phase::SingleFlowPhase::Review
+                    | crate::agent::phase::SingleFlowPhase::Implement
+                    | crate::agent::phase::SingleFlowPhase::AwaitUser
+            );
+        }
         if let Some(step) = self.current_step() {
             step.allow_tool_execution
         } else {
@@ -198,29 +138,171 @@ impl WorkflowEngine {
         if crate::agent::workflow_session::is_feedback_discuss(self) {
             return false;
         }
-        let step = match self.current_step() {
-            Some(s) => s,
-            None => return false,
-        };
-        if !step.allow_code_modification {
-            return false;
+        if self.is_single_step() {
+            return crate::agent::business_gate::scope_implementation_unlocked(self);
         }
-        // Exploring fast-path lands on Execute but must stay read-only until user approves.
-        if self.get_current_step_index() == 3
-            && Self::intent_routing_from_text(self.get_variable("_step0_output").as_deref())
-                .map(|r| r.intent == "exploring")
-                .unwrap_or(false)
-            && !crate::agent::workflow_session::is_execute_user_approved(self)
-        {
-            return false;
-        }
-        true
+        self.current_step()
+            .map(|s| s.allow_code_modification)
+            .unwrap_or(false)
     }
 
     /// True when running the default single-step agent workflow (no step/tool gating).
     pub fn is_single_step(&self) -> bool {
         self.current_workflow()
             .is_some_and(|w| w.id == crate::agent::workflow::DEFAULT_WORKFLOW_ID)
+    }
+
+    fn is_code_modifying_tool(tool_name: &str) -> bool {
+        matches!(tool_name, "file_write" | "edit_file" | "delete_range")
+    }
+
+    /// Implement-phase memory_search: conventions/architecture only — not a substitute for file_read.
+    fn validate_impl_memory_search(args: &serde_json::Value) -> Result<(), String> {
+        let query = args
+            .get("query")
+            .and_then(|q| q.as_str())
+            .unwrap_or("")
+            .trim();
+        if query.is_empty() {
+            return Err("memory_search 需要非空 query。".into());
+        }
+        let max = args
+            .get("max_results")
+            .and_then(|m| m.as_u64())
+            .unwrap_or(5);
+        if max > 10 {
+            return Err("实施阶段 memory_search max_results 不得超过 10。".into());
+        }
+        let lower = query.to_lowercase();
+        let looks_like_code_locator = [".java", ".rs", ".ts", ".py", "line ", "offset", "第", "行"]
+            .iter()
+            .any(|k| lower.contains(k));
+        if looks_like_code_locator {
+            return Err(
+                "实施阶段 memory_search 用于架构/约定/偏好，不可替代 file_read。\
+                 定位代码请用 find_symbol 或 file_read。"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_single_step_tool(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<(), String> {
+        if crate::agent::business_gate::is_pending_scope(self) {
+            return Err(
+                "⏸️ 业务流程门禁 — 等待用户确认 findings 范围（c /confirm）；讨论请直接输入文字。"
+                    .to_string(),
+            );
+        }
+        if crate::agent::phase::get(self) == crate::agent::phase::SingleFlowPhase::Complete {
+            return Err("✅ 任务已完成 — 禁止调用工具。".to_string());
+        }
+
+        let intent = self.get_task_intent();
+        let mode = crate::agent::phase::workspace_mode(self);
+
+        let review_locked = matches!(
+            mode,
+            crate::agent::workspace::WorkspaceMode::ExecuteReview
+                | crate::agent::workspace::WorkspaceMode::FeedbackDiscuss
+                | crate::agent::workspace::WorkspaceMode::ScopeConfirm
+        ) || matches!(intent, crate::agent::task_intent::TaskIntent::Review | crate::agent::task_intent::TaskIntent::Qa)
+            && crate::agent::phase::get(self) != crate::agent::phase::SingleFlowPhase::Implement;
+
+        if review_locked && Self::is_code_modifying_tool(tool_name) {
+            if crate::agent::business_gate::scope_implementation_unlocked(self) {
+                return Ok(());
+            }
+            return Err(format!(
+                "❌ 只读模式（intent={}）禁止 `{tool_name}`。审查产出后等待业务流程门禁确认；确认后 edit 走安全门禁。",
+                intent.as_str()
+            ));
+        }
+
+        if crate::agent::business_gate::scope_implementation_unlocked(self)
+            && matches!(mode, crate::agent::workspace::WorkspaceMode::ExecuteImpl)
+        {
+            if tool_name == "memory_search" {
+                return Self::validate_impl_memory_search(args);
+            }
+            if matches!(tool_name, "code_search" | "file_search" | "file_list") {
+                return Err(format!(
+                    "❌ 实施阶段禁止广泛探索 `{tool_name}`（易陷入搜索循环）。\
+                     架构/约定用 `memory_search`；定位符号用 `find_symbol`；取历史用 `recall`；\
+                     改代码前按 [WORKSPACE] 先 `file_read` 再 `edit_file`。"
+                ));
+            }
+        }
+
+        // After review report + findings: no more explore until user pivots to fix.
+        if matches!(
+            mode,
+            crate::agent::workspace::WorkspaceMode::ExecuteReview
+                | crate::agent::workspace::WorkspaceMode::ScopeConfirm
+        ) && self.execute_report_already_delivered()
+            && crate::agent::findings::load_or_migrate(self)
+                .is_some_and(|s| !s.findings.is_empty())
+            && matches!(
+                tool_name,
+                "find_symbol" | "code_search" | "file_search" | "file_list"
+            )
+        {
+            return Err(format!(
+                "❌ 审查报告已提交，禁止继续 `{tool_name}`。\
+                 请补全 ## Done / findings，或等待用户说「修复」/ /fix 后用 edit_file。"
+            ));
+        }
+
+        if review_locked && tool_name == "shell_exec" {
+            let cmd = args
+                .get("command")
+                .or_else(|| args.get("cmd"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if Self::shell_looks_like_file_read(cmd) {
+                return Err("❌ 只读模式禁止用 shell 读文件；请用 file_read。".to_string());
+            }
+        }
+
+        if tool_name == "file_read" {
+            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                let offset = args
+                    .get("offset")
+                    .and_then(|o| o.as_u64())
+                    .unwrap_or(0);
+                self.validate_impl_file_read(path, offset)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn set_task_intent(&self, intent: crate::agent::task_intent::TaskIntent) {
+        self.set_variable("_task_intent", intent.as_str().to_string());
+    }
+
+    pub fn get_task_intent(&self) -> crate::agent::task_intent::TaskIntent {
+        self.get_variable("_task_intent")
+            .map(|s| crate::agent::task_intent::TaskIntent::from_stored(&s))
+            .unwrap_or(crate::agent::task_intent::TaskIntent::General)
+    }
+
+    pub fn clear_turn_provenance(&self) {
+        self.set_variable("_explored_paths", "[]".to_string());
+        self.set_variable("_exploration_snapshot", "[]".to_string());
+        crate::agent::read_guard::clear(self);
+    }
+
+    pub fn reset_step_for_fix_reopen(&self) {
+        self.set_variable(crate::agent::user_round::ROUND_FINALIZED_KEY, String::new());
+        if let Ok(mut session) = self.session_state.try_lock() {
+            session.current_step_index = 0;
+            session.awaiting_user_confirmation = false;
+        }
     }
 
     /// Get allowed tools for current step.
@@ -400,18 +482,10 @@ impl WorkflowEngine {
             session.set_variable("_chat_reply", "");
             session.set_variable("_done_gate_blocks", "");
             session.set_variable("_turn_memory", "");
-            session.set_variable("_await_execute_confirm", "");
-            session.set_variable("_clarification_questions", "");
-            session.set_variable("_await_clarification", "");
-            session.set_variable("_clarification_pending_advance", "");
-            session.set_variable("_clarification_kind", "");
-            session.set_variable("_park_disambiguation_input", "");
-            session.set_variable("_park_follow_up_stage", "");
-            session.set_variable("_park_detail_kind", "");
             session.set_variable("_workflow_guidance", "[]");
             session.set_variable("_execute_report_delivered", "");
+            session.set_variable("_execute_handoff", "");
             crate::agent::workflow_session::clear_session_flags(self);
-            crate::agent::execute_handoff::ExecuteHandoff::clear(self);
             crate::agent::perception::clear(self);
             crate::agent::workflow_phases::clear_phase(self);
             for key in [
@@ -464,21 +538,25 @@ impl WorkflowEngine {
     }
 
     /// True when a new user message should correct the current workflow, not restart Intent.
-    pub fn workflow_preserves_on_user_input(&self) -> bool {
+    pub fn workflow_preserves_on_user_input(&self, user_text: &str) -> bool {
+        if crate::agent::workflow_session::looks_like_new_task(user_text) {
+            return false;
+        }
+        if self.is_single_step() && self.is_workflow_active() && !self.is_workflow_complete() {
+            return true;
+        }
         if crate::agent::workflow_session::is_parked(self) {
             return true;
         }
         if !self.is_workflow_active() || self.is_workflow_complete() {
             return false;
         }
-        // Act 阶段（非 park）不接受中途开放式介入
         if crate::agent::workflow_phases::get_phase(self)
             == crate::agent::workflow_phases::WorkflowPhase::Act
         {
             return false;
         }
         self.get_current_step_index() > 0
-            || self.is_awaiting_execute_confirmation()
             || self.is_current_step_waiting_confirmation()
             || self
                 .get_variable("_step0_output")
@@ -509,29 +587,8 @@ impl WorkflowEngine {
         crate::agent::workflow_session::unpark(self);
     }
 
-    /// Resume a parked session from user follow-up (stay on Execute, no Plan re-explore).
-    pub fn resume_parked_workflow(&self, user_text: &str) {
-        crate::agent::workflow_session::clear_feedback_discuss(self);
-        crate::agent::workflow_session::unpark(self);
-        self.append_workflow_guidance(user_text);
-        if crate::agent::workflow_session::looks_like_implementation_request(user_text) {
-            crate::agent::workflow_session::enter_implementation_phase(self);
-            self.bootstrap_implementation_plan();
-        } else if crate::agent::workflow_session::looks_like_workflow_continuation(user_text) {
-            crate::agent::workflow_session::mark_execute_approved(self);
-        }
-        self.set_variable("_turn_memory", String::new());
-        self.clear_execute_report_delivered();
-        self.clear_execute_confirmation();
-    }
-
     pub fn adopt_execute_interjection(&self, user_text: &str) {
-        self.append_workflow_guidance(user_text);
-        if crate::agent::workflow_session::looks_like_implementation_request(user_text) {
-            crate::agent::workflow_session::enter_implementation_phase(self);
-            self.clear_execute_report_delivered();
-            self.bootstrap_implementation_plan();
-        }
+        crate::agent::phase::on_user_message(self, user_text);
     }
 
     /// Build plan tracker from parked review report; reset per-file read ledger.
@@ -591,23 +648,26 @@ impl WorkflowEngine {
 
     /// Re-open workflow after premature ## Done or verify failure.
     pub fn reopen_execute_for_fixes(&mut self, user_text: &str) -> bool {
-        if !crate::agent::workflow_session::looks_like_fix_continuation(user_text) {
+        if !crate::agent::phase::can_pivot_to_fix(self, user_text) {
             return false;
         }
-        let had_findings = crate::agent::findings::load_or_migrate(self).is_some();
+        let had_findings = crate::agent::findings::load_or_migrate(self)
+            .map(|s| !s.findings.is_empty())
+            .unwrap_or(false);
+        let greenfield = crate::agent::task_intent::looks_like_greenfield_impl(user_text);
         let verify_failed =
             crate::agent::post_edit_verification::verify_status_failed(self);
-        if !self.is_workflow_complete() && !verify_failed && !had_findings {
+        if !self.is_workflow_complete() && !verify_failed && !had_findings && !greenfield {
             return false;
         }
+        let r = crate::agent::phase::transition(
+            self,
+            crate::agent::phase::PhaseEvent::ReopenForFix {
+                text: user_text.to_string(),
+            },
+        );
         self.set_variable(crate::agent::user_round::ROUND_FINALIZED_KEY, String::new());
-        if let Ok(mut session) = self.session_state.try_lock() {
-            session.current_step_index = 0;
-            session.awaiting_user_confirmation = false;
-        }
-        self.append_workflow_guidance(user_text);
-        self.sync_plan_from_findings();
-        true
+        r.changed || crate::agent::phase::get(self) == crate::agent::phase::SingleFlowPhase::Implement
     }
 
     pub fn has_file_read_snapshot(&self, path: &str) -> bool {
@@ -623,15 +683,6 @@ impl WorkflowEngine {
         ["cat ", "type ", "head ", "tail ", "more ", "less ", "get-content"]
             .iter()
             .any(|p| lower.contains(p))
-    }
-
-    /// Freeze structured perception at end of perceive phase (park / review complete).
-    pub fn freeze_perception_output(&self, output: &str) {
-        crate::agent::perception::freeze_from_output(self, output);
-        crate::agent::workflow_phases::set_phase(
-            self,
-            crate::agent::workflow_phases::WorkflowPhase::Think,
-        );
     }
 
     const IMPL_READ_KEY: &str = "_impl_files_read";
@@ -661,18 +712,21 @@ impl WorkflowEngine {
         }
     }
 
-    /// Implementation phase: one file_read per path; next tool must be edit.
-    pub fn validate_impl_file_read(&self, path: &str) -> Result<(), String> {
+    /// Implementation phase: one file_read per path at offset 0; offset>0 allowed for续读.
+    pub fn validate_impl_file_read(&self, path: &str, offset: u64) -> Result<(), String> {
         if !crate::agent::workflow_session::is_implementation_phase(self) {
             return Ok(());
         }
         if path.trim().is_empty() {
             return Ok(());
         }
+        if offset > 0 {
+            return Ok(());
+        }
         if self.impl_file_already_read(path) {
             return Err(format!(
-                "实施阶段 `{path}` 已读过（每文件最多 1 次 file_read）。\
-                 请直接对该文件 edit_file / file_write；内容见上一条 ToolResult。"
+                "实施阶段 `{path}` 已读过（每文件 offset=0 最多 1 次）。\
+                 请直接 edit_file；或 file_read 带 offset>0 续读指定行段。"
             ));
         }
         Ok(())
@@ -691,35 +745,7 @@ impl WorkflowEngine {
         ))
     }
 
-    pub fn implementation_execute_prompt_addon(&self) -> String {
-        let progress = self.plan_progress_summary();
-        let mut parts = vec![
-            "【实施阶段规则 — 覆盖上方只读/禁止重读规则】".to_string(),
-            "1. 严格按下方【计划进度】清单逐项修改，做完一项再下一项".to_string(),
-            "2. 每个源文件最多 file_read **1 次**；读后**下一个 tool 必须是** edit_file 或 file_write".to_string(),
-            "3. 禁止空转「需要先读取」；禁止重复输出审查报告".to_string(),
-            "4. 全部清单项完成后输出 ## Done".to_string(),
-        ];
-        if !progress.is_empty() {
-            parts.push(progress);
-        }
-        if let Some(report) = self.get_execute_review_report() {
-            let snippet: String = report.chars().take(4000).collect();
-            parts.push(format!("【审查报告摘要】\n{snippet}"));
-        }
-        parts.join("\n")
-    }
-
-    pub fn should_skip_execute_confirmation(&self, from_step: usize, target_step: usize) -> bool {
-        if target_step != 3 {
-            return false;
-        }
-        // Intent → Execute fast path for read-only exploring: no extra confirm gate
-        if from_step == 0 {
-            if let Some(r) = Self::intent_routing_from_text(self.get_variable("_step0_output").as_deref()) {
-                return r.intent == "exploring" && r.pipeline == "fast";
-            }
-        }
+    pub fn should_skip_execute_confirmation(&self, _from_step: usize, _target_step: usize) -> bool {
         false
     }
 
@@ -746,6 +772,11 @@ impl WorkflowEngine {
 
     /// Get system prompt for current step (with {PREVIOUS_OUTPUT} template substitution)
     pub fn get_step_system_prompt(&self) -> Option<String> {
+        if self.is_single_step()
+            && crate::agent::phase::get(self) == crate::agent::phase::SingleFlowPhase::Implement
+        {
+            return Some(crate::agent::workflow::IMPLEMENT_TURN_STEP_HINT.to_string());
+        }
         if let Some(step) = self.current_step() {
             if !step.step_prompt.is_empty() {
                 let mut prompt = step.step_prompt.clone();
@@ -773,10 +804,10 @@ impl WorkflowEngine {
                     prompt = prompt.replace("{EXPLORATION_SNAPSHOT}", &text);
                 }
                 if prompt.contains("{EXECUTE_HANDOFF}") {
-                    let block = crate::agent::execute_handoff::ExecuteHandoff::load(self)
-                        .map(|h| h.format_for_execute())
-                        .unwrap_or_else(|| "（无交接包 — 按前序输出执行）".to_string());
-                    prompt = prompt.replace("{EXECUTE_HANDOFF}", &block);
+                    prompt = prompt.replace(
+                        "{EXECUTE_HANDOFF}",
+                        "（单步模式 — 按 [WORKSPACE] 与 findings 执行）",
+                    );
                 }
                 if prompt.contains("{USER_GUIDANCE}") {
                     let block = self.workflow_guidance_block();
@@ -806,7 +837,7 @@ impl WorkflowEngine {
                 if prompt.contains("{ROUTING_HINT}") {
                     let hint = self
                         .get_variable("_current_user_request")
-                        .map(|u| Self::routing_hint_for_user(&u))
+                        .map(|u| crate::agent::intent_routing::routing_hint_for_user(&u))
                         .unwrap_or_default();
                     prompt = prompt.replace("{ROUTING_HINT}", &hint);
                 }
@@ -847,7 +878,7 @@ impl WorkflowEngine {
     ) -> Result<(), String> {
         // Single-step: registry tools only — no whitelist, phase, or legacy step gates.
         if self.is_single_step() {
-            return Ok(());
+            return self.validate_single_step_tool(tool_name, args);
         }
 
         let step = match self.current_step() {
@@ -877,7 +908,11 @@ impl WorkflowEngine {
 
         if tool_name == "file_read" {
             if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                self.validate_impl_file_read(path)?;
+                let offset = args
+                    .get("offset")
+                    .and_then(|o| o.as_u64())
+                    .unwrap_or(0);
+                self.validate_impl_file_read(path, offset)?;
             }
         }
 
@@ -907,11 +942,6 @@ impl WorkflowEngine {
         Ok(())
     }
 
-    /// Check if a file path is a source code file (delegates to shared registry).
-    fn is_source_code_file(file_path: &str) -> bool {
-        crate::source_paths::is_source_code_path(file_path)
-    }
-
     /// Check if workflow is currently active
     pub fn is_workflow_active(&self) -> bool {
         self.current_workflow.is_some()
@@ -938,21 +968,6 @@ impl WorkflowEngine {
         if let Ok(mut session) = self.session_state.try_lock() {
             session.clear_confirmation();
         }
-    }
-
-    /// Human must confirm after Review (or skip-review) before Execute starts.
-    pub fn arm_execute_confirmation(&self) {
-        self.set_variable("_await_execute_confirm", "1".to_string());
-        self.set_confirmation_flag();
-    }
-
-    pub fn is_awaiting_execute_confirmation(&self) -> bool {
-        self.get_variable("_await_execute_confirm").as_deref() == Some("1")
-    }
-
-    pub fn clear_execute_confirmation(&self) {
-        self.set_variable("_await_execute_confirm", String::new());
-        self.clear_confirmation_flag();
     }
 
     /// Get current step information for display
@@ -991,7 +1006,7 @@ impl WorkflowEngine {
     }
 
     pub fn interjection_should_resume_turn(&self, user_text: &str) -> bool {
-        if self.workflow_preserves_on_user_input() {
+        if self.workflow_preserves_on_user_input(user_text) {
             return true;
         }
         if crate::agent::workflow_session::looks_like_fix_continuation(user_text) {
@@ -1055,574 +1070,6 @@ impl WorkflowEngine {
         } else {
             Err("Failed to acquire session lock".to_string())
         }
-    }
-
-    pub fn consume_chat_route(&self) -> bool {
-        let v = self.get_variable("_route_chat").unwrap_or_default();
-        if v == "1" {
-            self.set_variable("_route_chat", String::new());
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn set_chat_route(&self) {
-        self.set_variable("_route_chat", "1".to_string());
-    }
-
-    pub fn set_chat_reply_pending(&self) {
-        self.set_variable("_chat_reply_pending", "1".to_string());
-    }
-
-    pub fn is_chat_reply_pending(&self) -> bool {
-        self.get_variable("_chat_reply_pending").as_deref() == Some("1")
-    }
-
-    pub fn clear_chat_reply_pending(&self) {
-        self.set_variable("_chat_reply_pending", String::new());
-    }
-
-    /// Parse intent JSON and verify `pipeline` matches the canonical routing table.
-    pub fn validate_intent_pipeline(
-        assistant_text: &str,
-        user_text: Option<&str>,
-    ) -> Result<IntentRouting, String> {
-        Self::parse_intent_output(assistant_text, user_text).map(|p| p.routing)
-    }
-
-    /// Full intent parse including optional requirement-clarification gate.
-    pub fn parse_intent_output(
-        assistant_text: &str,
-        user_text: Option<&str>,
-    ) -> Result<crate::agent::requirement_clarification::IntentParseResult, String> {
-        validate_json_field(
-            assistant_text,
-            &["intent", "complexity", "pipeline", "routing_reason"],
-        )?;
-        let json_str = extract_json_block(assistant_text).ok_or_else(|| {
-            "❌ 未找到 JSON。请按意图步骤格式输出。".to_string()
-        })?;
-        let v: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| format!("❌ JSON 解析失败：{e}"))?;
-        let intent = v
-            .get("intent")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| "❌ 缺少 intent 字段。".to_string())?;
-        let complexity = v
-            .get("complexity")
-            .and_then(|x| x.as_str())
-            .unwrap_or("complex");
-        let pipeline = v
-            .get("pipeline")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| "❌ 缺少 pipeline 字段。".to_string())?;
-        let reason = v
-            .get("routing_reason")
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
-        if reason.chars().count() < 8 {
-            return Err(
-                "❌ routing_reason 太短（≥8字）。请说明为何选此 pipeline、跳过或保留哪些步骤。"
-                    .to_string(),
-            );
-        }
-        let canonical = match user_text {
-            Some(u) => IntentRouting::compute_for_request(u, intent, complexity),
-            None => IntentRouting::compute(intent, complexity),
-        };
-        if pipeline != canonical.pipeline {
-            return Err(format!(
-                "❌ pipeline 应为 \"{}\"（{}），你填了 \"{}\"。\n请根据 intent={intent} complexity={complexity} 修正 pipeline 与 routing_reason。"
-                ,
-                canonical.pipeline, canonical.steps_summary, pipeline
-            ));
-        }
-        let (needs_clarification, clarification_questions) =
-            crate::agent::requirement_clarification::extract_clarification(&v);
-        Ok(crate::agent::requirement_clarification::IntentParseResult {
-            routing: canonical,
-            needs_clarification,
-            clarification_questions,
-        })
-    }
-
-    pub fn is_awaiting_clarification(&self) -> bool {
-        crate::agent::requirement_clarification::is_awaiting(self)
-    }
-
-    pub fn clarification_markdown(&self) -> String {
-        crate::agent::requirement_clarification::format_markdown(self)
-    }
-
-    pub fn is_park_disambiguation_awaiting(&self) -> bool {
-        crate::agent::requirement_clarification::is_park_disambiguation(self)
-    }
-
-    pub fn arm_park_follow_up_menu(&self) {
-        crate::agent::requirement_clarification::arm_park_follow_up_menu(self);
-    }
-
-    pub fn arm_park_disambiguation(&self, _pending_input: &str) {
-        self.arm_park_follow_up_menu();
-    }
-
-    pub fn finish_park_disambiguation(
-        &self,
-        answer: &str,
-    ) -> Result<crate::agent::requirement_clarification::ParkFollowUpOutcome, String> {
-        crate::agent::requirement_clarification::resolve_park_follow_up(self, answer)
-    }
-
-    /// Resume parked session for feedback / clarification (no implementation phase).
-    pub fn resume_parked_feedback(&self, user_text: &str) {
-        crate::agent::workflow_session::unpark(self);
-        self.append_workflow_guidance(user_text);
-        crate::agent::workflow_session::enter_feedback_discuss(self);
-        crate::agent::workflow_session::mark_execute_approved(self);
-        self.set_variable("_turn_memory", String::new());
-        self.clear_execute_report_delivered();
-        self.clear_execute_confirmation();
-    }
-
-    /// Apply park follow-up choice; returns resume block for Continue / Feedback.
-    pub fn apply_park_disambiguation_resolution(
-        &mut self,
-        resolution: crate::agent::requirement_clarification::ParkDisambiguationResolution,
-    ) -> Option<String> {
-        use crate::agent::requirement_clarification::ParkDisambiguationResolution;
-        let prior = self
-            .get_variable("_step3_output")
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| self.get_previous_step_output());
-        match resolution {
-            ParkDisambiguationResolution::ContinuePrevious { follow_up } => {
-                self.resume_parked_workflow(&follow_up);
-                Some(crate::agent::workflow_session::resume_message(
-                    &follow_up,
-                    prior.as_deref(),
-                ))
-            }
-            ParkDisambiguationResolution::Feedback { text } => {
-                self.resume_parked_feedback(&text);
-                let block = format!(
-                    "[TASK_SESSION_RESUME — 用户对审查结论发表意见/澄清；请基于审查报告回应，**勿**从 Intent/Plan 重来]\n{text}"
-                );
-                if let Some(out) = prior.as_deref() {
-                    Some(format!(
-                        "{block}\n\n【审查报告摘要】\n{}",
-                        out.chars().take(8000).collect::<String>()
-                    ))
-                } else {
-                    Some(block)
-                }
-            }
-            ParkDisambiguationResolution::NewTask { task } => {
-                let _ = self.finish_workflow_session();
-                self.begin_user_round(&task);
-                None
-            }
-        }
-    }
-
-    pub fn apply_clarification_answer(&self, answer: &str) {
-        crate::agent::requirement_clarification::apply_answer(self, answer);
-    }
-
-    pub fn clear_clarification_gate(&self) {
-        crate::agent::requirement_clarification::clear_gate(self);
-    }
-
-    pub fn clarification_pending_advance(&self) -> usize {
-        crate::agent::requirement_clarification::pending_advance_step(self)
-    }
-
-    /// After user answers Intent clarification: advance workflow to Plan (1) or Execute (3).
-    pub fn finish_clarification_and_advance(&mut self, answer: &str) -> Result<usize, String> {
-        crate::agent::requirement_clarification::validate_intent_clarification_answer(answer)?;
-        self.apply_clarification_answer(answer);
-        let target = self.clarification_pending_advance();
-        self.clear_clarification_gate();
-        let _ = self.advance_to_step(Some(target));
-        if target == 3 {
-            if let Some(intent_out) = self.get_variable("_step0_output") {
-                self.prepare_fast_path_execute(&intent_out);
-            }
-        }
-        Ok(target)
-    }
-
-    pub fn build_execute_confirmation_markdown(&self, review_text: &str, from_step: usize) -> String {
-        const HINT: &str = "\
----\n\n\
-> **审阅已完成 — 请确认后执行**\n\
-> - 输入修改意见 → 回到规划重新生成\n\
-> - 输入 `ok` / `继续` / `确认` → 开始执行";
-        let plan_raw = self
-            .get_variable("_step1_output")
-            .unwrap_or_else(|| self.get_previous_step_output().unwrap_or_default());
-        let plan_md = Self::format_step_output_for_confirm(1, &plan_raw, "📋 任务规划");
-        let review_md = if from_step == 2 {
-            Self::format_step_output_for_confirm(2, review_text, "🛡️ 审阅计划")
-        } else if from_step == 0 {
-            let exploring = Self::parse_intent_meta(self.get_variable("_step0_output").as_deref())
-                .map(|(intent, _)| intent == "exploring")
-                .unwrap_or(false);
-            if exploring {
-                "✅ **只读检查快速路径** — 跳过规划/审阅，确认后直接探索并输出分析".to_string()
-            } else {
-                "✅ **快速路径** — 简单改动跳过规划/审阅，直接进入人工确认".to_string()
-            }
-        } else {
-            "✅ **自动审阅已跳过**（只读检查或简单编码任务）".to_string()
-        };
-        format!("{plan_md}\n\n---\n\n{review_md}\n\n{HINT}")
-    }
-
-    fn format_step_output_for_confirm(step_idx: usize, raw: &str, title: &str) -> String {
-        if raw.trim().is_empty() {
-            return format!("### {title}\n\n（无输出）");
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(
-            &extract_json_block(raw).unwrap_or_else(|| raw.to_string()),
-        ) {
-            let pretty = serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.to_string());
-            let snippet: String = pretty.chars().take(4000).collect();
-            format!("### {title}\n\n```json\n{snippet}\n```")
-        } else {
-            let snippet: String = raw.chars().take(4000).collect();
-            format!("### {title}\n\n{snippet}")
-        }
-    }
-
-    pub fn arm_execute_confirmation_with_markdown(&self, markdown: &str, from_step: usize) {
-        let handoff = crate::agent::execute_handoff::ExecuteHandoff::freeze(
-            self,
-            markdown,
-            from_step,
-            false,
-        );
-        handoff.save(self);
-        self.arm_execute_confirmation();
-    }
-
-    pub fn intent_routing_from_text(step0: Option<&str>) -> Option<IntentRouting> {
-        let (intent, complexity) = Self::parse_intent_meta(step0)?;
-        Some(IntentRouting::compute(&intent, &complexity))
-    }
-
-    /// User text can force ops-fast even when step0 says coding/simple/fast.
-    pub fn effective_routing(user_text: &str, step0: Option<&str>) -> Option<IntentRouting> {
-        if Self::looks_like_ops_task(user_text) {
-            let (intent, complexity) =
-                Self::parse_intent_meta(step0).unwrap_or(("ops".into(), "simple".into()));
-            return Some(IntentRouting::ops_fast(&intent, &complexity));
-        }
-        Self::intent_routing_from_text(step0)
-    }
-
-    pub fn effective_routing_for_engine(&self) -> Option<IntentRouting> {
-        let user = self.get_variable("_current_user_request").unwrap_or_default();
-        Self::effective_routing(&user, self.get_variable("_step0_output").as_deref())
-    }
-
-    /// Git tag / release / push — route to ops-fast, not file-edit fast path.
-    pub fn looks_like_ops_task(user_text: &str) -> bool {
-        let t = user_text.trim();
-        if t.is_empty() {
-            return false;
-        }
-        let lower = t.to_lowercase();
-        [
-            "git tag",
-            "打 tag",
-            "打tag",
-            "tag ",
-            "release",
-            "发布",
-            "push",
-            "推送",
-            "deploy",
-            "部署",
-            "changelog",
-            "版本号",
-            "发版",
-            "git push",
-        ]
-        .iter()
-        .any(|k| t.contains(k) || lower.contains(k))
-    }
-
-    /// Phrasing that means read-only code audit (检查/审查), not implementation.
-    pub fn looks_like_read_only_audit(user_text: &str) -> bool {
-        let t = user_text.trim();
-        if t.is_empty() {
-            return false;
-        }
-        let lower = t.to_lowercase();
-        let has_audit = [
-            "检查", "审查", "排查", "分析", "看看", "评估", "audit", "review", "inspect", "check",
-        ]
-        .iter()
-        .any(|k| t.contains(k) || lower.contains(k));
-        let wants_modify = [
-            "修改", "重构", "实现", "修复", "添加", "删除", "改写", "fix", "implement", "refactor",
-        ]
-        .iter()
-        .any(|k| t.contains(k) || lower.contains(k));
-        has_audit && !wants_modify
-    }
-
-    pub fn routing_hint_for_user(user_text: &str) -> String {
-        if Self::looks_like_read_only_audit(user_text) {
-            "【路由提示】只读代码检查 → 必须 intent=exploring, pipeline=fast（跳过规划/审阅；人工确认后只读执行；禁止 modify/delete 计划）".to_string()
-        } else {
-            String::new()
-        }
-    }
-
-    /// If the user asked for read-only audit but the model chose coding/standard, force exploring/fast.
-    pub fn correct_intent_json_for_user(user_text: &str, assistant_text: &str) -> String {
-        if Self::looks_like_ops_task(user_text) {
-            if let Ok(r) = Self::validate_intent_pipeline(assistant_text, Some(user_text)) {
-                if r.pipeline == "ops-fast" {
-                    return assistant_text.to_string();
-                }
-            }
-            let topic = extract_json_block(assistant_text)
-                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
-                .and_then(|v| v.get("topic").and_then(|t| t.as_str()).map(String::from))
-                .unwrap_or_else(|| user_text.chars().take(80).collect());
-            tracing::info!("[INTENT] Ops/release request — auto-correcting to ops-fast");
-            return serde_json::json!({
-                "intent": "ops",
-                "complexity": "simple",
-                "files": [],
-                "topic": topic,
-                "pipeline": "ops-fast",
-                "routing_reason": "用户请求为 git tag/发布/推送类运维操作，使用 ops-fast：系统 Preflight 探测后人工确认再执行"
-            })
-            .to_string();
-        }
-        if !Self::looks_like_read_only_audit(user_text) {
-            return assistant_text.to_string();
-        }
-        if Self::validate_intent_pipeline(assistant_text, Some(user_text)).is_ok() {
-            if let Some(r) = Self::intent_routing_from_text(Some(assistant_text)) {
-                if r.intent == "exploring" && r.pipeline == "fast" {
-                    return assistant_text.to_string();
-                }
-            }
-        }
-        let topic = extract_json_block(assistant_text)
-            .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
-            .and_then(|v| v.get("topic").and_then(|t| t.as_str()).map(String::from))
-            .unwrap_or_else(|| user_text.chars().take(80).collect());
-        tracing::info!(
-            "[INTENT] Read-only audit request — auto-correcting intent to exploring/fast"
-        );
-        serde_json::json!({
-            "intent": "exploring",
-            "complexity": "complex",
-            "files": [],
-            "topic": topic,
-            "pipeline": "fast",
-            "routing_reason": "用户请求为只读代码检查，使用 exploring/fast：跳过规划与审阅，人工确认后只读探索输出，不修改文件"
-        })
-        .to_string()
-    }
-
-    /// Reject plans that propose file changes during read-only (exploring) workflows.
-    pub fn validate_plan_read_only(json_str: &str) -> Result<(), String> {
-        let v: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| format!("❌ plan JSON 解析失败：{e}"))?;
-        let Some(plan) = v.get("plan").and_then(|p| p.as_array()) else {
-            return Ok(());
-        };
-        for (i, step) in plan.iter().enumerate() {
-            let action = step
-                .get("action")
-                .and_then(|a| a.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if matches!(action.as_str(), "modify" | "delete" | "add" | "create") {
-                return Err(format!(
-                    "❌ 只读检查任务 plan 步骤 {} 不得使用 action={action}。请改为 explain，且 desc 中说明只分析不修改。",
-                    i + 1
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Read-only exploring and simple coding skip Review.
-    pub fn should_skip_review(&self) -> bool {
-        Self::intent_routing_from_text(self.get_variable("_step0_output").as_deref())
-            .map(|r| r.skip_review)
-            .unwrap_or(false)
-    }
-
-    /// Exploring and simple coding skip Plan + Review.
-    pub fn should_skip_plan_and_review(&self) -> bool {
-        Self::intent_routing_from_text(self.get_variable("_step0_output").as_deref())
-            .map(|r| r.skip_plan)
-            .unwrap_or(false)
-    }
-
-    /// Build a minimal plan JSON for fast-path Execute (no Plan/Review steps).
-    pub fn build_fast_path_plan(intent_text: &str, user_request: Option<&str>) -> Option<String> {
-        let json = extract_json_block(intent_text)?;
-        let v: serde_json::Value = serde_json::from_str(&json).ok()?;
-        let intent = v.get("intent").and_then(|t| t.as_str()).unwrap_or("coding");
-        let topic = v.get("topic").and_then(|t| t.as_str()).unwrap_or("任务");
-        let user_text = user_request.unwrap_or(topic);
-
-        if intent == "ops" || Self::looks_like_ops_task(user_text) {
-            return Some(Self::build_ops_fast_plan(topic, user_text));
-        }
-
-        let files: Vec<String> = v
-            .get("files")
-            .and_then(|f| f.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if intent == "exploring" {
-            let key_files = files.clone();
-            let file_hint = if files.is_empty() {
-                "项目整体".to_string()
-            } else {
-                files.join(", ")
-            };
-            return Some(
-                serde_json::json!({
-                    "structure_summary": format!("只读代码检查：{topic}（{file_hint}）"),
-                    "plan": [{
-                        "step": 1,
-                        "file": files.first().cloned().unwrap_or_default(),
-                        "action": "explain",
-                        "target": "项目代码",
-                        "desc": format!(
-                            "只读检查：{topic}。用 file_list / file_read / code_search 探索，汇总问题与改进建议，不修改任何文件。"
-                        ),
-                        "verify": "完成分析后输出 ## Done"
-                    }],
-                    "skills": [],
-                    "key_files": key_files
-                })
-                .to_string(),
-            );
-        }
-
-        let plan_steps: Vec<serde_json::Value> = if files.is_empty() {
-            vec![serde_json::json!({
-                "step": 1,
-                "file": "",
-                "action": "modify",
-                "target": "",
-                "desc": format!("完成用户请求: {topic}"),
-                "verify": "运行项目检查或手动验证"
-            })]
-        } else {
-            files
-                .iter()
-                .enumerate()
-                .map(|(i, f)| {
-                    serde_json::json!({
-                        "step": i + 1,
-                        "file": f,
-                        "action": "modify",
-                        "target": "",
-                        "desc": format!("处理 {f} — {topic}"),
-                        "verify": "file_read 确认修改"
-                    })
-                })
-                .collect()
-        };
-
-        let key_files = if files.is_empty() {
-            Vec::<String>::new()
-        } else {
-            files.clone()
-        };
-        let summary = if files.is_empty() {
-            format!("快速路径：简单编码任务 — {topic}")
-        } else {
-            format!(
-                "快速路径：简单编码任务，涉及 {} 个文件 — {topic}",
-                files.len()
-            )
-        };
-
-        Some(
-            serde_json::json!({
-                "structure_summary": summary,
-                "plan": plan_steps,
-                "skills": [],
-                "key_files": key_files
-            })
-            .to_string(),
-        )
-    }
-
-    fn build_ops_fast_plan(topic: &str, user_text: &str) -> String {
-        serde_json::json!({
-            "structure_summary": format!("运维/发布任务：{topic}"),
-            "probes": [
-                {
-                    "id": "git_tags",
-                    "command": "git tag -l --sort=-v:refname",
-                    "purpose": "现有 tag 列表（确认命名规则与最新版本）"
-                },
-                {
-                    "id": "git_head",
-                    "command": "git rev-parse --short HEAD",
-                    "purpose": "当前 HEAD 提交"
-                },
-                {
-                    "id": "git_status",
-                    "command": "git status -sb",
-                    "purpose": "工作区与分支状态"
-                }
-            ],
-            "plan": [{
-                "step": 1,
-                "action": "shell",
-                "command": "",
-                "desc": format!("按用户请求执行：{user_text}"),
-                "verify": "命令成功且 ## Done"
-            }],
-            "skills": [],
-            "key_files": []
-        })
-        .to_string()
-    }
-
-    /// Seed synthetic plan + tracker when jumping Intent → Execute.
-    pub fn prepare_fast_path_execute(&self, intent_output: &str) {
-        let user = self.get_variable("_current_user_request");
-        if let Some(plan) = Self::build_fast_path_plan(intent_output, user.as_deref()) {
-            self.set_variable("_step1_output", plan.clone());
-            self.load_plan_tracker(&plan);
-        }
-    }
-
-    pub fn parse_intent_meta(step0: Option<&str>) -> Option<(String, String)> {
-        let text = step0?;
-        let json = extract_json_block(text)?;
-        let v: serde_json::Value = serde_json::from_str(&json).ok()?;
-        let intent = v.get("intent")?.as_str()?.to_string();
-        let complexity = v
-            .get("complexity")
-            .and_then(|c| c.as_str())
-            .unwrap_or("complex")
-            .to_string();
-        Some((intent, complexity))
     }
 
     pub fn load_plan_tracker(&self, plan_output: &str) {
@@ -1824,10 +1271,6 @@ impl WorkflowEngine {
             || (hits >= 3)
     }
 
-    fn is_explaining_execute(&self) -> bool {
-        self.is_perceive_execute()
-    }
-
     /// Execute step in read-only perceive mode — disabled in single-step model.
     pub fn is_perceive_execute(&self) -> bool {
         false
@@ -1945,60 +1388,6 @@ impl WorkflowEngine {
             })
     }
 
-    /// Fast/exploring paths use synthetic plans — shell/git may not map to file_write markers.
-    pub fn should_skip_plan_done_gate(&self) -> bool {
-        Self::intent_routing_from_text(self.get_variable("_step0_output").as_deref())
-            .map(|r| r.intent == "exploring" || r.pipeline == "fast" || r.pipeline == "ops-fast")
-            .unwrap_or(false)
-    }
-
-    pub fn bump_done_gate_block(&self) -> u32 {
-        let n = self
-            .get_variable("_done_gate_blocks")
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0)
-            .saturating_add(1);
-        self.set_variable("_done_gate_blocks", n.to_string());
-        n
-    }
-
-    pub fn clear_done_gate_blocks(&self) {
-        self.set_variable("_done_gate_blocks", String::new());
-    }
-
-    pub fn mark_plan_all_done(&self) {
-        if let Some(mut tracker) = self.get_plan_tracker() {
-            for step in &mut tracker.steps {
-                step.status = crate::agent::plan_tracker::StepStatus::Done;
-            }
-            self.set_variable(
-                "_plan_tracker",
-                crate::agent::plan_tracker::tracker_to_json(&tracker),
-            );
-        }
-    }
-
-    /// Execute step output complete — park session for user follow-up (no workflow teardown).
-    pub fn try_complete_execute_on_done(&mut self, assistant_text: &str) -> Result<bool, String> {
-        if self.get_current_step_index() != 3 || !self.should_park_execute_output(assistant_text) {
-            return Ok(false);
-        }
-        if Self::looks_like_review_report(assistant_text) {
-            self.mark_execute_report_delivered();
-        }
-        if self.is_perceive_execute() {
-            self.freeze_perception_output(assistant_text);
-        }
-        if self.should_skip_plan_done_gate() {
-            self.mark_plan_all_done();
-        } else if let Some(msg) = self.check_plan_done_gate() {
-            return Err(msg);
-        }
-        self.park_workflow_awaiting_user()?;
-        self.clear_done_gate_blocks();
-        Ok(true)
-    }
-
     pub fn save_turn_memory(&self, tm: &crate::agent::turn_memory::TurnMemory) {
         self.set_variable(
             "_turn_memory",
@@ -2019,6 +1408,55 @@ impl WorkflowEngine {
     /// Retrieve the LLM output from the previous step
     pub fn get_previous_step_output(&self) -> Option<String> {
         self.get_variable("_prev_output")
+    }
+
+    fn get_explored_path_set(&self) -> std::collections::HashSet<String> {
+        self.get_variable("_explored_paths")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn get_execute_review_report(&self) -> Option<String> {
+        self.get_variable("_step3_output")
+            .filter(|s| !s.trim().is_empty())
+            .filter(|s| Self::looks_like_review_report(s))
+    }
+
+    pub fn execute_review_report_block(&self, max_chars: usize) -> Option<String> {
+        self.get_execute_review_report().map(|report| {
+            let snippet: String = report.chars().take(max_chars).collect();
+            format!("【审查报告 — park 前输出，用户在此基础上跟进】\n{snippet}")
+        })
+    }
+
+    pub fn get_all_step_outputs_summary(&self) -> String {
+        if self.is_single_step() {
+            return self
+                .get_previous_step_output()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "（无上一步输出）".to_string());
+        }
+        let mut summaries = Vec::new();
+        let labels = ["意图分类", "任务规划", "审阅计划"];
+        for i in 0..3 {
+            if let Some(output) = self.get_variable(&format!("_step{i}_output")) {
+                if output.trim().is_empty() {
+                    continue;
+                }
+                let label = labels.get(i).copied().unwrap_or("未知");
+                let json_or_summary = if let (Some(s), Some(e)) = (output.find('{'), output.rfind('}')) {
+                    &output[s..=e]
+                } else {
+                    &output[..output.len().min(500)]
+                };
+                summaries.push(format!("Step {}: {}\n{}", i + 1, label, json_or_summary));
+            }
+        }
+        if summaries.is_empty() {
+            "（无上一步输出）".to_string()
+        } else {
+            summaries.join("\n\n")
+        }
     }
 
     /// Normalize a directory path for exploration deduplication.
@@ -2070,28 +1508,6 @@ impl WorkflowEngine {
         );
     }
 
-    /// Store preflight probe output (before execute confirmation).
-    pub fn record_preflight_result(
-        &self,
-        working_dir: &std::path::Path,
-        target: &str,
-        raw_result: &str,
-    ) {
-        let content = crate::agent::exploration_snapshot::extract_data_content(raw_result);
-        let mut entries = self.get_exploration_entries();
-        crate::agent::exploration_snapshot::merge_entry(
-            &mut entries,
-            working_dir,
-            "preflight",
-            target,
-            &content,
-        );
-        self.set_variable(
-            "_exploration_snapshot",
-            crate::agent::exploration_snapshot::entries_to_json(&entries),
-        );
-    }
-
     /// Formatted exploration snapshot for Review / Execute steps.
     pub fn exploration_snapshot_summary(&self) -> String {
         let entries = self.get_exploration_entries();
@@ -2102,15 +1518,6 @@ impl WorkflowEngine {
         self.get_variable("_exploration_snapshot")
             .map(|s| crate::agent::exploration_snapshot::entries_from_json(&s))
             .unwrap_or_default()
-    }
-
-    /// True when mandatory Plan-step exploration is complete (gates JSON-only mode).
-    pub fn plan_exploration_satisfied(&self) -> bool {
-        crate::agent::plan_tracker::validate_plan_exploration(
-            &self.get_exploration_entries(),
-            &self.get_explored_path_set(),
-        )
-        .is_ok()
     }
 
     /// Return cached exploration preview when the same tool+path was already run.
@@ -2153,93 +1560,6 @@ impl WorkflowEngine {
             })
     }
 
-    /// What to call next during Plan exploration (reduces repeat-tool loops).
-    pub fn plan_exploration_hint(&self) -> String {
-        crate::agent::plan_tracker::exploration_next_action(
-            &self.get_exploration_entries(),
-            &self.get_explored_path_set(),
-        )
-    }
-
-    /// Whether exploration snapshot already contains a tool result.
-    pub fn has_exploration_tool(&self, tool: &str) -> bool {
-        self.get_exploration_entries()
-            .iter()
-            .any(|e| e.tool == tool)
-    }
-
-    /// Full plan readiness: field validation + exploration depth + path grounding.
-    pub fn validate_plan_ready(&self, json_str: &str) -> Result<(), String> {
-        crate::agent::plan_tracker::validate_plan_steps(json_str)?;
-        let entries = self.get_exploration_entries();
-        let explored = self.get_explored_path_set();
-        crate::agent::plan_tracker::validate_plan_exploration(&entries, &explored)?;
-        crate::agent::plan_tracker::validate_plan_paths_known(json_str, &entries, &explored)?;
-        Ok(())
-    }
-
-    /// Human-readable list of explored paths for context injection.
-    pub fn explored_paths_summary(&self) -> String {
-        let paths = self.get_explored_path_set();
-        if paths.is_empty() {
-            return String::new();
-        }
-        let mut items: Vec<String> = paths.into_iter().collect();
-        items.sort();
-        items.join("\n")
-    }
-
-    fn get_explored_path_set(&self) -> std::collections::HashSet<String> {
-        self.get_variable("_explored_paths")
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-
-    /// Full review report from Execute (exploring fast-path), stored at park time.
-    pub fn get_execute_review_report(&self) -> Option<String> {
-        self.get_variable("_step3_output")
-            .filter(|s| !s.trim().is_empty())
-            .filter(|s| Self::looks_like_review_report(s))
-    }
-
-    /// Durable block for LLM — park 前的审查报告（实施阶段每轮注入）。
-    pub fn execute_review_report_block(&self, max_chars: usize) -> Option<String> {
-        self.get_execute_review_report().map(|report| {
-            let snippet: String = report.chars().take(max_chars).collect();
-            format!("【审查报告 — park 前输出，用户在此基础上跟进】\n{snippet}")
-        })
-    }
-
-    /// Build an aggregated summary of all previous steps for the Execute step
-    pub fn get_all_step_outputs_summary(&self) -> String {
-        let mut summaries = Vec::new();
-        let labels = ["意图分类", "任务规划", "审阅计划"];
-        for i in 0..3 {
-            if let Some(output) = self.get_variable(&format!("_step{}_output", i)) {
-                if output.trim().is_empty() {
-                    continue;
-                }
-                let label = labels.get(i).copied().unwrap_or(&"未知");
-                // Extract the JSON portion only (strip surrounding text)
-                let json_or_summary = if let (Some(s), Some(e)) = (output.find('{'), output.rfind('}')) {
-                    &output[s..=e]
-                } else {
-                    &output[..output.len().min(500)]
-                };
-                summaries.push(format!("Step {}: {}\n{}", i + 1, label, json_or_summary));
-            }
-        }
-        if let Some(report) = self.get_execute_review_report() {
-            let snippet: String = report.chars().take(6000).collect();
-            summaries.push(format!("Step 4: 只读审查报告\n{snippet}"));
-        }
-        if summaries.is_empty() {
-            "（无上一步输出）".to_string()
-        } else {
-            summaries.join("\n\n")
-        }
-    }
-
     /// Snapshot task + step outputs for skill reflection before workflow reset.
     pub fn snapshot_for_skill_reflect(&self) -> (String, String) {
         let task_description = self
@@ -2253,184 +1573,6 @@ impl WorkflowEngine {
             summary
         };
         (task_description, execution_summary)
-    }
-
-    /// Check if the LLM's response should auto-advance to the next step.
-    /// Validates structured output per step. Returns (next_step_idx, None) on success,
-    /// or (None, Some(error_message)) if output is invalid.
-    ///
-    /// Validation per step:
-    /// - Step 0 (Intent): JSON with "intent" field
-    /// - Step 1 (Plan): JSON with "plan" array
-    /// - Step 2 (Review): JSON with "safe" + "complete" fields
-    /// - Step 3 (Execute): text contains "## Done" or "【Done】"
-    pub fn advance_on_output(
-        &mut self,
-        assistant_text: &str,
-        had_tool_calls: bool,
-    ) -> (Option<usize>, Option<String>) {
-        let step_idx = self.get_current_step_index();
-        let workflow = match self.current_workflow.as_ref() {
-            Some(w) => w, None => return (None, None),
-        };
-        let _total = workflow.total_steps();
-
-        match step_idx {
-            0 => {
-                let user = self.get_variable("_current_user_request");
-                match Self::parse_intent_output(assistant_text, user.as_deref()) {
-                    Ok(parsed) => {
-                        if parsed.routing.intent == "chat" {
-                            self.set_chat_route();
-                            return (None, None);
-                        }
-                        self.set_previous_output(assistant_text);
-                        if parsed.needs_clarification {
-                            let pending = if parsed.routing.skip_plan { 3 } else { 1 };
-                            crate::agent::requirement_clarification::arm_gate(
-                                self,
-                                &parsed.clarification_questions,
-                                pending,
-                            );
-                            return (None, None);
-                        }
-                        if parsed.routing.skip_plan {
-                            self.prepare_fast_path_execute(assistant_text);
-                            return (Some(3), None);
-                        }
-                        (Some(1), None)
-                    }
-                    Err(_msg) if had_tool_calls && assistant_text.trim().is_empty() => {
-                        (None, None)
-                    }
-                    Err(msg) => (None, Some(msg)),
-                }
-            }
-            1 => {
-                match validate_json_field(assistant_text, &["plan"]) {
-                    Ok(_) => {
-                        let json_str = extract_json_block(assistant_text).unwrap_or_default();
-                        if let Err(msg) = self.validate_plan_ready(&json_str) {
-                            return (None, Some(msg));
-                        }
-                        if Self::intent_routing_from_text(self.get_variable("_step0_output").as_deref())
-                            .map(|r| r.intent == "exploring")
-                            .unwrap_or(false)
-                        {
-                            if let Err(msg) = Self::validate_plan_read_only(&json_str) {
-                                return (None, Some(msg));
-                            }
-                        }
-                        self.set_variable("_review_feedback", String::new());
-                        let next = if self.should_skip_review() { 3 } else { 2 };
-                        (Some(next), None)
-                    }
-                    Err(_msg) if had_tool_calls && assistant_text.trim().is_empty() => {
-                        (None, None)
-                    }
-                    Err(msg) => (None, Some(msg)),
-                }
-            }
-            2 => {
-                match validate_json_field(assistant_text, &["safe", "complete"]) {
-                    Ok(_) => {
-                        let json_str = extract_json_block(assistant_text).unwrap_or_default();
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                            let safe = v.get("safe").and_then(|b| b.as_bool()).unwrap_or(false);
-                            let complete = v
-                                .get("complete")
-                                .and_then(|b| b.as_bool())
-                                .unwrap_or(false);
-                            if !safe || !complete {
-                                let issues: Vec<String> = v
-                                    .get("issues")
-                                    .and_then(|a| a.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|x| x.as_str().map(String::from))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                let msg = if issues.is_empty() {
-                                    "审阅未通过（safe 或 complete 为 false）。".to_string()
-                                } else {
-                                    format!("审阅未通过:\n{}", issues.join("\n"))
-                                };
-                                return (Some(1), Some(format!(
-                                    "【审阅回退】{msg}\n\n请根据审阅意见修正计划，重新输出完整 plan JSON。"
-                                )));
-                            }
-                        }
-                        (Some(3), None)
-                    }
-                    Err(msg) if looks_like_review_prose(assistant_text) => (
-                        Some(1),
-                        Some(format!(
-                            "❌ 审阅步骤必须输出 JSON，不能输出 Markdown 摘要。\n{msg}\n\n已回退到规划步骤，请修正计划后重新输出 plan JSON。"
-                        )),
-                    ),
-                    // Any other validation failure → rollback to Plan (第二步), not retry Review in place
-                    Err(msg) => (
-                        Some(1),
-                        Some(review_rollback_message(&msg)),
-                    ),
-                }
-            }
-            3 => {
-                if Self::text_signals_done(assistant_text) && !self.should_skip_plan_done_gate() {
-                    if let Some(msg) = self.check_plan_done_gate() {
-                        return (None, Some(msg));
-                    }
-                }
-                (None, None)
-            }
-            _ => (None, None),
-        }
-    }
-}
-
-fn looks_like_review_prose(text: &str) -> bool {
-    extract_json_block(text).is_none()
-        && (text.contains("计划不完整")
-            || text.contains("安全问题")
-            || text.contains("审阅未通过")
-            || text.contains('⚠'))
-}
-
-fn review_rollback_message(detail: &str) -> String {
-    format!(
-        "【审阅回退】{detail}\n\n请根据审阅意见修正计划，重新输出完整 plan JSON。"
-    )
-}
-
-/// Find and parse JSON from LLM output, validate required fields exist.
-fn validate_json_field(text: &str, required_fields: &[&str]) -> Result<(), String> {
-    let json_str = extract_json_block(text)
-        .ok_or_else(|| format!(
-            "❌ 你的回复不包含有效的 JSON。请输出 JSON 对象，包含以下字段：{}。\n请重新输出。",
-            required_fields.join("、")
-        ))?;
-
-    let parsed: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| format!("❌ JSON 解析失败：{}。请检查格式后重新输出。", e))?;
-
-    let obj = parsed.as_object()
-        .ok_or_else(|| "❌ 你的输出不是 JSON 对象。请输出 {{...}} 格式的 JSON。".to_string())?;
-
-    let mut missing = Vec::new();
-    for field in required_fields {
-        if !obj.contains_key(*field) || obj[*field].is_null() {
-            missing.push(*field);
-        }
-    }
-
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "❌ JSON 缺少必填字段：{}。请补全后重新输出。",
-            missing.join("、")
-        ))
     }
 }
 

@@ -117,6 +117,7 @@ pub fn finalize_cli_workflow_after_onboarding(
 ) -> anyhow::Result<()> {
     engine.reset_workflow();
     engine.set_variable("_current_user_request", task.to_string());
+    crate::agent::user_round::set_turn_user_input(engine, task);
     engine.set_variable(crate::agent::user_round::ROUND_FINALIZED_KEY, "1".into());
     crate::agent::post_edit_verification::clear_verify_state(engine);
     crate::agent::workflow_phases::clear_phase(engine);

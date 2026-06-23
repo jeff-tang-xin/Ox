@@ -360,7 +360,7 @@ async fn run_app(
         } else {
             KnowledgeEngine::start_file_watcher(Arc::clone(&knowledge_for_index));
             app.indexing = false;
-            app.status = "按需索引 — 检索时嵌入相关文件".to_string();
+            app.status = "按需索引 — findings/查询路径优先嵌入".to_string();
         }
     } else {
         tokio::spawn(async move {
@@ -468,6 +468,7 @@ async fn run_app(
                 let turn_messages = pre_turn_result.turn_messages;
                 let planning = pre_turn_result.planning;
 
+                let turn_id = agent_handler::prepare_agent_spawn(&mut app, &mut interrupt_ctrl);
                 app.agent_running = true;
                 let tx = agent_tx.clone();
                 let reg = Arc::clone(&tool_registry);
@@ -480,8 +481,11 @@ async fn run_app(
                 let p_clone = Arc::clone(p);
                 tokio::spawn(async move {
                     agent::run_agent_turn(
-                        p_clone, turn_messages, reg, ctx, tx, ui_rx,
+                        p_clone,
+                        agent::collaboration::RoleProviders::default(),
+                        turn_messages, reg, ctx, tx, ui_rx,
                         cancel, tm, ac, planning, None,
+                        turn_id,
                     )
                     .await;
                 });
@@ -687,8 +691,10 @@ async fn run_full_project_index(
     tracing::info!("[INDEXER] Phase 2: embedding {total_entities} symbols…");
     let progress_step = progress_step.min(embed_chunk_size).max(1);
     let mut offset = 0;
+    // Smaller write-lock windows so retrieval can interleave during background embed.
+    let embed_batch = progress_step.min(embed_chunk_size).min(16).max(1);
     while offset < total_entities {
-        let chunk = progress_step.min(total_entities - offset);
+        let chunk = embed_batch.min(total_entities - offset);
         let _ = index_progress_tx.send(ox_core::knowledge::IndexProgress::embedding(
             offset,
             total_entities,
@@ -867,13 +873,35 @@ fn process_key_event(
             app.user_scrolled = false;
         }
         KeyResult::FindingsConfirm => {
-            app.clear_workflow_confirmation();
-            app.findings_panel = None;
-            app.dirty = true;
+            let wd = rt_env.effective_project_root();
+            let (handled, spawn_turn) = try_apply_workflow_command(app, "/confirm", &wd);
+            if handled && spawn_turn {
+                spawn_agent_turn_for_text(
+                    app,
+                    "确认实施",
+                    session,
+                    provider,
+                    agent_tx,
+                    tool_registry,
+                    tool_ctx,
+                    context_builder,
+                    context_window,
+                    config,
+                    agent_config,
+                    trust_manager,
+                    rt_env,
+                    interrupt_ctrl,
+                    compressed_cache,
+                    false,
+                );
+            } else if handled {
+                app.output.push_system("（请先 1-9 选择要修复的 finding）");
+            }
             app.scroll_to_bottom();
             app.user_scrolled = false;
         }
         KeyResult::FindingsDiscuss => {
+            agent_handler::enter_findings_discuss_mode(app);
             app.scroll_to_bottom();
             app.user_scrolled = false;
         }
@@ -935,6 +963,38 @@ fn process_slash_command(
     compressed_cache: &Option<(Vec<Message>, usize)>,
     knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
 ) {
+    let workflow_line = if args.is_empty() {
+        format!("/{cmd}")
+    } else {
+        format!("/{cmd} {args}")
+    };
+    let (wf_handled, spawn_turn) =
+        try_apply_workflow_command(app, &workflow_line, &rt_env.effective_project_root());
+    if wf_handled {
+        if spawn_turn {
+            spawn_agent_turn_for_text(
+                app,
+                "确认实施",
+                session,
+                provider,
+                agent_tx,
+                tool_registry,
+                tool_ctx,
+                context_builder,
+                context_window,
+                config,
+                agent_config,
+                trust_manager,
+                rt_env,
+                interrupt_ctrl,
+                compressed_cache,
+                false,
+            );
+        }
+        app.dirty = true;
+        return;
+    }
+
     if let Some(meta) = command_registry.get_command(cmd) {
         let result = (meta.handler)(
             app, args, session, rt_env, config,
@@ -972,6 +1032,155 @@ fn process_slash_command(
     app.dirty = true;
 }
 
+/// Try workflow commands (`/fix`, `/confirm`, `/findings`, …). Returns `(handled, spawn_turn)`.
+fn try_apply_workflow_command(
+    app: &mut App,
+    line: &str,
+    working_dir: &std::path::Path,
+) -> (bool, bool) {
+    agent_handler::apply_workflow_slash(app, line, working_dir)
+}
+
+/// Spawn an agent turn for user text (optionally skip `begin_user_round` after scope confirm).
+#[allow(clippy::too_many_arguments)]
+fn spawn_agent_turn_for_text(
+    app: &mut App,
+    text: &str,
+    session: &mut Session,
+    provider: &Option<Arc<dyn LlmProvider>>,
+    agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    tool_registry: &Arc<ToolRegistry>,
+    tool_ctx: &Arc<ToolContext>,
+    context_builder: &ContextBuilder,
+    context_window: u32,
+    config: &OxConfig,
+    agent_config: &Arc<AgentConfig>,
+    trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
+    rt_env: &runtime::RuntimeEnvironment,
+    interrupt_ctrl: &mut InterruptController,
+    compressed_cache: &Option<(Vec<Message>, usize)>,
+    begin_round: bool,
+) {
+    if provider.is_none() {
+        app.output.push_line(OutputLine::System(format!("[echo] {}", text.trim())));
+        return;
+    }
+
+    let turn_id = agent_handler::prepare_agent_spawn(app, interrupt_ctrl);
+
+    app.status = "⏳ Preparing...".to_string();
+    app.dirty = true;
+    app.workflow_interrupted = false;
+
+    if begin_round {
+        if let Some(wf) = app.workflow_engine.clone() {
+            if let Ok(mut engine) = wf.try_lock() {
+                if !engine.accepts_user_round_input(text) {
+                    app.output.push_system(
+                        ox_core::agent::workflow_phases::act_interjection_blocked_message(),
+                    );
+                    app.status.clear();
+                    app.dirty = true;
+                    return;
+                }
+                if engine.workflow_preserves_on_user_input(text) {
+                    let step_idx = engine.get_current_step_index();
+                    app.output.push_system(&format!(
+                        "💬 workflow 介入 — 继续当前任务 (步骤 {})，不会重置会话",
+                        step_idx + 1,
+                    ));
+                }
+                let new_round = engine.begin_user_round(text);
+                if new_round {
+                    let task = engine
+                        .get_variable("_current_user_request")
+                        .unwrap_or_else(|| text.to_string());
+                    let _ = session.append_message(Message::system(
+                        ox_core::agent::user_round::format_round_boundary_message(&task),
+                    ));
+                }
+            }
+        }
+    } else if let Some(wf) = app.workflow_engine.clone() {
+        if let Ok(engine) = wf.try_lock() {
+            ox_core::agent::user_round::set_turn_user_input(&engine, text);
+            if ox_core::agent::phase::get(&engine)
+                == ox_core::agent::phase::SingleFlowPhase::Implement
+            {
+                let anchor = ox_core::agent::findings::load_or_migrate(&engine)
+                    .map(|s| s.scope_confirm_summary())
+                    .unwrap_or_else(|| text.to_string());
+                let _ = session.append_message(Message::system(
+                    ox_core::agent::user_round::format_round_boundary_message(&format!(
+                        "实施修复 — {anchor}"
+                    )),
+                ));
+            }
+        }
+    }
+
+    let _ = session.append_message(Message::user(text));
+
+    let rt_env_clone = rt_env.clone();
+    let config_clone = config.clone();
+    let tool_registry_clone = Arc::clone(tool_registry);
+    let context_builder_clone = context_builder.clone();
+    let session_messages = session.messages.clone();
+    let compressed_cache_data = compressed_cache.clone();
+    let workflow_engine_clone = app.workflow_engine.clone();
+    let session_id = session.meta.id.clone();
+    let knowledge_engine_clone = app.knowledge_engine.clone();
+    let tx = agent_tx.clone();
+    let provider_clone = Arc::clone(provider.as_ref().unwrap());
+    let tool_ctx_clone = Arc::clone(tool_ctx);
+    let cancel_token = interrupt_ctrl.token();
+    let tm = Arc::clone(trust_manager);
+    let ac = Arc::clone(agent_config);
+    let text = text.to_string();
+
+    let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
+    app.ui_to_agent_tx = Some(ui_to_agent_tx);
+    app.agent_running = true;
+
+    tokio::spawn(async move {
+        let status_tx = tx.clone();
+        let result = handlers::pre_turn::prepare_turn(
+            &config_clone,
+            &rt_env_clone,
+            &tool_registry_clone,
+            &context_builder_clone,
+            context_window,
+            &knowledge_engine_clone,
+            &text,
+            &session_messages,
+            &compressed_cache_data,
+            TurnVariant::Normal,
+            &workflow_engine_clone,
+            &session_id,
+            &status_tx,
+        )
+        .await;
+
+        let _ = status_tx.send(AgentToUiEvent::Status("🌐 Calling LLM...".to_string()));
+        agent::run_agent_turn(
+            provider_clone,
+            agent::collaboration::RoleProviders::default(),
+            result.turn_messages,
+            tool_registry_clone,
+            tool_ctx_clone,
+            tx,
+            ui_to_agent_rx,
+            cancel_token,
+            tm,
+            ac,
+            result.planning,
+            workflow_engine_clone,
+            turn_id,
+        )
+        .await;
+    });
+}
+
 /// Process normal text input (or interjection during agent run).
 #[allow(clippy::too_many_arguments)]
 fn process_text_input(
@@ -999,6 +1208,41 @@ fn process_text_input(
         app.output.push_system("⏳ Please wait — indexing in progress...");
         app.dirty = true;
         return;
+    }
+
+    let trimmed = text.trim();
+    if trimmed.starts_with('/') {
+        let (wf_handled, spawn_turn) = try_apply_workflow_command(
+            app,
+            trimmed,
+            &rt_env.effective_project_root(),
+        );
+        if wf_handled {
+            if spawn_turn {
+                spawn_agent_turn_for_text(
+                    app,
+                    "确认实施",
+                    session,
+                    provider,
+                    agent_tx,
+                    tool_registry,
+                    tool_ctx,
+                    context_builder,
+                    context_window,
+                    config,
+                    agent_config,
+                    trust_manager,
+                    rt_env,
+                    interrupt_ctrl,
+                    compressed_cache,
+                    false,
+                );
+            }
+            app.scroll_to_bottom();
+            app.user_scrolled = false;
+            app.dirty = true;
+            return;
+        }
     }
 
     // ── Skill draft confirmation (only explicit ok/save/dismiss — never steal normal chat) ──
@@ -1085,7 +1329,7 @@ fn process_text_input(
             .workflow_engine
             .as_ref()
             .and_then(|wf| wf.try_lock().ok())
-            .filter(|e| e.workflow_preserves_on_user_input())
+            .filter(|e| e.workflow_preserves_on_user_input(&content))
             .and_then(|e| e.current_step().map(|s| s.name.clone()))
         {
             format!("workflow·{name}")
@@ -1145,7 +1389,7 @@ fn process_text_input(
                 app.dirty = true;
                 return;
             }
-            if engine.workflow_preserves_on_user_input() {
+            if engine.workflow_preserves_on_user_input(&text) {
                 let step_idx = engine.get_current_step_index();
                 app.output.push_system(&format!(
                     "💬 workflow 介入 — 继续当前任务 (步骤 {})，不会重置会话",
@@ -1161,6 +1405,12 @@ fn process_text_input(
                     ox_core::agent::user_round::format_round_boundary_message(&task),
                 ));
             }
+            let (mode, banner) = ox_core::agent::phase::workspace_mode_event(&engine);
+            if ox_core::agent::phase::get(&engine) == ox_core::agent::phase::SingleFlowPhase::Implement
+            {
+                app.clear_workflow_confirmation();
+            }
+            let _ = agent_tx.send(AgentToUiEvent::WorkspaceModeChanged { mode, banner });
         }
     }
 
@@ -1186,6 +1436,8 @@ fn process_text_input(
     let tm = Arc::clone(trust_manager);
     let ac = Arc::clone(agent_config);
 
+    let turn_id = agent_handler::prepare_agent_spawn(app, interrupt_ctrl);
+
     let (ui_to_agent_tx, ui_to_agent_rx) = mpsc::unbounded_channel::<UiToAgentEvent>();
     app.ui_to_agent_tx = Some(ui_to_agent_tx);
     app.agent_running = true;
@@ -1204,9 +1456,12 @@ fn process_text_input(
 
         let _ = status_tx.send(AgentToUiEvent::Status("🌐 Calling LLM...".to_string()));
         agent::run_agent_turn(
-            provider_clone, result.turn_messages, tool_registry_clone,
+            provider_clone,
+            agent::collaboration::RoleProviders::default(),
+            result.turn_messages, tool_registry_clone,
             tool_ctx_clone, tx, ui_to_agent_rx,
             cancel_token, tm, ac, result.planning, workflow_engine_clone,
+            turn_id,
         )
         .await;
     });
@@ -1267,7 +1522,7 @@ fn spawn_agent_turn_from_slash(
     tool_ctx: &Arc<ToolContext>,
     context_builder: &ContextBuilder,
     context_window: u32,
-    interrupt_ctrl: &InterruptController,
+    interrupt_ctrl: &mut InterruptController,
     agent_config: &Arc<AgentConfig>,
     trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
     rt_env: &runtime::RuntimeEnvironment,
@@ -1288,7 +1543,7 @@ fn spawn_agent_turn_from_slash(
         return;
     }
 
-    app.agent_running = true;
+    let turn_id = agent_handler::prepare_agent_spawn(app, interrupt_ctrl);
     app.status = "Generating...".to_string();
 
     let provider = Arc::clone(provider.as_ref().unwrap());
@@ -1348,6 +1603,7 @@ fn spawn_agent_turn_from_slash(
         let _ = status_tx.send(AgentToUiEvent::Status("🌐 Calling LLM...".to_string()));
         agent::run_agent_turn(
             provider,
+            agent::collaboration::RoleProviders::default(),
             result.turn_messages,
             registry,
             ctx,
@@ -1358,6 +1614,7 @@ fn spawn_agent_turn_from_slash(
             ac,
             result.planning,
             wf,
+            turn_id,
         )
         .await;
     });
@@ -1510,9 +1767,9 @@ fn process_agent_event(
         AgentToUiEvent::ToolProgress { tool_call_id, tool_name, message, progress_percent } => {
             agent_handler::handle_tool_progress(app, tool_call_id, tool_name, message, progress_percent);
         }
-        AgentToUiEvent::TurnDone { new_messages, usage } => {
+        AgentToUiEvent::TurnDone { turn_id, new_messages, usage } => {
             let result = agent_handler::handle_turn_done(
-                app, session, background_session,
+                app, turn_id, session, background_session,
                 &new_messages, &usage,
                 provider.is_some(), rt_env, tool_registry,
                 knowledge_engine, cost_tracker, model_name,
@@ -1535,7 +1792,7 @@ fn process_agent_event(
                 }
                 HandleResult::BackgroundDone => {}
                 HandleResult::InterjectionTriggered { turn_messages, .. } => {
-                    // Fallback when live interjection channel was unavailable — continue current workflow step
+                    let turn_id = agent_handler::prepare_agent_spawn(app, interrupt_ctrl);
                     app.agent_running = true;
                     app.status = "🧠 Thinking...".to_string();
                     let p = Arc::clone(provider.as_ref().unwrap());
@@ -1559,8 +1816,11 @@ fn process_agent_event(
                     }
                     tokio::spawn(async move {
                         agent::run_agent_turn(
-                            p, turn_messages, registry, ctx, tx, ui_rx,
+                            p,
+                            agent::collaboration::RoleProviders::default(),
+                            turn_messages, registry, ctx, tx, ui_rx,
                             cancel, tm, ac, false, wf,
+                            turn_id,
                         )
                         .await;
                     });
@@ -1606,21 +1866,40 @@ fn process_agent_event(
             app.output.push_system(&message);
             app.dirty = true;
         }
-        AgentToUiEvent::ReasoningChunk(_) => {}
+        AgentToUiEvent::ReasoningChunk(text) => {
+            agent_handler::handle_reasoning_chunk(app, &text);
+        }
         AgentToUiEvent::FindingsPanel { summary, rows } => {
-            app.findings_panel = Some(crate::terminal::app::FindingsPanelState {
-                summary,
-                rows,
-            });
-            app.workflow_awaiting_confirmation = Some(4);
+            let show_panel = app
+                .workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .map(|e| {
+                    ox_core::agent::phase::get(&e)
+                        == ox_core::agent::phase::SingleFlowPhase::AwaitUser
+                })
+                .unwrap_or(true);
+            if show_panel {
+                app.findings_panel = Some(crate::terminal::app::FindingsPanelState {
+                    summary,
+                    rows,
+                });
+                app.workflow_awaiting_confirmation = Some(4);
+            }
             app.dirty = true;
         }
         AgentToUiEvent::ScopeConfirmPrompt { summary } => {
             app.output.push_system(&summary);
             app.dirty = true;
         }
-        AgentToUiEvent::WorkspaceModeChanged { mode } => {
-            app.status = format!("模式: {mode}");
+        AgentToUiEvent::WorkspaceModeChanged { mode, banner } => {
+            app.workflow_phase_line = mode.clone();
+            if mode == "execute_impl" {
+                app.clear_workflow_confirmation();
+            }
+            if !banner.is_empty() {
+                app.output.push_system(&banner);
+            }
             app.dirty = true;
         }
         AgentToUiEvent::WorkflowCompleted { task_description, execution_summary } => {
@@ -1657,13 +1936,21 @@ fn spawn_next_workflow_step_if_needed(
     tool_ctx: &Arc<ToolContext>,
     context_builder: &ContextBuilder,
     context_window: u32,
-    interrupt_ctrl: &InterruptController,
+    interrupt_ctrl: &mut InterruptController,
     agent_config: &Arc<AgentConfig>,
     trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
     config: &OxConfig,
     rt_env: &runtime::RuntimeEnvironment,
     _system_prompt: &str,
 ) {
+    if let Some(ref wf) = app.workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            if engine.is_single_step() {
+                return;
+            }
+        }
+    }
+
     // ── Don't auto-spawn if user interrupted the previous step ──
     if app.workflow_interrupted {
         tracing::info!("[WORKFLOW] Skipping auto-spawn: user interrupted previous step");
@@ -1723,6 +2010,7 @@ fn spawn_next_workflow_step_if_needed(
         }
     }
 
+    let turn_id = agent_handler::prepare_agent_spawn(app, interrupt_ctrl);
     app.agent_running = true;
     let p = Arc::clone(provider.as_ref().unwrap());
     let tx = agent_tx.clone();
@@ -1738,8 +2026,11 @@ fn spawn_next_workflow_step_if_needed(
     tokio::spawn(async move {
         let _ = tx.send(AgentToUiEvent::Status("🌐 Calling LLM...".to_string()));
         agent::run_agent_turn(
-            p, turn_messages, registry, ctx, tx, ui_rx,
+            p,
+            agent::collaboration::RoleProviders::default(),
+            turn_messages, registry, ctx, tx, ui_rx,
             cancel, tm, ac, false, wf,
+            turn_id,
         ).await;
     });
 

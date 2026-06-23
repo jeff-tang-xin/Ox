@@ -298,27 +298,9 @@ fn collapse_blank_lines(s: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
-/// User-facing Execute perceive output: strip machine JSON, append parsed findings as markdown.
+/// User-facing review output: strip machine JSON (findings list → TUI panel).
 pub fn format_for_user_display(text: &str) -> String {
-    let findings = extract_from_text(text);
-    if !text.contains("\"findings\"") && findings.is_none() {
-        return text.to_string();
-    }
-    let stripped = strip_findings_json_blocks(text);
-    let Some(f) = findings else {
-        return stripped;
-    };
-    if f.findings.is_empty() {
-        return stripped;
-    }
-    let summary_md = format_findings_markdown(&f);
-    if stripped.trim().is_empty() {
-        return summary_md;
-    }
-    if prose_covers_findings(&stripped, &f) {
-        return stripped;
-    }
-    format!("{}\n\n{}", stripped.trim_end(), summary_md)
+    strip_findings_json_blocks(text)
 }
 
 /// Whether prose already describes findings (skip duplicate appendix).
@@ -478,9 +460,7 @@ F1 - 问题A
         assert!(shown.contains("审查报告"));
         assert!(shown.contains("F1"));
         assert!(!shown.contains("```json"));
-        // issue "x" not in prose — appendix from JSON
-        assert!(shown.contains("问题汇总"));
-        assert!(shown.contains("**问题：** x"));
+        assert!(!shown.contains("\"findings\""));
     }
 
     #[test]
@@ -499,7 +479,7 @@ F1 - 问题A
     }
 
     #[test]
-    fn json_only_output_becomes_markdown_summary() {
+    fn json_only_output_strips_machine_json() {
         let text = r#"## Done
 ```json
 {
@@ -512,16 +492,11 @@ F1 - 问题A
 ```"#;
         let shown = format_for_user_display(text);
         assert!(!shown.contains("\"findings\""));
-        assert!(shown.contains("## 问题汇总"));
-        assert!(shown.contains("两处配置问题"));
-        assert!(shown.contains("**1. [高]"));
-        assert!(shown.contains("缺校验"));
-        assert!(shown.contains("**2. [中]"));
-        assert!(!shown.contains("| # |"));
+        assert!(shown.contains("## Done"));
     }
 
     #[test]
-    fn stream_filter_appends_summary_on_flush() {
+    fn stream_filter_flush_no_duplicate_appendix() {
         let mut f = FindingsStreamFilter::new();
         assert!(f.push("## 完成\n").unwrap().contains("完成"));
         assert!(f
@@ -529,9 +504,7 @@ F1 - 问题A
 {"findings_summary":"s","findings":[{"index":1,"issue":"i","recommendation":"r"}]}
 ```"#)
             .is_none());
-        let tail = f.flush_tail().unwrap();
-        assert!(tail.contains("问题汇总"));
-        assert!(tail.contains("**问题：** i"));
+        assert!(f.flush_tail().is_none());
     }
 
     #[test]

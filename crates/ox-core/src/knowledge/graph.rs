@@ -411,6 +411,7 @@ mod tests {
             weight: 0.9,
         });
         graph.upsert(e1);
+        graph.upsert(make_entity("e2", EntityKind::CodeSymbol, "helper"));
 
         let outgoing = graph.find_outgoing("e1", None);
         assert_eq!(outgoing.len(), 1);

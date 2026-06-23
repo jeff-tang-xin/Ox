@@ -1,6 +1,6 @@
 //! Skill loading policy — three tiers (system / global / project) and mandatory injection.
 
-use super::{Skill, SkillScope};
+use super::{Skill, SkillScope, skill_applies_to_phase};
 
 pub const OUTPUT_DISCIPLINE_SKILL_ID: &str = "ox-output-discipline";
 
@@ -75,7 +75,12 @@ pub fn build_on_demand_manifest(skills: &[Skill]) -> Option<String> {
     let mut global = Vec::new();
     let mut project = Vec::new();
     for s in on_demand {
-        let line = format!("- `{}`: {}", s.id, s.description.trim());
+        let phase_tag = if s.phases.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", s.phases.join(","))
+        };
+        let line = format!("- `{}`{}: {}", s.id, phase_tag, s.description.trim());
         match s.scope {
             SkillScope::System => system.push(line),
             SkillScope::Global => global.push(line),
@@ -111,6 +116,38 @@ pub fn build_on_demand_manifest(skills: &[Skill]) -> Option<String> {
     Some(out)
 }
 
+pub const SKILL_ROUTE_TAG: &str = "[SKILL_ROUTE]";
+
+/// Phase-filtered skill manifest for per-iteration injection.
+pub fn build_skill_route(skills: &[Skill], phase: &str) -> Option<String> {
+    let mut mandatory = Vec::new();
+    let mut on_demand = Vec::new();
+    for s in skills {
+        if !skill_applies_to_phase(s, phase) {
+            continue;
+        }
+        let line = format!("- `{}` [{}]: {}", s.id, s.scope, s.description.trim());
+        if is_mandatory_project_skill(&s.id) {
+            mandatory.push(line);
+        } else if s.id != PROJECT_ARCHITECTURE_LEGACY {
+            on_demand.push(line);
+        }
+    }
+    if mandatory.is_empty() && on_demand.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "{SKILL_ROUTE_TAG}\nphase={phase} | 必读已注入 system prompt 的 project skill 除外\n"
+    );
+    if !mandatory.is_empty() {
+        out.push_str(&format!("本阶段必读: {}\n", mandatory.join("\n")));
+    }
+    if !on_demand.is_empty() {
+        out.push_str(&format!("按需 load_skill:\n{}\n", on_demand.join("\n")));
+    }
+    Some(out.trim_end().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +161,7 @@ mod tests {
             content: body.into(),
             scope,
             created_at: Utc::now(),
+            phases: Vec::new(),
         }
     }
 

@@ -209,6 +209,13 @@ use_refined_context = true  # Enable refined context format (default: true)
 # max_iterations = 25          # Maximum agent loop iterations per turn
 # max_per_turn_tokens = 500000  # Max tokens per turn before user confirmation
 
+# Multi-model collaboration — different models per task role
+# [agent.collaboration]
+# enabled = true
+# review_model = "claude-sonnet-4"    # Code review / audit (read-only)
+# implement_model = "gpt-4o"          # Fix / implementation
+# qa_model = ""                       # Q&A (empty = default model)
+
 # ── Memory System ────────────────────────────────────────
 [memory]
 # max_nodes = 1000             # Maximum memory nodes to store
@@ -791,6 +798,7 @@ pub struct EmbeddingConfig {
     /// Max files to embed per user message when lazy_index is enabled.
     pub lazy_index_max_files_per_turn: usize,
     /// When lazy_index is true, continue full-project embed in background (non-blocking).
+    /// Default off — use on-demand paths + findings-first lazy embed instead.
     pub background_full_index: bool,
 }
 
@@ -812,12 +820,36 @@ impl Default for EmbeddingConfig {
             index_embed_max_chars: 2048,
             lazy_index: true,
             lazy_index_max_files_per_turn: 20,
-            background_full_index: true,
+            background_full_index: false,
         }
     }
 }
 
 // ──────────────────── Agent ────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CollaborationConfig {
+    /// When true, route LLM calls by task role (review / implement / qa).
+    pub enabled: bool,
+    /// Model for code review (read-only). Empty = use [models].default.
+    pub review_model: String,
+    /// Model for fix / implementation. Empty = use default.
+    pub implement_model: String,
+    /// Model for Q&A. Empty = use default.
+    pub qa_model: String,
+}
+
+impl Default for CollaborationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            review_model: String::new(),
+            implement_model: String::new(),
+            qa_model: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -830,6 +862,8 @@ pub struct AgentConfig {
     pub skill_reflect_enabled: bool,
     /// Workflow rounds to aggregate before prompting user to save Skill (5–10).
     pub skill_reflect_rounds: usize,
+    /// Multi-model collaboration (review vs implement vs qa).
+    pub collaboration: CollaborationConfig,
 }
 
 impl Default for AgentConfig {
@@ -839,6 +873,7 @@ impl Default for AgentConfig {
             max_per_turn_tokens: 500_000,
             skill_reflect_enabled: true,
             skill_reflect_rounds: crate::agent::skill_reflect_buffer::DEFAULT_REFLECT_THRESHOLD,
+            collaboration: CollaborationConfig::default(),
         }
     }
 }

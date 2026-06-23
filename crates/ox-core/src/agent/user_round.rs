@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::agent::engine::WorkflowEngine;
 
 pub const USER_ROUND_TAG: &str = "[USER_ROUND]";
+/// Latest user message that triggered the current agent turn (may differ from session task).
+pub const TURN_INPUT_TAG: &str = "[TURN_INPUT]";
+pub const TURN_INPUT_KEY: &str = "_turn_user_input";
 const MAX_HISTORY: usize = 3;
 pub const ROUND_FINALIZED_KEY: &str = "_round_finalized";
 
@@ -86,9 +89,77 @@ pub fn is_interrupt_boundary(content: &str) -> bool {
     content.starts_with(INTERRUPT_BOUNDARY_TAG)
 }
 
+pub fn set_turn_user_input(engine: &WorkflowEngine, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    engine.set_variable(TURN_INPUT_KEY, trimmed.to_string());
+}
+
+pub fn get_turn_user_input(engine: &WorkflowEngine) -> Option<String> {
+    engine
+        .get_variable(TURN_INPUT_KEY)
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// High-priority anchor: what the user just said this turn (overrides historical confusion).
+pub fn format_turn_input_block(engine: &WorkflowEngine) -> String {
+    let input = get_turn_user_input(engine).unwrap_or_default();
+    format_turn_input_text(&input, engine.get_variable("_current_user_request").as_deref())
+}
+
+pub fn format_turn_input_text(input: &str, session_task: Option<&str>) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+    let body: String = input.chars().take(2000).collect();
+    let mut parts = vec![
+        TURN_INPUT_TAG.to_string(),
+        format!(
+            "## ✉️ 本轮用户输入（**唯一待响应内容** — 覆盖历史误解）\n\
+             > {body}"
+        ),
+        "⚠️ **工具动作：** 以 [WORKSPACE]「本轮唯一动作」为准；本轮输入用于澄清意图、纠正历史误解。"
+            .to_string(),
+        "若历史 assistant 声称已做某事、或与本轮输入矛盾，**以本轮输入为准**；用户修正立即生效，不得沿用错误结论。"
+            .to_string(),
+    ];
+    if let Some(task) = session_task {
+        let task = task.trim();
+        if !task.is_empty() && task != input {
+            let snip: String = task.chars().take(400).collect();
+            parts.push(format!(
+                "（会话背景任务：「{snip}」— 仅作参考；**本轮须按上方输入执行**）"
+            ));
+        }
+    }
+    parts.join("\n\n")
+}
+
+pub fn inject_turn_input(messages: &mut Vec<crate::message::Message>, block: &str) {
+    if block.is_empty() {
+        return;
+    }
+    strip_turn_input(messages);
+    messages.push(crate::message::Message::system(block));
+}
+
+pub fn strip_turn_input(messages: &mut Vec<crate::message::Message>) {
+    messages.retain(|m| {
+        !matches!(
+            m,
+            crate::message::Message::System { content }
+                if content.starts_with(TURN_INPUT_TAG)
+        )
+    });
+}
+
 /// Archive previous round and reset workflow for a new user message.
 /// Returns `true` when a fresh round started (workflow reset + new anchor).
 pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool {
+    set_turn_user_input(engine, user_message);
     if engine.get_variable(ROUND_INTERRUPTED_KEY).as_deref() == Some("1") {
         let same_or_continue = engine
             .get_variable("_current_user_request")
@@ -99,8 +170,10 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
             });
         if same_or_continue && !WorkflowEngine::looks_like_new_task(user_message) {
             engine.set_variable(ROUND_INTERRUPTED_KEY, String::new());
-            if engine.workflow_preserves_on_user_input() {
-                crate::agent::workflow_guidance::append(engine, user_message);
+            if crate::agent::phase::on_user_message(engine, user_message).changed {
+                return false;
+            }
+            if engine.workflow_preserves_on_user_input(user_message) {
                 return false;
             }
         } else if let Some(prev) = engine.get_variable("_current_user_request") {
@@ -117,6 +190,8 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
         || engine.get_variable(ROUND_FINALIZED_KEY).as_deref() == Some("1")
     {
         if engine.reopen_execute_for_fixes(user_message) {
+            engine.clear_turn_provenance();
+            engine.set_variable("_current_user_request", user_message.to_string());
             return false;
         }
         if let Some(prev) = engine.get_variable("_current_user_request") {
@@ -128,7 +203,10 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
             }
         }
         engine.reset_workflow();
+        engine.clear_turn_provenance();
+        let intent = crate::agent::task_intent::resolve_for_round(&engine, user_message);
         engine.set_variable("_current_user_request", user_message.to_string());
+        crate::agent::phase::on_round_started(&engine, intent);
         return true;
     }
 
@@ -145,8 +223,8 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
         return false;
     }
 
-    if engine.workflow_preserves_on_user_input() {
-        crate::agent::workflow_guidance::append(engine, user_message);
+    if engine.workflow_preserves_on_user_input(user_message) {
+        crate::agent::phase::on_user_message(engine, user_message);
         return false;
     }
 
@@ -156,7 +234,10 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
         }
     }
     engine.reset_workflow();
+    engine.clear_turn_provenance();
+    let intent = crate::agent::task_intent::resolve_for_round(&engine, user_message);
     engine.set_variable("_current_user_request", user_message.to_string());
+    crate::agent::phase::on_round_started(&engine, intent);
     true
 }
 
@@ -310,15 +391,29 @@ pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
         return String::new();
     }
 
-    let mut parts = vec![
-        format!("{USER_ROUND_TAG}"),
-        format!(
+    let turn_input = get_turn_user_input(engine).unwrap_or_default();
+    let mut parts = vec![format!("{USER_ROUND_TAG}")];
+    if !turn_input.trim().is_empty() && turn_input.trim() != current.trim() {
+        parts.push(format!(
+            "## ✉️ 本轮用户输入（CURRENT — 优先于会话任务）\n\
+             {}\n\
+             ⚠️ 用户刚发送以上内容；若与下方会话任务不一致，**以本轮输入为准**。",
+            turn_input.chars().take(2000).collect::<String>()
+        ));
+        parts.push(format!(
+            "## 📋 会话任务（背景）\n\
+             {}\n\
+             ⚠️ 属较早轮次目标；勿与本轮输入混淆。",
+            current.chars().take(1200).collect::<String>()
+        ));
+    } else {
+        parts.push(format!(
             "## 🎯 本轮任务（CURRENT — 唯一执行目标）\n\
              {}\n\
              ⚠️ 只执行以上内容；对话历史与其它记忆中的任务均属 HISTORICAL，勿继续执行。",
             current.chars().take(2000).collect::<String>()
-        ),
-    ];
+        ));
+    }
 
     let history = load_round_history(engine);
     if !history.is_empty() {
@@ -362,6 +457,34 @@ pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
     parts.join("\n\n")
 }
 
+/// Minimal task anchor during Implement — findings live in [WORKSPACE].
+pub fn format_impl_anchor(engine: &WorkflowEngine) -> String {
+    let current = engine
+        .get_variable("_current_user_request")
+        .unwrap_or_default();
+    if current.trim().is_empty() {
+        return String::new();
+    }
+    let turn_input = get_turn_user_input(engine).unwrap_or_default();
+    if !turn_input.trim().is_empty() && turn_input.trim() != current.trim() {
+        format!(
+            "{USER_ROUND_TAG}\n\
+             ✉️ 本轮输入: {}\n\
+             📋 会话背景: {}\n\
+             ⚠️ 以本轮输入为准；findings / 进度 / 下一步见 [WORKSPACE]。",
+            turn_input.chars().take(600).collect::<String>(),
+            current.chars().take(300).collect::<String>()
+        )
+    } else {
+        format!(
+            "{USER_ROUND_TAG}\n\
+             🎯 实施任务: {}\n\
+             ⚠️ findings / 进度 / 下一步见 [WORKSPACE]；勿重复审查期探索。",
+            current.chars().take(600).collect::<String>()
+        )
+    }
+}
+
 pub fn inject_user_round(messages: &mut Vec<crate::message::Message>, block: &str) {
     if block.is_empty() {
         return;
@@ -386,12 +509,14 @@ mod tests {
 
     #[test]
     fn begin_user_round_preserves_mid_workflow() {
+        use crate::agent::workflow::{create_default_workflow, DEFAULT_WORKFLOW_ID};
+
         let session = Arc::new(Mutex::new(SessionState::new("t")));
         let mut engine = WorkflowEngine::new(Arc::clone(&session));
+        engine.register_workflow(create_default_workflow());
+        engine.activate_workflow(DEFAULT_WORKFLOW_ID).unwrap();
         engine.set_variable("_current_user_request", "fix bug A".into());
-        engine.set_variable("_step0_output", r#"{"intent":"coding"}"#.into());
-        engine.set_variable("_step1_output", r#"{"plan":[]}"#.into());
-        let _ = engine.advance_to_step(Some(1));
+        engine.set_task_intent(crate::agent::task_intent::TaskIntent::Fix);
 
         engine.begin_user_round("add feature B");
 
@@ -402,7 +527,7 @@ mod tests {
         let guidance = crate::agent::workflow_guidance::load(&engine);
         assert_eq!(guidance.len(), 1);
         assert_eq!(guidance[0].text, "add feature B");
-        assert!(!engine.get_variable("_step1_output").unwrap().is_empty());
+        assert!(engine.is_workflow_active());
     }
 
     #[test]
@@ -443,12 +568,12 @@ mod tests {
         engine.register_workflow(create_default_workflow());
         engine.activate_workflow(DEFAULT_WORKFLOW_ID).unwrap();
         engine.set_variable("_current_user_request", "push tag".into());
-        engine.set_variable("_step1_output", r#"{"plan":[]}"#.into());
-        session.blocking_lock().current_step_index = 1;
+        engine.set_variable("_step3_output", "## Done\npushed".into());
+        session.blocking_lock().current_step_index = 0;
 
         assert!(suspend_on_interrupt(&mut engine));
         assert_eq!(engine.get_variable("_round_interrupted").as_deref(), Some("1"));
-        assert!(!engine.get_variable("_step1_output").unwrap().is_empty());
+        assert!(!engine.get_variable("_step3_output").unwrap().is_empty());
         assert!(!suspend_on_interrupt(&mut engine));
     }
 
@@ -459,5 +584,35 @@ mod tests {
         assert!(msg.contains("CURRENT"));
         assert!(msg.contains("HISTORICAL"));
         assert!(msg.contains("完善 README"));
+    }
+
+    #[test]
+    fn turn_input_overrides_session_task_in_block() {
+        let session = Arc::new(Mutex::new(SessionState::new("t")));
+        let engine = WorkflowEngine::new(Arc::clone(&session));
+        engine.set_variable("_current_user_request", "审查 Foo.java".into());
+        set_turn_user_input(&engine, "先修复");
+        let block = format_turn_input_block(&engine);
+        assert!(block.contains(TURN_INPUT_TAG));
+        assert!(block.contains("先修复"));
+        assert!(block.contains("审查 Foo"));
+        assert!(block.contains("以本轮输入为准"));
+    }
+
+    #[test]
+    fn begin_user_round_sets_turn_input() {
+        use crate::agent::workflow::{create_default_workflow, DEFAULT_WORKFLOW_ID};
+
+        let session = Arc::new(Mutex::new(SessionState::new("t")));
+        let mut engine = WorkflowEngine::new(Arc::clone(&session));
+        engine.register_workflow(create_default_workflow());
+        engine.activate_workflow(DEFAULT_WORKFLOW_ID).unwrap();
+        engine.set_variable("_current_user_request", "审查".into());
+        engine.begin_user_round("先修复");
+        assert_eq!(get_turn_user_input(&engine).as_deref(), Some("先修复"));
+        assert_eq!(
+            engine.get_variable("_current_user_request").as_deref(),
+            Some("审查")
+        );
     }
 }

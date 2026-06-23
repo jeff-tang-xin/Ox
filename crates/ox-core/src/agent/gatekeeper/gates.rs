@@ -141,8 +141,10 @@ impl Gate for ScopeGate {
         if store.findings.is_empty() {
             return GateOutcome::Pass;
         }
-        // Review-only ## Done: findings reported, no code edited — receipt not required yet.
-        if !ctx.had_code_changes {
+        // Review-only ## Done (no edits yet): receipt not required — but not during implement.
+        if !ctx.had_code_changes
+            && crate::agent::phase::get(ctx.engine) != crate::agent::phase::SingleFlowPhase::Implement
+        {
             return GateOutcome::Pass;
         }
         match completion::extract_from_text(ctx.assistant_text) {
@@ -161,10 +163,119 @@ impl Gate for ScopeGate {
     }
 }
 
+/// Findings cited in store must have been read this turn (anti-hallucination).
+pub struct CitationGate;
+
+impl Gate for CitationGate {
+    fn id(&self) -> &'static str {
+        "citation"
+    }
+
+    fn check(&self, ctx: &GateCtx) -> GateOutcome {
+        if ctx.had_code_changes {
+            return GateOutcome::Pass;
+        }
+        let Some(store) = findings::load_or_migrate(ctx.engine) else {
+            return GateOutcome::Pass;
+        };
+        if store.findings.is_empty() {
+            return GateOutcome::Pass;
+        }
+        let read = crate::agent::read_guard::provenance_paths(ctx.engine);
+        let mut unread = Vec::new();
+        for f in &store.findings {
+            if f.file.trim().is_empty() {
+                continue;
+            }
+            let norm = crate::agent::plan_tracker::normalize_path(&f.file);
+            if !read.contains(&norm) {
+                unread.push(format!("#{} `{}`", f.index, f.file));
+            }
+        }
+        if unread.is_empty() {
+            return GateOutcome::Pass;
+        }
+        GateOutcome::Fail {
+            feedback: format!(
+                "❌ 以下 finding 引用了未在本轮读取的文件（须先 file_read 再断言）：\n{}\n\
+                 或从 findings 中移除未验证项。",
+                unread.join("\n")
+            ),
+        }
+    }
+}
+
+/// Report prose must not cite files that were never read.
+pub struct ProvenanceGate;
+
+impl Gate for ProvenanceGate {
+    fn id(&self) -> &'static str {
+        "provenance"
+    }
+
+    fn check(&self, ctx: &GateCtx) -> GateOutcome {
+        if ctx.had_code_changes {
+            return GateOutcome::Pass;
+        }
+        let read = crate::agent::read_guard::provenance_paths(ctx.engine);
+        if read.is_empty() {
+            return GateOutcome::Pass;
+        }
+        let mut unknown = Vec::new();
+        for path in extract_cited_paths(ctx.assistant_text) {
+            let norm = crate::agent::plan_tracker::normalize_path(&path);
+            if !read.contains(&norm) && looks_like_source_path(&path) {
+                unknown.push(path);
+            }
+        }
+        unknown.sort_unstable();
+        unknown.dedup();
+        if unknown.is_empty() {
+            return GateOutcome::Pass;
+        }
+        GateOutcome::Fail {
+            feedback: format!(
+                "❌ 报告中引用了未读取的文件（可能幻觉）：\n{}\n\
+                 请先 file_read 或删除未验证引用。",
+                unknown
+                    .iter()
+                    .take(8)
+                    .map(|p| format!("- `{p}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        }
+    }
+}
+
+fn looks_like_source_path(path: &str) -> bool {
+    path.contains('.') && (path.contains('/') || path.contains('\\'))
+}
+
+fn extract_cited_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(idx) = line.find(':') {
+            let candidate = line[..idx].trim();
+            if candidate.len() > 4 && looks_like_source_path(candidate) {
+                out.push(candidate.to_string());
+            }
+        }
+        for token in line.split(['`', '(', ')']) {
+            let t = token.trim();
+            if looks_like_source_path(t) {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::engine::WorkflowEngine;
+    use crate::agent::phase;
     use crate::agent::session::SessionState;
     use std::sync::Arc;
 
@@ -231,6 +342,23 @@ mod tests {
             ScopeGate.check(&ctx(&e, "## Done\n审查完成，见上文", false)),
             GateOutcome::Pass
         );
+    }
+
+    #[test]
+    fn scope_blocks_impl_done_without_receipt() {
+        let e = engine();
+        e.set_variable(
+            phase::PHASE_STATE_KEY,
+            phase::SingleFlowPhase::Implement.as_str().to_string(),
+        );
+        e.set_variable(
+            "_findings_store",
+            r#"{"summary":"ok","findings":[{"index":1,"severity":"high","file":"a.rs","symbol":"","issue":"x","recommendation":"","status":"open","user_notes":[],"dispute":null,"impl_log":[]}],"active_indices":[1]}"#.into(),
+        );
+        match ScopeGate.check(&ctx(&e, "## Done\n改好了", false)) {
+            GateOutcome::Fail { .. } => {}
+            other => panic!("expected fail, got {other:?}"),
+        }
     }
 
     #[test]

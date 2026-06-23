@@ -43,6 +43,9 @@ pub struct Skill {
     
     /// 文件修改时间（或 frontmatter 中的 updated_at），用于加载排序/截断；不是「本次加载时刻」
     pub created_at: chrono::DateTime<chrono::Utc>,
+
+    /// 适用阶段（review / implement …）；空 = 全阶段
+    pub phases: Vec<String>,
 }
 
 impl Skill {
@@ -159,6 +162,7 @@ impl SkillLoader {
             content: body,
             scope,
             created_at: skill_timestamp(path, &metadata),
+            phases: parse_phases_from_metadata(&metadata),
         })
     }
 }
@@ -235,7 +239,31 @@ fn parse_skill_file_static(path: &Path, scope: SkillScope) -> anyhow::Result<Ski
         content: body,
         scope,
         created_at: skill_timestamp(path, &metadata),
+        phases: parse_phases_from_metadata(&metadata),
     })
+}
+
+/// Parse `phases: review, implement` from skill frontmatter.
+pub fn parse_phases_from_metadata(metadata: &std::collections::HashMap<String, String>) -> Vec<String> {
+    metadata
+        .get("phases")
+        .map(|raw| {
+            raw.trim_matches(|c| c == '[' || c == ']')
+                .split([',', ' '])
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a skill applies to the given workflow phase string.
+pub fn skill_applies_to_phase(skill: &Skill, phase: &str) -> bool {
+    if skill.phases.is_empty() {
+        return true;
+    }
+    let p = phase.trim().to_lowercase();
+    skill.phases.iter().any(|sp| sp == &p || (p == "receive" && sp == "review"))
 }
 
 /// 解析 YAML frontmatter

@@ -5,7 +5,7 @@
 /// same, but the output type is now `Entity` instead of the legacy `Symbol` struct.
 use std::path::Path;
 use tree_sitter::Node;
-use super::entity::{Entity, SymbolType};
+use super::entity::{Entity, Relation, RelationType, SymbolType};
 use super::language::LanguageRegistry;
 
 pub struct AstExtractor {
@@ -45,6 +45,8 @@ impl AstExtractor {
         // Second pass: resolve `calls` relations by matching function names
         // against all extracted symbols in the same file
         self.resolve_calls(&mut entities);
+        // Third pass: metadata.calls → entity.relations (TriviumDB expand_depth + EntityGraph)
+        self.wire_call_relations(&mut entities);
 
         Ok(entities)
     }
@@ -129,6 +131,46 @@ impl AstExtractor {
     }
 
     // ── resolve_calls: populate the `calls` field on CodeSymbol entities ──
+
+    /// Map `metadata.calls` (fq_name strings) to `entity.relations` (target entity IDs).
+    fn wire_call_relations(&self, entities: &mut [Entity]) {
+        use std::collections::HashMap;
+
+        let fq_to_id: HashMap<String, String> = entities
+            .iter()
+            .filter_map(|e| {
+                if let super::entity::EntityMetadata::CodeSymbol { fq_name, .. } = &e.metadata {
+                    Some((fq_name.clone(), e.id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for entity in entities.iter_mut() {
+            let calls = match &entity.metadata {
+                super::entity::EntityMetadata::CodeSymbol { calls, .. } => calls.clone(),
+                _ => continue,
+            };
+            for callee_fq in calls {
+                if let Some(target_id) = fq_to_id.get(&callee_fq) {
+                    if target_id == &entity.id {
+                        continue;
+                    }
+                    let dup = entity.relations.iter().any(|r| {
+                        r.target_id == *target_id && r.relation_type == RelationType::Calls
+                    });
+                    if !dup {
+                        entity.relations.push(Relation {
+                            target_id: target_id.clone(),
+                            relation_type: RelationType::Calls,
+                            weight: 0.85,
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     fn resolve_calls(&self, entities: &mut [Entity]) {
         // Collect all function/method names defined in this file

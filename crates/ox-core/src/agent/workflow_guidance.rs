@@ -75,7 +75,7 @@ pub fn format_block(engine: &WorkflowEngine) -> String {
     }
     let mut lines = vec![
         WORKFLOW_GUIDANCE_TAG.to_string(),
-        "📣 **用户在 workflow 进行中补充说明** — 采纳后继续**当前阶段**，勿从 Intent/Plan 重来。".to_string(),
+        "📣 **用户补充说明** — 采纳后继续当前任务，勿重头探索。".to_string(),
     ];
     for e in &entries {
         let snippet: String = e.text.chars().take(800).collect();
@@ -89,16 +89,9 @@ pub fn format_block(engine: &WorkflowEngine) -> String {
 }
 
 /// Wrap a live interjection for the message list.
-pub fn format_interjection_message(engine: &WorkflowEngine, text: &str) -> String {
-    if !engine.workflow_preserves_on_user_input() {
-        return text.to_string();
-    }
-    let step_name = engine
-        .current_step()
-        .map(|s| s.name.clone())
-        .unwrap_or_else(|| "当前步骤".to_string());
+pub fn format_interjection_message(_engine: &WorkflowEngine, text: &str) -> String {
     format!(
-        "[WORKFLOW_INTERJECTION — 用户在 {step_name} 阶段补充，请采纳并继续当前 workflow，勿回到 Intent/Plan]\n{}",
+        "[WORKFLOW_INTERJECTION — 用户补充，请采纳并继续当前任务]\n{}",
         text.trim()
     )
 }

@@ -102,6 +102,37 @@ pub fn panel_summary(store: &FindingsStore) -> String {
     }
 }
 
+/// Compact findings card for chat / TurnDone (no JSON, no markdown table).
+pub fn format_findings_card(store: &FindingsStore) -> String {
+    let mut lines = vec!["**审查发现**".to_string()];
+    if !store.summary.is_empty() {
+        lines.push(store.summary.clone());
+    }
+    lines.push(String::new());
+    for f in &store.findings {
+        let loc = if f.file.is_empty() {
+            f.symbol.clone()
+        } else if f.symbol.is_empty() {
+            f.file.clone()
+        } else {
+            format!("{} · {}", f.file, f.symbol)
+        };
+        lines.push(format!(
+            "**#{}** [{}] {}",
+            f.index,
+            f.severity.label(),
+            loc
+        ));
+        lines.push(format!("  {}", f.issue));
+        if !f.recommendation.is_empty() {
+            lines.push(format!("  → {}", f.recommendation));
+        }
+        lines.push(String::new());
+    }
+    lines.push("面板 `1-9` 选范围 · `c` 或 /confirm 确认实施 · /discuss 讨论".to_string());
+    lines.join("\n").trim_end().to_string()
+}
+
 pub fn load_executive(engine: &super::engine::WorkflowEngine) -> Option<String> {
     findings::load_or_migrate(engine).map(|s| format_executive(&s))
 }

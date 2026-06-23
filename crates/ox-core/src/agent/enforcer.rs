@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn test_non_trivial_edit_requires_plan() {
         // 大段修改：old_string 超过阈值，没有 plan 应被拦截
-        let long_old = "fn main() {\n    println!(\"Hello, world!\");\n}".to_string();
+        let long_old = "fn main() {\n    println!(\"Hello, world!\");\n    let x = 1;\n    let y = 2;\n}".to_string();
         let tc = make_edit_file_call("src/main.rs", &long_old, "fn main() {}");
         let messages = vec![];
         let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn test_batch_edits_mixed_requires_plan() {
         // 批量编辑中有一个 old_string 很长，需要 plan
-        let long_old = "fn main() {\n    println!(\"Hello, world!\");\n}".to_string();
+        let long_old = "fn main() {\n    println!(\"Hello, world!\");\n    let x = 1;\n    let y = 2;\n}".to_string();
         let tc = ToolCall {
             id: "test".to_string(),
             name: "edit_file".to_string(),

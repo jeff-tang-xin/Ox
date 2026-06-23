@@ -104,6 +104,22 @@ impl TurnMemory {
         self.iterations += 1;
     }
 
+    pub fn format_injection_slim(&self, iteration: u32) -> String {
+        let mut out = format!(
+            "[TURN_MEMORY — IMPLEMENT]\n\
+             iteration {} | 工具 {} 次",
+            iteration + 1,
+            self.entries.len()
+        );
+        for e in self.entries.iter().rev().take(8).rev() {
+            out.push_str(&format!(
+                "\n  • {}({}) → {}",
+                e.tool, e.target, e.outcome
+            ));
+        }
+        out
+    }
+
     pub fn format_injection(&self, iteration: u32) -> String {
         let mut out = format!(
             "[TURN_MEMORY — CURRENT ROUND ONLY]\n\
@@ -113,7 +129,7 @@ impl TurnMemory {
         );
         if !self.user_task.is_empty() {
             let task: String = self.user_task.chars().take(300).collect();
-            out.push_str(&format!("\n🎯 本轮任务锚点: {task}"));
+            out.push_str(&format!("\n✉️ 本轮用户输入: {task}"));
         }
         if self.entries.is_empty() {
             out.push_str("\n（本轮尚无工具记录）");

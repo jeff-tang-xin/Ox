@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use super::entity::{Entity, EntityKind, EntityMetadata, injection_priority};
+use super::memory_cluster;
 use super::KnowledgeEngine;
 use crate::context::detect_intent;
 
@@ -48,6 +49,10 @@ pub struct ContextInjection {
 pub struct ContextBlocks {
     /// Relevant code symbols found
     pub code_symbols: String,
+    /// 1-hop call-graph neighbors of top symbol hits
+    pub code_graph: String,
+    /// L0–L3 entities linked via memory graph traversal
+    pub memory_clusters: String,
     /// Relevant memories (L1-L3)
     pub memories: String,
     /// Recent working memory (L0)
@@ -128,6 +133,9 @@ pub fn run_retrieval(
         }
     }
 
+    let graph_block = expand_code_graph_neighbors(engine, &mut candidates, 5, 12);
+    let memory_cluster_block = memory_cluster::expand_into_candidates(engine, &mut candidates, 10);
+
     // ── Step 4: Result Fusion ──
     // L0 WorkingMemory entities ALWAYS come first, then by injection priority + score
     let mut fused: Vec<(Entity, f32)> = candidates.into_values().collect();
@@ -148,7 +156,9 @@ pub fn run_retrieval(
     let fused = deduplicate_near_duplicates(fused);
 
     // ── Step 5: Budget-aware Cut ──
-    let (selected, blocks) = cut_by_budget(&fused, max_tokens);
+    let (selected, mut blocks) = cut_by_budget(&fused, max_tokens);
+    blocks.code_graph = graph_block;
+    blocks.memory_clusters = memory_cluster_block;
 
     let token_estimate = estimate_tokens(&blocks);
 
@@ -221,6 +231,9 @@ pub fn run_retrieval_for_step(
         }
     }
 
+    let graph_block = expand_code_graph_neighbors(engine, &mut candidates, 5, 12);
+    let memory_cluster_block = memory_cluster::expand_into_candidates(engine, &mut candidates, 10);
+
     // Fusion: L0 always top
     let mut fused: Vec<(Entity, f32)> = candidates.into_values().collect();
     fused.sort_by(|(a, a_score), (b, b_score)| {
@@ -235,7 +248,9 @@ pub fn run_retrieval_for_step(
         }
     });
     let fused = deduplicate_near_duplicates(fused);
-    let (selected, blocks) = cut_by_budget(&fused, max_tokens);
+    let (selected, mut blocks) = cut_by_budget(&fused, max_tokens);
+    blocks.code_graph = graph_block;
+    blocks.memory_clusters = memory_cluster_block;
     let token_estimate = estimate_tokens(&blocks);
 
     tracing::info!(
@@ -244,6 +259,44 @@ pub fn run_retrieval_for_step(
     );
 
     Ok(ContextInjection { entities: selected, blocks, token_estimate })
+}
+
+/// Expand top CodeSymbol hits along 1-hop `Calls` edges (in-memory EntityGraph).
+fn expand_code_graph_neighbors(
+    engine: &KnowledgeEngine,
+    candidates: &mut HashMap<String, (Entity, f32)>,
+    max_seeds: usize,
+    max_neighbors: usize,
+) -> String {
+    let seed_ids: Vec<String> = candidates
+        .iter()
+        .filter(|(_, (e, _))| e.kind == EntityKind::CodeSymbol)
+        .take(max_seeds)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if seed_ids.is_empty() {
+        return String::new();
+    }
+    let neighbors = engine.graph_call_neighbors(&seed_ids, max_neighbors);
+    let mut lines = Vec::new();
+    for n in neighbors {
+        let is_new = !candidates.contains_key(&n.id);
+        if is_new {
+            if let EntityMetadata::CodeSymbol {
+                fq_name,
+                file_path,
+                start_line,
+                ..
+            } = &n.metadata
+            {
+                lines.push(format!("- → `{fq_name}` @ {file_path}:{start_line}"));
+            }
+            candidates
+                .entry(n.id.clone())
+                .or_insert_with(|| (n, 0.55));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Classify the user's query intent and extract entities.
@@ -491,6 +544,8 @@ fn format_entity_for_context(entity: &Entity) -> String {
 /// Estimate token count from formatted context blocks.
 fn estimate_tokens(blocks: &ContextBlocks) -> usize {
     let total_chars = blocks.code_symbols.len()
+        + blocks.code_graph.len()
+        + blocks.memory_clusters.len()
         + blocks.memories.len()
         + blocks.working_memory.len();
     total_chars / 4 // Rough: 4 chars ≈ 1 token
@@ -525,6 +580,20 @@ pub fn format_context_for_prompt(
         parts.push(format!(
             "### Relevant Code Symbols（代码背景）\n{}",
             injection.blocks.code_symbols
+        ));
+    }
+
+    if !injection.blocks.code_graph.is_empty() {
+        parts.push(format!(
+            "### Code Graph（调用关联 — 1-hop）\n{}",
+            injection.blocks.code_graph
+        ));
+    }
+
+    if !injection.blocks.memory_clusters.is_empty() {
+        parts.push(format!(
+            "### Memory Clusters（记忆关联图 — L0–L3）\n{}",
+            injection.blocks.memory_clusters
         ));
     }
 
@@ -642,6 +711,8 @@ mod tests {
             entities: vec![],
             blocks: ContextBlocks {
                 code_symbols: "- [function] `auth::validate_token` @ src/auth.rs:42-58".into(),
+                code_graph: String::new(),
+                memory_clusters: String::new(),
                 memories: String::new(),
                 working_memory: "- [L0] fixed auth bug ✏️".into(),
             },

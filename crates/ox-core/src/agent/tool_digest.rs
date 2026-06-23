@@ -133,20 +133,10 @@ fn extract_symbols(lines: &[&str], line_offset: u32) -> Vec<SymbolRef> {
                 .to_string();
             (name, "function".to_string())
         } else if trimmed.starts_with("pub struct ") || trimmed.starts_with("struct ") {
-            let name = trimmed
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("struct")
-                .trim_end_matches('{')
-                .to_string();
+            let name = type_name_after_keyword(trimmed, "struct");
             (name, "struct".to_string())
         } else if trimmed.starts_with("pub enum ") || trimmed.starts_with("enum ") {
-            let name = trimmed
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("enum")
-                .trim_end_matches('{')
-                .to_string();
+            let name = type_name_after_keyword(trimmed, "enum");
             (name, "enum".to_string())
         } else if trimmed.starts_with("impl ") {
             let name = trimmed
@@ -155,6 +145,28 @@ fn extract_symbols(lines: &[&str], line_offset: u32) -> Vec<SymbolRef> {
                 .unwrap_or("impl")
                 .to_string();
             (name, "impl".to_string())
+        } else if trimmed.contains(" class ")
+            || trimmed.starts_with("public class ")
+            || trimmed.starts_with("class ")
+        {
+            let name = java_type_name(trimmed, "class");
+            (name, "class".to_string())
+        } else if trimmed.contains('(')
+            && !trimmed.starts_with("//")
+            && (trimmed.contains("void ")
+                || trimmed.contains("public ")
+                || trimmed.contains("private ")
+                || trimmed.contains("protected ")
+                || trimmed.contains("static "))
+        {
+            let name = trimmed
+                .split('(')
+                .next()
+                .and_then(|s| s.split_whitespace().last())
+                .filter(|n| !n.is_empty() && *n != "void")
+                .unwrap_or("method")
+                .to_string();
+            (name, "method".to_string())
         } else {
             continue;
         };
@@ -168,6 +180,25 @@ fn extract_symbols(lines: &[&str], line_offset: u32) -> Vec<SymbolRef> {
     }
     out.truncate(12);
     out
+}
+
+fn type_name_after_keyword(line: &str, keyword: &str) -> String {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let mut saw_keyword = false;
+    for part in parts {
+        if part == keyword {
+            saw_keyword = true;
+            continue;
+        }
+        if saw_keyword {
+            return part.trim_end_matches('{').to_string();
+        }
+    }
+    keyword.to_string()
+}
+
+fn java_type_name(line: &str, keyword: &str) -> String {
+    type_name_after_keyword(line, keyword)
 }
 
 fn summarize_content(path: &str, lines: &[&str], symbols: &[SymbolRef]) -> String {
@@ -217,5 +248,13 @@ mod tests {
         let d = build_digest("a.rs", content, 0, Some(1));
         assert!(d.symbols.iter().any(|s| s.name == "foo"));
         assert!(d.symbols.iter().any(|s| s.name == "Bar"));
+    }
+
+    #[test]
+    fn extract_java_method() {
+        let content = "public class Foo {\n  public void doHandle(Request req) {\n  }\n}\n";
+        let d = build_digest("Foo.java", content, 0, Some(1));
+        assert!(d.symbols.iter().any(|s| s.name == "doHandle"));
+        assert!(d.symbols.iter().any(|s| s.name == "Foo"));
     }
 }

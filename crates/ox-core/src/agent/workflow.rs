@@ -104,44 +104,37 @@ impl Workflow {
 }
 
 pub const DEFAULT_WORKFLOW_ID: &str = "single_step";
-pub const LEGACY_WORKFLOW_ID: &str = "four_step_pipeline";
+
+/// Minimal step directive during Implement — full [`TASK_PROMPT`] is omitted; `[WORKSPACE]` is authority.
+pub const IMPLEMENT_TURN_STEP_HINT: &str = "\
+【实施阶段 — 同一会话接续审查】\n\
+上方 findings / 工具 digest 仍有效。以 [WORKSPACE]「本轮唯一动作」为唯一依据；\n\
+禁止重出审查报告或 findings JSON；直接 file_read（如需）→ edit_file。";
 
 const TASK_PROMPT: &str = "\
-【任务】完成用户请求。每轮二选一：**调工具** 或 **交产物**。
+【单步 Agent — 同一会话内完成审查→确认→实施】
 
-【用户请求】{USER_REQUEST}
-【用户补充】{USER_GUIDANCE}
+用户请求: {USER_REQUEST}
+用户补充: {USER_GUIDANCE}
 
-【输出纪律】已注入 system prompt；每轮 LLM 前会刷新摘要，遵守 ox-output-discipline。
+生命周期（**一条 ReAct 链路**，非两次独立对话）:
+1. **审查** — 探索 + 产出 prose 报告 + findings JSON + `## Done`
+2. **门禁** — findings 入库后暂停工具；用户在面板选范围并确认（或输入讨论）
+3. **实施** — 收到 [PHASE_SWITCH] 后按 findings 逐项 edit_file → 验证 → completion_receipt + `## Done`
 
-【计划性 — 复杂/多文件任务】
-先输出 `## Plan`，用 checkbox 列出步骤，逐项推进；完成的标 `- [x]`：
-## Plan
-- [ ] 步骤一
-- [ ] 步骤二
-最终 ## Done 时所有项必须是 `- [x]`（门禁校验，未完成会被打回）。
+规则:
+1. 每次 LLM 调用前读 [WORKSPACE]「本轮唯一动作」— **只做这一件事**
+2. [WORKSPACE].禁止 里的工具/行为一律不可用
+3. 阶段切换看 [PHASE_SWITCH]；**上方审查 findings 在实施阶段仍然有效**，勿重出报告
+4. 门禁阶段（await_user）禁止一切工具 — 仅文字回应用户讨论
 
-【审查任务 — 输出 findings】
-检查/审查代码时，除文字报告外，附独立 findings JSON 块，然后 ## Done 结束（**只审查、不改代码**时到此为止，无需 completion_receipt）：
+findings JSON（审查 Done 时附在 prose 后，供机器解析）:
 ```json
-{
-  \"findings_summary\": \"≥30字结论\",
-  \"findings\": [
-    {\"index\":1,\"severity\":\"high|medium|low\",\"file\":\"路径\",\"target\":\"类/方法\",\"issue\":\"问题\",\"recommendation\":\"建议\"}
-  ]
-}
+{{\"findings_summary\":\"…\",\"findings\":[{{\"index\":1,\"severity\":\"high\",\"file\":\"路径\",\"target\":\"符号\",\"issue\":\"…\",\"recommendation\":\"…\"}}]}}
 ```
-用户要求**修复** findings 时，## Done 才须附 completion_receipt：
 
+completion_receipt（修复 Done 时）:
 {COMPLETION_RECEIPT_SCHEMA}
-
-【工具】file_read, file_list, file_search, code_search, find_symbol, project_detect, \
-file_write, edit_file, delete_range, shell_exec, git_status, git_diff, load_skill
-
-【完成格式】
-## Done
-<做了什么 + 验证结果，1–3 行>
-（有计划则附最终勾选状态；**仅修复任务**附 completion_receipt JSON）
 ";
 
 /// Single-step agent workflow — no Intent/Plan/Review pipeline.
@@ -163,11 +156,27 @@ pub fn create_default_workflow() -> Workflow {
     workflow
 }
 
-/// Legacy stubs — single-step model has no execute modes.
-pub fn execute_mode_banner(_engine: &crate::agent::engine::WorkflowEngine) -> &'static str {
-    "【Agent】"
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::engine::WorkflowEngine;
+    use crate::agent::phase::{self, SingleFlowPhase};
+    use crate::agent::session::SessionState;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
-pub fn execute_mode_rules(_engine: &crate::agent::engine::WorkflowEngine) -> &'static str {
-    ""
+    #[test]
+    fn implement_turn_omits_full_task_prompt() {
+        let session = Arc::new(Mutex::new(SessionState::new("t")));
+        let mut engine = WorkflowEngine::new(Arc::clone(&session));
+        engine.register_workflow(create_default_workflow());
+        engine.activate_workflow(DEFAULT_WORKFLOW_ID).unwrap();
+        engine.set_variable(
+            phase::PHASE_STATE_KEY,
+            SingleFlowPhase::Implement.as_str().to_string(),
+        );
+        let prompt = engine.get_step_system_prompt().unwrap();
+        assert_eq!(prompt, IMPLEMENT_TURN_STEP_HINT);
+        assert!(!prompt.contains("```json"));
+    }
 }

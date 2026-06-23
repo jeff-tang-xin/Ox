@@ -460,14 +460,6 @@ fn finding_from_item(item: &FindingItem) -> Finding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    use crate::agent::session::SessionState;
-
-    fn test_engine() -> WorkflowEngine {
-        WorkflowEngine::new(Arc::new(Mutex::new(SessionState::new("t"))))
-    }
 
     #[test]
     fn set_scope_marks_findings() {

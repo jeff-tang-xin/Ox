@@ -123,10 +123,24 @@ pub fn handle_confirmation_key(app: &mut App, key: &crossterm::event::KeyEvent) 
         return false;
     };
 
+    let is_iteration = pc.tool_call_id == "__iteration_limit__";
+    let is_budget = pc.tool_call_id == "__budget__";
+    let yn_only = is_iteration || is_budget;
+
     let decision = match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(ConfirmationDecision::Allow),
         KeyCode::Char('n') | KeyCode::Char('N') => Some(ConfirmationDecision::Deny),
-        KeyCode::Char('t') | KeyCode::Char('T') => Some(ConfirmationDecision::TrustAlways),
+        KeyCode::Char('t') | KeyCode::Char('T') if !yn_only => {
+            Some(ConfirmationDecision::TrustAlways)
+        }
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            app.pending_confirmation = Some(pc);
+            app.output.push_line(OutputLine::System(
+                "ℹ️ T 仅用于「始终信任该工具」。本轮续跑请按 Y，停止请按 N。".into(),
+            ));
+            app.dirty = true;
+            return true;
+        }
         _ => None,
     };
 
@@ -136,18 +150,32 @@ pub fn handle_confirmation_key(app: &mut App, key: &crossterm::event::KeyEvent) 
                 tool_call_id: pc.tool_call_id,
                 decision,
             });
-            let msg = match decision {
-                ConfirmationDecision::Allow => "  -> Allowed",
-                ConfirmationDecision::Deny => "  -> Denied",
-                ConfirmationDecision::TrustAlways => {
-                    app.trusted_all = true;
-                    "  -> Trusted all tools for this session. Use /untrust to revoke."
+            let msg = if is_iteration {
+                match decision {
+                    ConfirmationDecision::Allow => "  → 继续执行（迭代计数已重置）",
+                    ConfirmationDecision::Deny => "  → 已停止本轮",
+                    ConfirmationDecision::TrustAlways => unreachable!(),
+                }
+            } else if is_budget {
+                match decision {
+                    ConfirmationDecision::Allow => "  → 继续（忽略预算提醒）",
+                    ConfirmationDecision::Deny => "  → 已停止本轮",
+                    ConfirmationDecision::TrustAlways => unreachable!(),
+                }
+            } else {
+                match decision {
+                    ConfirmationDecision::Allow => "  → 已允许",
+                    ConfirmationDecision::Deny => "  → 已拒绝",
+                    ConfirmationDecision::TrustAlways => {
+                        app.trusted_all = true;
+                        "  → 已信任该工具（本会话不再询问）。用 /untrust 可撤销。"
+                    }
                 }
             };
             app.output.push_line(OutputLine::System(msg.to_string()));
         } else {
             app.output.push_line(OutputLine::Error(
-                "  -> Error: agent channel closed, cannot confirm".to_string(),
+                "  → 错误：agent 通道已关闭，无法确认".to_string(),
             ));
         }
         app.dirty = true;

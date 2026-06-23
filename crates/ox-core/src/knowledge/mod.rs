@@ -38,6 +38,8 @@ pub mod layering;
 pub mod keywords;
 pub mod memory_node;
 pub mod live_update;
+pub mod memory_cluster;
+pub mod consolidation;
 pub mod retrieval;
 pub mod vector_store;
 
@@ -49,7 +51,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use anyhow::Result;
 
-use entity::{Entity, EntityKind, injection_priority};
+use entity::{Entity, EntityKind, RelationType, injection_priority};
 use graph::EntityGraph;
 use layering::AutoLayering;
 use bm25::Bm25Index;
@@ -283,6 +285,51 @@ impl KnowledgeEngine {
         if let Ok(mut g) = self.entity_graph.try_lock() {
             g.upsert(entity.clone());
         }
+    }
+
+    pub(crate) fn lock_entity_graph(&self) -> std::sync::MutexGuard<'_, EntityGraph> {
+        self.entity_graph.lock().unwrap()
+    }
+
+    /// Persist entities produced by [`live_update::on_tool_executed`].
+    pub fn apply_live_update(&mut self, result: live_update::LiveUpdateResult) -> Result<()> {
+        let all: Vec<&Entity> = result
+            .new_working_memories
+            .iter()
+            .chain(result.updated_symbols.iter())
+            .chain(result.extracted_facts.iter())
+            .collect();
+        for entity in all {
+            self.store.insert_entity(entity)?;
+            self.track_entity(entity);
+            self.after_entity_stored(entity);
+        }
+        if !result.new_working_memories.is_empty() || !result.extracted_facts.is_empty() {
+            tracing::debug!(
+                "[LIVE_UPDATE] stored {} WM, {} facts",
+                result.new_working_memories.len(),
+                result.extracted_facts.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// Run live-update hook and persist new L0 / fact entities.
+    pub fn process_tool_execution(
+        &mut self,
+        ctx: &live_update::ToolExecutionContext,
+    ) -> Result<()> {
+        let session_id = ctx.session_id.clone();
+        let update = {
+            let graph = self.entity_graph.lock().unwrap();
+            live_update::on_tool_executed(ctx, &graph)
+        };
+        let layer_check = update.trigger_layering_check;
+        self.apply_live_update(update)?;
+        if layer_check {
+            consolidation::on_tool_layering_check(self, &session_id);
+        }
+        Ok(())
     }
 
     /// Rule-based L0→L3 promotion (no LLM). Returns number of new entities stored.
@@ -1038,8 +1085,62 @@ impl KnowledgeEngine {
         self.extractor.lock().unwrap().detect_language(path).map(|s| s.to_string())
     }
 
+    /// 1-hop `Calls` neighbors of seed symbols (in-memory EntityGraph).
+    pub fn graph_call_neighbors(&self, seed_ids: &[String], max_neighbors: usize) -> Vec<Entity> {
+        if seed_ids.is_empty() || max_neighbors == 0 {
+            return Vec::new();
+        }
+        let graph = self.entity_graph.lock().unwrap();
+        graph
+            .traverse(seed_ids, 1, Some(&[RelationType::Calls]))
+            .into_iter()
+            .filter(|r| r.distance > 0)
+            .take(max_neighbors)
+            .map(|r| r.entity)
+            .collect()
+    }
+
+    /// Symbols that call `symbol_id` (incoming `Calls` edges).
+    pub fn graph_callers(&self, symbol_id: &str, max: usize) -> Vec<Entity> {
+        let graph = self.entity_graph.lock().unwrap();
+        graph
+            .find_callers(symbol_id)
+            .into_iter()
+            .take(max)
+            .cloned()
+            .collect()
+    }
+
+    /// Symbols called by `symbol_id` (outgoing `Calls` edges).
+    pub fn graph_callees(&self, symbol_id: &str, max: usize) -> Vec<Entity> {
+        let graph = self.entity_graph.lock().unwrap();
+        graph
+            .find_outgoing(symbol_id, Some(RelationType::Calls))
+            .into_iter()
+            .take(max)
+            .cloned()
+            .collect()
+    }
+
     /// Get the embedding dimension.
     pub fn dimension(&self) -> usize {
         self.dimension
+    }
+}
+
+/// Poll until a read lock is available (background embed releases write between chunks).
+pub async fn acquire_read_with_backoff(
+    engine: &std::sync::Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    max_wait: std::time::Duration,
+) -> Option<tokio::sync::RwLockReadGuard<'_, KnowledgeEngine>> {
+    let deadline = std::time::Instant::now() + max_wait;
+    loop {
+        match engine.try_read() {
+            Ok(guard) => return Some(guard),
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(_) => return None,
+        }
     }
 }

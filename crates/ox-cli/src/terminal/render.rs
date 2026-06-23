@@ -8,7 +8,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::helpers::formatting::short_display_path;
 use super::app::{App, ParkFollowUpTag};
 use super::input_pane::InputPane;
-use super::output_pane::OutputLine;
+use super::output_pane::{
+    OutputLine, ThinkPaneMode, CHAT_THINK_HEIGHT_RATIO, SESSION_WIDTH_MAX, SESSION_WIDTH_MIN,
+    SESSION_WIDTH_PERCENT, THINK_PANE_SLIM_HEIGHT,
+};
 
 const BG: Color = Color::Rgb(0, 0, 0);
 const BG_INPUT: Color = Color::Rgb(30, 30, 30);
@@ -199,19 +202,47 @@ fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
 
     let has_sidebar_content = !app.sessions.is_empty() || !app.plan_items.is_empty();
+    // Session column: smallest width slice.
     let sidebar_w = if has_sidebar_content {
-        (area.width / 5).clamp(18, 35) // Adaptive sidebar width
+        let pct = area.width.saturating_mul(SESSION_WIDTH_PERCENT) / 100;
+        pct.clamp(SESSION_WIDTH_MIN, SESSION_WIDTH_MAX)
     } else {
         0
     };
 
-    let main_chunks =
+    let row_chunks =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(sidebar_w)]).split(area);
 
-    render_chat(frame, app, main_chunks[0]);
+    let tick = app.spinner_frame;
+    let think_mode = app.output.think_pane_mode(app.agent_running);
+
+    match think_mode {
+        ThinkPaneMode::Hidden => {
+            render_chat(frame, app, row_chunks[0]);
+        }
+        ThinkPaneMode::Slim => {
+            let col_chunks = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(THINK_PANE_SLIM_HEIGHT),
+            ])
+            .split(row_chunks[0]);
+            render_chat(frame, app, col_chunks[0]);
+            render_think_pane(frame, app, col_chunks[1], tick, think_mode);
+        }
+        ThinkPaneMode::Expanded => {
+            let (chat_ratio, think_ratio) = CHAT_THINK_HEIGHT_RATIO;
+            let col_chunks = Layout::vertical([
+                Constraint::Ratio(chat_ratio, chat_ratio + think_ratio),
+                Constraint::Ratio(think_ratio, chat_ratio + think_ratio),
+            ])
+            .split(row_chunks[0]);
+            render_chat(frame, app, col_chunks[0]);
+            render_think_pane(frame, app, col_chunks[1], tick, think_mode);
+        }
+    }
 
     if sidebar_w > 0 {
-        render_sidebar(frame, app, main_chunks[1]);
+        render_sidebar(frame, app, row_chunks[1]);
     }
 }
 
@@ -260,12 +291,9 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let output_width = inner.width as usize;
     let inner_height = inner.height as usize;
 
+    let tick = spinner_frame;
     let md = &app.md_renderer;
     let out = &mut app.output;
-    if out.has_live_thinking() {
-        out.invalidate_thinking_cache();
-    }
-    let tick = spinner_frame;
     let (mut lines, _total) =
         out.get_visible_lines(output_width, inner_height, scroll_offset, |ol, w| {
             render_single_line(ol, w, md, tick)
@@ -283,6 +311,107 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(block)
         .wrap(Wrap { trim: false });
 
+    frame.render_widget(paragraph, area);
+}
+
+/// Dedicated think pane — expands only while reasoning / agent activity.
+fn render_think_pane(frame: &mut Frame, app: &App, area: Rect, tick: u64, mode: ThinkPaneMode) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
+    const THINK_COLOR: Color = Color::Rgb(160, 140, 220);
+    const THINK_BG: Color = Color::Rgb(28, 24, 40);
+
+    let active = app.output.has_live_thinking() || app.agent_running;
+    let spinner = SPINNER[(tick as usize) % SPINNER.len()];
+    let title = if active {
+        format!(" {spinner} Think ")
+    } else {
+        " Think ".to_string()
+    };
+
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(BORDER))
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(THINK_COLOR)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(THINK_BG));
+
+    let inner = block.inner(area);
+    let width = inner.width as usize;
+    let max_lines = inner.height as usize;
+
+    let row_style = Style::default().fg(THINK_COLOR).bg(THINK_BG);
+    let pad_bg = Style::default().bg(THINK_BG);
+
+    let text_lines: Vec<String> = if let Some(dock) = &app.output.live_thinking {
+        let mut lines = Vec::new();
+        if let Some(hint) = dock.status_hint.as_deref().filter(|s| !s.trim().is_empty()) {
+            let max_chars = width.saturating_sub(4).max(12);
+            let h = if hint.chars().count() > max_chars {
+                format!(
+                    "{}…",
+                    hint.chars().take(max_chars.saturating_sub(1)).collect::<String>()
+                )
+            } else {
+                hint.to_string()
+            };
+            lines.push(h);
+        }
+        let body_max = max_lines.saturating_sub(lines.len());
+        if body_max > 0 && !dock.text.trim().is_empty() {
+            let mut body = super::output_pane::thinking_pane_lines(
+                &dock.text,
+                None,
+                width,
+                body_max,
+            );
+            lines.append(&mut body);
+        } else if lines.len() == 1 && body_max > 0 {
+            lines.push("等待模型推理输出…".to_string());
+        }
+        lines
+    } else if app.agent_running {
+        let hint = if app.status.trim().is_empty() {
+            "等待模型推理…".to_string()
+        } else {
+            app.status.clone()
+        };
+        super::output_pane::thinking_pane_lines(&hint, None, width, max_lines)
+    } else {
+        return;
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, line) in text_lines.iter().enumerate() {
+        let style = row_style;
+        let prefix = if i == 0 {
+            format!(" {spinner} ")
+        } else {
+            "    ".to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, pad_bg),
+            Span::styled(line.clone(), style),
+        ]));
+    }
+
+    while lines.len() < max_lines {
+        lines.push(Line::from(Span::styled(
+            " ".repeat(width.max(1)),
+            pad_bg,
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
@@ -337,50 +466,7 @@ fn render_single_line(
             }
             vec![Line::from(spans)]
         }
-        OutputLine::Thinking {
-            text,
-            collapsed,
-            status_hint,
-        } => {
-            const THINK_COLOR: Color = Color::Rgb(160, 140, 220);
-            let hint = status_hint.as_deref();
-            let display = if *collapsed {
-                text.clone()
-            } else {
-                let segments = super::output_pane::thinking_carousel_segments(text, hint);
-                if segments.is_empty() {
-                    hint.unwrap_or("思考中…").to_string()
-                } else {
-                    let idx = ((tick / 12) as usize) % segments.len();
-                    segments[idx].clone()
-                }
-            };
-            let max_chars = width.saturating_sub(8).max(20);
-            let shown = if display.chars().count() > max_chars {
-                format!("{}…", display.chars().take(max_chars.saturating_sub(1)).collect::<String>())
-            } else {
-                display
-            };
-            let spinner = if *collapsed {
-                "🧠"
-            } else {
-                SPINNER[(tick as usize) % SPINNER.len()]
-            };
-            vec![Line::from(vec![
-                Span::styled(
-                    format!(" {spinner} "),
-                    Style::default().fg(THINK_COLOR).bg(Color::Rgb(28, 24, 40)),
-                ),
-                Span::styled(
-                    if *collapsed {
-                        format!("思考 · {shown}")
-                    } else {
-                        shown
-                    },
-                    Style::default().fg(if *collapsed { TEXT_DIM } else { THINK_COLOR }),
-                ),
-            ])]
-        }
+        OutputLine::Thinking { .. } => Vec::new(),
         OutputLine::ToolResult {
             name: _,
             summary,
@@ -656,11 +742,16 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         left_parts.push(Span::styled(padded, status_style.add_modifier(Modifier::BOLD)));
     }
 
-    // Right side: Message count and cost (compact format)
+    // Right side: phase + message count and cost (compact format)
     let running_indicator = if app.agent_running { "⏳ " } else { "" };
+    let phase_part = if app.workflow_phase_line.is_empty() {
+        String::new()
+    } else {
+        format!("{} │ ", app.workflow_phase_line)
+    };
     let right_text = format!(
-        "{}{} msgs | {}",
-        running_indicator, app.message_count, app.cost_summary
+        "{}{}{} msgs | {}",
+        running_indicator, phase_part, app.message_count, app.cost_summary
     );
     let right_width = UnicodeWidthStr::width(right_text.as_str()) as u16;
 
@@ -807,7 +898,11 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     frame.render_widget(Clear, area);
 
     let indexing_prompt: String;
-    let (prompt_spans, prompt_len) = if app.pending_confirmation.is_some() {
+    let (prompt_spans, prompt_len) = if app.pending_confirmation.as_ref().is_some_and(|p| {
+        p.tool_call_id == "__iteration_limit__" || p.tool_call_id == "__budget__"
+    }) {
+        prompt_span("❯ Y/N > ", Color::Yellow)
+    } else if app.pending_confirmation.is_some() {
         prompt_span("❯ Y/N/T > ", Color::Yellow)
     } else if app.workflow_awaiting_confirmation == Some(0) {
         prompt_span("❯ 澄清 > ", Color::Magenta)
@@ -836,7 +931,18 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     };
 
     // Add visual indicator for confirmation mode
-    let block = if app.pending_confirmation.is_some() {
+    let block = if app.pending_confirmation.as_ref().is_some_and(|p| p.tool_call_id == "__iteration_limit__") {
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(BG_INPUT))
+            .title(" 迭代续跑确认 ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+    } else if app.pending_confirmation.is_some() {
         Block::default()
             .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::Yellow))

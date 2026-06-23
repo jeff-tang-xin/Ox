@@ -60,6 +60,11 @@ pub fn is_idle_narrative(content: &str) -> bool {
     if crate::agent::engine::extract_json_block(t).is_some() {
         return false;
     }
+    // Long prose is substantive reasoning — not "空转" just because it says "让我先读".
+    const SUBSTANTIVE_CHARS: usize = 280;
+    if t.chars().count() >= SUBSTANTIVE_CHARS {
+        return false;
+    }
     let lower = t.to_lowercase();
     const MARKERS: &[&str] = &[
         "好的",
@@ -122,103 +127,24 @@ pub fn is_step_deliverable(ctx: &IdleContext<'_>, content: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    match ctx.step_idx {
-        0 => {
-            if let Some(engine) = ctx.engine {
-                if engine.is_single_step() {
-                    return WorkflowEngine::text_signals_done(t)
-                        || WorkflowEngine::looks_like_review_report(t)
-                        || crate::agent::perception::extract_from_text(t).is_some()
-                        || (!is_idle_narrative(t) && t.chars().count() >= 80);
-                }
-            }
-            crate::agent::engine::extract_json_block(t)
-                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
-                .map(|v| v.get("routing").is_some() || v.get("intent").is_some())
-                .unwrap_or(false)
-        }
-        1 => {
-            if crate::agent::engine::extract_json_block(t)
-                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
-                .map(|v| v.get("plan").is_some())
-                .unwrap_or(false)
-            {
-                return true;
-            }
-            if let Some(engine) = ctx.engine {
-                if engine.plan_exploration_satisfied() && t.len() > 400 {
-                    return true;
-                }
-            }
-            false
-        }
-        2 => crate::agent::engine::extract_json_block(t)
-            .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
-            .map(|v| v.get("safe").is_some() && v.get("complete").is_some())
-            .unwrap_or(false),
-        3 => {
-            if WorkflowEngine::looks_like_review_report(t) || WorkflowEngine::text_signals_done(t) {
-                return true;
-            }
-            if ctx
-                .engine
-                .is_some_and(|e| crate::agent::workflow_session::is_feedback_discuss(e))
-            {
-                return !is_idle_narrative(t) && t.len() >= 40;
-            }
-            false
-        }
-        _ => !is_idle_narrative(t),
+    if ctx.engine.is_some_and(|e| e.is_single_step()) {
+        return WorkflowEngine::text_signals_done(t)
+            || WorkflowEngine::looks_like_review_report(t)
+            || crate::agent::perception::extract_from_text(t).is_some()
+            || (!is_idle_narrative(t) && t.chars().count() >= 80);
     }
+    !is_idle_narrative(t)
 }
 
-pub fn idle_streak_limit(ctx: &IdleContext<'_>) -> u32 {
-    if ctx.step_idx == 3 {
-        if ctx
-            .engine
-            .is_some_and(|e| crate::agent::workflow_session::is_feedback_discuss(e))
-        {
-            2
-        } else {
-            3
-        }
-    } else {
-        2
-    }
+pub fn idle_streak_limit(_: &IdleContext<'_>) -> u32 {
+    2
 }
 
 pub fn directive_for(ctx: &IdleContext<'_>) -> String {
     if ctx.engine.is_some_and(|e| e.is_single_step()) {
-        return "审查/问答：输出报告 + findings JSON + ## Done 即结束；禁止重复 file_read/shell 读同一文件。"
-            .into();
+        return "调工具或交产物（报告 + findings JSON + ## Done）；禁止空转重读。".into();
     }
-    match ctx.step_idx {
-        0 => "立即输出 intent JSON（含 routing），不要解释。".into(),
-        1 => {
-            if ctx
-                .engine
-                .is_some_and(|e| e.plan_exploration_satisfied())
-            {
-                "探索已完成：立即输出 plan JSON，禁止 prose，禁止再调探索工具。".into()
-            } else {
-                "立即调用 file_read / code_search / find_symbol，或输出 plan JSON；禁止只说「要先探索」。".into()
-            }
-        }
-        2 => "立即输出审阅 JSON（safe、complete、issues），禁止 Markdown 摘要。".into(),
-        3 => {
-            if ctx
-                .engine
-                .is_some_and(|e| crate::agent::workflow_session::is_feedback_discuss(e))
-            {
-                "直接回答用户问题（引用审查报告）；若需核对代码立即 file_read，禁止重出报告。".into()
-            } else if ctx.engine.is_some_and(|e| e.is_perceive_execute()) {
-                "立即写审查报告 + findings JSON + ## Done，或调用 file_read；禁止空转重读叙述。".into()
-            } else {
-                "立即 edit_file / shell_exec 推进计划，或输出 ## Done + completion_receipt。".into()
-            }
-        }
-        _ => "调用工具或输出最终结果，禁止空转。".into(),
-    }
+    "调用工具或输出 ## Done，禁止空转。".into()
 }
 
 /// Handle empty tool-call responses; returns whether to end the turn.
@@ -227,7 +153,17 @@ pub fn handle_empty_response(
     text: &str,
     idle_streak: &mut u32,
     had_validation_error: bool,
+    completion_tokens: Option<u32>,
 ) -> IdleAction {
+    // Hitting max_tokens often yields long prose with no tools — not intentional idle.
+    if completion_tokens.is_some_and(|ct| ct >= 7500) {
+        let ct = completion_tokens.unwrap_or(0);
+        return IdleAction::Continue {
+            directive: Some(format!(
+                "{IDLE_HINT_TAG} 输出约 {ct} tokens，可能已达 max_tokens 上限被截断。请直接调工具或交产物（报告/findings/## Done），勿长篇空转。"
+            )),
+        };
+    }
     if is_step_deliverable(ctx, text) {
         return IdleAction::Continue { directive: None };
     }
@@ -409,6 +345,12 @@ mod tests {
     }
 
     #[test]
+    fn long_prose_with_planning_marker_not_idle() {
+        let body = "让我先逐条对照代码。".repeat(30);
+        assert!(!is_idle_narrative(&body));
+    }
+
+    #[test]
     fn ends_after_streak() {
         let ctx = IdleContext {
             step_idx: 1,
@@ -417,12 +359,27 @@ mod tests {
         let mut streak = 0;
         let t = "好的，让我先看看项目结构";
         assert!(matches!(
-            handle_empty_response(&ctx, t, &mut streak, false),
+            handle_empty_response(&ctx, t, &mut streak, false, None),
             IdleAction::Continue { .. }
         ));
         assert!(matches!(
-            handle_empty_response(&ctx, t, &mut streak, false),
+            handle_empty_response(&ctx, t, &mut streak, false, None),
             IdleAction::EndTurn { .. }
         ));
+    }
+
+    #[test]
+    fn truncation_does_not_end_turn() {
+        let ctx = IdleContext {
+            step_idx: 0,
+            engine: None,
+        };
+        let mut streak = 1;
+        let t = "好的，让我先看看";
+        assert!(matches!(
+            handle_empty_response(&ctx, t, &mut streak, false, Some(8192)),
+            IdleAction::Continue { .. }
+        ));
+        assert_eq!(streak, 1);
     }
 }

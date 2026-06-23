@@ -125,13 +125,16 @@ impl OpenAiSseParser {
             events.push(LlmStreamEvent::TextDelta(content.to_string()));
         }
 
-        // DeepSeek reasoning_content (thinking mode)
-        if let Some(reasoning) = delta
-            .get("reasoning_content")
-            .and_then(|c| c.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            events.push(LlmStreamEvent::ReasoningDelta(reasoning.to_string()));
+        // DeepSeek / compatible reasoning fields
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(reasoning) = delta
+                .get(key)
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                events.push(LlmStreamEvent::ReasoningDelta(reasoning.to_string()));
+                break;
+            }
         }
 
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {

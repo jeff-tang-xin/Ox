@@ -156,7 +156,11 @@ pub struct App {
     pub scroll_offset: u16,
     pub should_quit: bool,
     pub agent_running: bool,
+    /// Monotonic id for the active agent turn; stale TurnDone events are ignored.
+    pub agent_turn_id: u64,
     pub status: String,
+    /// Persistent workflow phase line (阶段: … | 模式: …) — not overwritten by Thinking…
+    pub workflow_phase_line: String,
     pub dirty: bool,
     pub spinner_frame: u64,
     pub model_name: String,
@@ -274,7 +278,9 @@ impl App {
             scroll_offset: 0,
             should_quit: false,
             agent_running: false,
+            agent_turn_id: 0,
             status: String::new(),
+            workflow_phase_line: String::new(),
             dirty: true,
             spinner_frame: 0,
             model_name: String::new(),

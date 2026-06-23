@@ -277,12 +277,22 @@ impl ContextBuilder {
 
         // 2. Fill history from newest to oldest within budget.
         let history_budget = budgets.history as usize;
+        // Skip the first message if it's a system message (already merged above)
+        let start_idx = if has_leading_system { 1 } else { 0 };
+        let history_count = history.len().saturating_sub(start_idx);
+        if history_count <= 8 {
+            for i in start_idx..history.len() {
+                result.push(history[i].clone());
+            }
+            sanitize_tool_pairs(&mut result);
+            deduplicate_file_reads(&mut result);
+            filter_noisy_messages(&mut result);
+            return result;
+        }
+
         let mut used_tokens: usize = 0;
         let mut selected_indices: Vec<usize> = Vec::new();
         let mut skipped_indices: Vec<usize> = Vec::new();
-
-        // Skip the first message if it's a system message (already merged above)
-        let start_idx = if has_leading_system { 1 } else { 0 };
 
         // Phase 1: Fill with high-priority messages (user messages, assistant plans)
         // These are the conversation backbone — must keep
@@ -653,12 +663,10 @@ fn estimate_message_tokens(msg: &Message) -> usize {
         Message::Assistant {
             content,
             tool_calls,
-            reasoning_content,
+            reasoning_content: _,
         } => {
+            // Think/reasoning is UI-only — never counts toward context budget.
             let mut tokens = estimate_tokens(content);
-            if let Some(reasoning) = reasoning_content {
-                tokens += estimate_tokens(reasoning);
-            }
             for tc in tool_calls {
                 tokens += estimate_tokens(&tc.name);
                 tokens += estimate_tokens(&tc.arguments);
@@ -673,6 +681,22 @@ fn estimate_message_tokens(msg: &Message) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_content_not_counted_in_budget() {
+        let msg = Message::Assistant {
+            content: "hi".into(),
+            tool_calls: vec![],
+            reasoning_content: Some("x".repeat(10_000)),
+        };
+        let with = estimate_message_tokens(&msg);
+        let without = estimate_message_tokens(&Message::Assistant {
+            content: "hi".into(),
+            tool_calls: vec![],
+            reasoning_content: None,
+        });
+        assert_eq!(with, without);
+    }
 
     #[test]
     fn budgets_sum_is_reasonable() {

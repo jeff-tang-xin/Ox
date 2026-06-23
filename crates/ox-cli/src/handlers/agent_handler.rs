@@ -21,6 +21,20 @@ use crate::terminal::app::{App, FindingsPanelState, ParkFollowUpTag, PendingConf
 use crate::terminal::output_pane::OutputLine;
 use crate::helpers;
 
+/// Cancel a running agent (if any), reset interrupt token, bump turn id. Returns the new turn id.
+pub fn prepare_agent_spawn(
+    app: &mut App,
+    interrupt_ctrl: &mut ox_core::agent::interrupt::InterruptController,
+) -> u64 {
+    if app.agent_running {
+        interrupt_ctrl.token().cancel();
+        app.ui_to_agent_tx = None;
+    }
+    interrupt_ctrl.reset();
+    app.agent_turn_id = app.agent_turn_id.wrapping_add(1);
+    app.agent_turn_id
+}
+
 /// Result of handling an agent event — tells the event loop what to do next.
 pub enum HandleResult {
     /// Normal processing — continue the event loop.
@@ -37,6 +51,9 @@ pub enum HandleResult {
 
 /// Handle a single TextChunk event.
 pub fn handle_text_chunk(app: &mut App, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
     app.output.collapse_thinking();
     app.output.push_streaming_chunk(text);
     if !app.user_scrolled {
@@ -48,15 +65,12 @@ pub fn handle_text_chunk(app: &mut App, text: &str) {
 /// Handle streaming reasoning / thinking tokens.
 pub fn handle_reasoning_chunk(app: &mut App, text: &str) {
     app.output.push_reasoning_chunk(text);
-    if !app.user_scrolled {
-        app.scroll_to_bottom();
-    }
     app.dirty = true;
 }
 
 /// Handle a single ToolStart event.
 pub fn handle_tool_start(app: &mut App, name: &str, detail: &Option<String>) {
-    app.output.collapse_thinking();
+    app.output.note_tool_activity(name);
     if detail.is_some() {
         let mut updated = false;
         for line in app.output.lines.iter_mut().rev() {
@@ -153,6 +167,7 @@ pub fn handle_tool_progress(
 #[allow(clippy::too_many_arguments)]
 pub fn handle_turn_done(
     app: &mut App,
+    turn_id: u64,
     session: &mut Session,
     background_session: &mut Option<Session>,
     new_messages: &[Message],
@@ -178,7 +193,34 @@ pub fn handle_turn_done(
 ) -> HandleResult {
     use std::collections::HashSet;
 
+    if turn_id != 0 && turn_id != app.agent_turn_id {
+        tracing::info!(
+            "Ignoring stale TurnDone (id {turn_id}, current {})",
+            app.agent_turn_id
+        );
+        return HandleResult::Normal;
+    }
+
     app.output.finalize_streaming();
+
+    if let Some(ref wf) = app.workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            if ox_core::agent::phase::get(&engine)
+                != ox_core::agent::phase::SingleFlowPhase::AwaitUser
+            {
+                // Already in implement / complete — don't re-open the confirm UI.
+            } else if let Some(panel) = findings_panel_from_engine(&engine) {
+                app.findings_panel = Some(panel);
+                app.workflow_awaiting_confirmation = Some(4);
+                let card = ox_core::agent::findings::load_or_migrate(&engine)
+                    .filter(|s| !s.findings.is_empty())
+                    .map(|s| ox_core::agent::presentation::format_findings_card(&s));
+                if let Some(text) = card {
+                    app.output.push_line(OutputLine::Markdown(text));
+                }
+            }
+        }
+    }
 
     let interrupt_boundary = if app.workflow_interrupted {
         let boundary = if let Some(ref wf) = app.workflow_engine {
@@ -492,7 +534,7 @@ pub fn handle_turn_done(
                             engine.adopt_execute_interjection(last);
                         }
                         resume = true;
-                    } else if engine.workflow_preserves_on_user_input() {
+                    } else if engine.workflow_preserves_on_user_input(last) {
                         engine.append_workflow_guidance(last);
                         resume = true;
                     }
@@ -593,7 +635,12 @@ pub fn handle_error(
 
 /// Handle Status update event.
 pub fn handle_status(app: &mut App, status: String) {
-    // Iteration status belongs in the status bar only — not duplicated per-iteration in the timeline.
+    // Once the LLM request is in flight, show a live thinking row (reasoning stream or status carousel).
+    if status.contains("Calling LLM") || status.contains("Thinking") {
+        app.output.touch_thinking_status(&status);
+    } else if !app.user_scrolled {
+        app.scroll_to_bottom();
+    }
     app.status = status;
     app.dirty = true;
 }
@@ -715,37 +762,127 @@ pub fn apply_workflow_slash(
     use ox_core::agent::workflow_command::{CommandOutcome, WorkflowCommand};
     let mut spawn_workflow = false;
     let mut clear_confirm = false;
-    let mut panel = None;
+    let mut refresh_panel = false;
     let mut system_msgs: Vec<String> = Vec::new();
+    let scope_confirmed = matches!(parsed_cmd, Some(WorkflowCommand::ConfirmScope));
+    let enter_discuss = matches!(parsed_cmd, Some(WorkflowCommand::EnterDiscuss));
+    let new_task = matches!(parsed_cmd, Some(WorkflowCommand::NewTask(_)));
+    let panel_cmd = matches!(
+        parsed_cmd,
+        Some(
+            WorkflowCommand::ToggleFinding(_)
+                | WorkflowCommand::SelectFindings(_)
+                | WorkflowCommand::SelectAllFindings
+                | WorkflowCommand::ShrinkScope(_)
+                | WorkflowCommand::ShowFindings
+        )
+    );
     match outcome {
         CommandOutcome::Applied(Some(msg)) => {
             system_msgs.push(msg);
-            spawn_workflow = matches!(parsed_cmd, Some(WorkflowCommand::NewTask(_)));
-            if spawn_workflow {
+            if scope_confirmed || new_task {
+                if scope_confirmed && app.agent_running {
+                    if let Some(tx) = &app.ui_to_agent_tx {
+                        use ox_core::agent::ui_event::{BusinessGateKind, UiToAgentEvent};
+                        let sent = tx
+                            .send(UiToAgentEvent::BusinessAck {
+                                kind: BusinessGateKind::FindingsScope,
+                            })
+                            .is_ok()
+                            || tx.send(UiToAgentEvent::ScopeConfirmed).is_ok();
+                        if sent {
+                            spawn_workflow = false;
+                        } else {
+                            spawn_workflow = true;
+                        }
+                    } else {
+                        spawn_workflow = true;
+                    }
+                } else {
+                    spawn_workflow = true;
+                }
                 clear_confirm = true;
-            } else {
-                panel = findings_panel_from_engine(&engine);
+            } else if enter_discuss {
+                clear_confirm = true;
+            } else if panel_cmd {
+                refresh_panel = true;
             }
         }
         CommandOutcome::Applied(None) | CommandOutcome::Ignored => {}
     }
+    let panel = if refresh_panel {
+        findings_panel_from_engine(&engine)
+    } else {
+        None
+    };
+    let mode_banner = if scope_confirmed {
+        Some(ox_core::agent::phase::workspace_mode_event(&engine))
+    } else {
+        None
+    };
     drop(engine);
     for msg in system_msgs {
         app.output.push_system(&msg);
     }
     if clear_confirm {
         app.clear_workflow_confirmation();
+    } else if enter_discuss {
+        enter_findings_discuss_mode(app);
     } else if let Some(p) = panel {
         app.findings_panel = Some(p);
         app.park_follow_up_tag = None;
         app.workflow_awaiting_confirmation = Some(4);
     }
+    if let Some((mode, banner)) = mode_banner {
+        if !banner.is_empty() {
+            app.output.push_system(&banner);
+        }
+        app.workflow_phase_line = mode;
+    }
     app.dirty = true;
     (true, spawn_workflow)
 }
 
-/// Legacy park menu shortcut — no-op in single-step model.
-pub fn handle_park_menu_shortcut(_app: &mut App, _choice: char) {}
+/// Enter read-only discuss mode from findings panel (`d` / `/discuss`).
+pub fn enter_findings_discuss_mode(app: &mut App) {
+    app.workflow_awaiting_confirmation = None;
+    app.park_follow_up_tag = Some(ParkFollowUpTag::Feedback);
+    if let Some(ref wf) = app.workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            ox_core::agent::workflow_session::enter_feedback_discuss(&engine);
+        }
+    }
+    app.output.push_system(
+        "💬 讨论模式（只读）— 在下方输入意见或问题，不会修改代码、不会进入实施。",
+    );
+    app.dirty = true;
+}
+
+/// Enter new-task mode from findings panel (`n` / park menu 3).
+pub fn enter_findings_new_task_mode(app: &mut App) {
+    app.clear_workflow_confirmation();
+    app.park_follow_up_tag = Some(ParkFollowUpTag::NewTask);
+    app.output.push_system("🆕 新任务 — 在下方描述新需求（Enter 提交后将结束当前 workflow）。");
+    app.dirty = true;
+}
+
+/// Park / findings menu shortcuts.
+pub fn handle_park_menu_shortcut(app: &mut App, choice: char) {
+    match choice {
+        '1' => {
+            app.workflow_awaiting_confirmation = None;
+            app.findings_panel = None;
+            app.park_follow_up_tag = Some(ParkFollowUpTag::Continue);
+            app.output.push_system(
+                "🔧 继续修复 — 说明范围（如「修复 1,2」）或输入 /confirm 确认实施。",
+            );
+            app.dirty = true;
+        }
+        '2' => enter_findings_discuss_mode(app),
+        '3' => enter_findings_new_task_mode(app),
+        _ => {}
+    }
+}
 
 /// Handle ToolConfirmationRequest event.
 pub fn handle_tool_confirmation(
@@ -812,8 +949,10 @@ pub fn handle_budget_exceeded(
 /// Handle IterationLimitReached event.
 pub fn handle_iteration_limit(app: &mut App, iteration: u32) {
     app.output.push_line(OutputLine::System(format!(
-        "Agent reached {} iterations. Continue? [Y] Yes / [N] Stop",
-        iteration
+        "⏸️ 本轮已执行 {iteration} 步 ReAct 循环（安全上限），暂停等待确认。\n\
+         • **Y** — 继续执行（计数重置，再跑一批）\n\
+         • **N** — 停止本轮（可稍后输入继续修复）\n\
+         （此处无 T；T 仅用于工具授权确认）"
     )));
     app.pending_confirmation = Some(PendingConfirmation {
         tool_call_id: "__iteration_limit__".into(),

@@ -19,7 +19,7 @@ pub enum Message {
         content: String,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         tool_calls: Vec<ToolCall>,
-        /// DeepSeek reasoning_content (thinking mode) — must be sent back to the API.
+        /// Provider round-trip only (e.g. DeepSeek); stripped before context assembly — not in token budget.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         reasoning_content: Option<String>,
     },
