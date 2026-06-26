@@ -27,6 +27,7 @@ pub struct OxConfig {
     pub cost: CostConfig,
     pub spec: SpecConfig,
     pub embedding: EmbeddingConfig,
+    pub gitnexus: GitNexusConfig,
 }
 
 impl OxConfig {
@@ -206,7 +207,8 @@ use_refined_context = true  # Enable refined context format (default: true)
 
 # ── Agent Loop Settings ──────────────────────────────────
 [agent]
-# max_iterations = 25          # Maximum agent loop iterations per turn
+# max_iterations is deprecated and ignored — the ReAct loop runs until the agent
+# finishes or you stop it (N / Ctrl+C). It no longer auto-pauses on a step count.
 # max_per_turn_tokens = 500000  # Max tokens per turn before user confirmation
 
 # Multi-model collaboration — different models per task role
@@ -335,6 +337,23 @@ store_refined_memories = true  # Enable refined memory storage (default: true)
 # lazy_index_max_files_per_turn = 20  # Cap per-message lazy embed work
 # background_full_index = true   # When lazy_index: still embed full project in background (non-blocking)
 
+# ── GitNexus Code Graph (via MCP) ────────────────────────
+# Ox spawns the GitNexus stdio MCP server as a child process and exposes its
+# graph queries (symbol context, execution flows, change impact) to the agent.
+# The launch command lives here so each machine can point at its own install.
+[gitnexus]
+# enabled = true               # Master switch for the code-graph integration
+# command = "npx"              # Launcher. Portable default; auto-downloads gitnexus.
+                                #   Global install on PATH:  command = "gitnexus", base_args = []
+                                #   Windows absolute path:    command = "F:\\soft\\nodejs\\gitnexus.cmd", base_args = []
+# base_args = ["-y", "gitnexus"]  # Args before the subcommand
+# mcp_subcommand = "mcp"       # Subcommand that starts the stdio MCP server
+# auto_index = true            # (B) Reindex at startup ONLY when index is missing/stale
+# reindex_on_change = true     # (E) Refresh index before a code_graph query if Ox edited files
+# augment_find_symbol = true   # Seamlessly add graph callers/callees to find_symbol when ready
+# startup_timeout_ms = 30000   # MCP initialize handshake timeout
+# request_timeout_ms = 30000   # Per tool-call timeout
+
 # ── Cost Management ──────────────────────────────────────
 [cost]
 # max_monthly_cost = 5.0       # Maximum monthly spending (USD)
@@ -451,8 +470,8 @@ impl Default for ContextConfig {
             memory_budget_tokens: 3000,
             history_budget_tokens: 80000,
             reply_reserve_tokens: 50000,
-            history_ratio: 0.18,  // ↑ 10% → 18% (more history for long conversations)
-            memory_ratio: 0.03,   // ↑ 2% → 3%
+            history_ratio: 0.18, // ↑ 10% → 18% (more history for long conversations)
+            memory_ratio: 0.03,  // ↑ 2% → 3%
             system_prompt_ratio: 0.02,
             use_refined_context: true, // 🆕 Default: ENABLED to reduce hallucinations and improve instruction following
         }
@@ -481,7 +500,7 @@ impl Default for ToolsConfig {
     }
 }
 
-/// Per-provider LLM configuration (api_key, base_url, max_tokens).
+/// Per-provider LLM configuration (api_key, base_url, max_tokens, sampling).
 /// All fields are optional — empty/None means use provider defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -492,6 +511,10 @@ pub struct ProviderConfig {
     pub base_url: String,
     /// Max tokens for response. None = use provider's built-in default.
     pub max_tokens: Option<u32>,
+    /// Sampling temperature. Lower values reduce divergent/repetitive exploration.
+    pub temperature: Option<f32>,
+    /// Nucleus sampling cap. Lower values reduce low-probability branches.
+    pub top_p: Option<f32>,
     /// Disable tools/function calling for this provider.
     /// Set true for providers like MiniMax that don't support tools.
     pub disable_tools: Option<bool>,
@@ -616,8 +639,8 @@ impl Default for MemoryConfig {
             language_config: lang_config,
             transform: MemoryTransformConfig::default(),
             // 🆕 LLM Judge defaults (enabled by default)
-            enable_llm_judge: true,  // Default: ENABLED
-            llm_judge_threshold: 7,   // Only keep memories with score >= 7
+            enable_llm_judge: true,       // Default: ENABLED
+            llm_judge_threshold: 7,       // Only keep memories with score >= 7
             store_refined_memories: true, // Default: ENABLED for better memory quality
         }
     }
@@ -825,6 +848,88 @@ impl Default for EmbeddingConfig {
     }
 }
 
+// ──────────────────── GitNexus (Code Graph via MCP) ────────────────────
+
+/// Configuration for the GitNexus code-graph integration.
+///
+/// GitNexus is an external CLI/MCP server (`gitnexus`, normally run via Node).
+/// Ox spawns its **stdio MCP server** as a child process and speaks JSON-RPC to
+/// it, exposing graph queries (symbol context, execution flows, change impact)
+/// to the LLM. Index lifecycle (`analyze` / `status`) is delegated to the same
+/// binary's CLI subcommands.
+///
+/// The launch command lives here (not hardcoded) so each machine can point at
+/// its own install. Examples:
+/// - `command = "npx"`, `base_args = ["-y", "gitnexus"]`  (portable, auto-download)
+/// - `command = "gitnexus"`, `base_args = []`              (global install on PATH)
+/// - `command = "F:\\soft\\nodejs\\gitnexus.cmd"`, `base_args = []`  (Windows absolute path)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitNexusConfig {
+    /// Master switch for the GitNexus code-graph integration.
+    pub enabled: bool,
+    /// Program that launches GitNexus. Default `npx` (portable); can be the
+    /// `gitnexus` binary directly or an absolute path (e.g. `gitnexus.cmd` on Windows).
+    pub command: String,
+    /// Args prepended before any subcommand. The stdio MCP server is launched as
+    /// `{command} {base_args...} {mcp_subcommand}`; CLI ops as
+    /// `{command} {base_args...} <analyze|status|...>`.
+    pub base_args: Vec<String>,
+    /// Subcommand that starts the stdio MCP server (default `mcp`).
+    pub mcp_subcommand: String,
+    /// Startup freshness gate (B): at launch, reindex via `analyze` ONLY when the
+    /// index is missing or stale (newer source files than the registry's
+    /// `indexedAt`). When fresh, startup skips the rebuild.
+    pub auto_index: bool,
+    /// On-change reindex (E): after Ox edits/writes/deletes a file, the next
+    /// `code_graph` query first refreshes the index (incremental `analyze`), so
+    /// graph answers reflect the just-changed code. Cost is paid lazily, only
+    /// when the graph is actually consulted.
+    pub reindex_on_change: bool,
+    /// Seamlessly enrich `find_symbol` output with GitNexus `context`
+    /// (callers/callees/refs) when the graph is ready — the LLM gets relationship
+    /// info through a tool it already favors, no `code_graph` call required.
+    /// Only fires when the server is ready and the index is clean, so it never
+    /// adds latency to `find_symbol`.
+    pub augment_find_symbol: bool,
+    /// MCP `initialize` handshake timeout (milliseconds).
+    pub startup_timeout_ms: u64,
+    /// Per tool-call request timeout (milliseconds).
+    pub request_timeout_ms: u64,
+}
+
+impl Default for GitNexusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: "npx".into(),
+            base_args: vec!["-y".into(), "gitnexus".into()],
+            mcp_subcommand: "mcp".into(),
+            auto_index: true,
+            reindex_on_change: true,
+            augment_find_symbol: true,
+            startup_timeout_ms: 30_000,
+            request_timeout_ms: 30_000,
+        }
+    }
+}
+
+impl GitNexusConfig {
+    /// Full argv for the stdio MCP server: `base_args + [mcp_subcommand]`.
+    pub fn mcp_args(&self) -> Vec<String> {
+        let mut args = self.base_args.clone();
+        args.push(self.mcp_subcommand.clone());
+        args
+    }
+
+    /// Full argv for a CLI subcommand (e.g. `"analyze"`, `"status"`): `base_args + [sub]`.
+    pub fn cli_args(&self, sub: &str) -> Vec<String> {
+        let mut args = self.base_args.clone();
+        args.push(sub.to_string());
+        args
+    }
+}
+
 // ──────────────────── Agent ────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -854,7 +959,9 @@ impl Default for CollaborationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
-    /// Maximum agent loop iterations per turn (safety limit).
+    /// DEPRECATED / no-op. The per-turn ReAct loop no longer auto-pauses on an
+    /// iteration count — it runs until the agent calls finish or the user stops it
+    /// (N / Ctrl+C). Kept only so existing `config.toml` files keep parsing.
     pub max_iterations: u32,
     /// Maximum total tokens per turn before requesting user confirmation.
     pub max_per_turn_tokens: u32,
@@ -864,16 +971,19 @@ pub struct AgentConfig {
     pub skill_reflect_rounds: usize,
     /// Multi-model collaboration (review vs implement vs qa).
     pub collaboration: CollaborationConfig,
+    /// All LLM actions via single `complete_and_check` tool + sparse gates.
+    pub unified_tool_mode: bool,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 50,
+            max_iterations: 0, // 0 = unlimited; termination is LLM-driven
             max_per_turn_tokens: 500_000,
             skill_reflect_enabled: true,
             skill_reflect_rounds: crate::agent::skill_reflect_buffer::DEFAULT_REFLECT_THRESHOLD,
             collaboration: CollaborationConfig::default(),
+            unified_tool_mode: true,
         }
     }
 }
@@ -925,6 +1035,8 @@ mod tests {
         assert!(cfg.api_key.is_empty());
         assert!(cfg.base_url.is_empty());
         assert!(cfg.max_tokens.is_none());
+        assert!(cfg.temperature.is_none());
+        assert!(cfg.top_p.is_none());
     }
 
     #[test]
@@ -937,6 +1049,8 @@ default = "gpt-4o"
 api_key = "sk-test-123"
 base_url = "https://custom.openai.com/v1"
 max_tokens = 4096
+temperature = 0.05
+top_p = 0.7
 
 [models.providers.anthropic]
 api_key = "sk-ant-test"
@@ -948,6 +1062,8 @@ api_key = "sk-ant-test"
         assert_eq!(openai.api_key, "sk-test-123");
         assert_eq!(openai.base_url, "https://custom.openai.com/v1");
         assert_eq!(openai.max_tokens, Some(4096));
+        assert_eq!(openai.temperature, Some(0.05));
+        assert_eq!(openai.top_p, Some(0.7));
 
         let anthropic = config.models.providers.get("anthropic").unwrap();
         assert_eq!(anthropic.api_key, "sk-ant-test");

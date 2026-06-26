@@ -113,7 +113,11 @@ pub fn load_from_json(json_str: &str) -> Option<PlanTracker> {
             .get("step")
             .and_then(|s| s.as_u64())
             .unwrap_or((i + 1) as u64) as u32;
-        let file = obj.get("file").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let file = obj
+            .get("file")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
         let action = obj
             .get("action")
             .and_then(|s| s.as_str())
@@ -124,7 +128,11 @@ pub fn load_from_json(json_str: &str) -> Option<PlanTracker> {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string();
-        let desc = obj.get("desc").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let desc = obj
+            .get("desc")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
         let verify = obj
             .get("verify")
             .and_then(|s| s.as_str())
@@ -221,9 +229,7 @@ impl PlanTracker {
     ) -> WriteCompletionOutcome {
         let norm = normalize_path(path);
         let pos = self.steps.iter().position(|s| {
-            !s.file.is_empty()
-                && normalize_path(&s.file) == norm
-                && s.status != StepStatus::Done
+            !s.file.is_empty() && normalize_path(&s.file) == norm && s.status != StepStatus::Done
         });
         let Some(pos) = pos else {
             return WriteCompletionOutcome::NoMatchingStep;
@@ -257,9 +263,7 @@ impl PlanTracker {
                     self.steps[pos].verify = cmd.clone();
                 }
             }
-            return WriteCompletionOutcome::AwaitingVerify(
-                needs_verify.unwrap_or_default(),
-            );
+            return WriteCompletionOutcome::AwaitingVerify(needs_verify.unwrap_or_default());
         }
 
         self.steps[pos].status = StepStatus::Done;
@@ -313,9 +317,7 @@ impl PlanTracker {
     pub fn try_mark_done_for_path(&mut self, path: &str) -> bool {
         let norm = normalize_path(path);
         let idx = self.steps.iter().position(|s| {
-            !s.file.is_empty()
-                && normalize_path(&s.file) == norm
-                && s.status != StepStatus::Done
+            !s.file.is_empty() && normalize_path(&s.file) == norm && s.status != StepStatus::Done
         });
         let Some(pos) = idx else {
             return false;
@@ -327,9 +329,10 @@ impl PlanTracker {
 
     /// Mark the current in-progress or first pending step done (shell/git tasks).
     pub fn mark_current_step_done(&mut self) -> bool {
-        let pos = self.steps.iter().position(|s| {
-            matches!(s.status, StepStatus::InProgress | StepStatus::Pending)
-        });
+        let pos = self
+            .steps
+            .iter()
+            .position(|s| matches!(s.status, StepStatus::InProgress | StepStatus::Pending));
         let Some(pos) = pos else {
             return false;
         };
@@ -379,9 +382,9 @@ impl PlanTracker {
     }
 
     pub fn all_done(&self) -> bool {
-        self.steps.iter().all(|s| {
-            matches!(s.status, StepStatus::Done | StepStatus::Skipped)
-        })
+        self.steps
+            .iter()
+            .all(|s| matches!(s.status, StepStatus::Done | StepStatus::Skipped))
     }
 
     pub fn pending_count(&self) -> usize {
@@ -512,10 +515,7 @@ fn parse_bug_review_line(line: &str) -> Option<(u32, &str)> {
     let rest = if upper.strip_prefix("BUG-").is_some() {
         t.get(4..)?
     } else if upper.starts_with('F') && t.len() > 1 {
-        let digit_end = t[1..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .count();
+        let digit_end = t[1..].chars().take_while(|c| c.is_ascii_digit()).count();
         if digit_end == 0 {
             return None;
         }
@@ -610,8 +610,8 @@ fn looks_like_source_path(s: &str) -> bool {
     }
     let lower = s.to_lowercase();
     [
-        ".java", ".kt", ".kts", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".cs",
-        ".vue", ".rb", ".php", ".scala", ".xml",
+        ".java", ".kt", ".kts", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".cs", ".vue",
+        ".rb", ".php", ".scala", ".xml",
     ]
     .iter()
     .any(|ext| lower.ends_with(ext))
@@ -659,8 +659,8 @@ fn extract_symbol_target(s: &str) -> String {
 
 /// Validate plan steps have minimum required fields and exploration depth.
 pub fn validate_plan_steps(json_str: &str) -> Result<(), String> {
-    let v: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| format!("❌ plan JSON 解析失败: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| format!("❌ plan JSON 解析失败: {e}"))?;
 
     let summary = v
         .get("structure_summary")
@@ -747,12 +747,13 @@ fn has_non_root_directory_list(
     entries: &[ExplorationEntry],
     explored: &std::collections::HashSet<String>,
 ) -> bool {
-    entries.iter().any(|e| {
-        e.tool == "file_list" && !is_root_list_path(&e.target)
-    }) || explored.iter().any(|p| {
-        p.starts_with("file_list:")
-            && !is_root_list_path(p.strip_prefix("file_list:").unwrap_or(""))
-    })
+    entries
+        .iter()
+        .any(|e| e.tool == "file_list" && !is_root_list_path(&e.target))
+        || explored.iter().any(|p| {
+            p.starts_with("file_list:")
+                && !is_root_list_path(p.strip_prefix("file_list:").unwrap_or(""))
+        })
 }
 
 fn count_tool(entries: &[ExplorationEntry], tool: &str) -> usize {
@@ -762,7 +763,12 @@ fn count_tool(entries: &[ExplorationEntry], tool: &str) -> usize {
 fn count_code_probes(entries: &[ExplorationEntry]) -> usize {
     entries
         .iter()
-        .filter(|e| matches!(e.tool.as_str(), "find_symbol" | "code_search" | "file_search"))
+        .filter(|e| {
+            matches!(
+                e.tool.as_str(),
+                "find_symbol" | "code_search" | "file_search"
+            )
+        })
         .count()
 }
 
@@ -792,7 +798,8 @@ pub fn exploration_next_action(
     }
 
     if file_reads < 2 && code_probes == 0 {
-        return "下一步: 再 file_read 一个相关文件，或 find_symbol/code_search 确认符号".to_string();
+        return "下一步: 再 file_read 一个相关文件，或 find_symbol/code_search 确认符号"
+            .to_string();
     }
 
     if code_probes == 0 && !(file_lists >= 2 && file_reads >= 1) {
@@ -813,8 +820,7 @@ pub fn validate_plan_exploration(
 ) -> Result<(), String> {
     if !entries.iter().any(|e| e.tool == "project_detect") {
         return Err(
-            "❌ 探索不足：必须先 project_detect 了解项目类型，再探索目录与关键文件。"
-                .to_string(),
+            "❌ 探索不足：必须先 project_detect 了解项目类型，再探索目录与关键文件。".to_string(),
         );
     }
 
@@ -829,8 +835,9 @@ pub fn validate_plan_exploration(
         );
     }
 
-    let hierarchical_ok =
-        file_lists >= 2 && has_root_directory_list(entries, explored) && has_non_root_directory_list(entries, explored);
+    let hierarchical_ok = file_lists >= 2
+        && has_root_directory_list(entries, explored)
+        && has_non_root_directory_list(entries, explored);
     let flat_ok = file_lists >= 1 && file_reads >= 2;
     let search_ok = file_lists >= 1 && file_reads >= 1 && code_probes >= 1;
 
@@ -854,8 +861,8 @@ pub fn validate_plan_paths_known(
     entries: &[ExplorationEntry],
     explored: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
-    let v: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| format!("❌ plan JSON 解析失败: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| format!("❌ plan JSON 解析失败: {e}"))?;
     let plan = v
         .get("plan")
         .and_then(|p| p.as_array())
@@ -1083,7 +1090,8 @@ mod tests {
 
     #[test]
     fn load_from_review_report_numbered() {
-        let report = "1. **Controller** — @Idempotent 加 waitTime\n2. **Request DTO** — 删除 pi 字段";
+        let report =
+            "1. **Controller** — @Idempotent 加 waitTime\n2. **Request DTO** — 删除 pi 字段";
         let t = load_from_review_report(report).unwrap();
         assert_eq!(t.steps.len(), 2);
         assert_eq!(t.steps[0].target, "Controller");

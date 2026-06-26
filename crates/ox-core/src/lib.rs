@@ -5,6 +5,7 @@ pub mod cost;
 pub mod feedback;
 pub mod knowledge;
 pub mod llm;
+pub mod mcp;
 pub mod message;
 pub mod runtime;
 pub mod safety;

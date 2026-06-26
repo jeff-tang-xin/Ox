@@ -5,7 +5,6 @@
 /// (each entity carries its own relations in its payload). The in-memory graph
 /// enables fast queries like "find all symbols that call X" or "find all
 /// sessions that modified Y" without scanning TriviumDB.
-
 use std::collections::{HashMap, HashSet};
 
 use super::entity::{Entity, EntityKind, RelationType};
@@ -113,7 +112,8 @@ impl EntityGraph {
 
     /// Remove all entities associated with a file path (for re-indexing).
     pub fn remove_by_file(&mut self, file_path: &str) {
-        let ids: Vec<String> = self.entities
+        let ids: Vec<String> = self
+            .entities
             .iter()
             .filter(|(_, e)| e.file_path() == Some(file_path))
             .map(|(id, _)| id.clone())
@@ -142,10 +142,8 @@ impl EntityGraph {
     ) -> Vec<GraphTraversalResult> {
         let mut visited: HashSet<String> = HashSet::new();
         let mut results = Vec::new();
-        let mut frontier: Vec<(String, u32, f32)> = origin_ids
-            .iter()
-            .map(|id| (id.clone(), 0, 1.0))
-            .collect();
+        let mut frontier: Vec<(String, u32, f32)> =
+            origin_ids.iter().map(|id| (id.clone(), 0, 1.0)).collect();
 
         for (id, dist, _) in &frontier {
             visited.insert(id.clone());
@@ -207,10 +205,9 @@ impl EntityGraph {
         self.in_edges
             .get(entity_id)
             .map(|edges| {
-                edges.iter()
-                    .filter(|e| {
-                        relation_type.map_or(true, |rt| e.relation_type == rt)
-                    })
+                edges
+                    .iter()
+                    .filter(|e| relation_type.map_or(true, |rt| e.relation_type == rt))
                     .filter_map(|e| self.entities.get(&e.from_id))
                     .collect()
             })
@@ -226,10 +223,9 @@ impl EntityGraph {
         self.out_edges
             .get(entity_id)
             .map(|edges| {
-                edges.iter()
-                    .filter(|e| {
-                        relation_type.map_or(true, |rt| e.relation_type == rt)
-                    })
+                edges
+                    .iter()
+                    .filter(|e| relation_type.map_or(true, |rt| e.relation_type == rt))
                     .filter_map(|e| self.entities.get(&e.to_id))
                     .collect()
             })
@@ -291,11 +287,7 @@ impl EntityGraph {
 
     /// Find entities that share similar content (for dedup and clustering).
     /// This is a simplified approach using entity ID overlap in relations.
-    pub fn find_related_entities(
-        &self,
-        entity_id: &str,
-        max_results: usize,
-    ) -> Vec<&Entity> {
+    pub fn find_related_entities(&self, entity_id: &str, max_results: usize) -> Vec<&Entity> {
         let mut scored: Vec<(&Entity, usize)> = Vec::new();
 
         // Entities that share the same outgoing targets
@@ -345,17 +337,14 @@ impl EntityGraph {
 
     /// Get all entities of a specific kind.
     pub fn entities_of_kind(&self, kind: EntityKind) -> Vec<&Entity> {
-        self.entities
-            .values()
-            .filter(|e| e.kind == kind)
-            .collect()
+        self.entities.values().filter(|e| e.kind == kind).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::entity::{SymbolType, EntityKind, EntityMetadata, Relation};
+    use crate::knowledge::entity::{EntityKind, EntityMetadata, Relation, SymbolType};
 
     fn make_entity(id: &str, kind: EntityKind, content: &str) -> Entity {
         let _now = chrono::Utc::now().timestamp();
@@ -442,9 +431,17 @@ mod tests {
         let mut graph = EntityGraph::new();
         // e1 → e2 → e3
         let mut e1 = make_entity("e1", EntityKind::CodeSymbol, "a");
-        e1.relations.push(Relation { target_id: "e2".into(), relation_type: RelationType::Calls, weight: 0.9 });
+        e1.relations.push(Relation {
+            target_id: "e2".into(),
+            relation_type: RelationType::Calls,
+            weight: 0.9,
+        });
         let mut e2 = make_entity("e2", EntityKind::CodeSymbol, "b");
-        e2.relations.push(Relation { target_id: "e3".into(), relation_type: RelationType::Calls, weight: 0.8 });
+        e2.relations.push(Relation {
+            target_id: "e3".into(),
+            relation_type: RelationType::Calls,
+            weight: 0.8,
+        });
         let e3 = make_entity("e3", EntityKind::CodeSymbol, "c");
         graph.upsert(e1);
         graph.upsert(e2);

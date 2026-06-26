@@ -50,7 +50,10 @@ impl TrustManager {
     /// Returns the matching pattern if blocked.
     pub fn is_command_blacklisted(&self, command: &str) -> Option<&str> {
         let lower = command.to_lowercase();
-        self.command_blacklist.iter().find(|p| lower.contains(&p.to_lowercase())).map(|s| s.as_str())
+        self.command_blacklist
+            .iter()
+            .find(|p| lower.contains(&p.to_lowercase()))
+            .map(|s| s.as_str())
     }
 
     /// Add a pattern to the command blacklist.
@@ -124,17 +127,17 @@ pub fn is_high_risk_command(command: &str) -> bool {
 pub fn is_path_within_workdir(path: &Path, working_dir: &Path) -> bool {
     let canonical_workdir = normalize_path(working_dir);
     let canonical_path = normalize_path(path);
-    
+
     if canonical_path.starts_with(&canonical_workdir) {
         return true;
     }
-    
+
     // Path doesn't exist yet — check parent.
     if let Some(parent) = path.parent() {
         let canonical_parent = normalize_path(parent);
         return canonical_parent.starts_with(&canonical_workdir);
     }
-    
+
     false
 }
 

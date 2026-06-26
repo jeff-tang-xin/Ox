@@ -8,6 +8,7 @@ pub const OUTPUT_DISCIPLINE_SKILL_ID: &str = "ox-output-discipline";
 pub fn priority_system_skill_ids() -> &'static [&'static str] {
     &[
         OUTPUT_DISCIPLINE_SKILL_ID,
+        "ox-systemic-comprehension",
         "concise-direct",
         "coding-principles",
     ]
@@ -88,10 +89,7 @@ pub fn build_on_demand_manifest(skills: &[Skill]) -> Option<String> {
         }
     }
 
-    let mut out = String::from(
-        "【Skill 按需加载 — 用 load_skill(name) 读完整手册】\n\
-         项目必填 Skill（规范/业务）已在上方注入；以下仅在需要时加载：\n",
-    );
+    let mut out = String::from("【Skill — load_skill(name) 加载完整手册】\n");
     if !system.is_empty() {
         out.push_str("\n**内置**（~ox-core/skill/builtin，跨项目通用原则）\n");
         for l in system {

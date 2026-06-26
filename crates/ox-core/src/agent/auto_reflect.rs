@@ -1,17 +1,16 @@
+use anyhow::Result;
+use std::fs;
 /// Auto-reflection module - Automatically analyze completed workflows and generate Skills
-/// 
+///
 /// This module implements the auto-reflection mechanism that triggers after workflow completion.
 /// It analyzes the execution trace, identifies reusable patterns, and creates new Skills.
-
 use std::path::Path;
-use std::fs;
 use std::sync::Arc;
-use anyhow::Result;
 use tracing;
 
-use crate::message::Message;
-use crate::llm::LlmProvider;
 use crate::context::SKILL_CREATION_PROMPT;
+use crate::llm::LlmProvider;
+use crate::message::Message;
 
 /// Outcome of auto-reflection — draft for user confirmation or skip.
 #[derive(Debug, Clone)]
@@ -36,10 +35,7 @@ pub struct AutoReflector {
 
 impl AutoReflector {
     /// Create a new AutoReflector
-    pub fn new(
-        llm_provider: Arc<dyn LlmProvider>,
-        project_root: &Path,
-    ) -> Result<Self> {
+    pub fn new(llm_provider: Arc<dyn LlmProvider>, project_root: &Path) -> Result<Self> {
         Ok(Self {
             llm_provider,
             project_root: project_root.to_path_buf(),
@@ -54,7 +50,9 @@ impl AutoReflector {
         execution_summary: &str,
         conversation_history: &[Message],
     ) -> Result<ReflectOutcome> {
-        if let Some(reason) = Self::quality_gate(task_description, execution_summary, conversation_history) {
+        if let Some(reason) =
+            Self::quality_gate(task_description, execution_summary, conversation_history)
+        {
             tracing::info!("[AUTO-REFLECT] Skipped: {reason}");
             return Ok(ReflectOutcome::Skipped { reason });
         }
@@ -64,7 +62,8 @@ impl AutoReflector {
             task_description.chars().take(80).collect::<String>()
         );
 
-        let prompt = self.build_reflection_prompt(task_description, execution_summary, conversation_history);
+        let prompt =
+            self.build_reflection_prompt(task_description, execution_summary, conversation_history);
         let skill_content = self.call_llm_for_reflection(&prompt).await?;
 
         if skill_content.trim().is_empty() {
@@ -74,14 +73,12 @@ impl AutoReflector {
         }
 
         let (skill_id, description) = self.parse_draft_metadata(&skill_content);
-        let canonical = crate::skill::dedup::canonical_mandatory_id(&skill_id)
-            .unwrap_or(skill_id.as_str());
+        let canonical =
+            crate::skill::dedup::canonical_mandatory_id(&skill_id).unwrap_or(skill_id.as_str());
         let skill_id = canonical.to_string();
 
         if self.skill_exists(&skill_id) {
-            tracing::info!(
-                "[AUTO-REFLECT] Skill `{skill_id}` exists — will merge on save"
-            );
+            tracing::info!("[AUTO-REFLECT] Skill `{skill_id}` exists — will merge on save");
         }
 
         Ok(ReflectOutcome::Draft {
@@ -110,13 +107,33 @@ impl AutoReflector {
         if task_description.trim().len() < MIN_TASK_LEN {
             return Some("Task too short for skill extraction".into());
         }
-        let has_substance = execution_summary.contains("## Done")
-            || execution_summary.contains("modify")
-            || execution_summary.contains("file_write")
-            || execution_summary.contains("edit_file")
-            || conversation_history.iter().any(|m| {
-                matches!(m, Message::ToolResult { content, .. }
-                    if content.contains("Successfully") || content.contains("patched"))
+        // Substance = real edits happened. Detect case-insensitively and via the
+        // unified tool-result envelope markers (`✓ edit_file` / `✓ file_write` /
+        // `✓ delete_range`), so this no longer depends on the free-text summary or
+        // on a case-sensitive match (edit_file emits "✅ Patched", capital P, which
+        // the old lowercase `contains("patched")` never matched → reflection was
+        // wrongly skipped for edit_file-only turns).
+        let summary_lc = execution_summary.to_ascii_lowercase();
+        let has_substance = summary_lc.contains("## done")
+            || summary_lc.contains("modify")
+            || summary_lc.contains("file_write")
+            || summary_lc.contains("edit_file")
+            || conversation_history.iter().any(|m| match m {
+                Message::ToolResult { content, .. } => {
+                    let c = content.to_ascii_lowercase();
+                    c.contains("successfully")
+                        || c.contains("patched")
+                        || c.contains("edit_file")
+                        || c.contains("file_write")
+                        || c.contains("delete_range")
+                }
+                Message::Assistant { tool_calls, .. } => tool_calls.iter().any(|tc| {
+                    let a = tc.arguments.to_ascii_lowercase();
+                    a.contains("edit_file")
+                        || a.contains("file_write")
+                        || a.contains("delete_range")
+                }),
+                _ => false,
             });
         if !has_substance {
             return Some("No substantive code changes detected".into());
@@ -134,19 +151,31 @@ impl AutoReflector {
 
     fn parse_draft_metadata(&self, content: &str) -> (String, String) {
         if let Ok((meta, body)) = self.extract_frontmatter(content) {
-            let id = meta.get("id").cloned().or_else(|| {
-                body.lines().next()
-                    .and_then(|l| l.strip_prefix("# "))
-                    .map(|s| s.to_lowercase().replace(' ', "-"))
-            }).unwrap_or_else(|| "generated-skill".into());
-            let desc = meta.get("description").cloned()
+            let id = meta
+                .get("id")
+                .cloned()
+                .or_else(|| {
+                    body.lines()
+                        .next()
+                        .and_then(|l| l.strip_prefix("# "))
+                        .map(|s| s.to_lowercase().replace(' ', "-"))
+                })
+                .unwrap_or_else(|| "generated-skill".into());
+            let desc = meta
+                .get("description")
+                .cloned()
                 .unwrap_or_else(|| "AI generated skill".into());
             return (id, desc);
         }
-        let title = content.lines().next()
+        let title = content
+            .lines()
+            .next()
             .and_then(|l| l.strip_prefix("# "))
             .unwrap_or("generated-skill");
-        (title.to_lowercase().replace(' ', "-"), "AI generated skill".into())
+        (
+            title.to_lowercase().replace(' ', "-"),
+            "AI generated skill".into(),
+        )
     }
 
     /// Legacy entry — kept for tests; prefer reflect_on_workflow + save_skill_draft.
@@ -156,7 +185,10 @@ impl AutoReflector {
         execution_summary: &str,
         conversation_history: &[Message],
     ) -> Result<Option<String>> {
-        match self.reflect_on_workflow(task_description, execution_summary, conversation_history).await? {
+        match self
+            .reflect_on_workflow(task_description, execution_summary, conversation_history)
+            .await?
+        {
             ReflectOutcome::Draft { content, .. } => Ok(Some(self.save_skill_draft(&content)?)),
             ReflectOutcome::Skipped { .. } => Ok(None),
         }
@@ -177,15 +209,20 @@ impl AutoReflector {
         } else {
             &[]
         };
-        
-        let conversation_context = context_messages.iter().map(|msg| {
-            match msg {
+
+        let conversation_context = context_messages
+            .iter()
+            .map(|msg| match msg {
                 Message::User { content } => format!("User: {}", content),
                 Message::Assistant { content, .. } => format!("Assistant: {}", content),
-                Message::ToolResult { content, .. } => format!("Tool result: {}", content.chars().take(200).collect::<String>()),
+                Message::ToolResult { content, .. } => format!(
+                    "Tool result: {}",
+                    content.chars().take(200).collect::<String>()
+                ),
                 _ => String::new(),
-            }
-        }).collect::<Vec<_>>().join("\n\n");
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
 
         SKILL_CREATION_PROMPT
             .replace("{task_description}", task_description)
@@ -196,15 +233,15 @@ impl AutoReflector {
     /// Call LLM to generate reflection insights
     async fn call_llm_for_reflection(&self, prompt: &str) -> Result<String> {
         use tokio::sync::mpsc;
-        
+
         let messages = vec![Message::system(prompt)];
         let (tx, mut rx) = mpsc::unbounded_channel::<crate::llm::LlmStreamEvent>();
-        
+
         // Use stream_chat and collect the full response
         self.llm_provider
             .stream_chat(&messages, &[], tx, crate::llm::StreamOptions::default())
             .await?;
-        
+
         let mut full_content = String::new();
         while let Some(event) = rx.recv().await {
             match event {
@@ -236,16 +273,24 @@ impl AutoReflector {
         let (repaired_content, skill_id, scope) = match Self::extract_frontmatter_static(content) {
             Ok((metadata, body)) => {
                 let id = metadata.get("id").cloned().unwrap_or_else(|| {
-                    body.lines().next()
+                    body.lines()
+                        .next()
                         .and_then(|l| l.strip_prefix("# "))
                         .unwrap_or("generated-skill")
-                        .to_lowercase().replace(' ', "-")
+                        .to_lowercase()
+                        .replace(' ', "-")
                 });
-                let name = metadata.get("name").cloned()
+                let name = metadata
+                    .get("name")
+                    .cloned()
                     .unwrap_or_else(|| id.replace('-', " "));
-                let description = metadata.get("description").cloned()
+                let description = metadata
+                    .get("description")
+                    .cloned()
                     .unwrap_or_else(|| "AI generated skill".to_string());
-                let scope = metadata.get("scope").cloned()
+                let scope = metadata
+                    .get("scope")
+                    .cloned()
                     .unwrap_or_else(|| "project".to_string());
                 let scope = match scope.as_str() {
                     "project" | "global" | "system" => scope,
@@ -253,13 +298,18 @@ impl AutoReflector {
                 };
                 let fixed = format!(
                     "---\nname: \"{}\"\ndescription: \"{}\"\nscope: \"{}\"\n---\n\n{}",
-                    name, description, scope, body.trim()
+                    name,
+                    description,
+                    scope,
+                    body.trim()
                 );
                 (fixed, id, scope)
             }
             Err(_) => {
                 let body = content.trim();
-                let title = body.lines().next()
+                let title = body
+                    .lines()
+                    .next()
                     .and_then(|l| l.strip_prefix("# "))
                     .unwrap_or("generated-skill");
                 let id = title.to_lowercase().replace(' ', "-");
@@ -295,7 +345,10 @@ impl AutoReflector {
             if let Ok(existing) = fs::read_to_string(skill_file) {
                 let merged = crate::skill::dedup::merge_skill_markdown(&existing, repaired_content);
                 fs::write(skill_file, &merged)?;
-                tracing::info!("[AUTO-REFLECT] Merged into existing skill: {:?}", skill_file);
+                tracing::info!(
+                    "[AUTO-REFLECT] Merged into existing skill: {:?}",
+                    skill_file
+                );
                 return Ok(format!("{skill_id} (merged)"));
             }
         }
@@ -305,24 +358,34 @@ impl AutoReflector {
     }
 
     /// Extract YAML frontmatter from markdown content
-    fn extract_frontmatter(&self, content: &str) -> Result<(std::collections::HashMap<String, String>, String)> {
+    fn extract_frontmatter(
+        &self,
+        content: &str,
+    ) -> Result<(std::collections::HashMap<String, String>, String)> {
         Self::extract_frontmatter_static(content)
     }
 
-    fn extract_frontmatter_static(content: &str) -> Result<(std::collections::HashMap<String, String>, String)> {
+    fn extract_frontmatter_static(
+        content: &str,
+    ) -> Result<(std::collections::HashMap<String, String>, String)> {
         let content = content.trim();
-        
+
         if !content.starts_with("---") {
-            return Err(anyhow::anyhow!("Missing YAML frontmatter (---) at start of content"));
+            return Err(anyhow::anyhow!(
+                "Missing YAML frontmatter (---) at start of content"
+            ));
         }
 
-        let end_marker = content.find("\n---\n")
+        let end_marker = content
+            .find("\n---\n")
             .ok_or_else(|| anyhow::anyhow!("Missing closing --- for frontmatter"))?;
 
         // 使用安全的字符边界检查
-        let frontmatter_str = content.get(3..end_marker)
+        let frontmatter_str = content
+            .get(3..end_marker)
             .ok_or_else(|| anyhow::anyhow!("Invalid frontmatter boundaries"))?; // Skip opening ---
-        let body = content.get(end_marker + 5..)
+        let body = content
+            .get(end_marker + 5..)
             .map(|s| s.trim())
             .unwrap_or(""); // Skip closing ---\n
 
@@ -333,13 +396,15 @@ impl AutoReflector {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            
+
             if let Some(colon_pos) = line.find(':') {
                 // 使用安全的字符边界检查
-                let key = line.get(..colon_pos)
+                let key = line
+                    .get(..colon_pos)
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
-                let value = line.get(colon_pos + 1..)
+                let value = line
+                    .get(colon_pos + 1..)
                     .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
                     .unwrap_or_default();
                 metadata.insert(key, value);
@@ -367,5 +432,43 @@ Some markdown content."#;
 
         // This is just a compile check - actual test would need mock providers
         assert!(content.contains("rust_async_best_practices"));
+    }
+
+    fn convo(tool_result: &str) -> Vec<Message> {
+        vec![
+            Message::user("请修复登录逻辑"),
+            Message::assistant("好的，我来改"),
+            Message::ToolResult {
+                tool_call_id: "t1".into(),
+                content: tool_result.into(),
+            },
+            Message::assistant("完成"),
+        ]
+    }
+
+    #[test]
+    fn quality_gate_detects_edit_file_patched_case_insensitive() {
+        // edit_file emits "✅ Patched" (capital P) wrapped by the unified
+        // envelope as "✓ edit_file\n✅ Patched ...". Must count as substance.
+        let convo = convo("✓ edit_file\n✅ Patched src/auth.rs (3 → 5 lines)");
+        let skip = AutoReflector::quality_gate("修复登录鉴权逻辑的边界问题", "改完了", &convo);
+        assert!(
+            skip.is_none(),
+            "edit_file change should pass the gate, got {skip:?}"
+        );
+    }
+
+    #[test]
+    fn quality_gate_detects_file_write_success() {
+        let convo = convo("✓ file_write\n✅ Successfully written 200 bytes to a.rs");
+        let skip = AutoReflector::quality_gate("新增配置文件加载逻辑", "done", &convo);
+        assert!(skip.is_none());
+    }
+
+    #[test]
+    fn quality_gate_skips_pure_readonly_turn() {
+        let convo = convo("✓ file_read\nfn main() {}");
+        let skip = AutoReflector::quality_gate("看看这个函数是干嘛的", "这是入口", &convo);
+        assert!(skip.is_some(), "read-only Q&A should be skipped");
     }
 }

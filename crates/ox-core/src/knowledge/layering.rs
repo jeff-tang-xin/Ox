@@ -11,7 +11,6 @@
 /// - Enough time/iterations have passed since last confirmation (≥ N agent iterations)
 ///
 /// This prevents token-burning on every turn while still automating the layering process.
-
 use super::entity::{Entity, EntityKind, EntityMetadata, Relation, RelationType};
 use super::graph::EntityGraph;
 
@@ -168,7 +167,8 @@ impl AutoLayering {
                 }
 
                 // Build a summary hint from the turn actions
-                let actions: Vec<String> = turn_ids.iter()
+                let actions: Vec<String> = turn_ids
+                    .iter()
                     .filter_map(|tid| {
                         graph.get(tid).and_then(|e| {
                             if let EntityMetadata::WorkingMemory { ref action, .. } = e.metadata {
@@ -227,7 +227,9 @@ impl AutoLayering {
                 }
 
                 // Build a topic hint from the first few facts
-                let topic_items: Vec<String> = fact_ids.iter().take(3)
+                let topic_items: Vec<String> = fact_ids
+                    .iter()
+                    .take(3)
                     .filter_map(|id| graph.get(id))
                     .map(|e| e.content.chars().take(80).collect())
                     .collect();
@@ -266,7 +268,10 @@ impl AutoLayering {
         for (domain, episode_ids) in &by_domain {
             if episode_ids.len() as u32 >= self.config.l2_to_l3_min_episodes {
                 let already_pending = self.pending_candidates.iter().any(|c| {
-                    if let LayeringCandidate::L2ToL3 { source_episodes, .. } = c {
+                    if let LayeringCandidate::L2ToL3 {
+                        source_episodes, ..
+                    } = c
+                    {
                         source_episodes.iter().any(|e| episode_ids.contains(e))
                     } else {
                         false
@@ -276,11 +281,7 @@ impl AutoLayering {
                     continue;
                 }
 
-                let pattern_hint = format!(
-                    "{} episodes in domain '{}'",
-                    episode_ids.len(),
-                    domain
-                );
+                let pattern_hint = format!("{} episodes in domain '{}'", episode_ids.len(), domain);
 
                 if self.pending_candidates.len() < self.config.max_candidates_per_batch * 3 {
                     self.pending_candidates.push(LayeringCandidate::L2ToL3 {
@@ -343,33 +344,55 @@ impl AutoLayering {
             prompt.push_str(&format!("### Candidate {}\n", idx + 1));
 
             match candidate {
-                LayeringCandidate::L0ToL1 { source_turns, common_symbols, summary_hint } => {
+                LayeringCandidate::L0ToL1 {
+                    source_turns,
+                    common_symbols,
+                    summary_hint,
+                } => {
                     prompt.push_str("**Type**: L0 WorkingMemory → L1 AtomicMemory\n");
                     prompt.push_str(&format!("**Source turns**: {} turns\n", source_turns.len()));
                     prompt.push_str(&format!(
                         "**Common symbols**: {}\n",
-                        common_symbols.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        common_symbols
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ));
                     prompt.push_str(&format!("**Context**: {}\n", summary_hint));
 
                     // Include turn details from graph
                     for tid in source_turns.iter().take(3) {
                         if let Some(e) = graph.get(tid) {
-                            prompt.push_str(&format!("  - {}\n", e.content.chars().take(150).collect::<String>()));
+                            prompt.push_str(&format!(
+                                "  - {}\n",
+                                e.content.chars().take(150).collect::<String>()
+                            ));
                         }
                     }
                     prompt.push_str("**If approved, produce**: A single L1 AtomicMemory fact capturing what was learned.\n\n");
                 }
-                LayeringCandidate::L1ToL2 { source_facts, topic, episode_hint } => {
+                LayeringCandidate::L1ToL2 {
+                    source_facts,
+                    topic,
+                    episode_hint,
+                } => {
                     prompt.push_str("**Type**: L1 AtomicMemory → L2 EpisodicMemory\n");
                     prompt.push_str(&format!("**Source facts**: {} facts\n", source_facts.len()));
                     prompt.push_str(&format!("**Topic**: {}\n", topic));
                     prompt.push_str(&format!("**Hint**: {}\n", episode_hint));
                     prompt.push_str("**If approved, produce**: An L2 EpisodicMemory checkpoint summarizing the task/topic.\n\n");
                 }
-                LayeringCandidate::L2ToL3 { source_episodes, pattern_hint, domain } => {
+                LayeringCandidate::L2ToL3 {
+                    source_episodes,
+                    pattern_hint,
+                    domain,
+                } => {
                     prompt.push_str("**Type**: L2 EpisodicMemory → L3 SemanticMemory\n");
-                    prompt.push_str(&format!("**Source episodes**: {} episodes\n", source_episodes.len()));
+                    prompt.push_str(&format!(
+                        "**Source episodes**: {} episodes\n",
+                        source_episodes.len()
+                    ));
                     prompt.push_str(&format!("**Pattern**: {}\n", pattern_hint));
                     prompt.push_str(&format!("**Domain**: {}\n", domain));
                     prompt.push_str("**If approved, produce**: An L3 SemanticMemory abstraction of the architectural pattern.\n\n");
@@ -403,9 +426,7 @@ impl AutoLayering {
 
         for (idx, candidate) in candidates.iter().enumerate() {
             let decision = decisions.iter().find(|d| d.id == format!("c{}", idx + 1));
-            let is_approved = decision
-                .map(|d| d.decision == "approve")
-                .unwrap_or(false);
+            let is_approved = decision.map(|d| d.decision == "approve").unwrap_or(false);
             let content = decision
                 .and_then(|d| d.upgraded_content.clone())
                 .unwrap_or_default();
@@ -414,9 +435,8 @@ impl AutoLayering {
                 confirmed_count += 1;
                 match candidate {
                     LayeringCandidate::L0ToL1 { source_turns, .. } => {
-                        let mut entity = Entity::atomic_memory(
-                            &content, "Fact", None, "", "LlmExtraction",
-                        );
+                        let mut entity =
+                            Entity::atomic_memory(&content, "Fact", None, "", "LlmExtraction");
                         // Link to source turns
                         for tid in source_turns {
                             entity.relations.push(Relation {
@@ -428,10 +448,13 @@ impl AutoLayering {
                         new_entities.push(entity);
                         updated_source_ids.extend(source_turns.iter().cloned());
                     }
-                    LayeringCandidate::L1ToL2 { source_facts, topic, .. } => {
-                        let mut entity = Entity::episodic_memory(
-                            &topic, session_id, None, &content,
-                        );
+                    LayeringCandidate::L1ToL2 {
+                        source_facts,
+                        topic,
+                        ..
+                    } => {
+                        let mut entity =
+                            Entity::episodic_memory(&topic, session_id, None, &content);
                         for fid in source_facts {
                             entity.relations.push(Relation {
                                 target_id: fid.clone(),
@@ -442,9 +465,14 @@ impl AutoLayering {
                         new_entities.push(entity);
                         updated_source_ids.extend(source_facts.iter().cloned());
                     }
-                    LayeringCandidate::L2ToL3 { source_episodes, .. } => {
+                    LayeringCandidate::L2ToL3 {
+                        source_episodes, ..
+                    } => {
                         let mut entity = Entity::semantic_memory(
-                            "", &content, "architecture", source_episodes.clone(),
+                            "",
+                            &content,
+                            "architecture",
+                            source_episodes.clone(),
                         );
                         for eid in source_episodes {
                             entity.relations.push(Relation {
@@ -464,7 +492,9 @@ impl AutoLayering {
 
         tracing::info!(
             "[AUTO_LAYERING] Applied confirmations: {} approved, {} rejected, {} new entities",
-            confirmed_count, rejected_count, new_entities.len()
+            confirmed_count,
+            rejected_count,
+            new_entities.len()
         );
 
         LayeringResult {
@@ -496,13 +526,8 @@ impl AutoLayering {
                     summary_hint,
                     ..
                 } if !summary_hint.is_empty() => {
-                    let mut entity = Entity::atomic_memory(
-                        summary_hint,
-                        "Fact",
-                        project_id,
-                        "",
-                        "AutoLayering",
-                    );
+                    let mut entity =
+                        Entity::atomic_memory(summary_hint, "Fact", project_id, "", "AutoLayering");
                     for tid in source_turns {
                         entity.relations.push(Relation {
                             target_id: tid.clone(),
@@ -617,7 +642,8 @@ fn parse_llm_decisions(raw: &str) -> Vec<LlmDecision> {
             Some(LlmDecision {
                 id: v.get("id")?.as_str()?.to_string(),
                 decision: v.get("decision")?.as_str()?.to_string(),
-                upgraded_content: v.get("upgraded_content")
+                upgraded_content: v
+                    .get("upgraded_content")
                     .and_then(|c| c.as_str())
                     .map(|s| s.to_string()),
             })
@@ -632,17 +658,33 @@ fn parse_llm_decisions(raw: &str) -> Vec<LlmDecision> {
 /// Classify content into a domain for L2→L3 grouping.
 fn classify_domain(content: &str) -> String {
     let lower = content.to_lowercase();
-    if lower.contains("architecture") || lower.contains("module") || lower.contains("trait") || lower.contains("interface") {
+    if lower.contains("architecture")
+        || lower.contains("module")
+        || lower.contains("trait")
+        || lower.contains("interface")
+    {
         "architecture".into()
-    } else if lower.contains("test") || lower.contains("bug") || lower.contains("error") || lower.contains("fix") {
+    } else if lower.contains("test")
+        || lower.contains("bug")
+        || lower.contains("error")
+        || lower.contains("fix")
+    {
         "debugging".into()
-    } else if lower.contains("build") || lower.contains("deploy") || lower.contains("ci") || lower.contains("release") {
+    } else if lower.contains("build")
+        || lower.contains("deploy")
+        || lower.contains("ci")
+        || lower.contains("release")
+    {
         "deployment".into()
     } else if lower.contains("style") || lower.contains("format") || lower.contains("lint") {
         "coding_style".into()
     } else if lower.contains("api") || lower.contains("endpoint") || lower.contains("auth") {
         "api_design".into()
-    } else if lower.contains("db") || lower.contains("sql") || lower.contains("query") || lower.contains("cache") {
+    } else if lower.contains("db")
+        || lower.contains("sql")
+        || lower.contains("query")
+        || lower.contains("cache")
+    {
         "data_layer".into()
     } else {
         "general".into()
@@ -654,9 +696,14 @@ fn classify_domain(content: &str) -> String {
 pub fn export_episode_to_markdown(entity: &Entity, related_atoms: &[&Entity]) -> String {
     let em = match &entity.metadata {
         EntityMetadata::EpisodicMemory {
-            episode_name, start_time, end_time,
-            task_description, conclusions, unresolved,
-            continuation_hint, ..
+            episode_name,
+            start_time,
+            end_time,
+            task_description,
+            conclusions,
+            unresolved,
+            continuation_hint,
+            ..
         } => {
             let start_dt = chrono::DateTime::from_timestamp(*start_time, 0)
                 .map(|dt| dt.to_rfc3339())
@@ -680,10 +727,19 @@ pub fn export_episode_to_markdown(entity: &Entity, related_atoms: &[&Entity]) ->
                 name = episode_name,
                 id = entity.id,
                 task = task_description,
-                conclusions = conclusions.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
-                unresolved = if unresolved.is_empty() { "(none)".into() } else { unresolved.join("\n") },
+                conclusions = conclusions
+                    .iter()
+                    .map(|c| format!("- {}", c))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                unresolved = if unresolved.is_empty() {
+                    "(none)".into()
+                } else {
+                    unresolved.join("\n")
+                },
                 hint = continuation_hint.as_deref().unwrap_or("(none)"),
-                atoms = related_atoms.iter()
+                atoms = related_atoms
+                    .iter()
                     .map(|a| format!("- [L1] {}", a.content.chars().take(200).collect::<String>()))
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -697,7 +753,12 @@ pub fn export_episode_to_markdown(entity: &Entity, related_atoms: &[&Entity]) ->
 /// Export a SemanticMemory entity to a human-readable Markdown file.
 pub fn export_semantic_to_markdown(entity: &Entity, related_episodes: &[&Entity]) -> String {
     let sm = match &entity.metadata {
-        EntityMetadata::SemanticMemory { domain, version, confidence, .. } => {
+        EntityMetadata::SemanticMemory {
+            domain,
+            version,
+            confidence,
+            ..
+        } => {
             format!(
                 "# Semantic Memory: {domain}\n\n\
                  **ID**: {id}\n\
@@ -711,7 +772,8 @@ pub fn export_semantic_to_markdown(entity: &Entity, related_episodes: &[&Entity]
                 version = version,
                 confidence_pct = (confidence * 100.0) as u32,
                 content = entity.content,
-                episodes = related_episodes.iter()
+                episodes = related_episodes
+                    .iter()
                     .map(|e| format!("- {}", e.content.chars().take(200).collect::<String>()))
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -729,7 +791,7 @@ pub fn export_semantic_to_markdown(entity: &Entity, related_episodes: &[&Entity]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::entity::{SymbolType, EntityKind};
+    use crate::knowledge::entity::{EntityKind, SymbolType};
 
     fn make_entity(id: &str, kind: EntityKind, content: &str) -> Entity {
         let _now = chrono::Utc::now().timestamp();
@@ -738,7 +800,9 @@ mod tests {
             kind,
             content: content.to_string(),
             coordinate: crate::knowledge::entity::MemoryCoordinate::new(
-                kind.depth().unwrap_or(0), id, 384,
+                kind.depth().unwrap_or(0),
+                id,
+                384,
             ),
             metadata: match kind {
                 EntityKind::CodeSymbol => EntityMetadata::CodeSymbol {
@@ -844,13 +908,11 @@ mod tests {
 
     #[test]
     fn test_build_confirmation_prompt() {
-        let candidates = vec![
-            LayeringCandidate::L0ToL1 {
-                source_turns: vec!["t1".into(), "t2".into(), "t3".into()],
-                common_symbols: vec!["auth::validate_token".into()],
-                summary_hint: "Fixed token expiry handling".into(),
-            },
-        ];
+        let candidates = vec![LayeringCandidate::L0ToL1 {
+            source_turns: vec!["t1".into(), "t2".into(), "t3".into()],
+            common_symbols: vec!["auth::validate_token".into()],
+            summary_hint: "Fixed token expiry handling".into(),
+        }];
         let graph = EntityGraph::new();
         let prompt = AutoLayering::build_confirmation_prompt(&candidates, &graph);
         assert!(prompt.contains("L0 WorkingMemory"));
@@ -881,13 +943,11 @@ mod tests {
 
     #[test]
     fn test_apply_confirmation_approve_l0_to_l1() {
-        let candidates = vec![
-            LayeringCandidate::L0ToL1 {
-                source_turns: vec!["t1".into(), "t2".into(), "t3".into()],
-                common_symbols: vec!["sym1".into()],
-                summary_hint: "test".into(),
-            },
-        ];
+        let candidates = vec![LayeringCandidate::L0ToL1 {
+            source_turns: vec!["t1".into(), "t2".into(), "t3".into()],
+            common_symbols: vec!["sym1".into()],
+            summary_hint: "test".into(),
+        }];
         let response = r#"[{"id": "c1", "decision": "approve", "upgraded_content": "Token must be validated before use"}]"#;
         let result = AutoLayering::apply_confirmation(&candidates, response, "sess-1");
 
@@ -900,13 +960,11 @@ mod tests {
 
     #[test]
     fn test_apply_confirmation_reject() {
-        let candidates = vec![
-            LayeringCandidate::L0ToL1 {
-                source_turns: vec!["t1".into()],
-                common_symbols: vec![],
-                summary_hint: "noise".into(),
-            },
-        ];
+        let candidates = vec![LayeringCandidate::L0ToL1 {
+            source_turns: vec!["t1".into()],
+            common_symbols: vec![],
+            summary_hint: "noise".into(),
+        }];
         let response = r#"[{"id": "c1", "decision": "reject", "upgraded_content": null}]"#;
         let result = AutoLayering::apply_confirmation(&candidates, response, "sess-1");
 

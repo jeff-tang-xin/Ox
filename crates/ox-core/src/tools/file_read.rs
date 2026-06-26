@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
+/// Files smaller than this on disk are read fully; tool results below this stay inline (no ref).
+pub const SMALL_FILE_THRESHOLD: u64 = 512 * 1024;
+pub const INLINE_CONTENT_THRESHOLD: usize = SMALL_FILE_THRESHOLD as usize;
+
 /// Read a line slice from a workspace-relative path (shared by tool + exploration cache).
 pub fn read_file_slice(
     working_dir: &std::path::Path,
@@ -20,18 +24,15 @@ pub fn read_file_slice(
         working_dir.join(&path_str)
     };
 
-    let path =
-        match crate::safety::validate_path_within_workdir(&resolved_path, working_dir) {
-            Ok(p) => p,
-            Err(e) => return Err(format!("Path validation failed: {e}")),
-        };
+    let path = match crate::safety::validate_path_within_workdir(&resolved_path, working_dir) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("Path validation failed: {e}")),
+    };
 
     let file_size = match std::fs::metadata(&path) {
         Ok(m) => m.len(),
         Err(e) => return Err(format!("Cannot access file: {e}")),
     };
-
-    const SMALL_FILE_THRESHOLD: u64 = 512 * 1024;
 
     let (content, total_lines) = if file_size < SMALL_FILE_THRESHOLD {
         read_full_then_slice(&path, offset, limit)?
@@ -39,7 +40,13 @@ pub fn read_file_slice(
         stream_read_lines(&path, offset, limit)?
     };
 
-    Ok(format_read_output(&path_str, content, offset, limit, total_lines))
+    Ok(format_read_output(
+        &path_str,
+        content,
+        offset,
+        limit,
+        total_lines,
+    ))
 }
 
 fn format_read_output(
@@ -128,9 +135,11 @@ impl Tool for FileReadTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let path_str = match args.get("path").and_then(|p| p.as_str()) {
             Some(p) if !p.is_empty() => p.trim().replace('\\', "/"),
-            _ => return ToolOutput::error(
-                "❌ Missing or empty 'path' parameter.\nUsage: {\"path\": \"src/main.rs\"}",
-            ),
+            _ => {
+                return ToolOutput::error(
+                    "❌ Missing or empty 'path' parameter.\nUsage: {\"path\": \"src/main.rs\"}",
+                );
+            }
         };
         let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
             std::path::PathBuf::from(&path_str)
@@ -145,8 +154,16 @@ impl Tool for FileReadTool {
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
             };
 
-        let offset = args.get("offset").and_then(|o| o.as_u64()).map(|o| o as usize).unwrap_or(0);
-        let limit = args.get("limit").and_then(|l| l.as_u64()).map(|l| l as usize).unwrap_or(200);
+        let offset = args
+            .get("offset")
+            .and_then(|o| o.as_u64())
+            .map(|o| o as usize)
+            .unwrap_or(0);
+        let limit = args
+            .get("limit")
+            .and_then(|l| l.as_u64())
+            .map(|l| l as usize)
+            .unwrap_or(200);
 
         // Get encoding parameter
         let encoding = args.get("encoding").and_then(|e| e.as_str()).map(|e| {
@@ -166,8 +183,6 @@ impl Tool for FileReadTool {
             Err(e) => return ToolOutput::error(format!("Cannot access file: {e}")),
         };
 
-        const SMALL_FILE_THRESHOLD: u64 = 512 * 1024; // 512 KB
-
         let result = if file_size < SMALL_FILE_THRESHOLD && encoding.is_none() {
             read_full_then_slice(&path, offset, limit)
         } else if encoding.is_some() {
@@ -179,14 +194,19 @@ impl Tool for FileReadTool {
         match result {
             Ok((content, total_lines)) => {
                 let abs_path = path.to_path_buf();
-                let knowledge = Arc::clone(&ctx.knowledge);
-                tokio::spawn(async move {
-                    if let Ok(mut engine) = knowledge.try_write() {
-                        if let Err(e) = engine.index_file(&abs_path) {
-                            tracing::debug!("[FILE_READ] Auto-index failed for {}: {e}", abs_path.display());
+                if let Some(ref knowledge) = ctx.knowledge {
+                    let knowledge = knowledge.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mut engine) = knowledge.try_write() {
+                            if let Err(e) = engine.index_file(&abs_path) {
+                                tracing::debug!(
+                                    "[FILE_READ] Auto-index failed for {}: {e}",
+                                    abs_path.display()
+                                );
+                            }
                         }
-                    }
-                });
+                    });
+                }
 
                 let output = format_read_output(&path_str, content, offset, limit, total_lines);
                 ToolOutput::success(output)
@@ -197,9 +217,12 @@ impl Tool for FileReadTool {
 }
 
 /// Small file or unknown encoding: read entire file, decode, then slice lines.
-fn read_full_then_slice(path: &std::path::Path, offset: usize, limit: usize) -> Result<(String, usize), String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Cannot read file: {e}"))?;
+fn read_full_then_slice(
+    path: &std::path::Path,
+    offset: usize,
+    limit: usize,
+) -> Result<(String, usize), String> {
+    let content = std::fs::read_to_string(path).map_err(|e| format!("Cannot read file: {e}"))?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     let start = offset.min(total);
@@ -222,7 +245,9 @@ fn read_with_encoding_then_slice(
     let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
     let mut reader = BufReader::new(file);
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).map_err(|e| format!("Read error: {e}"))?;
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Read error: {e}"))?;
 
     let (cow, _enc, had_errors) = match encoding {
         Some(enc) => enc.decode(&bytes),
@@ -246,17 +271,19 @@ fn read_with_encoding_then_slice(
 
 /// Large UTF-8 file: stream-read only the needed lines using BufRead.
 /// Does NOT load the entire file into memory.
-fn stream_read_lines(path: &std::path::Path, offset: usize, limit: usize) -> Result<(String, usize), String> {
+fn stream_read_lines(
+    path: &std::path::Path,
+    offset: usize,
+    limit: usize,
+) -> Result<(String, usize), String> {
     let file = File::open(path).map_err(|e| format!("Cannot open file: {e}"))?;
     let reader = BufReader::new(file);
 
     let mut formatted = Vec::with_capacity(limit.min(500));
     let mut line_num: usize = 0;
-    let mut total_lines: usize = 0;
 
     for line_result in reader.lines() {
         let line = line_result.map_err(|e| format!("Read error at line {}: {e}", line_num + 1))?;
-        total_lines += 1; // count all lines in file
 
         if line_num >= offset && (line_num - offset) < limit {
             formatted.push(format!("{:>4}\t{line}", line_num + 1));
@@ -270,11 +297,34 @@ fn stream_read_lines(path: &std::path::Path, offset: usize, limit: usize) -> Res
     }
 
     // For large files, we may not know the exact total — show what we know
-    if line_num < offset + limit {
-        total_lines = line_num;
+    let total_lines = if line_num < offset + limit {
+        line_num
     } else {
-        total_lines = 0; // 0 means "unknown total" for large files
-    }
+        0 // 0 means "unknown total" for large files
+    };
 
     Ok((formatted.join("\n"), total_lines))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn read_with_absolute_windows_path() {
+        let dir = std::env::temp_dir().join("ox_test_file_read");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = dir.join("Test.java");
+        let mut f = std::fs::File::create(&fp).unwrap();
+        for i in 1..=150 {
+            writeln!(f, "line {}", i).unwrap();
+        }
+        drop(f);
+        let abs = fp.to_string_lossy().replace('\\', "/");
+        let r = read_file_slice(&dir, &abs, 74, 30);
+        assert!(r.is_ok(), "fail: {:?}", r.err());
+        assert!(r.unwrap().contains("line 75"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

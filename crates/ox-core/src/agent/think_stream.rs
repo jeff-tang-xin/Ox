@@ -4,7 +4,10 @@
 //! `delta.content` instead of a separate `reasoning_content` field.
 
 const OPEN_TAGS: &[&str] = &[concat!("<", "think"), concat!("<", "redacted_thinking")];
-const CLOSE_TAGS: &[&str] = &[concat!("<", "/think", ">"), concat!("<", "/redacted_thinking", ">")];
+const CLOSE_TAGS: &[&str] = &[
+    concat!("<", "/think", ">"),
+    concat!("<", "/redacted_thinking", ">"),
+];
 
 /// Incremental filter: think-tag bodies → reasoning UI; outside text → chat.
 #[derive(Debug, Default)]
@@ -168,9 +171,7 @@ mod tests {
 
     #[test]
     fn redacted_thinking_tag() {
-        let (t, v) = partition_think_stream(
-            "x<think>inner</think>y",
-        );
+        let (t, v) = partition_think_stream("x<think>inner</think>y");
         assert_eq!(t, "inner");
         assert_eq!(v, "xy");
     }

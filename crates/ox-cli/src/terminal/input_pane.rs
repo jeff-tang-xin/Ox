@@ -49,7 +49,9 @@ impl InputPane {
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             // Find the previous char boundary.
-            let prev = self.buffer.get(..self.cursor)
+            let prev = self
+                .buffer
+                .get(..self.cursor)
                 .and_then(|s| s.char_indices().next_back().map(|(i, _)| i))
                 .unwrap_or(0);
             self.buffer.drain(prev..self.cursor);
@@ -60,7 +62,9 @@ impl InputPane {
     /// Delete the character at the cursor (delete key).
     pub fn delete(&mut self) {
         if self.cursor < self.buffer.len() {
-            let next_char_len = self.buffer.get(self.cursor..)
+            let next_char_len = self
+                .buffer
+                .get(self.cursor..)
                 .and_then(|s| s.chars().next().map(|c| c.len_utf8()))
                 .unwrap_or(0);
             let next = self.cursor + next_char_len;
@@ -71,7 +75,9 @@ impl InputPane {
     /// Move cursor left by one character.
     pub fn move_left(&mut self) {
         if self.cursor > 0 {
-            self.cursor = self.buffer.get(..self.cursor)
+            self.cursor = self
+                .buffer
+                .get(..self.cursor)
                 .and_then(|s| s.char_indices().next_back().map(|(i, _)| i))
                 .unwrap_or(0);
         }
@@ -80,7 +86,9 @@ impl InputPane {
     /// Move cursor right by one character.
     pub fn move_right(&mut self) {
         if self.cursor < self.buffer.len() {
-            let next_char_len = self.buffer.get(self.cursor..)
+            let next_char_len = self
+                .buffer
+                .get(self.cursor..)
                 .and_then(|s| s.chars().next().map(|c| c.len_utf8()))
                 .unwrap_or(0);
             self.cursor += next_char_len;
@@ -208,7 +216,9 @@ impl InputPane {
 
         // Content doesn't fit - need to scroll
         // Strategy: keep cursor visible with some padding
-        let cursor_visual_pos = self.buffer.get(..self.cursor)
+        let cursor_visual_pos = self
+            .buffer
+            .get(..self.cursor)
             .map(|s| Self::visual_width(s))
             .unwrap_or(0);
 

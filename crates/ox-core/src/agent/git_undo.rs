@@ -29,7 +29,9 @@ pub fn undo_finding(
         }
     }
     if paths.is_empty() {
-        return Err(format!("finding #{finding_index} 无关联文件路径，无法 git checkout"));
+        return Err(format!(
+            "finding #{finding_index} 无关联文件路径，无法 git checkout"
+        ));
     }
 
     let rel_paths: Vec<String> = paths
@@ -70,7 +72,10 @@ pub fn git_checkout_paths(cwd: &Path, paths: &[String]) -> Result<String, String
         .map_err(|e| format!("git checkout 失败: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("git checkout 退出码 {:?}: {stderr}", out.status.code()));
+        return Err(format!(
+            "git checkout 退出码 {:?}: {stderr}",
+            out.status.code()
+        ));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     Ok(if stdout.trim().is_empty() {

@@ -3,7 +3,6 @@
 /// Each anchor must match exactly one line in the file. The range
 /// (inclusive by default) is deleted. Use for large block deletions
 /// where constructing a giant old_string for edit_file would be unwieldy.
-
 use serde_json::{Value, json};
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
@@ -53,10 +52,12 @@ impl Tool for DeleteRangeTool {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let path_str = match args.get("path").and_then(|p| p.as_str()) {
             Some(p) => p.trim().replace('\\', "/"),
-            None => return ToolOutput::error(
-                "❌ Missing required parameter: 'path'.\n\
+            None => {
+                return ToolOutput::error(
+                    "❌ Missing required parameter: 'path'.\n\
                  Usage: {\"path\": \"<file>\", \"start_anchor\": \"<first line>\", \"end_anchor\": \"<last line>\"}",
-            ),
+                );
+            }
         };
 
         let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
@@ -65,10 +66,11 @@ impl Tool for DeleteRangeTool {
             ctx.working_dir.join(&path_str)
         };
 
-        let path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
-            Ok(p) => p,
-            Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
-        };
+        let path =
+            match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
+                Ok(p) => p,
+                Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
+            };
 
         let start_anchor = match args.get("start_anchor").and_then(|s| s.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -78,7 +80,8 @@ impl Tool for DeleteRangeTool {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => return ToolOutput::error("❌ Missing required parameter: 'end_anchor'."),
         };
-        let inclusive = args.get("inclusive")
+        let inclusive = args
+            .get("inclusive")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
@@ -87,10 +90,12 @@ impl Tool for DeleteRangeTool {
         let result = tokio::task::spawn_blocking(move || {
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
-                Err(e) => return Err(format!(
-                    "❌ Cannot read {}: {e}\n💡 Check the path with file_list or file_read.",
-                    path.display()
-                )),
+                Err(e) => {
+                    return Err(format!(
+                        "❌ Cannot read {}: {e}\n💡 Check the path with file_list or file_read.",
+                        path.display()
+                    ));
+                }
             };
 
             let lines: Vec<&str> = content.lines().collect();
@@ -120,9 +125,12 @@ impl Tool for DeleteRangeTool {
                     // Build hint: show lines containing similar text
                     let mut hint = String::new();
                     for (i, line) in lines.iter().enumerate() {
-                        if line.contains(start_anchor.trim()) || start_anchor.trim().contains(line) {
+                        if line.contains(start_anchor.trim()) || start_anchor.trim().contains(line)
+                        {
                             hint.push_str(&format!("  Line {}: {}\n", i + 1, line));
-                            if hint.lines().count() >= 5 { break; }
+                            if hint.lines().count() >= 5 {
+                                break;
+                            }
                         }
                     }
                     return Err(format!(
@@ -177,7 +185,9 @@ impl Tool for DeleteRangeTool {
                 return Err(format!(
                     "❌ end_anchor (line {}) is before start_anchor (line {}) in {}.\n\
                      💡 Swap start_anchor and end_anchor, or check the anchors.",
-                    end_idx + 1, start_idx + 1, display_path
+                    end_idx + 1,
+                    start_idx + 1,
+                    display_path
                 ));
             }
 
@@ -190,7 +200,8 @@ impl Tool for DeleteRangeTool {
                         "❌ Nothing to delete: start_anchor (line {}) and end_anchor (line {}) \
                          are adjacent with inclusive=false.\n\
                          💡 Set inclusive: true or use wider anchors.",
-                        start_idx + 1, end_idx + 1
+                        start_idx + 1,
+                        end_idx + 1
                     ));
                 }
                 (start_idx + 1, end_idx)
@@ -218,12 +229,10 @@ impl Tool for DeleteRangeTool {
                         range_desc, display_path
                     ))
                 }
-                Err(e) => Err(format!(
-                    "❌ Failed to write {}: {e}",
-                    display_path
-                )),
+                Err(e) => Err(format!("❌ Failed to write {}: {e}", display_path)),
             }
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(msg)) => ToolOutput::success(msg),

@@ -6,6 +6,9 @@ use crate::message::Message;
 pub const RESPONSE_DISCIPLINE: &str = "【输出纪律】每轮二选一：① 调工具 ② 交本步产物（JSON/报告/## Done/直接答）。\
 禁止空转：不说「好的/明白/让我先/被摘要/需重读」而不立刻行动。详见 ox-output-discipline skill。";
 
+pub const UNIFIED_RESPONSE_DISCIPLINE: &str = "【输出纪律】每轮必须调用 `complete_and_check`（禁止纯文本）。\
+二选一：① action=read/write/探索 ② action=finish（有 finding_json→确认 / 无→结束）。禁止空转寒暄。";
+
 const OUTPUT_DISCIPLINE_SKILL: &str = include_str!("../skill/builtin/ox-output-discipline.md");
 
 /// Per-iteration discipline — full skill body on first iteration, one-liner after.
@@ -17,6 +20,17 @@ pub fn discipline_for_iteration(iteration: u32) -> String {
     } else {
         RESPONSE_DISCIPLINE.to_string()
     }
+}
+
+/// Unified mode discipline — references ox-unified-tooling skill.
+pub fn discipline_for_iteration_unified(iteration: u32) -> String {
+    if iteration > 0 {
+        return String::new();
+    }
+    format!(
+        "{UNIFIED_RESPONSE_DISCIPLINE}\n\
+         主流程见 [WORKSPACE]：探索 → finish(finding_json) 确认一次 → 实施 → finish 结束。"
+    )
 }
 
 fn output_discipline_skill_body() -> &'static str {
@@ -142,6 +156,13 @@ pub fn idle_streak_limit(_: &IdleContext<'_>) -> u32 {
 
 pub fn directive_for(ctx: &IdleContext<'_>) -> String {
     if ctx.engine.is_some_and(|e| e.is_single_step()) {
+        return "调 complete_and_check（探索或 finish）；禁止空转重读。".into();
+    }
+    "调用 complete_and_check，禁止空转。".into()
+}
+
+pub fn directive_for_legacy(ctx: &IdleContext<'_>) -> String {
+    if ctx.engine.is_some_and(|e| e.is_single_step()) {
         return "调工具或交产物（报告 + findings JSON + ## Done）；禁止空转重读。".into();
     }
     "调用工具或输出 ## Done，禁止空转。".into()
@@ -154,13 +175,19 @@ pub fn handle_empty_response(
     idle_streak: &mut u32,
     had_validation_error: bool,
     completion_tokens: Option<u32>,
+    unified_tool_mode: bool,
 ) -> IdleAction {
     // Hitting max_tokens often yields long prose with no tools — not intentional idle.
     if completion_tokens.is_some_and(|ct| ct >= 7500) {
         let ct = completion_tokens.unwrap_or(0);
+        let hint = if unified_tool_mode {
+            "请直接 complete_and_check（read 或 finish），勿长篇 prose"
+        } else {
+            "请直接调工具或交产物（报告/findings/## Done），勿长篇空转"
+        };
         return IdleAction::Continue {
             directive: Some(format!(
-                "{IDLE_HINT_TAG} 输出约 {ct} tokens，可能已达 max_tokens 上限被截断。请直接调工具或交产物（报告/findings/## Done），勿长篇空转。"
+                "{IDLE_HINT_TAG} 输出约 {ct} tokens，可能已达 max_tokens 上限被截断。{hint}。"
             )),
         };
     }
@@ -186,14 +213,20 @@ pub fn handle_empty_response(
             3 => "⚠️ 执行空转 — 已暂停，请重试或缩小任务范围".into(),
             _ => "⚠️ 空转过多 — 已暂停".into(),
         };
-        return IdleAction::EndTurn { user_status: status };
+        return IdleAction::EndTurn {
+            user_status: status,
+        };
     }
     IdleAction::Continue {
         directive: Some(format!(
             "{IDLE_HINT_TAG} 已连续 {}/{} 轮空转。{}",
             *idle_streak,
             limit,
-            directive_for(ctx)
+            if unified_tool_mode {
+                directive_for(ctx)
+            } else {
+                directive_for_legacy(ctx)
+            }
         )),
     }
 }
@@ -224,10 +257,16 @@ pub fn upsert_idle_assistant(messages: &mut Vec<Message>, new_msg: &Message) {
         content: prev,
         tool_calls: prev_tc,
         ..
-    }) = messages.iter().rev().find(|m| matches!(m, Message::Assistant { .. }))
+    }) = messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m, Message::Assistant { .. }))
     {
         if prev_tc.is_empty() && is_idle_narrative(prev) {
-            if let Some(idx) = messages.iter().rposition(|m| matches!(m, Message::Assistant { .. })) {
+            if let Some(idx) = messages
+                .iter()
+                .rposition(|m| matches!(m, Message::Assistant { .. }))
+            {
                 messages[idx] = new_msg.clone();
                 return;
             }
@@ -237,9 +276,11 @@ pub fn upsert_idle_assistant(messages: &mut Vec<Message>, new_msg: &Message) {
 }
 
 pub fn upsert_idle_hint(messages: &mut Vec<Message>, hint: &str) {
-    if let Some(Message::System { content }) = messages.iter_mut().rev().find(|m| {
-        matches!(m, Message::System { content } if is_idle_system_hint(content))
-    }) {
+    if let Some(Message::System { content }) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| matches!(m, Message::System { content } if is_idle_system_hint(content)))
+    {
         *content = hint.to_string();
     } else {
         messages.push(Message::system(hint));
@@ -247,9 +288,7 @@ pub fn upsert_idle_hint(messages: &mut Vec<Message>, hint: &str) {
 }
 
 pub fn strip_idle_hints(messages: &mut Vec<Message>) {
-    messages.retain(|m| {
-        !matches!(m, Message::System { content } if is_idle_system_hint(content))
-    });
+    messages.retain(|m| !matches!(m, Message::System { content } if is_idle_system_hint(content)));
 }
 
 /// Collapse consecutive idle assistant runs to the latest only.
@@ -359,11 +398,11 @@ mod tests {
         let mut streak = 0;
         let t = "好的，让我先看看项目结构";
         assert!(matches!(
-            handle_empty_response(&ctx, t, &mut streak, false, None),
+            handle_empty_response(&ctx, t, &mut streak, false, None, false),
             IdleAction::Continue { .. }
         ));
         assert!(matches!(
-            handle_empty_response(&ctx, t, &mut streak, false, None),
+            handle_empty_response(&ctx, t, &mut streak, false, None, false),
             IdleAction::EndTurn { .. }
         ));
     }
@@ -377,7 +416,7 @@ mod tests {
         let mut streak = 1;
         let t = "好的，让我先看看";
         assert!(matches!(
-            handle_empty_response(&ctx, t, &mut streak, false, Some(8192)),
+            handle_empty_response(&ctx, t, &mut streak, false, Some(8192), false),
             IdleAction::Continue { .. }
         ));
         assert_eq!(streak, 1);

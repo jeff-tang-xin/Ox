@@ -52,7 +52,7 @@ pub struct IntentInfo {
     pub keywords: Vec<String>,
     /// 建议使用的工具列表
     pub suggested_tools: Vec<String>,
-    
+
     // === 新增：记忆检索决策 ===
     /// 是否需要检索记忆
     #[serde(default = "default_false")]
@@ -127,12 +127,9 @@ impl RuleBasedClassifier {
         ActionVerbMap {
             read_verbs: [
                 // English
-                "read", "view", "show", "display", "check", "inspect", "see",
-                // 中文
-                "看", "查看", "读", "阅读", "显示", "检查", "看看",
-                // Japanese
-                "読む", "見る",
-                // Spanish
+                "read", "view", "show", "display", "check", "inspect", "see", // 中文
+                "看", "查看", "读", "阅读", "显示", "检查", "看看", // Japanese
+                "読む", "見る", // Spanish
                 "leer", "ver", "mostrar",
             ]
             .iter()
@@ -141,13 +138,31 @@ impl RuleBasedClassifier {
 
             write_verbs: [
                 // English
-                "write", "create", "add", "implement", "build", "make", "generate",
+                "write",
+                "create",
+                "add",
+                "implement",
+                "build",
+                "make",
+                "generate",
                 // 中文
-                "写", "创建", "添加", "实现", "构建", "做", "新建", "生成",
+                "写",
+                "创建",
+                "添加",
+                "实现",
+                "构建",
+                "做",
+                "新建",
+                "生成",
                 // Japanese
-                "書く", "作る", "追加",
+                "書く",
+                "作る",
+                "追加",
                 // Spanish
-                "escribir", "crear", "añadir", "implementar",
+                "escribir",
+                "crear",
+                "añadir",
+                "implementar",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -155,13 +170,21 @@ impl RuleBasedClassifier {
 
             search_verbs: [
                 // English
-                "search", "find", "locate", "look",
+                "search",
+                "find",
+                "locate",
+                "look",
                 // 中文
-                "搜索", "查找", "找", "寻找",
+                "搜索",
+                "查找",
+                "找",
+                "寻找",
                 // Japanese
-                "検索", "探す",
+                "検索",
+                "探す",
                 // Spanish
-                "buscar", "encontrar",
+                "buscar",
+                "encontrar",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -169,13 +192,30 @@ impl RuleBasedClassifier {
 
             debug_verbs: [
                 // English
-                "fix", "debug", "repair", "solve", "troubleshoot", "error", "bug",
+                "fix",
+                "debug",
+                "repair",
+                "solve",
+                "troubleshoot",
+                "error",
+                "bug",
                 // 中文
-                "修复", "调试", "解决", "修", "排除", "错误", "bug", "报错",
+                "修复",
+                "调试",
+                "解决",
+                "修",
+                "排除",
+                "错误",
+                "bug",
+                "报错",
                 // Japanese
-                "修正", "デバッグ", "解決",
+                "修正",
+                "デバッグ",
+                "解決",
                 // Spanish
-                "arreglar", "depurar", "solucionar",
+                "arreglar",
+                "depurar",
+                "solucionar",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -183,13 +223,27 @@ impl RuleBasedClassifier {
 
             refactor_verbs: [
                 // English
-                "refactor", "optimize", "improve", "clean", "restructure", "enhance",
+                "refactor",
+                "optimize",
+                "improve",
+                "clean",
+                "restructure",
+                "enhance",
                 // 中文
-                "重构", "优化", "改进", "清理", "重组", "增强",
+                "重构",
+                "优化",
+                "改进",
+                "清理",
+                "重组",
+                "增强",
                 // Japanese
-                "リファクタ", "最適化", "改善",
+                "リファクタ",
+                "最適化",
+                "改善",
                 // Spanish
-                "refactorizar", "optimizar", "mejorar",
+                "refactorizar",
+                "optimizar",
+                "mejorar",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -197,13 +251,30 @@ impl RuleBasedClassifier {
 
             explore_verbs: [
                 // English
-                "explore", "understand", "learn", "analyze", "explain", "structure",
+                "explore",
+                "understand",
+                "learn",
+                "analyze",
+                "explain",
+                "structure",
                 // 中文
-                "探索", "了解", "学习", "分析", "解释", "理解", "结构", "介绍",
+                "探索",
+                "了解",
+                "学习",
+                "分析",
+                "解释",
+                "理解",
+                "结构",
+                "介绍",
                 // Japanese
-                "探検", "理解", "学ぶ",
+                "探検",
+                "理解",
+                "学ぶ",
                 // Spanish
-                "explorar", "entender", "aprender", "analizar",
+                "explorar",
+                "entender",
+                "aprender",
+                "analizar",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -277,17 +348,13 @@ impl RuleBasedClassifier {
         };
 
         // 提取关键词（简单实现：取前 5 个有意义的词）
-        let keywords: Vec<String> = words
-            .into_iter()
-            .filter(|w| w.len() > 1)
-            .take(5)
-            .collect();
+        let keywords: Vec<String> = words.into_iter().filter(|w| w.len() > 1).take(5).collect();
 
         // 根据意图推荐工具
         let suggested_tools = self.recommend_tools(&best_intent);
-        
+
         // === 新增：记忆检索决策 ===
-        let (should_search_memory, memory_query, memory_scope) = 
+        let (should_search_memory, memory_query, memory_scope) =
             self.decide_memory_search(user_message, &best_intent, &keywords);
 
         IntentInfo {
@@ -300,7 +367,7 @@ impl RuleBasedClassifier {
             memory_scope,
         }
     }
-    
+
     /// 决策是否需要检索记忆
     fn decide_memory_search(
         &self,
@@ -309,13 +376,21 @@ impl RuleBasedClassifier {
         keywords: &[String],
     ) -> (bool, Option<String>, MemoryScope) {
         let msg_lower = user_message.to_lowercase();
-        
+
         // 规则 1: 用户明确提到历史/之前的内容
         let history_indicators = [
-            "之前", "以前", "上次", "记得", "历史", "before", "previous", 
-            "remember", "last time", "earlier"
+            "之前",
+            "以前",
+            "上次",
+            "记得",
+            "历史",
+            "before",
+            "previous",
+            "remember",
+            "last time",
+            "earlier",
         ];
-        
+
         for indicator in &history_indicators {
             if msg_lower.contains(indicator) {
                 return (
@@ -325,13 +400,21 @@ impl RuleBasedClassifier {
                 );
             }
         }
-        
+
         // 规则 2: 涉及项目特定知识（架构、约定等）
         let project_knowledge_indicators = [
-            "架构", "结构", "规范", "约定", "风格", "习惯",
-            "architecture", "convention", "pattern", "style"
+            "架构",
+            "结构",
+            "规范",
+            "约定",
+            "风格",
+            "习惯",
+            "architecture",
+            "convention",
+            "pattern",
+            "style",
         ];
-        
+
         for indicator in &project_knowledge_indicators {
             if msg_lower.contains(indicator) {
                 return (
@@ -341,11 +424,12 @@ impl RuleBasedClassifier {
                 );
             }
         }
-        
+
         // 规则 3: 复杂任务可能需要参考最佳实践
         match intent {
             QuestionType::CodeWriting | QuestionType::Refactoring => {
-                if keywords.len() >= 3 { // 任务较复杂
+                if keywords.len() >= 3 {
+                    // 任务较复杂
                     return (
                         true,
                         Some(self.extract_memory_query(user_message, keywords)),
@@ -363,11 +447,11 @@ impl RuleBasedClassifier {
             }
             _ => {}
         }
-        
+
         // 默认不检索
         (false, None, MemoryScope::Both)
     }
-    
+
     /// 从用户消息中提取记忆检索查询词
     fn extract_memory_query(&self, user_message: &str, keywords: &[String]) -> String {
         // 简单策略：使用关键词作为查询词
@@ -443,18 +527,15 @@ impl RuleBasedClassifier {
                 ]
             }
             QuestionType::GeneralQuestion => {
-                vec![
-                    "file_read".to_string(),
-                    "web_fetch".to_string(),
-                ]
+                vec!["file_read".to_string(), "web_fetch".to_string()]
             }
         };
-        
+
         // 始终添加 memory_search（LLM 可以根据需要决定是否使用）
         if !tools.contains(&"memory_search".to_string()) {
             tools.push("memory_search".to_string());
         }
-        
+
         tools
     }
 }
@@ -473,7 +554,7 @@ pub fn extract_intent_from_llm_response(response: &str) -> Option<IntentInfo> {
             // 使用字符边界安全的切片方法
             let start_byte = json_start + 7; // "```json" 的长度是7
             let end_byte = json_start + json_end;
-            
+
             // 确保字节索引在有效范围内且位于字符边界
             if start_byte <= end_byte && end_byte <= response.len() {
                 // 使用 get() 方法进行安全切片
@@ -510,10 +591,9 @@ pub fn remove_intent_json(response: &str) -> String {
             // 确保字节索引在有效范围内
             if json_start <= response.len() && json_block_end <= response.len() {
                 // 使用 get() 方法进行安全切片
-                if let (Some(before_part), Some(after_part)) = (
-                    response.get(..json_start),
-                    response.get(json_block_end..)
-                ) {
+                if let (Some(before_part), Some(after_part)) =
+                    (response.get(..json_start), response.get(json_block_end..))
+                {
                     // 移除 JSON 块及其前后的空行
                     let before = before_part.trim_end();
                     let after = after_part.trim_start();
@@ -546,7 +626,10 @@ mod tests {
 
         assert_eq!(result.intent, QuestionType::CodeWriting);
         // 置信度可能较低，因为中文分词简单
-        println!("Intent: {:?}, Confidence: {}", result.intent, result.confidence);
+        println!(
+            "Intent: {:?}, Confidence: {}",
+            result.intent, result.confidence
+        );
     }
 
     #[test]
@@ -565,7 +648,10 @@ mod tests {
         let result = classifier.classify("Explore the project structure");
 
         assert_eq!(result.intent, QuestionType::Exploration);
-        println!("Intent: {:?}, Confidence: {}", result.intent, result.confidence);
+        println!(
+            "Intent: {:?}, Confidence: {}",
+            result.intent, result.confidence
+        );
     }
 
     #[test]
@@ -575,9 +661,9 @@ mod tests {
 
         assert_eq!(result.intent, QuestionType::Debugging);
     }
-    
+
     // === 新增：记忆检索决策测试 ===
-    
+
     #[test]
     fn test_memory_search_with_history_reference() {
         let classifier = RuleBasedClassifier::new();
@@ -587,7 +673,7 @@ mod tests {
         assert!(result.memory_query.is_some());
         assert_eq!(result.memory_scope, MemoryScope::Project);
     }
-    
+
     #[test]
     fn test_memory_search_with_architecture_mention() {
         let classifier = RuleBasedClassifier::new();
@@ -596,7 +682,7 @@ mod tests {
         assert!(result.should_search_memory);
         assert_eq!(result.memory_scope, MemoryScope::Project);
     }
-    
+
     #[test]
     fn test_no_memory_search_for_simple_task() {
         let classifier = RuleBasedClassifier::new();
@@ -606,7 +692,7 @@ mod tests {
         // 这里我们只验证不会崩溃
         println!("Should search memory: {}", result.should_search_memory);
     }
-    
+
     #[test]
     fn test_memory_search_for_debugging() {
         let classifier = RuleBasedClassifier::new();

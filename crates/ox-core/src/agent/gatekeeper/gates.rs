@@ -143,7 +143,8 @@ impl Gate for ScopeGate {
         }
         // Review-only ## Done (no edits yet): receipt not required — but not during implement.
         if !ctx.had_code_changes
-            && crate::agent::phase::get(ctx.engine) != crate::agent::phase::SingleFlowPhase::Implement
+            && crate::agent::phase::get(ctx.engine)
+                != crate::agent::phase::SingleFlowPhase::Implement
         {
             return GateOutcome::Pass;
         }
@@ -322,13 +323,19 @@ mod tests {
         let e = engine();
         e.set_variable("_verify_command", "mvn compile".into());
         e.set_variable("_verify_status", "failed".into());
-        assert_eq!(VerifyGate.check(&ctx(&e, "## Done x", false)), GateOutcome::Pass);
+        assert_eq!(
+            VerifyGate.check(&ctx(&e, "## Done x", false)),
+            GateOutcome::Pass
+        );
     }
 
     #[test]
     fn scope_passes_without_findings() {
         let e = engine();
-        assert_eq!(ScopeGate.check(&ctx(&e, "## Done x", false)), GateOutcome::Pass);
+        assert_eq!(
+            ScopeGate.check(&ctx(&e, "## Done x", false)),
+            GateOutcome::Pass
+        );
     }
 
     #[test]

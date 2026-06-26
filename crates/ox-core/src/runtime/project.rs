@@ -50,10 +50,7 @@ pub fn ensure_ox_project_scaffold(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(ox.join("skills"))?;
     let marker = dir.join(".oxroot");
     if !marker.exists() {
-        std::fs::write(
-            &marker,
-            "# Ox project root marker (any language/stack)\n",
-        )?;
+        std::fs::write(&marker, "# Ox project root marker (any language/stack)\n")?;
     }
     Ok(())
 }

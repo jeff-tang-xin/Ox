@@ -4,13 +4,12 @@
 /// /index          - Show index status and statistics
 /// /index build    - Trigger full project re-indexing
 /// /index clear    - Clear the symbol database
-
-use crate::slash_commands::{CommandResult, CommandMeta};
+use crate::slash_commands::{CommandMeta, CommandResult};
 use crate::terminal::app::App as AppState;
-use ox_core::message::Session;
-use ox_core::runtime::RuntimeEnvironment;
 use ox_core::config::OxConfig;
 use ox_core::cost::CostTracker;
+use ox_core::message::Session;
+use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
 use std::sync::Arc;
 
@@ -31,13 +30,16 @@ fn handle_index_command(
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
     let args_trimmed = args.trim();
-    
+
     match args_trimmed {
         "build" | "rebuild" => {
-            app.output.push_system("🔨 Starting full project re-indexing...");
-            app.output.push_system("   This will parse all source files and build semantic embeddings.");
-            app.output.push_system("   The process runs in the background. You can continue working.");
-            
+            app.output
+                .push_system("🔨 Starting full project re-indexing...");
+            app.output
+                .push_system("   This will parse all source files and build semantic embeddings.");
+            app.output
+                .push_system("   The process runs in the background. You can continue working.");
+
             if let Some(ref engine) = app.knowledge_engine {
                 let engine_clone = Arc::clone(engine);
                 tokio::spawn(async move {
@@ -52,47 +54,52 @@ fn handle_index_command(
                     }
                 });
             } else {
-                app.output.push_system("⚠️ Knowledge engine not initialized. Restart Ox.");
+                app.output
+                    .push_system("⚠️ Knowledge engine not initialized. Restart Ox.");
             }
-            
+
             CommandResult::Success
         }
-        
+
         "clear" | "reset" => {
-            let db_path = dirs::home_dir()
-                .map(|h| h.join(".ox").join("db").join("knowledge.tdb"));
-            
+            let db_path = dirs::home_dir().map(|h| h.join(".ox").join("db").join("knowledge.tdb"));
+
             if let Some(path) = db_path {
                 if path.exists() {
                     match std::fs::remove_file(&path) {
                         Ok(_) => {
-                            app.output.push_system(&format!("✅ Cleared knowledge database: {:?}", path));
-                            app.output.push_system("   Restart Ox or run /index build to rebuild.");
+                            app.output
+                                .push_system(&format!("✅ Cleared knowledge database: {:?}", path));
+                            app.output
+                                .push_system("   Restart Ox or run /index build to rebuild.");
                         }
                         Err(e) => {
-                            app.output.push_system(&format!("❌ Failed to clear database: {}", e));
+                            app.output
+                                .push_system(&format!("❌ Failed to clear database: {}", e));
                         }
                     }
                 } else {
-                    app.output.push_system("ℹ️ Knowledge database does not exist.");
+                    app.output
+                        .push_system("ℹ️ Knowledge database does not exist.");
                 }
             } else {
-                app.output.push_system("⚠️ Could not determine database path.");
+                app.output
+                    .push_system("⚠️ Could not determine database path.");
             }
-            
+
             CommandResult::Success
         }
-        
+
         "" | "status" | "stat" => {
             if let Some(ref engine) = app.knowledge_engine {
                 let engine_clone = Arc::clone(engine);
                 tokio::spawn(async move {
                     let eng = engine_clone.read().await;
                     let _dim = eng.dimension();
-                    
-                    let db_path = dirs::home_dir()
-                        .map(|h| h.join(".ox").join("db").join("knowledge.tdb"));
-                    
+
+                    let db_path =
+                        dirs::home_dir().map(|h| h.join(".ox").join("db").join("knowledge.tdb"));
+
                     let db_status = if let Some(path) = db_path {
                         if path.exists() {
                             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -103,33 +110,36 @@ fn handle_index_command(
                     } else {
                         "⚠️ Unknown".to_string()
                     };
-                    
-                    tracing::info!(
-                        "[INDEX STATUS] dim={}, {}",
-                        _dim,
-                        db_status
-                    );
+
+                    tracing::info!("[INDEX STATUS] dim={}, {}", _dim, db_status);
                 });
-                
-                app.output.push_system("📊 Checking index status... (see logs for details)");
-                app.output.push_system("   Tip: Use /index build to trigger full indexing");
+
+                app.output
+                    .push_system("📊 Checking index status... (see logs for details)");
+                app.output
+                    .push_system("   Tip: Use /index build to trigger full indexing");
             } else {
-                app.output.push_system("⚠️ Knowledge engine not initialized.");
+                app.output
+                    .push_system("⚠️ Knowledge engine not initialized.");
             }
-            
+
             CommandResult::Success
         }
-        
+
         "help" | "--help" | "-h" => {
             app.output.push_system("📖 Index Command Help");
             app.output.push_system("");
             app.output.push_system("Usage: /index [action]");
             app.output.push_system("");
             app.output.push_system("Actions:");
-            app.output.push_system("  (no args)  - Show index status and statistics");
-            app.output.push_system("  build      - Trigger full project re-indexing");
-            app.output.push_system("  clear      - Clear the symbol database");
-            app.output.push_system("  help       - Show this help message");
+            app.output
+                .push_system("  (no args)  - Show index status and statistics");
+            app.output
+                .push_system("  build      - Trigger full project re-indexing");
+            app.output
+                .push_system("  clear      - Clear the symbol database");
+            app.output
+                .push_system("  help       - Show this help message");
             app.output.push_system("");
             app.output.push_system("Examples:");
             app.output.push_system("  /index          # Check status");
@@ -137,15 +147,19 @@ fn handle_index_command(
             app.output.push_system("  /index clear    # Reset database");
             app.output.push_system("");
             app.output.push_system("Notes:");
-            app.output.push_system("  • Indexing happens automatically when you read files");
-            app.output.push_system("  • Full indexing runs in background on startup");
-            app.output.push_system("  • Use find_symbol tool to search indexed symbols");
-            
+            app.output
+                .push_system("  • Indexing happens automatically when you read files");
+            app.output
+                .push_system("  • Full indexing runs in background on startup");
+            app.output
+                .push_system("  • Use find_symbol tool to search indexed symbols");
+
             CommandResult::Success
         }
-        
-        _ => {
-            CommandResult::Error(format!("Unknown index action: '{}'. Use /index help for usage.", args_trimmed))
-        }
+
+        _ => CommandResult::Error(format!(
+            "Unknown index action: '{}'. Use /index help for usage.",
+            args_trimmed
+        )),
     }
 }

@@ -1,3 +1,4 @@
+use anyhow::Result;
 /// Language detection and parsing registry (migrated from symbol/language.rs).
 ///
 /// Detects language from file extension, loads the appropriate tree-sitter grammar,
@@ -6,7 +7,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 use tree_sitter::{Language, Parser, Tree};
-use anyhow::Result;
 
 pub struct LanguageRegistry {
     parser: Parser,
@@ -73,14 +73,16 @@ impl LanguageRegistry {
             _ => anyhow::bail!("Unsupported language: {}", lang_name),
         };
 
-        self.languages.insert(lang_name.to_string(), language.clone());
+        self.languages
+            .insert(lang_name.to_string(), language.clone());
         Ok(language)
     }
 
     pub fn parse(&mut self, code: &str, lang_name: &str) -> Result<Tree> {
         let language = self.get_language(lang_name)?;
         self.parser.set_language(&language)?;
-        let tree = self.parser
+        let tree = self
+            .parser
             .parse(code, None)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse code"))?;
         Ok(tree)
@@ -96,7 +98,12 @@ impl LanguageRegistry {
         Ok(errors)
     }
 
-    fn collect_errors(node: tree_sitter::Node, code: &str, total_lines: usize, errors: &mut Vec<SyntaxError>) {
+    fn collect_errors(
+        node: tree_sitter::Node,
+        code: &str,
+        total_lines: usize,
+        errors: &mut Vec<SyntaxError>,
+    ) {
         if node.is_error() || node.is_missing() {
             let line = node.start_position().row + 1;
             let col = node.start_position().column + 1;
@@ -110,15 +117,18 @@ impl LanguageRegistry {
                     return;
                 }
             }
-            let snippet = node.utf8_text(code.as_bytes())
+            let snippet = node
+                .utf8_text(code.as_bytes())
                 .unwrap_or("<invalid>")
                 .chars()
                 .take(80)
                 .collect::<String>();
 
             let snippet_trimmed = snippet.trim();
-            if snippet_trimmed.starts_with("//") || snippet_trimmed.starts_with("/*")
-                || snippet_trimmed.starts_with("#") || snippet_trimmed.starts_with('"')
+            if snippet_trimmed.starts_with("//")
+                || snippet_trimmed.starts_with("/*")
+                || snippet_trimmed.starts_with("#")
+                || snippet_trimmed.starts_with('"')
             {
                 return;
             }
@@ -127,7 +137,11 @@ impl LanguageRegistry {
             }
 
             let description = format!("Syntax error at line {}:{}: `{}`", line, col, snippet);
-            errors.push(SyntaxError { line, column: col, description });
+            errors.push(SyntaxError {
+                line,
+                column: col,
+                description,
+            });
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {

@@ -12,13 +12,15 @@ pub const USER_ROUND_TAG: &str = "[USER_ROUND]";
 /// Latest user message that triggered the current agent turn (may differ from session task).
 pub const TURN_INPUT_TAG: &str = "[TURN_INPUT]";
 pub const TURN_INPUT_KEY: &str = "_turn_user_input";
-const MAX_HISTORY: usize = 3;
+const MAX_HISTORY: usize = 8;
 pub const ROUND_FINALIZED_KEY: &str = "_round_finalized";
 
 /// Session-visible marker written when a new user round starts.
 pub const ROUND_BOUNDARY_TAG: &str = "[ROUND_BOUNDARY]";
 /// Session-visible marker when the user interrupts (Ctrl+C) mid-round.
 pub const INTERRUPT_BOUNDARY_TAG: &str = "[INTERRUPT_BOUNDARY]";
+/// Session-visible marker written when a round completes successfully (finish).
+pub const COMPLETE_BOUNDARY_TAG: &str = "[ROUND_COMPLETE]";
 const ROUND_INTERRUPTED_KEY: &str = "_round_interrupted";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +54,8 @@ pub fn suspend_on_interrupt(engine: &mut WorkflowEngine) -> bool {
         return false;
     }
     engine.set_variable("_turn_memory", String::new());
+    engine.clear_impl_files_read();
+    engine.set_variable("_impl_files_edited", "[]".to_string());
     engine.set_variable(ROUND_INTERRUPTED_KEY, "1".to_string());
     true
 }
@@ -89,6 +93,35 @@ pub fn is_interrupt_boundary(content: &str) -> bool {
     content.starts_with(INTERRUPT_BOUNDARY_TAG)
 }
 
+/// Visible session marker for a successfully completed round.
+///
+/// Symmetric to `format_interrupt_boundary_message`: without this, a completed
+/// round left only a trail of tool results (e.g. `file_read` dumps) as the tail,
+/// and the LLM could not tell from message history whether that work had finished
+/// — so it re-explored or treated stale results as pending. This terminator makes
+/// completion explicit and machine-detectable.
+pub fn format_complete_boundary_message(task: &str, summary: &str) -> String {
+    let task: String = task.trim().chars().take(1500).collect();
+    let summary: String = summary.trim().chars().take(800).collect();
+    let mut out = format!(
+        "{COMPLETE_BOUNDARY_TAG}\n\
+         ✅ **上一轮任务已完成并交付（COMPLETED — HISTORICAL）**\n\
+         任务: {task}"
+    );
+    if !summary.is_empty() {
+        out.push_str(&format!("\n交付摘要: {summary}"));
+    }
+    out.push_str(
+        "\n此标记**之前**的工具输出与中间步骤均属**已完成**的历史轮次，仅供只读参考；\
+         **不要**重复执行、也**不要**当作未完成的待办。新需求以本轮用户输入为准。",
+    );
+    out
+}
+
+pub fn is_complete_boundary(content: &str) -> bool {
+    content.starts_with(COMPLETE_BOUNDARY_TAG)
+}
+
 pub fn set_turn_user_input(engine: &WorkflowEngine, text: &str) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -106,7 +139,10 @@ pub fn get_turn_user_input(engine: &WorkflowEngine) -> Option<String> {
 /// High-priority anchor: what the user just said this turn (overrides historical confusion).
 pub fn format_turn_input_block(engine: &WorkflowEngine) -> String {
     let input = get_turn_user_input(engine).unwrap_or_default();
-    format_turn_input_text(&input, engine.get_variable("_current_user_request").as_deref())
+    format_turn_input_text(
+        &input,
+        engine.get_variable("_current_user_request").as_deref(),
+    )
 }
 
 pub fn format_turn_input_text(input: &str, session_task: Option<&str>) -> String {
@@ -212,12 +248,11 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
 
     if engine.is_workflow_active()
         && !engine.is_workflow_complete()
-        && crate::agent::workflow_phases::get_phase(engine)
-            == crate::agent::workflow_phases::WorkflowPhase::Act
+        && crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::Implement
         && !WorkflowEngine::looks_like_new_task(user_message)
     {
         tracing::info!(
-            "[WORKFLOW] Act phase: blocked user round (not park resume /new): {}",
+            "[WORKFLOW] Implement phase: blocked user round (not /new): {}",
             user_message.chars().take(80).collect::<String>()
         );
         return false;
@@ -286,11 +321,7 @@ fn archive_completed_round(engine: &WorkflowEngine, prev_user: &str) {
     } else {
         outcome
     };
-    push_round_history(
-        engine,
-        prev_user,
-        format!("✅ **本轮已完成**\n\n{body}"),
-    );
+    push_round_history(engine, prev_user, format!("✅ **本轮已完成**\n\n{body}"));
 }
 
 fn archive_round(engine: &WorkflowEngine, prev_user: &str) {
@@ -344,29 +375,26 @@ pub fn build_round_outcome_summary(engine: &WorkflowEngine) -> String {
         }
     }
 
-    for (i, label) in [
-        ("_step3_output", "执行结果"),
-        ("_step2_output", "审阅"),
-        ("_step1_output", "计划"),
-        ("_step0_output", "意图"),
+    for (i, label, cap) in [
+        ("_step3_output", "执行结果", 2200usize),
+        ("_step2_output", "审阅", 1200),
+        ("_step1_output", "计划", 1200),
+        ("_step0_output", "意图", 800),
     ] {
         if let Some(raw) = engine.get_variable(i) {
             if raw.trim().is_empty() {
                 continue;
             }
-            let snippet: String = raw.chars().take(1200).collect();
+            let snippet: String = raw.chars().take(cap).collect();
             parts.push(format!("【{label}】\n{snippet}"));
         }
     }
 
     if let Some(tm) = engine.load_turn_memory() {
         if !tm.entries.is_empty() {
-            let mut lines = vec!["【工具调用】".to_string()];
-            for e in tm.entries.iter().take(20) {
-                lines.push(format!(
-                    "  - {}({}) → {}",
-                    e.tool, e.target, e.outcome
-                ));
+            let mut lines = vec!["【工具调用/改动】".to_string()];
+            for e in tm.entries.iter().take(30) {
+                lines.push(format!("  - {}({}) → {}", e.tool, e.target, e.outcome));
             }
             parts.push(lines.join("\n"));
         }
@@ -417,13 +445,11 @@ pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
 
     let history = load_round_history(engine);
     if !history.is_empty() {
-        let mut hist_lines = vec![
-            "## 📚 历史轮次（HISTORICAL — 只读参考，禁止执行）".to_string(),
-        ];
+        let mut hist_lines = vec!["## 📚 历史轮次（HISTORICAL — 只读参考，禁止执行）".to_string()];
         for (i, entry) in history.iter().enumerate() {
             let n = i + 1;
-            let user_snip: String = entry.user_request.chars().take(400).collect();
-            let out_snip: String = entry.outcome_summary.chars().take(1000).collect();
+            let user_snip: String = entry.user_request.chars().take(500).collect();
+            let out_snip: String = entry.outcome_summary.chars().take(2500).collect();
             hist_lines.push(format!(
                 "### 历史 #{n}\n\
                  - 用户曾请求: {user_snip}\n\
@@ -445,13 +471,10 @@ pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
     if !guidance.is_empty() {
         parts.push(guidance);
         parts.push(
-            "⚠️ workflow 进行中 — 上方补充说明优先；继续当前任务，勿重复已完成的工作。"
-                .to_string(),
+            "⚠️ workflow 进行中 — 上方补充说明优先；继续当前任务，勿重复已完成的工作。".to_string(),
         );
     } else if !engine.is_workflow_complete() {
-        parts.push(
-            "⚠️ 本轮 workflow 已重置；上轮探索/工具记录已清空。".to_string(),
-        );
+        parts.push("⚠️ 本轮 workflow 已重置；上轮探索/工具记录已清空。".to_string());
     }
 
     parts.join("\n\n")
@@ -509,7 +532,7 @@ mod tests {
 
     #[test]
     fn begin_user_round_preserves_mid_workflow() {
-        use crate::agent::workflow::{create_default_workflow, DEFAULT_WORKFLOW_ID};
+        use crate::agent::workflow::{DEFAULT_WORKFLOW_ID, create_default_workflow};
 
         let session = Arc::new(Mutex::new(SessionState::new("t")));
         let mut engine = WorkflowEngine::new(Arc::clone(&session));
@@ -532,7 +555,7 @@ mod tests {
 
     #[test]
     fn complete_workflow_finalizes_round_without_duplicate_archive() {
-        use crate::agent::workflow::{create_default_workflow, DEFAULT_WORKFLOW_ID};
+        use crate::agent::workflow::{DEFAULT_WORKFLOW_ID, create_default_workflow};
 
         let session = Arc::new(Mutex::new(SessionState::new("t")));
         let mut engine = WorkflowEngine::new(Arc::clone(&session));
@@ -544,7 +567,10 @@ mod tests {
 
         engine.complete_workflow().unwrap();
 
-        assert_eq!(engine.get_variable("_round_finalized").as_deref(), Some("1"));
+        assert_eq!(
+            engine.get_variable("_round_finalized").as_deref(),
+            Some("1")
+        );
         assert!(engine.get_variable("_step3_output").unwrap().is_empty());
         let history = load_round_history(&engine);
         assert_eq!(history.len(), 1);
@@ -561,7 +587,7 @@ mod tests {
 
     #[test]
     fn suspend_on_interrupt_marks_round_without_finalizing() {
-        use crate::agent::workflow::{create_default_workflow, DEFAULT_WORKFLOW_ID};
+        use crate::agent::workflow::{DEFAULT_WORKFLOW_ID, create_default_workflow};
 
         let session = Arc::new(Mutex::new(SessionState::new("t")));
         let mut engine = WorkflowEngine::new(Arc::clone(&session));
@@ -572,7 +598,10 @@ mod tests {
         session.blocking_lock().current_step_index = 0;
 
         assert!(suspend_on_interrupt(&mut engine));
-        assert_eq!(engine.get_variable("_round_interrupted").as_deref(), Some("1"));
+        assert_eq!(
+            engine.get_variable("_round_interrupted").as_deref(),
+            Some("1")
+        );
         assert!(!engine.get_variable("_step3_output").unwrap().is_empty());
         assert!(!suspend_on_interrupt(&mut engine));
     }
@@ -584,6 +613,25 @@ mod tests {
         assert!(msg.contains("CURRENT"));
         assert!(msg.contains("HISTORICAL"));
         assert!(msg.contains("完善 README"));
+    }
+
+    #[test]
+    fn complete_boundary_marks_done_and_is_detectable() {
+        let msg = format_complete_boundary_message("审查 Foo.java", "修复了空指针，新增 3 个测试");
+        assert!(is_complete_boundary(&msg));
+        assert!(msg.contains("COMPLETED"));
+        assert!(msg.contains("审查 Foo.java"));
+        assert!(msg.contains("修复了空指针"));
+        // Must not be mistaken for the other two boundary kinds.
+        assert!(!is_round_boundary(&msg));
+        assert!(!is_interrupt_boundary(&msg));
+    }
+
+    #[test]
+    fn complete_boundary_without_summary_still_valid() {
+        let msg = format_complete_boundary_message("修复登录 bug", "");
+        assert!(is_complete_boundary(&msg));
+        assert!(!msg.contains("交付摘要"));
     }
 
     #[test]
@@ -601,7 +649,7 @@ mod tests {
 
     #[test]
     fn begin_user_round_sets_turn_input() {
-        use crate::agent::workflow::{create_default_workflow, DEFAULT_WORKFLOW_ID};
+        use crate::agent::workflow::{DEFAULT_WORKFLOW_ID, create_default_workflow};
 
         let session = Arc::new(Mutex::new(SessionState::new("t")));
         let mut engine = WorkflowEngine::new(Arc::clone(&session));

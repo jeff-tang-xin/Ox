@@ -1,14 +1,14 @@
-use regex::Regex;
 use ox_core::knowledge::KeywordExtraction;
+use regex::Regex;
 
 /// 从 LLM 响应中提取关键词 JSON 块
 pub fn extract_keywords_from_response(response: &str) -> Option<KeywordExtraction> {
     // 查找 ```json ... ``` 代码块
     let json_pattern = Regex::new(r"```json\s*([\s\S]*?)\s*```").ok()?;
-    
+
     if let Some(caps) = json_pattern.captures(response) {
         let json_str = caps.get(1)?.as_str();
-        
+
         // 尝试解析 JSON
         match serde_json::from_str::<KeywordExtraction>(json_str) {
             Ok(keywords) => {
@@ -18,10 +18,7 @@ pub fn extract_keywords_from_response(response: &str) -> Option<KeywordExtractio
                     keywords.topics.len(),
                     keywords.related_files.len()
                 );
-                tracing::debug!(
-                    "[KEYWORD EXTRACTION] Keywords: {:?}",
-                    keywords.keywords
-                );
+                tracing::debug!("[KEYWORD EXTRACTION] Keywords: {:?}", keywords.keywords);
                 return Some(keywords);
             }
             Err(e) => {
@@ -34,7 +31,7 @@ pub fn extract_keywords_from_response(response: &str) -> Option<KeywordExtractio
             }
         }
     }
-    
+
     tracing::debug!(
         "[KEYWORD EXTRACTION] ⚠️ No JSON block found in response (length: {} chars)",
         response.len()

@@ -158,7 +158,11 @@ pub fn apply_with_cwd(
             }
             CommandOutcome::Ignored
         }
-        WorkflowCommand::DisputeFinding { index, kind, reason } => {
+        WorkflowCommand::DisputeFinding {
+            index,
+            kind,
+            reason,
+        } => {
             if let Some(mut store) = findings::load_or_migrate(engine) {
                 store.mark_dispute(
                     index,
@@ -174,9 +178,7 @@ pub fn apply_with_cwd(
             }
             CommandOutcome::Ignored
         }
-        WorkflowCommand::ShowProgress => {
-            CommandOutcome::Applied(Some(format_progress(engine)))
-        }
+        WorkflowCommand::ShowProgress => CommandOutcome::Applied(Some(format_progress(engine))),
         WorkflowCommand::ShowFindings => {
             let msg = if let Some(store) = findings::load_or_migrate(engine) {
                 format!(
@@ -368,7 +370,7 @@ mod tests {
         use crate::agent::engine::WorkflowEngine;
         use crate::agent::phase::{self, PhaseEvent, SingleFlowPhase};
         use crate::agent::session::SessionState;
-        use crate::agent::workflow::{create_default_workflow, DEFAULT_WORKFLOW_ID};
+        use crate::agent::workflow::{DEFAULT_WORKFLOW_ID, create_default_workflow};
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
@@ -385,6 +387,7 @@ mod tests {
                 symbol: String::new(),
                 issue: "i".into(),
                 recommendation: String::new(),
+                fix_plan: String::new(),
                 status: findings::FindingStatus::Open,
                 user_notes: vec![],
                 dispute: None,

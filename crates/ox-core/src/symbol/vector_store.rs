@@ -1,9 +1,9 @@
+use crate::config::EmbeddingConfig;
+use crate::symbol::embedding::EmbeddingModel;
+use crate::symbol::types::{Symbol, SymbolType};
 use anyhow::Result;
 use serde_json::json;
 use std::collections::HashMap;
-use crate::symbol::types::{Symbol, SymbolType};
-use crate::symbol::embedding::EmbeddingModel;
-use crate::config::EmbeddingConfig;
 
 /// TriviumDB-backed vector store for semantic symbol search.
 pub struct VectorStore {
@@ -55,27 +55,28 @@ impl VectorStore {
         }
 
         // Batch-embed all signatures
-        let signatures: Vec<&str> = symbols.iter()
-            .map(|s| s.signature.as_str())
-            .collect();
+        let signatures: Vec<&str> = symbols.iter().map(|s| s.signature.as_str()).collect();
         let embeddings = self.embedding_model.embed_batch(&signatures)?;
 
         let mut new_ids = Vec::with_capacity(symbols.len());
 
         for (symbol, embedding) in symbols.iter().zip(embeddings.iter()) {
-            let id = self.db.insert(
-                embedding,
-                json!({
-                    "file_path": symbol.file_path,
-                    "symbol_name": symbol.name,
-                    "symbol_type": symbol.kind.to_string(),
-                    "language": symbol.language,
-                    "start_line": symbol.start_line,
-                    "end_line": symbol.end_line,
-                    "signature": symbol.signature,
-                    "parent": symbol.parent,
-                }),
-            ).map_err(|e| anyhow::anyhow!("TriviumDB insert error: {e}"))?;
+            let id = self
+                .db
+                .insert(
+                    embedding,
+                    json!({
+                        "file_path": symbol.file_path,
+                        "symbol_name": symbol.name,
+                        "symbol_type": symbol.kind.to_string(),
+                        "language": symbol.language,
+                        "start_line": symbol.start_line,
+                        "end_line": symbol.end_line,
+                        "signature": symbol.signature,
+                        "parent": symbol.parent,
+                    }),
+                )
+                .map_err(|e| anyhow::anyhow!("TriviumDB insert error: {e}"))?;
 
             new_ids.push(id);
         }
@@ -107,7 +108,11 @@ impl VectorStore {
                 for id in old_ids {
                     let _ = self.db.delete(id);
                 }
-                tracing::debug!("[VECTOR_STORE] Removed {} old vectors for {}", old_count, file_path);
+                tracing::debug!(
+                    "[VECTOR_STORE] Removed {} old vectors for {}",
+                    old_count,
+                    file_path
+                );
             }
         }
 
@@ -119,36 +124,44 @@ impl VectorStore {
 
         for (chunk_idx, chunk) in all_symbols.chunks(CHUNK_SIZE).enumerate() {
             // Collect signatures for this chunk
-            let signatures: Vec<&str> = chunk.iter()
-                .map(|s| s.signature.as_str())
-                .collect();
-            
+            let signatures: Vec<&str> = chunk.iter().map(|s| s.signature.as_str()).collect();
+
             // Embed this chunk
             let embeddings = self.embedding_model.embed_batch(&signatures)?;
 
             // Insert all symbols in this chunk
             for (symbol, embedding) in chunk.iter().zip(embeddings.iter()) {
-                let id = self.db.insert(
-                    embedding,
-                    json!({
-                        "file_path": symbol.file_path,
-                        "symbol_name": symbol.name,
-                        "symbol_type": symbol.kind.to_string(),
-                        "language": symbol.language,
-                        "start_line": symbol.start_line,
-                        "end_line": symbol.end_line,
-                        "signature": symbol.signature,
-                        "parent": symbol.parent,
-                    }),
-                ).map_err(|e| anyhow::anyhow!("TriviumDB insert error: {e}"))?;
+                let id = self
+                    .db
+                    .insert(
+                        embedding,
+                        json!({
+                            "file_path": symbol.file_path,
+                            "symbol_name": symbol.name,
+                            "symbol_type": symbol.kind.to_string(),
+                            "language": symbol.language,
+                            "start_line": symbol.start_line,
+                            "end_line": symbol.end_line,
+                            "signature": symbol.signature,
+                            "parent": symbol.parent,
+                        }),
+                    )
+                    .map_err(|e| anyhow::anyhow!("TriviumDB insert error: {e}"))?;
 
-                new_ids.entry(symbol.file_path.clone()).or_default().push(id);
+                new_ids
+                    .entry(symbol.file_path.clone())
+                    .or_default()
+                    .push(id);
                 total_count += 1;
             }
 
             // Log progress every chunk
             let processed = ((chunk_idx + 1) * CHUNK_SIZE).min(total_symbols);
-            tracing::debug!("[VECTOR_STORE] Embedding progress: {}/{} symbols", processed, total_symbols);
+            tracing::debug!(
+                "[VECTOR_STORE] Embedding progress: {}/{} symbols",
+                processed,
+                total_symbols
+            );
         }
 
         // Update file_ids tracking
@@ -162,32 +175,44 @@ impl VectorStore {
         let query_embedding = self.embedding_model.embed(query)?;
 
         // triviumdb search(query_vector, top_k, expand_depth, min_score)
-        let results = self.db.search(
-            &query_embedding,
-            top_k,
-            0,    // no graph expansion
-            0.0,  // no minimum score threshold
-        ).map_err(|e| anyhow::anyhow!("TriviumDB search error: {e}"))?;
+        let results = self
+            .db
+            .search(
+                &query_embedding,
+                top_k,
+                0,   // no graph expansion
+                0.0, // no minimum score threshold
+            )
+            .map_err(|e| anyhow::anyhow!("TriviumDB search error: {e}"))?;
 
-        let symbols = results.into_iter().map(|r| {
-            let payload = &r.payload;
-            Symbol {
-                name: payload["symbol_name"].as_str().unwrap_or("").to_string(),
-                kind: SymbolType::from_str(
-                    payload["symbol_type"].as_str().unwrap_or("function")
-                ).unwrap_or(SymbolType::Function),
-                start_line: payload["start_line"].as_u64().unwrap_or(0) as usize,
-                end_line: payload["end_line"].as_u64().unwrap_or(0) as usize,
-                file_path: payload["file_path"].as_str().unwrap_or("").to_string(),
-                language: payload["language"].as_str().unwrap_or("").to_string(),
-                signature: payload["signature"].as_str().unwrap_or("").to_string(),
-                parent: payload["parent"].as_str().map(|s| s.to_string()),
-                fq_name: payload["fq_name"].as_str().unwrap_or("").to_string(),
-                calls: payload["calls"].as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default(),
-            }
-        }).collect();
+        let symbols = results
+            .into_iter()
+            .map(|r| {
+                let payload = &r.payload;
+                Symbol {
+                    name: payload["symbol_name"].as_str().unwrap_or("").to_string(),
+                    kind: SymbolType::from_str(
+                        payload["symbol_type"].as_str().unwrap_or("function"),
+                    )
+                    .unwrap_or(SymbolType::Function),
+                    start_line: payload["start_line"].as_u64().unwrap_or(0) as usize,
+                    end_line: payload["end_line"].as_u64().unwrap_or(0) as usize,
+                    file_path: payload["file_path"].as_str().unwrap_or("").to_string(),
+                    language: payload["language"].as_str().unwrap_or("").to_string(),
+                    signature: payload["signature"].as_str().unwrap_or("").to_string(),
+                    parent: payload["parent"].as_str().map(|s| s.to_string()),
+                    fq_name: payload["fq_name"].as_str().unwrap_or("").to_string(),
+                    calls: payload["calls"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
 
         Ok(symbols)
     }

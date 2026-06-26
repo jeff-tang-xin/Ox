@@ -5,9 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::KnowledgeEngine;
 use super::entity::{Entity, EntityKind, EntityMetadata, RelationType};
 use super::graph::EntityGraph;
-use super::KnowledgeEngine;
 
 const MEMORY_RELATIONS: &[RelationType] = &[
     RelationType::Precedes,
@@ -126,11 +126,13 @@ fn expand_with_graph(
                     &mut added,
                     max_entities,
                 ) {
-                    let via = hit
-                        .via
-                        .map(|r| r.as_str())
-                        .unwrap_or("link");
-                    hop_lines.push(format!("- [{}·{}] {}", via, hit.entity.kind.as_str(), preview(&hit.entity.content, 72)));
+                    let via = hit.via.map(|r| r.as_str()).unwrap_or("link");
+                    hop_lines.push(format!(
+                        "- [{}·{}] {}",
+                        via,
+                        hit.entity.kind.as_str(),
+                        preview(&hit.entity.content, 72)
+                    ));
                 }
                 if added >= max_entities {
                     break;
@@ -198,14 +200,21 @@ fn is_long_term_memory(kind: EntityKind) -> bool {
 }
 
 fn format_cluster_line(entity: &Entity) -> String {
-    format!("- [{}] {}", entity.kind.as_str(), preview(&entity.content, 72))
+    format!(
+        "- [{}] {}",
+        entity.kind.as_str(),
+        preview(&entity.content, 72)
+    )
 }
 
 fn preview(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
@@ -215,7 +224,17 @@ mod tests {
     use crate::knowledge::entity::{Relation, SymbolType};
 
     fn sym(id: &str, fq: &str) -> Entity {
-        Entity::code_symbol("f", fq, SymbolType::Function, "rs", "a.rs", 1, 2, "fn f()", None)
+        Entity::code_symbol(
+            "f",
+            fq,
+            SymbolType::Function,
+            "rs",
+            "a.rs",
+            1,
+            2,
+            "fn f()",
+            None,
+        )
     }
 
     #[test]

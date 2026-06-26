@@ -1,12 +1,11 @@
-/// Trust management commands: /trust, /untrust
-
-use crate::terminal::app::App as AppState;
 use crate::slash_commands::{CommandMeta, CommandResult};
+/// Trust management commands: /trust, /untrust
+use crate::terminal::app::App as AppState;
 use crate::terminal::output_pane::OutputLine;
-use ox_core::message::Session;
-use ox_core::runtime::RuntimeEnvironment;
 use ox_core::config::OxConfig;
 use ox_core::cost::CostTracker;
+use ox_core::message::Session;
+use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
 use std::sync::Arc;
 
@@ -49,12 +48,19 @@ pub fn handle_trust(
 ) -> CommandResult {
     let args = args.trim();
     let all = args == "--all" || args == "-a";
-    let tools: Vec<&str> = if all { vec![] } else { args.split_whitespace().collect() };
+    let tools: Vec<&str> = if all {
+        vec![]
+    } else {
+        args.split_whitespace().collect()
+    };
 
     let mut tm = match trust_manager.lock() {
         Ok(guard) => guard,
         Err(e) => {
-            app.output.push_line(OutputLine::Error(format!("Failed to lock trust manager: {}", e)));
+            app.output.push_line(OutputLine::Error(format!(
+                "Failed to lock trust manager: {}",
+                e
+            )));
             return CommandResult::Error("Lock failed".to_string());
         }
     };
@@ -62,19 +68,23 @@ pub fn handle_trust(
     if all {
         tm.trust_all();
         app.trusted_all = true;
-        app.output.push_system("Trusted all tools for this session. Use /untrust to revoke.");
+        app.output
+            .push_system("Trusted all tools for this session. Use /untrust to revoke.");
     } else if tools.is_empty() {
         let list = tm.trusted_list();
         if list.is_empty() {
-            app.output.push_system("No tools currently trusted. Use /trust <tool_name> or /trust --all.");
+            app.output
+                .push_system("No tools currently trusted. Use /trust <tool_name> or /trust --all.");
         } else {
-            app.output.push_system(&format!("Trusted tools: {}", list.join(", ")));
+            app.output
+                .push_system(&format!("Trusted tools: {}", list.join(", ")));
         }
     } else {
         for tool in &tools {
             tm.trust(tool);
         }
-        app.output.push_system(&format!("Trusted for this session: {}", tools.join(", ")));
+        app.output
+            .push_system(&format!("Trusted for this session: {}", tools.join(", ")));
     }
 
     CommandResult::Success
@@ -93,7 +103,8 @@ pub fn handle_untrust(
         tm.untrust_all();
     }
     app.trusted_all = false;
-    app.output.push_system("All tool trust revoked. Confirmations restored.");
+    app.output
+        .push_system("All tool trust revoked. Confirmations restored.");
     CommandResult::Success
 }
 
@@ -112,15 +123,25 @@ pub fn handle_block(
         let tm = match trust_manager.lock() {
             Ok(guard) => guard,
             Err(e) => {
-                app.output.push_line(OutputLine::Error(format!("Failed to lock trust manager: {}", e)));
+                app.output.push_line(OutputLine::Error(format!(
+                    "Failed to lock trust manager: {}",
+                    e
+                )));
                 return CommandResult::Error("Lock failed".to_string());
             }
         };
         let list = tm.blacklist();
         if list.is_empty() {
-            app.output.push_system("No blocked command patterns. Use /block <pattern> to add one.");
+            app.output
+                .push_system("No blocked command patterns. Use /block <pattern> to add one.");
         } else {
-            app.output.push_system(&format!("Blocked patterns: {}", list.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ")));
+            app.output.push_system(&format!(
+                "Blocked patterns: {}",
+                list.iter()
+                    .map(|s| format!("\"{}\"", s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         return CommandResult::Success;
     }
@@ -128,14 +149,18 @@ pub fn handle_block(
     let mut tm = match trust_manager.lock() {
         Ok(guard) => guard,
         Err(e) => {
-            app.output.push_line(OutputLine::Error(format!("Failed to lock trust manager: {}", e)));
+            app.output.push_line(OutputLine::Error(format!(
+                "Failed to lock trust manager: {}",
+                e
+            )));
             return CommandResult::Error("Lock failed".to_string());
         }
     };
     for pattern in args.split_whitespace() {
         tm.block_command(pattern);
     }
-    app.output.push_system(&format!("Blocked command patterns containing: {}", args));
+    app.output
+        .push_system(&format!("Blocked command patterns containing: {}", args));
     CommandResult::Success
 }
 
@@ -156,13 +181,17 @@ pub fn handle_unblock(
     let mut tm = match trust_manager.lock() {
         Ok(guard) => guard,
         Err(e) => {
-            app.output.push_line(OutputLine::Error(format!("Failed to lock trust manager: {}", e)));
+            app.output.push_line(OutputLine::Error(format!(
+                "Failed to lock trust manager: {}",
+                e
+            )));
             return CommandResult::Error("Lock failed".to_string());
         }
     };
     for pattern in args.split_whitespace() {
         tm.unblock_command(pattern);
     }
-    app.output.push_system(&format!("Unblocked command patterns: {}", args));
+    app.output
+        .push_system(&format!("Unblocked command patterns: {}", args));
     CommandResult::Success
 }

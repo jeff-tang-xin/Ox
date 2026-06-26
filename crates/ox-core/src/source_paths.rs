@@ -8,50 +8,85 @@ use std::path::Path;
 /// Covers common compiled / scripted / markup-in-code languages — not Rust/Java-specific.
 const SOURCE_EXTENSIONS: &[&str] = &[
     // Rust / systems
-    "rs", "zig", "v", "nim", "cr", "odin", "asm", "s",
-    // C / C++ / ObjC family
-    "c", "cc", "cpp", "cxx", "h", "hpp", "hxx", "ino",
-    // Go / D
-    "go", "d",
-    // JVM
-    "java", "kt", "kts", "scala", "groovy",
-    // .NET
-    "cs", "fs", "fsx", "fsi", "vb",
-    // JavaScript / TypeScript / front-end
-    "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx",
-    "vue", "svelte", "astro",
+    "rs", "zig", "v", "nim", "cr", "odin", "asm", "s", // C / C++ / ObjC family
+    "c", "cc", "cpp", "cxx", "h", "hpp", "hxx", "ino", // Go / D
+    "go", "d", // JVM
+    "java", "kt", "kts", "scala", "groovy", // .NET
+    "cs", "fs", "fsx", "fsi", "vb", // JavaScript / TypeScript / front-end
+    "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "vue", "svelte", "astro",
     // Styles / templates (code-like assets)
-    "css", "scss", "sass", "less", "styl",
-    "html", "htm", "xhtml",
+    "css", "scss", "sass", "less", "styl", "html", "htm", "xhtml",
     // Python / Ruby / Perl / Lua
-    "py", "pyw", "pyi", "rb", "rake", "pl", "pm", "lua",
-    // PHP / mobile / Dart
-    "php", "phtml", "swift", "m", "mm", "dart",
-    // Shell / automation
-    "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd",
-    // Functional / BEAM / Lisp
-    "hs", "lhs", "erl", "hrl", "ex", "exs", "clj", "cljs", "cljc", "edn",
-    "ml", "mli", "rkt", "lisp", "cl",
-    // R / Julia / MATLAB / Fortran / Pascal / Ada
+    "py", "pyw", "pyi", "rb", "rake", "pl", "pm", "lua", // PHP / mobile / Dart
+    "php", "phtml", "swift", "m", "mm", "dart", // Shell / automation
+    "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd", // Functional / BEAM / Lisp
+    "hs", "lhs", "erl", "hrl", "ex", "exs", "clj", "cljs", "cljc", "edn", "ml", "mli", "rkt",
+    "lisp", "cl", // R / Julia / MATLAB / Fortran / Pascal / Ada
     "r", "jl", "m", "f", "f90", "f95", "for", "pas", "pp", "ada", "adb", "ads",
     // SQL / API / schema
-    "sql", "graphql", "gql", "proto", "thrift",
-    // IaC / infra-as-code
-    "tf", "hcl",
-    // Blockchain / niche
+    "sql", "graphql", "gql", "proto", "thrift", // IaC / infra-as-code
+    "tf", "hcl", // Blockchain / niche
     "sol", "move", "cairo",
 ];
 
 /// Extensions commonly mentioned in user queries (source + docs + config).
 const QUERY_PATH_EXTENSIONS: &[&str] = &[
     // source (subset + overlap ok)
-    "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "kt", "scala", "cs",
-    "cpp", "c", "h", "hpp", "rb", "php", "swift", "dart", "vue", "svelte",
-    "sql", "sh", "ps1", "ex", "exs", "hs", "ml", "r", "jl", "zig", "nim",
+    "rs",
+    "py",
+    "js",
+    "ts",
+    "tsx",
+    "jsx",
+    "go",
+    "java",
+    "kt",
+    "scala",
+    "cs",
+    "cpp",
+    "c",
+    "h",
+    "hpp",
+    "rb",
+    "php",
+    "swift",
+    "dart",
+    "vue",
+    "svelte",
+    "sql",
+    "sh",
+    "ps1",
+    "ex",
+    "exs",
+    "hs",
+    "ml",
+    "r",
+    "jl",
+    "zig",
+    "nim",
     // docs / config / build
-    "md", "txt", "rst", "adoc", "toml", "json", "yaml", "yml", "xml",
-    "ini", "cfg", "properties", "gradle", "pom", "sbt", "cmake", "mk",
-    "dockerfile", "mod", "sum", "lock", "env",
+    "md",
+    "txt",
+    "rst",
+    "adoc",
+    "toml",
+    "json",
+    "yaml",
+    "yml",
+    "xml",
+    "ini",
+    "cfg",
+    "properties",
+    "gradle",
+    "pom",
+    "sbt",
+    "cmake",
+    "mk",
+    "dockerfile",
+    "mod",
+    "sum",
+    "lock",
+    "env",
 ];
 
 /// True when `path` points to a source-code file (any supported language).
@@ -61,8 +96,7 @@ pub fn is_source_code_path(path: impl AsRef<Path>) -> bool {
 
 /// True when `path` has an extension we recognize in user queries / lazy-index paths.
 pub fn is_query_mentionable_path(path: impl AsRef<Path>) -> bool {
-    extension_matches(path.as_ref(), QUERY_PATH_EXTENSIONS)
-        || is_source_code_path(path.as_ref())
+    extension_matches(path.as_ref(), QUERY_PATH_EXTENSIONS) || is_source_code_path(path.as_ref())
 }
 
 /// Human-readable hint for tool-guard error messages (language-neutral).

@@ -21,7 +21,10 @@ pub fn enter_feedback_discuss(engine: &WorkflowEngine) {
 pub fn clear_feedback_discuss(engine: &WorkflowEngine) {
     engine.set_variable(FEEDBACK_DISCUSS_KEY, String::new());
 }
-pub fn validate_feedback_discuss_tool(engine: &WorkflowEngine, tool_name: &str) -> Result<(), String> {
+pub fn validate_feedback_discuss_tool(
+    engine: &WorkflowEngine,
+    tool_name: &str,
+) -> Result<(), String> {
     if !is_feedback_discuss(engine) {
         return Ok(());
     }
@@ -41,18 +44,20 @@ pub fn validate_feedback_discuss_tool(engine: &WorkflowEngine, tool_name: &str) 
 }
 pub fn compact_discuss_session(_: &mut Vec<crate::message::Message>) {}
 pub fn is_implementation_phase(engine: &WorkflowEngine) -> bool {
-    crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::Implement
+    matches!(
+        crate::agent::phase::get(engine),
+        crate::agent::phase::SingleFlowPhase::Implement
+    )
 }
 pub fn enter_implementation_phase(_: &WorkflowEngine) {}
 pub fn mark_execute_approved(_: &WorkflowEngine) {}
-pub fn is_execute_user_approved(_: &WorkflowEngine) -> bool {
-    true
+pub fn is_execute_user_approved(engine: &WorkflowEngine) -> bool {
+    crate::agent::business_gate::scope_implementation_unlocked(engine)
 }
 pub fn is_scope_confirm(engine: &WorkflowEngine) -> bool {
     crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::AwaitUser
         && !is_feedback_discuss(engine)
-        && crate::agent::findings::load_or_migrate(engine)
-            .is_some_and(|s| !s.findings.is_empty())
+        && crate::agent::findings::load_or_migrate(engine).is_some_and(|s| !s.findings.is_empty())
 }
 pub fn enter_scope_confirm(_: &WorkflowEngine) {}
 pub fn leave_scope_confirm(_: &WorkflowEngine) {}
@@ -73,9 +78,16 @@ pub fn looks_like_post_failure_fix(user_text: &str) -> bool {
         return false;
     }
     let lower = t.to_lowercase();
-    ["还有报错", "仍有错误", "编译失败", "构建失败", "没通过", "build failed"]
-        .iter()
-        .any(|k| t.contains(k) || lower.contains(k))
+    [
+        "还有报错",
+        "仍有错误",
+        "编译失败",
+        "构建失败",
+        "没通过",
+        "build failed",
+    ]
+    .iter()
+    .any(|k| t.contains(k) || lower.contains(k))
         && ["修复", "fix", "改", "解决", "处理"]
             .iter()
             .any(|k| t.contains(k) || lower.contains(k))
@@ -91,8 +103,16 @@ pub fn looks_like_implementation_request(user_text: &str) -> bool {
     }
     let lower = t.to_lowercase();
     [
-        "修复", "fix", "改", "解决", "处理", "执行", "implement", "/fix",
-        "apply fix", "resolve finding",
+        "修复",
+        "fix",
+        "改",
+        "解决",
+        "处理",
+        "执行",
+        "implement",
+        "/fix",
+        "apply fix",
+        "resolve finding",
     ]
     .iter()
     .any(|k| t.contains(k) || lower.contains(k))

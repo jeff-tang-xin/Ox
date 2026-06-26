@@ -26,3 +26,4 @@ target
 reasonix.toml
 .env
 .codegraph
+.gitnexus

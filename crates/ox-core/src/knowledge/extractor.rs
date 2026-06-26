@@ -1,3 +1,5 @@
+use super::entity::{Entity, Relation, RelationType, SymbolType};
+use super::language::LanguageRegistry;
 /// AST-based code symbol extractor — produces `Entity::CodeSymbol` entities
 /// from source files using tree-sitter multi-language parsing.
 ///
@@ -5,8 +7,6 @@
 /// same, but the output type is now `Entity` instead of the legacy `Symbol` struct.
 use std::path::Path;
 use tree_sitter::Node;
-use super::entity::{Entity, Relation, RelationType, SymbolType};
-use super::language::LanguageRegistry;
 
 pub struct AstExtractor {
     registry: LanguageRegistry,
@@ -26,7 +26,9 @@ impl AstExtractor {
         code: &str,
     ) -> anyhow::Result<Vec<Entity>> {
         let path = path.as_ref();
-        let lang_name = self.registry.detect_language(path)
+        let lang_name = self
+            .registry
+            .detect_language(path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {:?}", path))?
             .to_string();
 
@@ -57,7 +59,11 @@ impl AstExtractor {
     }
 
     /// Check code for syntax errors via tree-sitter.
-    pub fn check_syntax(&mut self, code: &str, lang_name: &str) -> anyhow::Result<Vec<super::language::SyntaxError>> {
+    pub fn check_syntax(
+        &mut self,
+        code: &str,
+        lang_name: &str,
+    ) -> anyhow::Result<Vec<super::language::SyntaxError>> {
         self.registry.check_syntax(code, lang_name)
     }
 
@@ -76,13 +82,12 @@ impl AstExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            let child_parent = if child.kind().ends_with("_item")
-                || child.kind().ends_with("_declaration")
-            {
-                parent.clone()
-            } else {
-                self.get_node_name(node, code).or(parent.clone())
-            };
+            let child_parent =
+                if child.kind().ends_with("_item") || child.kind().ends_with("_declaration") {
+                    parent.clone()
+                } else {
+                    self.get_node_name(node, code).or(parent.clone())
+                };
             self.extract_from_node(child, code, lang_name, path, child_parent, entities);
         }
     }
@@ -174,7 +179,8 @@ impl AstExtractor {
 
     fn resolve_calls(&self, entities: &mut [Entity]) {
         // Collect all function/method names defined in this file
-        let defined: Vec<String> = entities.iter()
+        let defined: Vec<String> = entities
+            .iter()
             .filter_map(|e| {
                 if e.kind == super::entity::EntityKind::CodeSymbol {
                     match &e.metadata {
@@ -190,7 +196,12 @@ impl AstExtractor {
             .collect();
 
         for entity in entities.iter_mut() {
-            if let super::entity::EntityMetadata::CodeSymbol { ref mut calls, ref signature, .. } = entity.metadata {
+            if let super::entity::EntityMetadata::CodeSymbol {
+                ref mut calls,
+                ref signature,
+                ..
+            } = entity.metadata
+            {
                 // Simple approach: scan the signature for names that match defined symbols
                 let sig_lower = signature.to_lowercase();
                 for def in &defined {
@@ -217,7 +228,9 @@ impl AstExtractor {
     }
 
     fn get_node_text(&self, node: Node, code: &str) -> String {
-        node.utf8_text(code.as_bytes()).unwrap_or_default().to_string()
+        node.utf8_text(code.as_bytes())
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// Declaration header only — excludes class/interface bodies (Java, TS, etc.).
@@ -269,7 +282,9 @@ impl AstExtractor {
                 Some((SymbolType::Function, name))
             }
             "impl_item" => {
-                let name = self.get_node_name(node, code).unwrap_or_else(|| "<impl>".to_string());
+                let name = self
+                    .get_node_name(node, code)
+                    .unwrap_or_else(|| "<impl>".to_string());
                 Some((SymbolType::Impl, name))
             }
             "struct_item" => {
@@ -477,15 +492,16 @@ public class BigService implements Runnable {
 }
 "#;
         let mut extractor = AstExtractor::new();
-        let entities = extractor
-            .extract_entities("BigService.java", code)
-            .unwrap();
+        let entities = extractor.extract_entities("BigService.java", code).unwrap();
         let class_entity = entities
             .iter()
             .find(|e| {
                 matches!(
                     &e.metadata,
-                    EntityMetadata::CodeSymbol { symbol_type: SymbolType::Class, .. }
+                    EntityMetadata::CodeSymbol {
+                        symbol_type: SymbolType::Class,
+                        ..
+                    }
                 )
             })
             .expect("class entity");
@@ -522,7 +538,11 @@ impl User {
         let mut extractor = AstExtractor::new();
         let entities = extractor.extract_entities("src/main.rs", code).unwrap();
 
-        assert!(entities.len() >= 3, "Expected at least 3 symbols, got {}", entities.len());
+        assert!(
+            entities.len() >= 3,
+            "Expected at least 3 symbols, got {}",
+            entities.len()
+        );
 
         let functions: Vec<_> = entities.iter()
             .filter(|e| matches!(&e.metadata, EntityMetadata::CodeSymbol { symbol_type, .. } if *symbol_type == SymbolType::Function))

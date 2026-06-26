@@ -19,15 +19,26 @@ struct ToolRouteSpec {
 fn route_spec(engine: &WorkflowEngine) -> ToolRouteSpec {
     let phase = phase::get(engine);
     let report_done = engine.execute_report_already_delivered();
-    let has_findings = super::findings::load_or_migrate(engine)
-        .is_some_and(|s| !s.findings.is_empty());
+    let has_findings =
+        super::findings::load_or_migrate(engine).is_some_and(|s| !s.findings.is_empty());
 
     let (recommended, allowed, blocked, note) = match phase {
         SingleFlowPhase::Complete => (
+            // Not a lock: the turn was handed back to the user. Keep read-only
+            // tools available so a re-invocation never strands with no tools.
             vec![],
-            vec![],
-            vec!["*"],
-            "任务已完成，禁止调用工具。",
+            vec![
+                "file_read",
+                "find_symbol",
+                "code_search",
+                "file_list",
+                "file_search",
+                "load_skill",
+                "git_status",
+                "git_diff",
+            ],
+            vec!["edit_file", "file_write", "delete_range", "shell_exec"],
+            "本轮已收尾 — 等用户新输入；如需继续可只读探索。",
         ),
         SingleFlowPhase::AwaitUser => {
             if super::business_gate::scope_implementation_unlocked(engine) {
@@ -39,8 +50,6 @@ fn route_spec(engine: &WorkflowEngine) -> ToolRouteSpec {
                         "file_write",
                         "delete_range",
                         "find_symbol",
-                        "recall",
-                        "memory_search",
                         "shell_exec",
                         "git_status",
                         "git_diff",
@@ -74,7 +83,7 @@ fn route_spec(engine: &WorkflowEngine) -> ToolRouteSpec {
                 "load_skill",
             ],
             vec!["code_search", "file_search", "file_list"],
-            "实施：先 file_read 再 edit_file；架构/约定用 memory_search；定位符号用 find_symbol。",
+            "实施：先 file_read 再 edit_file；定位符号用 find_symbol。",
         ),
         SingleFlowPhase::Review | SingleFlowPhase::Receive => {
             if report_done && has_findings {
@@ -180,11 +189,11 @@ pub fn build_tool_route(engine: &WorkflowEngine) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::findings::{self, Finding, FindingsStore, FindingStatus, Severity};
+    use crate::agent::findings::{self, Finding, FindingStatus, FindingsStore, Severity};
     use crate::agent::phase::{self};
     use crate::agent::session::SessionState;
     use crate::agent::task_intent::TaskIntent;
-    use crate::agent::workflow::{create_default_workflow, DEFAULT_WORKFLOW_ID};
+    use crate::agent::workflow::{DEFAULT_WORKFLOW_ID, create_default_workflow};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -203,6 +212,7 @@ mod tests {
                 symbol: "bar".into(),
                 issue: "bug".into(),
                 recommendation: "fix".into(),
+                fix_plan: String::new(),
                 status: FindingStatus::Open,
                 user_notes: vec![],
                 dispute: None,
@@ -241,6 +251,7 @@ mod tests {
                 symbol: "m".into(),
                 issue: "x".into(),
                 recommendation: "y".into(),
+                fix_plan: String::new(),
                 status: FindingStatus::Open,
                 user_notes: vec![],
                 dispute: None,

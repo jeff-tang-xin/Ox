@@ -2,11 +2,11 @@
 //!
 //! Contains helper functions for keyboard input processing.
 
+use crate::terminal::app::App;
+use crate::terminal::output_pane::OutputLine;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ox_core::agent::interrupt::{InterruptAction, InterruptController};
 use ox_core::agent::ui_event::{ConfirmationDecision, UiToAgentEvent};
-use crate::terminal::app::App;
-use crate::terminal::output_pane::OutputLine;
 
 /// Handle navigation keys (arrows, PageUp/Down, Home/End).
 pub fn handle_navigation_key(app: &mut App, key: &crossterm::event::KeyEvent) {

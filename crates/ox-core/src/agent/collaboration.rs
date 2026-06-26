@@ -7,7 +7,7 @@ use crate::llm::{self, LlmProvider};
 
 use super::engine::WorkflowEngine;
 use super::task_intent::TaskIntent;
-use super::workspace::{WorkspaceMode, WorkflowWorkspace};
+use super::workspace::{WorkflowWorkspace, WorkspaceMode};
 
 /// Optional per-role LLM providers (falls back to default when unset).
 #[derive(Clone, Default)]
@@ -20,7 +20,11 @@ pub struct RoleProviders {
 
 impl RoleProviders {
     /// Pick provider for the current workflow state.
-    pub fn pick(&self, default: &Arc<dyn LlmProvider>, engine: &WorkflowEngine) -> Arc<dyn LlmProvider> {
+    pub fn pick(
+        &self,
+        default: &Arc<dyn LlmProvider>,
+        engine: &WorkflowEngine,
+    ) -> Arc<dyn LlmProvider> {
         if !self.enabled {
             return Arc::clone(default);
         }
@@ -40,7 +44,9 @@ impl RoleProviders {
                 }
             }
         };
-        slot.as_ref().map(Arc::clone).unwrap_or_else(|| Arc::clone(default))
+        slot.as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::clone(default))
     }
 
     pub fn role_label(&self, engine: &WorkflowEngine) -> &'static str {

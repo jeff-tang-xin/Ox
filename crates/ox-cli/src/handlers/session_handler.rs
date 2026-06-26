@@ -55,7 +55,7 @@ pub fn handle_session_new(
     app: &mut App,
     session: &mut Session,
     rt_env: &RuntimeEnvironment,
-    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
 ) -> Result<(), String> {
     let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
 
@@ -64,14 +64,16 @@ pub fn handle_session_new(
             "Triggering knowledge consolidation for session with {} messages",
             session.messages.len()
         );
-        if let Ok(mut engine) = knowledge_engine.try_write() {
-            match engine.run_consolidation("current", Some(&rt_env.project_id)) {
-                Ok(n) => {
-                    app.output.push_system(&format!(
-                        "🧠 Knowledge consolidation complete — {n} entities promoted."
-                    ));
+        if let Some(knowledge) = knowledge_engine {
+            if let Ok(mut engine) = knowledge.try_write() {
+                match engine.run_consolidation("current", Some(&rt_env.project_id)) {
+                    Ok(n) => {
+                        app.output.push_system(&format!(
+                            "🧠 Knowledge consolidation complete — {n} entities promoted."
+                        ));
+                    }
+                    Err(e) => tracing::error!("Knowledge consolidation failed: {e}"),
                 }
-                Err(e) => tracing::error!("Knowledge consolidation failed: {e}"),
             }
         }
     }
@@ -132,7 +134,8 @@ pub fn handle_session_resume(
     }
 
     app.output.clear();
-    app.output.push_system(&format!("Resumed session: {filename}"));
+    app.output
+        .push_system(&format!("Resumed session: {filename}"));
     crate::helpers::refresh_header_info(app, rt_env, has_provider);
     app.message_count = session.messages.len();
     Ok(())

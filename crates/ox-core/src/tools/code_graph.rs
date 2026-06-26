@@ -1,0 +1,219 @@
+//! `code_graph` — the agent's gateway to the GitNexus code knowledge graph.
+//!
+//! One tool, many ops. The LLM picks an `op` and supplies that op's native
+//! GitNexus arguments; everything except `op` is forwarded verbatim to the
+//! GitNexus MCP server, so the full capability surface is available without
+//! per-op plumbing. Read-only (safe): even `rename` defaults to a dry-run
+//! preview, so the agent can plan against the graph before touching files.
+
+use serde_json::{Value, json};
+
+use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
+
+/// Known GitNexus ops (MCP tool names) the agent may call.
+const OPS: &[&str] = &[
+    // comprehension
+    "query",
+    "context",
+    "cypher",
+    "list_repos",
+    // pre-change impact
+    "impact",
+    "detect_changes",
+    "api_impact",
+    // API surface maps
+    "route_map",
+    "tool_map",
+    "shape_check",
+    // refactor (preview by default)
+    "rename",
+    // multi-repo groups
+    "group_list",
+    "group_sync",
+];
+
+/// Cap forwarded graph output so a huge result can't blow the context window.
+const MAX_OUTPUT_CHARS: usize = 20_000;
+
+pub struct CodeGraphTool;
+
+#[async_trait::async_trait]
+impl Tool for CodeGraphTool {
+    fn name(&self) -> &str {
+        "code_graph"
+    }
+
+    fn description(&self) -> &str {
+        "查询代码知识图谱(GitNexus)。改代码前用它建立关系模型与影响面。\
+         params.op 选择能力，其余字段按该 op 透传：\n\
+         • query{query} 概念→执行流(调用链)  • context{name|uid} 单符号360°(谁调谁/读写)\n\
+         • impact{target,direction:upstream|downstream} 改动爆炸半径  • detect_changes{} 未提交改动影响\n\
+         • api_impact{route|file} 路由改动报告  • route_map/tool_map/shape_check API面貌\n\
+         • cypher{query} 原生图查询  • rename{symbol_name,new_name}(默认dry_run预览)\n\
+         • list_repos{} / group_list{} / group_sync{name}"
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "description": "GitNexus 能力名",
+                    "enum": OPS
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": true
+        })
+    }
+
+    fn safety_level(&self) -> SafetyLevel {
+        // All ops are read-only (rename defaults to dry-run preview).
+        SafetyLevel::Safe
+    }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
+        let Some(svc) = ctx.gitnexus.clone() else {
+            return ToolOutput::error(
+                "代码图谱不可用：GitNexus 未启用或未就绪。可继续用 file_read / find_symbol / code_search 探索。",
+            );
+        };
+
+        let op = match args.get("op").and_then(Value::as_str) {
+            Some(s) if OPS.contains(&s) => s.to_string(),
+            Some(s) => {
+                return ToolOutput::error(format!("未知 op `{s}`。可用: {}", OPS.join(", ")));
+            }
+            None => {
+                return ToolOutput::error(format!("缺少 params.op。可用: {}", OPS.join(", ")));
+            }
+        };
+
+        // Light client-side checks for ops with hard-required args — gives a
+        // clearer error than a round-trip to the server.
+        if let Err(e) = precheck(&op, &args) {
+            return ToolOutput::error(e);
+        }
+
+        // (E) If Ox edited files since the last index, refresh before answering
+        // so the graph reflects the current code. Cost is paid only here, lazily.
+        if ctx.config.gitnexus.reindex_on_change && svc.is_dirty() {
+            ctx.report_progress("更新代码图谱索引（检测到改动）…".to_string(), None);
+            svc.ensure_fresh_for_query().await;
+        }
+
+        // Forward everything except `op` as the GitNexus tool arguments.
+        let mut forwarded = args.clone();
+        if let Some(obj) = forwarded.as_object_mut() {
+            obj.remove("op");
+        }
+
+        match svc.call(&op, forwarded).await {
+            Ok(result) => {
+                let mut text = result.text;
+                if text.trim().is_empty() {
+                    text = "(空结果)".to_string();
+                }
+                if text.len() > MAX_OUTPUT_CHARS {
+                    let mut cut = MAX_OUTPUT_CHARS;
+                    while !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    text.truncate(cut);
+                    text.push_str("\n…(结果已截断；用更具体的参数缩小范围)");
+                }
+                let header = format!("── code_graph/{op} ──\n");
+                if result.is_error {
+                    ToolOutput::error(format!("{header}{text}"))
+                } else {
+                    ToolOutput::success(format!("{header}{text}"))
+                }
+            }
+            Err(e) => ToolOutput::error(format!("code_graph/{op} 失败: {e}")),
+        }
+    }
+}
+
+/// Validate hard-required args for ops the server would otherwise reject.
+fn precheck(op: &str, args: &Value) -> Result<(), String> {
+    let has = |k: &str| args.get(k).map(|v| !v.is_null()).unwrap_or(false);
+    match op {
+        "query" | "cypher" => {
+            if !has("query") {
+                return Err(format!("op={op} 需要 params.query"));
+            }
+        }
+        "context" => {
+            if !has("name") && !has("uid") {
+                return Err("op=context 需要 params.name 或 params.uid".into());
+            }
+        }
+        "impact" => {
+            if !has("target") && !has("target_uid") {
+                return Err("op=impact 需要 params.target（或 target_uid）".into());
+            }
+            if !has("direction") {
+                return Err("op=impact 需要 params.direction（upstream 或 downstream）".into());
+            }
+        }
+        "api_impact" => {
+            if !has("route") && !has("file") {
+                return Err("op=api_impact 需要 params.route 或 params.file".into());
+            }
+        }
+        "rename" => {
+            if !has("new_name") {
+                return Err("op=rename 需要 params.new_name".into());
+            }
+            if !has("symbol_name") && !has("symbol_uid") {
+                return Err("op=rename 需要 params.symbol_name（或 symbol_uid）".into());
+            }
+        }
+        "group_sync" => {
+            if !has("name") {
+                return Err("op=group_sync 需要 params.name".into());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precheck_requires_query() {
+        assert!(precheck("query", &json!({})).is_err());
+        assert!(precheck("query", &json!({"query": "auth"})).is_ok());
+    }
+
+    #[test]
+    fn precheck_impact_needs_target_and_direction() {
+        assert!(precheck("impact", &json!({"target": "f"})).is_err());
+        assert!(precheck("impact", &json!({"target": "f", "direction": "upstream"})).is_ok());
+        assert!(
+            precheck(
+                "impact",
+                &json!({"target_uid": "u#1", "direction": "downstream"})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn precheck_context_accepts_name_or_uid() {
+        assert!(precheck("context", &json!({})).is_err());
+        assert!(precheck("context", &json!({"name": "AuthService"})).is_ok());
+        assert!(precheck("context", &json!({"uid": "x#1"})).is_ok());
+    }
+
+    #[test]
+    fn precheck_no_arg_ops_ok() {
+        assert!(precheck("list_repos", &json!({})).is_ok());
+        assert!(precheck("detect_changes", &json!({})).is_ok());
+        assert!(precheck("route_map", &json!({})).is_ok());
+    }
+}

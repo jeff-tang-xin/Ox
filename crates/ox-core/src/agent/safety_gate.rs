@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::message::Message;
@@ -60,7 +60,10 @@ pub fn build_request(
             .last()
             .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(0);
-        format!("{}...(truncated)", arguments.get(..end).unwrap_or(arguments))
+        format!(
+            "{}...(truncated)",
+            arguments.get(..end).unwrap_or(arguments)
+        )
     } else {
         arguments.to_string()
     };
@@ -88,6 +91,9 @@ pub async fn await_decision(
         &mpsc::UnboundedSender<super::AgentToUiEvent>,
     ),
 ) -> Result<SafetyDecision, SafetyGateCancelled> {
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(300));
+    tokio::pin!(timeout);
+
     loop {
         tokio::select! {
             ev = ui_rx.recv() => {
@@ -100,11 +106,35 @@ pub async fn await_decision(
                     }
                     Some(ui_event::UiToAgentEvent::Interjection(text)) => {
                         push_interjection(workflow_engine, messages, &text, ui_tx);
+                        let is_urgent = text.to_lowercase().contains("stop")
+                            || text.to_lowercase().contains("cancel")
+                            || text.to_lowercase().contains("中断")
+                            || text.to_lowercase().contains("取消");
+                        if is_urgent {
+                            return Err(SafetyGateCancelled);
+                        }
+                    }
+                    Some(ui_event::UiToAgentEvent::BusinessAck { .. }) => {
+                        tracing::warn!(
+                            "[SAFETY_GATE] 收到意外的 BusinessAck，business gate 可能超时"
+                        );
+                    }
+                    Some(ui_event::UiToAgentEvent::FinishAck { finished, .. }) => {
+                        if finished {
+                            return Err(SafetyGateCancelled);
+                        }
+                    }
+                    Some(ui_event::UiToAgentEvent::ScopeConfirmed) => {
+                        tracing::warn!("[SAFETY_GATE] 收到意外的 ScopeConfirmed");
                     }
                     _ => {}
                 }
             }
             _ = cancel_token.cancelled() => return Err(SafetyGateCancelled),
+            () = &mut timeout => {
+                tracing::warn!("[SAFETY_GATE] 超时（300秒），自动取消");
+                return Err(SafetyGateCancelled);
+            }
         }
     }
 }

@@ -7,9 +7,24 @@
 ///
 /// This module provides `on_tool_executed()` which is called by the agent loop
 /// after each tool completes, keeping the knowledge graph in sync with reality.
-
 use super::entity::{Entity, EntityKind, EntityMetadata, Relation, RelationType};
 use super::graph::EntityGraph;
+
+/// Char-boundary-safe prefix of `s` capped at `max_bytes`.
+///
+/// `&s[..n]` panics when byte `n` lands inside a multibyte UTF-8 char (common with
+/// Chinese tool args/results). These hooks run inline after every tool call, so a
+/// panic here silently kills the agent task and freezes the UI. Always use this.
+fn safe_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Tool execution context passed to the live update hooks.
 pub struct ToolExecutionContext {
@@ -39,20 +54,11 @@ pub struct LiveUpdateResult {
 ///
 /// Returns updated entities that should be upserted into the EntityGraph
 /// and stored in TriviumDB.
-pub fn on_tool_executed(
-    ctx: &ToolExecutionContext,
-    graph: &EntityGraph,
-) -> LiveUpdateResult {
+pub fn on_tool_executed(ctx: &ToolExecutionContext, graph: &EntityGraph) -> LiveUpdateResult {
     match ctx.tool_name.as_str() {
-        "file_write" | "edit_file" | "delete_range" => {
-            on_code_modification(ctx, graph)
-        }
-        "shell_exec" => {
-            on_shell_execution(ctx)
-        }
-        "file_read" => {
-            on_file_read(ctx)
-        }
+        "file_write" | "edit_file" | "delete_range" => on_code_modification(ctx, graph),
+        "shell_exec" => on_shell_execution(ctx),
+        "file_read" => on_file_read(ctx),
         "memory_search" | "recall" | "find_symbol" | "code_search" | "web_fetch" => {
             on_search_tool(ctx)
         }
@@ -66,16 +72,21 @@ pub fn on_tool_executed(
 /// 1. WorkingMemory entity recording the modification
 /// 2. Extracts file path for re-indexing
 /// 3. Checks for key info extraction (user preferences, architecture patterns)
-fn on_code_modification(
-    ctx: &ToolExecutionContext,
-    graph: &EntityGraph,
-) -> LiveUpdateResult {
+fn on_code_modification(ctx: &ToolExecutionContext, graph: &EntityGraph) -> LiveUpdateResult {
     let file_path = extract_file_path_from_args(&ctx.tool_args);
 
     let action = if ctx.is_error {
-        format!("FAILED to {}: {}", ctx.tool_name, &ctx.tool_result[..ctx.tool_result.len().min(100)])
+        format!(
+            "FAILED to {}: {}",
+            ctx.tool_name,
+            safe_prefix(&ctx.tool_result, 100)
+        )
     } else {
-        format!("{}: {}", ctx.tool_name, file_path.as_deref().unwrap_or("unknown file"))
+        format!(
+            "{}: {}",
+            ctx.tool_name,
+            file_path.as_deref().unwrap_or("unknown file")
+        )
     };
 
     let intent = extract_intent_from_message(&ctx.user_message);
@@ -85,7 +96,7 @@ fn on_code_modification(
         &ctx.session_id,
         &action,
         intent.as_deref(),
-        Some(&ctx.tool_result[..ctx.tool_result.len().min(200)]),
+        Some(safe_prefix(&ctx.tool_result, 200)),
         vec![ctx.tool_name.clone()],
         !ctx.is_error,
     );
@@ -93,7 +104,8 @@ fn on_code_modification(
     // Link to modified symbols (if we know which file)
     if let Some(ref fp) = file_path {
         // Find existing symbols in this file
-        let symbols_in_file: Vec<&Entity> = graph.find_outgoing(fp, None)
+        let symbols_in_file: Vec<&Entity> = graph
+            .find_outgoing(fp, None)
             .into_iter()
             .filter(|e| e.kind == EntityKind::CodeSymbol)
             .collect();
@@ -129,18 +141,18 @@ fn on_shell_execution(ctx: &ToolExecutionContext) -> LiveUpdateResult {
         || ctx.tool_args.contains("pytest");
 
     let action = if ctx.is_error {
-        format!("shell exec FAILED: {}", &ctx.tool_args[..ctx.tool_args.len().min(80)])
+        format!("shell exec FAILED: {}", safe_prefix(&ctx.tool_args, 80))
     } else if is_build {
-        format!("Build/test PASSED: {}", &ctx.tool_args[..ctx.tool_args.len().min(80)])
+        format!("Build/test PASSED: {}", safe_prefix(&ctx.tool_args, 80))
     } else {
-        format!("shell exec: {}", &ctx.tool_args[..ctx.tool_args.len().min(80)])
+        format!("shell exec: {}", safe_prefix(&ctx.tool_args, 80))
     };
 
     let wm = Entity::working_memory(
         &ctx.session_id,
         &action,
         None,
-        Some(&ctx.tool_result[..ctx.tool_result.len().min(200)]),
+        Some(safe_prefix(&ctx.tool_result, 200)),
         vec!["shell_exec".into()],
         !ctx.is_error,
     );
@@ -179,7 +191,11 @@ fn on_file_read(ctx: &ToolExecutionContext) -> LiveUpdateResult {
 fn on_search_tool(ctx: &ToolExecutionContext) -> LiveUpdateResult {
     let wm = Entity::working_memory(
         &ctx.session_id,
-        &format!("Search via {}: {}", ctx.tool_name, &ctx.tool_args[..ctx.tool_args.len().min(80)]),
+        &format!(
+            "Search via {}: {}",
+            ctx.tool_name,
+            safe_prefix(&ctx.tool_args, 80)
+        ),
         None,
         None,
         vec![ctx.tool_name.clone()],
@@ -221,7 +237,11 @@ fn on_generic_tool(ctx: &ToolExecutionContext) -> LiveUpdateResult {
 fn extract_file_path_from_args(args: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(args)
         .ok()
-        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("path")
+                .and_then(|p| p.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 /// Extract the user's intent from their message.
@@ -301,8 +321,16 @@ fn extract_facts_from_tool_result(ctx: &ToolExecutionContext) -> Vec<Entity> {
 
 fn contains_preference(text: &str) -> bool {
     let keywords = [
-        "prefer", "always use", "never use", "avoid", "should use",
-        "习惯", "偏好", "以后都", "不要用", "改成",
+        "prefer",
+        "always use",
+        "never use",
+        "avoid",
+        "should use",
+        "习惯",
+        "偏好",
+        "以后都",
+        "不要用",
+        "改成",
     ];
     let lower = text.to_lowercase();
     keywords.iter().any(|k| lower.contains(k))
@@ -310,9 +338,21 @@ fn contains_preference(text: &str) -> bool {
 
 fn contains_arch_keywords(text: &str) -> bool {
     let keywords = [
-        "module", "struct ", "trait ", "impl ", "interface", "abstract",
-        "architecture", "design pattern", "middleware", "pipeline",
-        "handler", "service", "repository", "factory", "builder",
+        "module",
+        "struct ",
+        "trait ",
+        "impl ",
+        "interface",
+        "abstract",
+        "architecture",
+        "design pattern",
+        "middleware",
+        "pipeline",
+        "handler",
+        "service",
+        "repository",
+        "factory",
+        "builder",
     ];
     let lower = text.to_lowercase();
     keywords.iter().any(|k| lower.contains(k))
@@ -320,9 +360,22 @@ fn contains_arch_keywords(text: &str) -> bool {
 
 fn contains_business_keywords(text: &str) -> bool {
     let keywords = [
-        "api", "endpoint", "model", "schema", "controller",
-        "entity", "dto", "request", "response", "route",
-        "auth", "login", "register", "user", "role", "permission",
+        "api",
+        "endpoint",
+        "model",
+        "schema",
+        "controller",
+        "entity",
+        "dto",
+        "request",
+        "response",
+        "route",
+        "auth",
+        "login",
+        "register",
+        "user",
+        "role",
+        "permission",
     ];
     let lower = text.to_lowercase();
     keywords.iter().any(|k| lower.contains(k))
@@ -452,11 +505,9 @@ mod tests {
         let graph = EntityGraph::new();
         let result = on_tool_executed(&ctx, &graph);
 
-        let has_style = result.extracted_facts.iter().any(|f| {
-            match &f.metadata {
-                EntityMetadata::AtomicMemory { memory_type, .. } => memory_type == "Style",
-                _ => false,
-            }
+        let has_style = result.extracted_facts.iter().any(|f| match &f.metadata {
+            EntityMetadata::AtomicMemory { memory_type, .. } => memory_type == "Style",
+            _ => false,
         });
         assert!(has_style, "Should extract user preference as Style");
     }

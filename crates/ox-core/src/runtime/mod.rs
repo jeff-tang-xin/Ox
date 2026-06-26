@@ -3,8 +3,8 @@ mod project;
 
 pub use directory::{DirectoryChangeResult, change_directory};
 pub use project::{
-    compute_project_id, effective_project_root, ensure_ox_project_scaffold,
-    find_project_root, has_project_markers,
+    compute_project_id, effective_project_root, ensure_ox_project_scaffold, find_project_root,
+    has_project_markers,
 };
 
 use std::path::PathBuf;

@@ -94,7 +94,10 @@ pub fn track_edits_and_verify_plan(
     let mut ast_pending = read_ast_pending(engine);
 
     for tc in tool_calls {
-        if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
+        if !matches!(
+            tc.name.as_str(),
+            "file_write" | "edit_file" | "delete_range"
+        ) {
             continue;
         }
         let Some(content) = tool_result_content(new_messages, &tc.id) else {
@@ -154,6 +157,45 @@ pub fn note_shell_verify_result(engine: &WorkflowEngine, command: &str, succeede
         VERIFY_STATUS_KEY,
         if succeeded { "passed" } else { "failed" }.into(),
     );
+    // Track CONSECUTIVE verify failures so the main loop can stop auto-retrying
+    // a fix that never converges, instead of spinning silently. A pass clears it.
+    if succeeded {
+        reset_verify_failures(engine);
+    } else {
+        bump_verify_failures(engine);
+    }
+}
+
+/// Max consecutive verify (or AST) failures on the same task before the agent
+/// stops auto-retrying and hands control back to the user.
+pub const MAX_CONSECUTIVE_VERIFY_FAILS: u32 = 3;
+
+const VERIFY_FAIL_KEY: &str = "_verify_fail_streak";
+
+/// Current consecutive verify-failure streak for this turn.
+pub fn verify_fail_streak(engine: &WorkflowEngine) -> u32 {
+    engine
+        .get_variable(VERIFY_FAIL_KEY)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Increment the consecutive verify-failure streak and return the new value.
+pub fn bump_verify_failures(engine: &WorkflowEngine) -> u32 {
+    let next = verify_fail_streak(engine) + 1;
+    engine.set_variable(VERIFY_FAIL_KEY, next.to_string());
+    next
+}
+
+/// Clear the verify-failure streak (on a pass, or at the start of a fresh turn).
+pub fn reset_verify_failures(engine: &WorkflowEngine) {
+    engine.set_variable(VERIFY_FAIL_KEY, String::new());
+}
+
+/// True when consecutive failures have hit the stop threshold — the loop should
+/// surface a `## Failed`-style hand-off instead of retrying again.
+pub fn should_stop_on_repeated_failure(engine: &WorkflowEngine) -> bool {
+    verify_fail_streak(engine) >= MAX_CONSECUTIVE_VERIFY_FAILS
 }
 
 /// Gate for `## Done` on coding Execute — AST clean + verify passed (if applicable).
@@ -172,9 +214,7 @@ pub fn check_execute_done_gate(engine: &WorkflowEngine) -> Option<String> {
         ));
     }
 
-    let status = engine
-        .get_variable(VERIFY_STATUS_KEY)
-        .unwrap_or_default();
+    let status = engine.get_variable(VERIFY_STATUS_KEY).unwrap_or_default();
     if status == "skipped" || status == "passed" {
         return None;
     }
@@ -199,9 +239,7 @@ pub fn verify_hint_message(engine: &WorkflowEngine) -> Option<String> {
     if !read_ast_pending(engine).is_empty() {
         return None;
     }
-    let status = engine
-        .get_variable(VERIFY_STATUS_KEY)
-        .unwrap_or_default();
+    let status = engine.get_variable(VERIFY_STATUS_KEY).unwrap_or_default();
     if status == "passed" || status == "skipped" {
         return None;
     }
@@ -219,8 +257,7 @@ pub fn verify_hint_message(engine: &WorkflowEngine) -> Option<String> {
 pub fn tool_batch_has_ast_issues(new_messages: &[Message], tool_calls: &[ToolCall]) -> bool {
     tool_calls.iter().any(|tc| {
         matches!(tc.name.as_str(), "file_write" | "edit_file")
-            && tool_result_content(new_messages, &tc.id)
-                .is_some_and(|c| c.contains(AST_MARKER))
+            && tool_result_content(new_messages, &tc.id).is_some_and(|c| c.contains(AST_MARKER))
     })
 }
 
@@ -264,8 +301,7 @@ pub fn resolve_verify_command(project_root: &Path, _touched: &[String]) -> Optio
             command: "mvn -q -DskipTests compile".into(),
         });
     }
-    if project_root.join("build.gradle").exists()
-        || project_root.join("build.gradle.kts").exists()
+    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists()
     {
         return Some(VerifyCommand {
             label: "Gradle — compile".into(),
@@ -309,10 +345,22 @@ fn is_source_path(path: &str) -> bool {
             matches!(
                 ext,
                 "rs" | "py"
-                    | "js" | "ts" | "tsx" | "jsx" | "mjs" | "cjs"
+                    | "js"
+                    | "ts"
+                    | "tsx"
+                    | "jsx"
+                    | "mjs"
+                    | "cjs"
                     | "go"
-                    | "java" | "kt" | "kts"
-                    | "cpp" | "cc" | "cxx" | "c" | "h" | "hpp"
+                    | "java"
+                    | "kt"
+                    | "kts"
+                    | "cpp"
+                    | "cc"
+                    | "cxx"
+                    | "c"
+                    | "h"
+                    | "hpp"
                     | "cs"
                     | "rb"
                     | "php"
@@ -400,7 +448,12 @@ pub fn tool_result_ast_clean(tool_content: &str) -> bool {
 }
 
 pub fn clear_verify_state(engine: &WorkflowEngine) {
-    for key in [TOUCHED_KEY, VERIFY_CMD_KEY, VERIFY_STATUS_KEY, AST_PENDING_KEY] {
+    for key in [
+        TOUCHED_KEY,
+        VERIFY_CMD_KEY,
+        VERIFY_STATUS_KEY,
+        AST_PENDING_KEY,
+    ] {
         engine.set_variable(key, String::new());
     }
 }
@@ -422,9 +475,7 @@ pub fn verify_status_failed(engine: &WorkflowEngine) -> bool {
 
 /// Whether verify is still required before ## Done.
 pub fn verify_status_blocks_done(engine: &WorkflowEngine) -> bool {
-    let status = engine
-        .get_variable(VERIFY_STATUS_KEY)
-        .unwrap_or_default();
+    let status = engine.get_variable(VERIFY_STATUS_KEY).unwrap_or_default();
     if status == "failed" || status == "pending" {
         return true;
     }
@@ -469,7 +520,9 @@ mod tests {
         }];
         let mut messages = Vec::new();
         check_ast_and_recover(&mut messages, &new_messages, &[tc]);
-        assert!(messages.iter().any(|m| matches!(m, Message::System { content } if content.contains("AST SYNTAX ERROR"))));
+        assert!(messages.iter().any(
+            |m| matches!(m, Message::System { content } if content.contains("AST SYNTAX ERROR"))
+        ));
     }
 
     #[test]
@@ -489,6 +542,32 @@ mod tests {
         engine.set_variable(VERIFY_STATUS_KEY, "pending".into());
         let gate = check_execute_done_gate(&engine).unwrap();
         assert!(gate.contains("cargo check"));
+    }
+
+    #[test]
+    fn verify_failures_accumulate_then_trigger_stop() {
+        let engine = test_engine_at_execute();
+        engine.set_variable(VERIFY_CMD_KEY, "cargo check".into());
+        // Each failed run of the expected command bumps the streak.
+        note_shell_verify_result(&engine, "cargo check", false);
+        assert_eq!(verify_fail_streak(&engine), 1);
+        assert!(!should_stop_on_repeated_failure(&engine));
+        note_shell_verify_result(&engine, "cargo check", false);
+        note_shell_verify_result(&engine, "cargo check", false);
+        assert_eq!(verify_fail_streak(&engine), 3);
+        assert!(should_stop_on_repeated_failure(&engine));
+    }
+
+    #[test]
+    fn verify_pass_clears_failure_streak() {
+        let engine = test_engine_at_execute();
+        engine.set_variable(VERIFY_CMD_KEY, "cargo check".into());
+        note_shell_verify_result(&engine, "cargo check", false);
+        note_shell_verify_result(&engine, "cargo check", false);
+        assert_eq!(verify_fail_streak(&engine), 2);
+        note_shell_verify_result(&engine, "cargo check", true);
+        assert_eq!(verify_fail_streak(&engine), 0);
+        assert!(!should_stop_on_repeated_failure(&engine));
     }
 
     #[test]

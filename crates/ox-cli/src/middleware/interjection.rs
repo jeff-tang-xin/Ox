@@ -2,17 +2,13 @@
 //!
 //! Manages the interjection buffer and processes user input during agent execution.
 
-use ox_core::agent::interjection::{InterjectionBuffer, InterjectionPriority};
-use ox_core::agent::ui_event::UiToAgentEvent;
 use crate::terminal::app::App;
 use crate::terminal::output_pane::OutputLine;
+use ox_core::agent::interjection::{InterjectionBuffer, InterjectionPriority};
+use ox_core::agent::ui_event::UiToAgentEvent;
 
 /// Process user input as an interjection during agent execution.
-pub fn handle_interjection(
-    app: &mut App,
-    text: &str,
-    interjection_buf: &mut InterjectionBuffer,
-) {
+pub fn handle_interjection(app: &mut App, text: &str, interjection_buf: &mut InterjectionBuffer) {
     let parked_resume = app
         .workflow_engine
         .as_ref()
@@ -55,11 +51,8 @@ pub fn handle_interjection(
     } else {
         "(queued)"
     };
-    app.output.push_line(OutputLine::System(format!(
-        "{} {}",
-        prefix,
-        content.trim()
-    )));
+    app.output
+        .push_line(OutputLine::System(format!("{} {}", prefix, content.trim())));
     app.scroll_to_bottom();
     app.dirty = true;
 }

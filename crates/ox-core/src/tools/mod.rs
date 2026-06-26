@@ -1,4 +1,6 @@
+pub mod code_graph;
 pub mod code_search;
+pub mod complete_and_check;
 pub mod content_validation;
 pub mod delete_range;
 pub mod edit_file;
@@ -8,11 +10,9 @@ pub mod file_search;
 pub mod file_write;
 pub mod find_symbol;
 pub mod git;
-pub mod intent_classifier;  // 新增：意图分类器
+pub mod intent_classifier;
 pub mod load_skill;
-pub mod memory_search;
 pub mod project_detect;
-pub mod recall;
 pub mod shell_exec;
 pub mod web_fetch;
 
@@ -69,8 +69,10 @@ pub struct ToolContext {
     pub runtime: RuntimeEnvironment,
     pub working_dir: std::path::PathBuf,
     pub config: Arc<OxConfig>,
-    /// Unified knowledge engine (replaces memory + code_indexer)
-    pub knowledge: Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>,
+    /// Unified knowledge engine (optional; disabled when embedding is removed)
+    pub knowledge: Option<Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>>,
+    /// GitNexus code-graph service (optional; None when unavailable/disabled).
+    pub gitnexus: Option<Arc<crate::mcp::GitNexusService>>,
     /// Current tool call ID (for progress reporting)
     pub tool_call_id: String,
     /// Optional progress callback for real-time updates
@@ -92,16 +94,23 @@ impl ToolContext {
         runtime: RuntimeEnvironment,
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
-        knowledge: Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>,
+        knowledge: Option<Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>>,
     ) -> Self {
         Self {
             runtime,
             working_dir,
             config,
             knowledge,
+            gitnexus: None,
             tool_call_id: String::new(),
             progress_callback: None,
         }
+    }
+
+    /// Attach the GitNexus code-graph service (builder style).
+    pub fn with_gitnexus(mut self, gitnexus: Option<Arc<crate::mcp::GitNexusService>>) -> Self {
+        self.gitnexus = gitnexus;
+        self
     }
 
     /// Create a new ToolContext with progress callback support
@@ -109,7 +118,7 @@ impl ToolContext {
         runtime: RuntimeEnvironment,
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
-        knowledge: Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>,
+        knowledge: Option<Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>>,
         tool_call_id: String,
         progress_callback: impl Fn(ToolProgress) + Send + Sync + 'static,
     ) -> Self {
@@ -118,6 +127,7 @@ impl ToolContext {
             working_dir,
             config,
             knowledge,
+            gitnexus: None,
             tool_call_id,
             progress_callback: Some(Arc::new(progress_callback)),
         }
@@ -188,23 +198,23 @@ impl ToolRegistry {
         registry.register(Box::new(shell_exec::ShellExecTool));
         registry.register(Box::new(project_detect::ProjectDetectTool));
         registry.register(Box::new(web_fetch::WebFetchTool));
-        registry.register(Box::new(memory_search::MemorySearchTool));
-        registry.register(Box::new(recall::RecallTool));
         registry.register(Box::new(git::GitStatusTool));
         registry.register(Box::new(git::GitDiffTool));
+        registry.register(Box::new(code_graph::CodeGraphTool));
+        registry.register(Box::new(complete_and_check::CompleteAndCheckTool));
 
         registry
     }
-    
+
     /// Load Skills from filesystem and register them
     pub fn load_skills(&self, rt_env: &crate::runtime::RuntimeEnvironment) -> anyhow::Result<()> {
         use crate::skill::SkillLoader;
-        
+
         let loader = SkillLoader::new(
             rt_env.ox_home_dir.join("skills"),
-            rt_env.working_dir.join(".ox").join("skills")
+            rt_env.working_dir.join(".ox").join("skills"),
         );
-        
+
         // ⚠️ Cap at 10 skills to prevent context bloat
         // Keep the most recently modified skills (created_at = file mtime / frontmatter)
         let mut skills = loader.load_enabled_skills()?;
@@ -215,9 +225,9 @@ impl ToolRegistry {
             tracing::info!("Capped skills at {} (oldest by mtime trimmed)", MAX_SKILLS);
         }
         *self.skills.lock().unwrap() = skills;
-        
+
         tracing::info!("Loaded {} skills", self.skills.lock().unwrap().len());
-        
+
         Ok(())
     }
 
@@ -256,6 +266,15 @@ impl ToolRegistry {
                 parameters: t.parameters_schema(),
             })
             .collect()
+    }
+
+    /// Agent tool list: unified single schema or full registry.
+    pub fn schemas_for_agent(&self, unified_tool_mode: bool) -> Vec<crate::llm::ToolSchema> {
+        if unified_tool_mode {
+            crate::agent::unified_action::unified_tool_schemas()
+        } else {
+            self.schemas()
+        }
     }
 
     /// List all tool names.

@@ -11,6 +11,8 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
     disable_tools: bool,
     client: reqwest::Client,
 }
@@ -21,6 +23,8 @@ impl OpenAiProvider {
         api_key: String,
         base_url: String,
         max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
         disable_tools: bool,
     ) -> Self {
         let client = reqwest::Client::builder()
@@ -43,6 +47,8 @@ impl OpenAiProvider {
                 base_url
             },
             max_tokens,
+            temperature,
+            top_p,
             disable_tools,
             client,
         }
@@ -56,7 +62,7 @@ fn is_network_retryable_error(error: &reqwest::Error) -> bool {
     // - Timeout
     // - Network unreachable
     // - DNS resolution temporary failure
-    
+
     error.is_timeout()
         || error.is_connect()
         || error.to_string().contains("connection reset")
@@ -71,7 +77,7 @@ fn calculate_retry_delay(consecutive_errors: u32) -> u64 {
     // Cap at 5 seconds to avoid excessive waiting
     let base_delay = 100u64;
     let max_delay = 5000u64;
-    
+
     let delay = base_delay * (2_u64.pow(consecutive_errors.min(6))); // Cap exponent at 6
     delay.min(max_delay)
 }
@@ -143,7 +149,12 @@ impl LlmProvider for OpenAiProvider {
 
             // Remove empty Assistant messages (no content + no tool_calls)
             messages.retain(|m| {
-                if let Message::Assistant { content, tool_calls, .. } = m {
+                if let Message::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } = m
+                {
                     !(content.is_empty() && tool_calls.is_empty())
                 } else {
                     true
@@ -156,7 +167,8 @@ impl LlmProvider for OpenAiProvider {
                 if let Message::Assistant { tool_calls, .. } = &messages[i] {
                     if !tool_calls.is_empty() {
                         let expected = tool_calls.len();
-                        let expected_ids: Vec<_> = tool_calls.iter().map(|tc| tc.id.clone()).collect();
+                        let expected_ids: Vec<_> =
+                            tool_calls.iter().map(|tc| tc.id.clone()).collect();
                         let mut valid = true;
                         let mut found_ids = Vec::new();
                         for j in 1..=expected {
@@ -186,7 +198,9 @@ impl LlmProvider for OpenAiProvider {
                         // Remove dangling ToolResults that followed
                         let mut remove_count = 0;
                         for j in 1..=expected {
-                            if i + j < messages.len() && matches!(&messages[i + j], Message::ToolResult { .. }) {
+                            if i + j < messages.len()
+                                && matches!(&messages[i + j], Message::ToolResult { .. })
+                            {
                                 remove_count += 1;
                             }
                         }
@@ -216,6 +230,10 @@ impl LlmProvider for OpenAiProvider {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
 
+        // Low-temperature defaults reduce divergent/repetitive ReAct exploration.
+        body["temperature"] = serde_json::json!(self.temperature.unwrap_or(0.1));
+        body["top_p"] = serde_json::json!(self.top_p.unwrap_or(0.8));
+
         if !tools.is_empty() && !self.disable_tools {
             let tool_defs: Vec<serde_json::Value> = tools
                 .iter()
@@ -231,10 +249,27 @@ impl LlmProvider for OpenAiProvider {
                 })
                 .collect();
             body["tools"] = serde_json::Value::Array(tool_defs);
+            if let Some(tc) = &opts.tool_choice {
+                body["tool_choice"] = match tc {
+                    crate::llm::ToolChoice::Auto => serde_json::json!("auto"),
+                    crate::llm::ToolChoice::None => serde_json::json!("none"),
+                    crate::llm::ToolChoice::Required => serde_json::json!("required"),
+                    crate::llm::ToolChoice::Function(name) => serde_json::json!({
+                        "type": "function",
+                        "function": { "name": name }
+                    }),
+                };
+            }
+            if let Some(par) = opts.parallel_tool_calls {
+                body["parallel_tool_calls"] = serde_json::json!(par);
+            }
         }
 
         // Debug: Log the request body for troubleshooting
-        tracing::debug!("OpenAI request body: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
+        tracing::debug!(
+            "OpenAI request body: {}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
 
         // Retry loop with exponential backoff for transient failures
         const MAX_RETRIES: u32 = 3;
@@ -258,13 +293,24 @@ impl LlmProvider for OpenAiProvider {
             match result {
                 Ok(r) if r.status().is_server_error() && attempt < MAX_RETRIES => {
                     let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
-                    tracing::warn!("[API RETRY] 5xx, retry {}/{} in {:?}", attempt, MAX_RETRIES, delay);
+                    tracing::warn!(
+                        "[API RETRY] 5xx, retry {}/{} in {:?}",
+                        attempt,
+                        MAX_RETRIES,
+                        delay
+                    );
                     tokio::time::sleep(delay).await;
                 }
                 Ok(r) => break r,
                 Err(e) if attempt < MAX_RETRIES && (e.is_timeout() || e.is_connect()) => {
                     let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
-                    tracing::warn!("[API RETRY] Network error, retry {}/{} in {:?}: {}", attempt, MAX_RETRIES, delay, e);
+                    tracing::warn!(
+                        "[API RETRY] Network error, retry {}/{} in {:?}: {}",
+                        attempt,
+                        MAX_RETRIES,
+                        delay,
+                        e
+                    );
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
@@ -282,7 +328,9 @@ impl LlmProvider for OpenAiProvider {
             let err_msg = format!("API error {status}: {body_text}");
             tracing::error!(
                 "[LLM ERROR] {} | URL: {} | Model: {}",
-                err_msg, request_url, self.model
+                err_msg,
+                request_url,
+                self.model
             );
             let _ = tx.send(LlmStreamEvent::Error(err_msg));
             return Ok(());
@@ -293,15 +341,15 @@ impl LlmProvider for OpenAiProvider {
             self.base_url,
             self.model
         );
-        
+
         let mut stream = resp.bytes_stream();
         let mut parser = OpenAiSseParser::new();
         let mut done_sent = false;
         let mut consecutive_errors = 0u32;
         let mut total_chunks_received = 0u32;
         let mut total_errors = 0u32;
-        const MAX_CONSECUTIVE_ERRORS: u32 = 10;  // Increased from 3 to 10 for better network tolerance
-        const MAX_TOTAL_ERRORS: u32 = 20;         // Total error limit to prevent infinite loops
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10; // Increased from 3 to 10 for better network tolerance
+        const MAX_TOTAL_ERRORS: u32 = 20; // Total error limit to prevent infinite loops
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
@@ -309,8 +357,13 @@ impl LlmProvider for OpenAiProvider {
                     consecutive_errors = 0;
                     total_chunks_received += 1;
 
-                    if total_chunks_received % 10 == 1 {  // Log every 10 chunks to avoid spam
-                        tracing::debug!("[LLM STREAM] Received chunk #{}: {} bytes", total_chunks_received, chunk.len());
+                    if total_chunks_received % 10 == 1 {
+                        // Log every 10 chunks to avoid spam
+                        tracing::debug!(
+                            "[LLM STREAM] Received chunk #{}: {} bytes",
+                            total_chunks_received,
+                            chunk.len()
+                        );
                     }
 
                     let chunk_str = String::from_utf8_lossy(&chunk);
@@ -327,10 +380,10 @@ impl LlmProvider for OpenAiProvider {
                 Err(e) => {
                     consecutive_errors += 1;
                     total_errors += 1;
-                    
+
                     // Determine if error is retryable
                     let is_retryable = is_network_retryable_error(&e);
-                    
+
                     tracing::warn!(
                         "[LLM STREAM] ⚠️ Chunk error (consecutive: {}/{}, total: {}): {} - Retryable: {}",
                         consecutive_errors,
@@ -341,29 +394,30 @@ impl LlmProvider for OpenAiProvider {
                     );
 
                     // Check if we should abort
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS || total_errors >= MAX_TOTAL_ERRORS {
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS
+                        || total_errors >= MAX_TOTAL_ERRORS
+                    {
                         tracing::error!(
                             "Too many stream errors (consecutive: {}, total: {}), aborting. Received {} chunks before failure.",
                             consecutive_errors,
                             total_errors,
                             total_chunks_received
                         );
-                        
+
                         let error_msg = if total_chunks_received == 0 {
                             "无法连接到 LLM API，请检查网络连接".to_string()
                         } else if total_chunks_received < 10 {
                             format!(
-                                "流式响应过早中断（仅接收 {} 个数据块）。\n\n可能原因：\n• 网络连接不稳定\n• API 服务器超时\n• 防火墙/代理阻止\n\n建议：检查网络后重试", 
+                                "流式响应过早中断（仅接收 {} 个数据块）。\n\n可能原因：\n• 网络连接不稳定\n• API 服务器超时\n• 防火墙/代理阻止\n\n建议：检查网络后重试",
                                 total_chunks_received
                             )
                         } else {
                             format!(
                                 "网络不稳定，流式响应中断（已接收 {} 个数据块，失败 {} 次）。\n\n已接收的内容可能不完整，建议：\n• 检查网络连接\n• 稍后重试\n• 尝试使用更小的请求",
-                                total_chunks_received,
-                                total_errors
+                                total_chunks_received, total_errors
                             )
                         };
-                        
+
                         let _ = tx.send(LlmStreamEvent::Error(error_msg));
                         return Ok(());
                     }
@@ -445,6 +499,20 @@ fn message_to_openai(msg: &Message) -> serde_json::Value {
                     .map(|tc| {
                         let args_str = if tc.arguments.trim().is_empty() {
                             "{}".to_string()
+                        } else if tc.name == crate::agent::unified_action::TOOL_NAME {
+                            crate::agent::tool_args_repair::repair_unified_arguments(&tc.arguments)
+                                .unwrap_or_else(|| {
+                                    match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                                        Ok(_) => tc.arguments.clone(),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Invalid tool arguments JSON for '{}', sending empty object: {e}",
+                                                tc.name
+                                            );
+                                            "{}".to_string()
+                                        }
+                                    }
+                                })
                         } else {
                             match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                                 Ok(_) => tc.arguments.clone(),

@@ -106,9 +106,8 @@ pub fn validate(engine: &WorkflowEngine, receipt: &CompletionReceipt) -> Result<
                 .to_string(),
         );
     }
-    let store = findings::load_or_migrate(engine).ok_or_else(|| {
-        "无 findings store，无法校验完成".to_string()
-    })?;
+    let store = findings::load_or_migrate(engine)
+        .ok_or_else(|| "无 findings store，无法校验完成".to_string())?;
     let expected = if store.active_indices.is_empty() {
         store
             .findings

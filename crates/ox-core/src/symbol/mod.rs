@@ -1,21 +1,21 @@
-pub mod types;
-pub mod language;
-pub mod extractor;
 pub mod embedding;
+pub mod extractor;
+pub mod language;
+pub mod types;
 pub mod vector_store;
 
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
 
-use types::{Symbol, SymbolQueryResult, CallGraphResult};
+use crate::config::EmbeddingConfig;
 use extractor::AstExtractor;
 use language::SyntaxError;
+use types::{CallGraphResult, Symbol, SymbolQueryResult};
 use vector_store::VectorStore;
-use crate::config::EmbeddingConfig;
 
 /// Cached file metadata for incremental indexing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,10 +89,15 @@ impl CodeIndexer {
 
         tracing::info!(
             "[INDEXER] Initializing vector store at {:?} (model={}, dim={})...",
-            db_path, self.embedding_config.model_id, self.embedding_config.dimension
+            db_path,
+            self.embedding_config.model_id,
+            self.embedding_config.dimension
         );
 
-        match VectorStore::open(db_path.to_str().unwrap_or("symbols.tdb"), &self.embedding_config) {
+        match VectorStore::open(
+            db_path.to_str().unwrap_or("symbols.tdb"),
+            &self.embedding_config,
+        ) {
             Ok(store) => {
                 let mut guard = self.vector_store.lock().await;
                 *guard = Some(store);
@@ -128,7 +133,9 @@ impl CodeIndexer {
             self.project_path.to_string_lossy().hash(&mut hasher);
             format!("{:016x}", hasher.finish())
         };
-        home.join(".ox").join("cache").join(format!("symbols_{}.json", path_hash))
+        home.join(".ox")
+            .join("cache")
+            .join(format!("symbols_{}.json", path_hash))
     }
 
     /// Load symbol cache from disk.
@@ -140,7 +147,11 @@ impl CodeIndexer {
         match std::fs::read_to_string(&path) {
             Ok(data) => match serde_json::from_str::<SymbolCache>(&data) {
                 Ok(cache) if cache.project_path == self.project_path.to_string_lossy() => {
-                    tracing::info!("[INDEXER] Loaded symbol cache: {} files from {:?}", cache.files.len(), path);
+                    tracing::info!(
+                        "[INDEXER] Loaded symbol cache: {} files from {:?}",
+                        cache.files.len(),
+                        path
+                    );
                     Some(cache)
                 }
                 Ok(_) => {
@@ -174,7 +185,11 @@ impl CodeIndexer {
                 if let Err(e) = std::fs::write(&path, data) {
                     tracing::warn!("[INDEXER] Failed to write symbol cache: {}", e);
                 } else {
-                    tracing::info!("[INDEXER] Saved symbol cache: {} files to {:?}", files.len(), path);
+                    tracing::info!(
+                        "[INDEXER] Saved symbol cache: {} files to {:?}",
+                        files.len(),
+                        path
+                    );
                 }
             }
             Err(e) => {
@@ -198,14 +213,16 @@ impl CodeIndexer {
     /// Full-project index with incremental caching.
     /// Only re-indexes files that have been modified since last run.
     /// Accepts an optional progress callback: (files_done, total_files, symbols_indexed).
-    pub async fn index_project(&mut self, progress: Option<tokio::sync::mpsc::UnboundedSender<(usize, usize, usize)>>) -> anyhow::Result<usize> {
+    pub async fn index_project(
+        &mut self,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<(usize, usize, usize)>>,
+    ) -> anyhow::Result<usize> {
         tracing::info!("[INDEXER] Indexing project: {:?}", self.project_path);
 
         // Load cache for incremental indexing
         let cache = self.load_cache();
-        let mut file_cache: HashMap<String, FileCacheEntry> = cache
-            .map(|c| c.files)
-            .unwrap_or_default();
+        let mut file_cache: HashMap<String, FileCacheEntry> =
+            cache.map(|c| c.files).unwrap_or_default();
 
         // Pre-scan source files
         let source_files: Vec<PathBuf> = walkdir::WalkDir::new(&self.project_path)
@@ -214,14 +231,22 @@ impl CodeIndexer {
             .filter(|e| e.file_type().is_file())
             .filter(|e| {
                 let p = e.path().to_string_lossy();
-                !(p.contains("target/") || p.contains("target\\")
-                    || p.contains("node_modules/") || p.contains("node_modules\\")
-                    || p.contains(".git/") || p.contains(".git\\")
-                    || p.contains("dist/") || p.contains("dist\\")
-                    || p.contains("build/") || p.contains("build\\")
-                    || p.contains("__pycache__/") || p.contains("__pycache__\\")
-                    || p.contains(".venv/") || p.contains(".venv\\")
-                    || p.contains(".ox/") || p.contains(".ox\\"))
+                !(p.contains("target/")
+                    || p.contains("target\\")
+                    || p.contains("node_modules/")
+                    || p.contains("node_modules\\")
+                    || p.contains(".git/")
+                    || p.contains(".git\\")
+                    || p.contains("dist/")
+                    || p.contains("dist\\")
+                    || p.contains("build/")
+                    || p.contains("build\\")
+                    || p.contains("__pycache__/")
+                    || p.contains("__pycache__\\")
+                    || p.contains(".venv/")
+                    || p.contains(".venv\\")
+                    || p.contains(".ox/")
+                    || p.contains(".ox\\"))
             })
             .map(|e| e.path().to_path_buf())
             .collect();
@@ -234,7 +259,8 @@ impl CodeIndexer {
         let mut stale_keys: Vec<String> = Vec::new();
 
         // Collect current file paths for stale detection
-        let current_paths: std::collections::HashSet<String> = source_files.iter()
+        let current_paths: std::collections::HashSet<String> = source_files
+            .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
@@ -267,7 +293,9 @@ impl CodeIndexer {
         let unchanged_count = total_files - changed_count;
         tracing::info!(
             "[INDEXER] {} files total: {} unchanged (from cache), {} to re-index",
-            total_files, unchanged_count, changed_count
+            total_files,
+            unchanged_count,
+            changed_count
         );
 
         // Send initial count
@@ -282,20 +310,20 @@ impl CodeIndexer {
         }
 
         // Index files: AST sync + memory update, embedding deferred
-        const BATCH_FILES: usize = 50;  // Process 50 files at once
+        const BATCH_FILES: usize = 50; // Process 50 files at once
         let mut all_new_symbols: Vec<Symbol> = Vec::new();
         let mut file_cache_updates: HashMap<String, (i64, Vec<Symbol>)> = HashMap::new();
 
         for batch_start in (0..files_to_index.len()).step_by(BATCH_FILES) {
             let batch_end = (batch_start + BATCH_FILES).min(files_to_index.len());
             let batch = &files_to_index[batch_start..batch_end];
-            
+
             // Step 1: Extract AST (FAST)
             let mut batch_symbols: Vec<Symbol> = Vec::new();
             for path in batch {
                 let path_str = path.to_string_lossy().to_string();
                 let current_mtime = Self::file_modified_secs(path).unwrap_or(0);
-                
+
                 match self.index_file_ast_only(path).await {
                     Ok(symbols) => {
                         batch_symbols.extend(symbols.clone());
@@ -306,7 +334,7 @@ impl CodeIndexer {
                     }
                 }
             }
-            
+
             // Step 2: IMMEDIATELY update memory (agent can search NOW!)
             if !batch_symbols.is_empty() {
                 let mut symbols_lock = self.symbols.write().await;
@@ -314,7 +342,7 @@ impl CodeIndexer {
                 drop(symbols_lock);
                 all_new_symbols.extend(batch_symbols);
             }
-            
+
             // Step 3: Report progress
             if let Some(ref tx) = progress {
                 let files_done = unchanged_count + batch_end;
@@ -325,10 +353,13 @@ impl CodeIndexer {
 
         // Apply cache updates
         for (path_str, (mtime, symbols)) in file_cache_updates {
-            file_cache.insert(path_str, FileCacheEntry {
-                modified_secs: mtime,
-                symbols,
-            });
+            file_cache.insert(
+                path_str,
+                FileCacheEntry {
+                    modified_secs: mtime,
+                    symbols,
+                },
+            );
         }
 
         // Save updated cache
@@ -337,17 +368,29 @@ impl CodeIndexer {
         let total = cached_symbols.len() + all_new_symbols.len();
         let new_symbols = all_new_symbols.len();
         if changed_count == 0 {
-            tracing::info!("[INDEXER] ✅ All {} files cached. {} symbols loaded instantly.", total_files, total);
+            tracing::info!(
+                "[INDEXER] ✅ All {} files cached. {} symbols loaded instantly.",
+                total_files,
+                total
+            );
         } else {
-            tracing::info!("[INDEXER] Indexing complete. {} symbols indexed ({} from cache, {} re-indexed).", total, cached_symbols.len(), new_symbols);
+            tracing::info!(
+                "[INDEXER] Indexing complete. {} symbols indexed ({} from cache, {} re-indexed).",
+                total,
+                cached_symbols.len(),
+                new_symbols
+            );
         }
-        
+
         // Embedding is now deferred to background task
         // Return immediately so agent can start searching!
         if !all_new_symbols.is_empty() {
-            tracing::info!("[INDEXER] {} symbols ready for keyword search. Embedding will complete in background.", new_symbols);
+            tracing::info!(
+                "[INDEXER] {} symbols ready for keyword search. Embedding will complete in background.",
+                new_symbols
+            );
         }
-        
+
         Ok(total)
     }
 
@@ -375,7 +418,8 @@ impl CodeIndexer {
         {
             let mut symbols_lock = self.symbols.write().await;
             // First pass: build a lookup map from name/fq_name -> fq_name
-            let lookup: std::collections::HashMap<String, String> = symbols_lock.iter()
+            let lookup: std::collections::HashMap<String, String> = symbols_lock
+                .iter()
                 .flat_map(|s| {
                     let mut m = std::collections::HashMap::new();
                     m.insert(s.name.clone(), s.fq_name.clone());
@@ -388,7 +432,9 @@ impl CodeIndexer {
             // Second pass: resolve calls
             for sym in symbols_lock.iter_mut() {
                 if !sym.calls.is_empty() {
-                    let resolved: Vec<String> = sym.calls.iter()
+                    let resolved: Vec<String> = sym
+                        .calls
+                        .iter()
                         .filter_map(|call| lookup.get(call).cloned())
                         .collect();
                     sym.calls = resolved;
@@ -401,7 +447,11 @@ impl CodeIndexer {
             let mut vs_guard = self.vector_store.lock().await;
             if let Some(ref mut vs) = *vs_guard {
                 if let Err(e) = vs.insert_symbols(&symbols) {
-                    tracing::debug!("[VECTOR_STORE] Failed to batch insert for {}: {}", path.display(), e);
+                    tracing::debug!(
+                        "[VECTOR_STORE] Failed to batch insert for {}: {}",
+                        path.display(),
+                        e
+                    );
                 }
             }
         }
@@ -421,7 +471,10 @@ impl CodeIndexer {
             return;
         }
 
-        tracing::info!("[VECTOR_STORE] Background embedding {} symbols...", all_symbols.len());
+        tracing::info!(
+            "[VECTOR_STORE] Background embedding {} symbols...",
+            all_symbols.len()
+        );
         let mut vs_guard = self.vector_store.lock().await;
         if let Some(ref mut vs) = *vs_guard {
             if let Err(e) = vs.insert_symbols_batch(&all_symbols) {
@@ -455,7 +508,8 @@ impl CodeIndexer {
         results.sort_by(|a, b| {
             let a_exact = a.name.to_lowercase() == lower;
             let b_exact = b.name.to_lowercase() == lower;
-            b_exact.cmp(&a_exact)
+            b_exact
+                .cmp(&a_exact)
                 .then_with(|| {
                     let a_pref = a.name.to_lowercase().starts_with(&lower);
                     let b_pref = b.name.to_lowercase().starts_with(&lower);
@@ -464,7 +518,11 @@ impl CodeIndexer {
                 .then_with(|| a.name.cmp(&b.name))
         });
 
-        SymbolQueryResult { symbols: results, total_count: total, query: name.to_string() }
+        SymbolQueryResult {
+            symbols: results,
+            total_count: total,
+            query: name.to_string(),
+        }
     }
 
     /// Unified search: keyword first, then semantic fallback.
@@ -512,9 +570,8 @@ impl CodeIndexer {
         let symbols = self.symbols.read().await;
 
         // Build lookup: fq_name -> Symbol
-        let fq_lookup: std::collections::HashMap<String, &Symbol> = symbols.iter()
-            .map(|s| (s.fq_name.clone(), s))
-            .collect();
+        let fq_lookup: std::collections::HashMap<String, &Symbol> =
+            symbols.iter().map(|s| (s.fq_name.clone(), s)).collect();
 
         // Resolve input name to FQ name
         let target_fq = {
@@ -564,9 +621,8 @@ impl CodeIndexer {
         }
 
         // Second pass: expand 1 level - find what these callers call
-        let caller_fqs: std::collections::HashSet<String> = results.iter()
-            .map(|r| r.fq_name.to_lowercase())
-            .collect();
+        let caller_fqs: std::collections::HashSet<String> =
+            results.iter().map(|r| r.fq_name.to_lowercase()).collect();
 
         for sym in symbols.iter() {
             if !sym.calls.is_empty() {
@@ -626,12 +682,13 @@ impl CodeIndexer {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<notify::Event>();
 
         // Create the OS-level file watcher (runs in its own thread)
-        let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res {
-                let _ = event_tx.send(event);
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("Failed to create file watcher: {}", e))?;
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let _ = event_tx.send(event);
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to create file watcher: {}", e))?;
 
         use notify::{RecursiveMode, Watcher};
         watcher
@@ -691,14 +748,21 @@ impl CodeIndexer {
                                 // File removed: clean from in-memory index
                                 let idx = self_clone.lock().await;
                                 let path_str = path.to_string_lossy().to_string();
-                                idx.symbols.write().await.retain(|s| s.file_path != path_str);
+                                idx.symbols
+                                    .write()
+                                    .await
+                                    .retain(|s| s.file_path != path_str);
                                 tracing::debug!("[WATCHER] Removed symbols for {}", path_str);
                             } else {
                                 // File created/modified: re-index
                                 let mut idx = self_clone.lock().await;
                                 match idx.index_file(&path).await {
                                     Ok(n) if n > 0 => {
-                                        tracing::debug!("[WATCHER] Re-indexed {} ({} symbols)", path.display(), n);
+                                        tracing::debug!(
+                                            "[WATCHER] Re-indexed {} ({} symbols)",
+                                            path.display(),
+                                            n
+                                        );
                                     }
                                     Err(e) => {
                                         tracing::debug!("[WATCHER] Skip {}: {}", path.display(), e);
@@ -720,13 +784,21 @@ impl CodeIndexer {
     /// Check if a path should be excluded from watching (non-source directories).
     fn should_skip_path(path: &Path) -> bool {
         let path_str = path.to_string_lossy();
-        path_str.contains("target/") || path_str.contains("target\\")
-            || path_str.contains("node_modules/") || path_str.contains("node_modules\\")
-            || path_str.contains(".git/") || path_str.contains(".git\\")
-            || path_str.contains("dist/") || path_str.contains("dist\\")
-            || path_str.contains("build/") || path_str.contains("build\\")
-            || path_str.contains("__pycache__/") || path_str.contains("__pycache__\\")
-            || path_str.contains(".venv/") || path_str.contains(".venv\\")
-            || path_str.contains(".ox/") || path_str.contains(".ox\\")
+        path_str.contains("target/")
+            || path_str.contains("target\\")
+            || path_str.contains("node_modules/")
+            || path_str.contains("node_modules\\")
+            || path_str.contains(".git/")
+            || path_str.contains(".git\\")
+            || path_str.contains("dist/")
+            || path_str.contains("dist\\")
+            || path_str.contains("build/")
+            || path_str.contains("build\\")
+            || path_str.contains("__pycache__/")
+            || path_str.contains("__pycache__\\")
+            || path_str.contains(".venv/")
+            || path_str.contains(".venv\\")
+            || path_str.contains(".ox/")
+            || path_str.contains(".ox\\")
     }
 }

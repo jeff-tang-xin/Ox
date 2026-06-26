@@ -6,11 +6,7 @@ use ox_core::message::Message;
 
 /// Short label for an embedding model id (last path segment).
 pub fn short_model_id(model_id: &str) -> String {
-    model_id
-        .rsplit('/')
-        .next()
-        .unwrap_or(model_id)
-        .to_string()
+    model_id.rsplit('/').next().unwrap_or(model_id).to_string()
 }
 
 /// Compact path for status bar: `…/parent/name` or truncated.
@@ -52,7 +48,10 @@ pub fn short_display_path(path: &str, max_chars: usize) -> String {
     if file_name.chars().count() <= max_chars {
         file_name
     } else {
-        let truncated: String = file_name.chars().take(max_chars.saturating_sub(1)).collect();
+        let truncated: String = file_name
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect();
         format!("{truncated}…")
     }
 }
@@ -121,6 +120,20 @@ pub fn summarize_tool_result(name: &str, output: &str) -> String {
         "web_fetch" => {
             let len = output.len();
             format!("{len} chars")
+        }
+        "complete_and_check" => {
+            // Compact format: "✓ action\noutput" or "✗ error" or "✓ confirmed (gate:kind)"
+            let first = output.lines().next().unwrap_or("?");
+            if first.starts_with("✓ file_read")
+                || first.starts_with("✓ find_symbol")
+                || first.starts_with("✓ code_search")
+            {
+                let rest: String = output.lines().skip(1).take(2).collect::<Vec<_>>().join(" ");
+                let rest: String = rest.chars().take(80).collect();
+                format!("{} {}", first, rest)
+            } else {
+                first.chars().take(120).collect()
+            }
         }
         _ => {
             let truncated: String = output.chars().take(120).collect();

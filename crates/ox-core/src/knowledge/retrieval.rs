@@ -1,3 +1,4 @@
+use anyhow::Result;
 /// Pre-turn knowledge retrieval pipeline.
 ///
 /// Implements the "深度优先 + Token预算" (depth-first + token budget) retrieval
@@ -12,13 +13,11 @@
 ///
 /// # Extraction Filtering (per design doc §3.2)
 /// Auto-filters: greetings, repeated confirmations, exploratory chatter with no signal.
-
 use std::collections::HashMap;
-use anyhow::Result;
 
+use super::KnowledgeEngine;
 use super::entity::{Entity, EntityKind, EntityMetadata, injection_priority};
 use super::memory_cluster;
-use super::KnowledgeEngine;
 use crate::context::detect_intent;
 
 /// Result of intent classification for query decomposition.
@@ -149,7 +148,11 @@ pub fn run_retrieval(
             (false, true) => std::cmp::Ordering::Greater,
             _ => injection_priority(a.kind)
                 .cmp(&injection_priority(b.kind))
-                .then_with(|| b_score.partial_cmp(a_score).unwrap_or(std::cmp::Ordering::Equal)),
+                .then_with(|| {
+                    b_score
+                        .partial_cmp(a_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }),
         }
     });
 
@@ -164,7 +167,10 @@ pub fn run_retrieval(
 
     tracing::info!(
         "[RETRIEVAL] Query '{}' → {} entities ({} L0 recent, {} tokens)",
-        user_query, selected.len(), recent_turns.len(), token_estimate
+        user_query,
+        selected.len(),
+        recent_turns.len(),
+        token_estimate
     );
 
     Ok(ContextInjection {
@@ -187,12 +193,18 @@ pub fn run_retrieval_for_step(
     memory_layers: &[String],
 ) -> Result<ContextInjection> {
     // Parse memory layers to EntityKind
-    let mut kinds: Vec<EntityKind> = memory_layers.iter()
+    let mut kinds: Vec<EntityKind> = memory_layers
+        .iter()
         .filter_map(|s| EntityKind::from_str(s))
         .collect();
 
     // Plan/review steps still need code-symbol context even if not listed explicitly
-    if !kinds.iter().any(|k| matches!(k, EntityKind::CodeSymbol | EntityKind::CodeFile | EntityKind::CodeModule)) {
+    if !kinds.iter().any(|k| {
+        matches!(
+            k,
+            EntityKind::CodeSymbol | EntityKind::CodeFile | EntityKind::CodeModule
+        )
+    }) {
         kinds.push(EntityKind::CodeSymbol);
     }
 
@@ -202,19 +214,17 @@ pub fn run_retrieval_for_step(
     let recent_turns = engine.get_recent_turns(2);
     let mut candidates: HashMap<String, (Entity, f32)> = HashMap::new();
     for turn in &recent_turns {
-        candidates.entry(turn.id.clone()).or_insert_with(|| (turn.clone(), 1.0));
+        candidates
+            .entry(turn.id.clone())
+            .or_insert_with(|| (turn.clone(), 1.0));
     }
 
     // Semantic search — ONLY for the specified memory layers (not all kinds)
     if !kinds.is_empty() {
-        let hits = engine.search_by_kinds(
-            &intent.search_query,
-            &kinds,
-            15,
-            0.2,
-        )?;
+        let hits = engine.search_by_kinds(&intent.search_query, &kinds, 15, 0.2)?;
         for hit in hits {
-            candidates.entry(hit.entity.id.clone())
+            candidates
+                .entry(hit.entity.id.clone())
                 .and_modify(|(_, score)| *score = (*score + hit.score).min(2.0))
                 .or_insert_with(|| (hit.entity, hit.score));
         }
@@ -224,7 +234,8 @@ pub fn run_retrieval_for_step(
     for file_path in &intent.file_paths {
         if let Ok(symbols) = engine.find_symbols_in_file(file_path) {
             for sym in symbols {
-                candidates.entry(sym.id.clone())
+                candidates
+                    .entry(sym.id.clone())
                     .and_modify(|(_, score)| *score = (*score + 0.95).min(2.0))
                     .or_insert_with(|| (sym, 0.95));
             }
@@ -244,7 +255,11 @@ pub fn run_retrieval_for_step(
             (false, true) => std::cmp::Ordering::Greater,
             _ => injection_priority(a.kind)
                 .cmp(&injection_priority(b.kind))
-                .then_with(|| b_score.partial_cmp(a_score).unwrap_or(std::cmp::Ordering::Equal)),
+                .then_with(|| {
+                    b_score
+                        .partial_cmp(a_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }),
         }
     });
     let fused = deduplicate_near_duplicates(fused);
@@ -255,10 +270,17 @@ pub fn run_retrieval_for_step(
 
     tracing::info!(
         "[RETRIEVAL-STEP] '{}' → {} entities (layers={:?}, L0={})",
-        user_query, selected.len(), memory_layers, recent_turns.len()
+        user_query,
+        selected.len(),
+        memory_layers,
+        recent_turns.len()
     );
 
-    Ok(ContextInjection { entities: selected, blocks, token_estimate })
+    Ok(ContextInjection {
+        entities: selected,
+        blocks,
+        token_estimate,
+    })
 }
 
 /// Expand top CodeSymbol hits along 1-hop `Calls` edges (in-memory EntityGraph).
@@ -291,9 +313,7 @@ fn expand_code_graph_neighbors(
             {
                 lines.push(format!("- → `{fq_name}` @ {file_path}:{start_line}"));
             }
-            candidates
-                .entry(n.id.clone())
-                .or_insert_with(|| (n, 0.55));
+            candidates.entry(n.id.clone()).or_insert_with(|| (n, 0.55));
         }
     }
     lines.join("\n")
@@ -321,7 +341,9 @@ fn classify_intent(query: &str) -> QueryIntent {
 
     tracing::debug!(
         "[RETRIEVAL] Intent: {:?} | files: {:?} | hints: {:?}",
-        intent, file_paths, symbol_hints
+        intent,
+        file_paths,
+        symbol_hints
     );
 
     QueryIntent {
@@ -335,10 +357,7 @@ fn classify_intent(query: &str) -> QueryIntent {
 /// Extract file paths from a query string using regex.
 pub fn extract_file_paths(query: &str) -> Vec<String> {
     let exts = crate::source_paths::query_path_extensions_regex();
-    let re = regex::Regex::new(&format!(
-        r"([\w./\\-]+\.({exts}))\b"
-    ))
-    .unwrap();
+    let re = regex::Regex::new(&format!(r"([\w./\\-]+\.({exts}))\b")).unwrap();
 
     let mut paths = Vec::new();
     for cap in re.captures_iter(query) {
@@ -358,7 +377,8 @@ fn extract_symbol_hints(query: &str) -> Vec<String> {
     let mut hints = Vec::new();
 
     // CamelCase / PascalCase patterns
-    let re = regex::Regex::new(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+)+|[a-z]+(?:[A-Z][a-z]+)+)\b").unwrap();
+    let re =
+        regex::Regex::new(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+)+|[a-z]+(?:[A-Z][a-z]+)+)\b").unwrap();
     for cap in re.captures_iter(query) {
         if let Some(m) = cap.get(1) {
             let s = m.as_str().to_string();
@@ -373,7 +393,10 @@ fn extract_symbol_hints(query: &str) -> Vec<String> {
         if let Some(pos) = query.find(keyword) {
             let after = &query[pos + keyword.len()..];
             if let Some(word) = after.split_whitespace().next() {
-                let clean: String = word.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+                let clean: String = word
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
                 if clean.len() >= 2 && !hints.contains(&clean) {
                     hints.push(clean);
                 }
@@ -389,10 +412,14 @@ fn deduplicate_near_duplicates(mut entities: Vec<(Entity, f32)>) -> Vec<(Entity,
     let mut seen: HashMap<String, ()> = HashMap::new();
     entities.retain(|(entity, _)| {
         let key = match &entity.metadata {
-            EntityMetadata::CodeSymbol { file_path, fq_name, .. } => {
+            EntityMetadata::CodeSymbol {
+                file_path, fq_name, ..
+            } => {
                 format!("code:{}:{}", file_path, fq_name)
             }
-            EntityMetadata::WorkingMemory { session_id, action, .. } => {
+            EntityMetadata::WorkingMemory {
+                session_id, action, ..
+            } => {
                 format!("wm:{}:{}", session_id, action)
             }
             EntityMetadata::AtomicMemory { project_id, .. } => {
@@ -504,7 +531,12 @@ fn format_entity_for_context(entity: &Entity) -> String {
             ..
         } => {
             let sig = if signature.len() > 80 {
-                format!("{}...", &signature[..77])
+                // Char-boundary-safe: `&signature[..77]` panics mid-UTF-8 char.
+                let mut end = 77;
+                while end > 0 && !signature.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &signature[..end])
             } else {
                 signature.clone()
             };
@@ -513,7 +545,11 @@ fn format_entity_for_context(entity: &Entity) -> String {
                 symbol_type, fq_name, file_path, start_line, end_line, sig
             )
         }
-        EntityMetadata::WorkingMemory { action, has_code_changes, .. } => {
+        EntityMetadata::WorkingMemory {
+            action,
+            has_code_changes,
+            ..
+        } => {
             let marker = if *has_code_changes { " ✏️" } else { "" };
             format!("- [L0:可能为历史会话] {}{}", action, marker)
         }
@@ -521,7 +557,11 @@ fn format_entity_for_context(entity: &Entity) -> String {
             let preview: String = entity.content.chars().take(120).collect();
             format!("- [L1:背景记忆:{}] {}", memory_type, preview)
         }
-        EntityMetadata::EpisodicMemory { episode_name, task_description, .. } => {
+        EntityMetadata::EpisodicMemory {
+            episode_name,
+            task_description,
+            ..
+        } => {
             let preview: String = task_description.chars().take(100).collect();
             format!(
                 "- [L2:历史任务:{}] {} — 已结束，非本轮待办",
@@ -649,7 +689,11 @@ mod tests {
     #[test]
     fn test_extract_symbol_hints_camelcase() {
         let hints = extract_symbol_hints("explain validateToken and UserAuth");
-        assert!(hints.iter().any(|h| h == "validateToken" || h == "UserAuth"));
+        assert!(
+            hints
+                .iter()
+                .any(|h| h == "validateToken" || h == "UserAuth")
+        );
     }
 
     #[test]
@@ -694,11 +738,31 @@ mod tests {
     #[test]
     fn test_deduplicate_near_duplicates() {
         let e1 = (
-            Entity::code_symbol("a", "a::a", crate::knowledge::entity::SymbolType::Function, "rust", "src/a.rs", 1, 2, "fn a()", None),
+            Entity::code_symbol(
+                "a",
+                "a::a",
+                crate::knowledge::entity::SymbolType::Function,
+                "rust",
+                "src/a.rs",
+                1,
+                2,
+                "fn a()",
+                None,
+            ),
             0.9,
         );
         let e2 = (
-            Entity::code_symbol("a", "a::a", crate::knowledge::entity::SymbolType::Function, "rust", "src/a.rs", 1, 2, "fn a()", None),
+            Entity::code_symbol(
+                "a",
+                "a::a",
+                crate::knowledge::entity::SymbolType::Function,
+                "rust",
+                "src/a.rs",
+                1,
+                2,
+                "fn a()",
+                None,
+            ),
             0.8,
         );
         let deduped = deduplicate_near_duplicates(vec![e1, e2]);

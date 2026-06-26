@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use ox_core::agent::AgentToUiEvent;
 use ox_core::agent::interjection::InterjectionBuffer;
 use ox_core::agent::interrupt::InterruptController;
-use ox_core::agent::AgentToUiEvent;
 use ox_core::config::{AgentConfig, OxConfig};
-use ox_core::context::compressed_store::CompressedContextStore;
 use ox_core::context::ContextBuilder;
+use ox_core::context::compressed_store::CompressedContextStore;
 use ox_core::cost::CostTracker;
 use ox_core::knowledge::KnowledgeEngine;
 use ox_core::llm::{LlmProvider, ProviderResolveInfo};

@@ -1,10 +1,9 @@
 /// Mermaid Task Canvas - Symbolic short-term memory for long-horizon tasks
-/// 
+///
 /// Inspired by TencentDB-Agent-Memory's approach:
 /// - Encodes task state in high-density Mermaid syntax
 /// - Cuts token usage while preserving full traceability via node_id
 /// - Provides Agent with a "task map" to avoid getting lost in long tasks
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -187,7 +186,7 @@ impl TaskCanvas {
     /// Generate complete Mermaid diagram
     pub fn to_mermaid(&self) -> String {
         let mut output = String::new();
-        
+
         // Header
         output.push_str(&format!("---\ntitle: {}\n---\n\n", self.title));
         output.push_str("graph TB\n");
@@ -251,7 +250,10 @@ impl TaskCanvas {
         // Only show node_id and status emoji for compactness
         for node in &self.nodes {
             let emoji = node.status.emoji();
-            output.push_str(&format!("    {}[\"{} {}\"]\n", node.node_id, emoji, node.label));
+            output.push_str(&format!(
+                "    {}[\"{} {}\"]\n",
+                node.node_id, emoji, node.label
+            ));
         }
 
         output.push('\n');
@@ -303,7 +305,8 @@ impl TaskCanvasBuilder {
     }
 
     pub fn add_step_with_ref(mut self, node_id: &str, label: &str, ref_path: &str) -> Self {
-        self.canvas.add_node(TaskNode::new(node_id, label).with_ref(ref_path));
+        self.canvas
+            .add_node(TaskNode::new(node_id, label).with_ref(ref_path));
         self
     }
 
@@ -313,7 +316,8 @@ impl TaskCanvasBuilder {
     }
 
     pub fn add_dependency_with_label(mut self, from: &str, to: &str, label: &str) -> Self {
-        self.canvas.add_edge(TaskEdge::new(from, to).with_label(label));
+        self.canvas
+            .add_edge(TaskEdge::new(from, to).with_label(label));
         self
     }
 

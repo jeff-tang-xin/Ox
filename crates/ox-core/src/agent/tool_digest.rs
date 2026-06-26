@@ -111,7 +111,11 @@ fn merge_digest(existing: &mut FileDigest, new: &FileDigest) {
     }
     existing.line_count = existing.line_count.saturating_add(new.line_count);
     for s in &new.symbols {
-        if !existing.symbols.iter().any(|e| e.name == s.name && e.line_start == s.line_start) {
+        if !existing
+            .symbols
+            .iter()
+            .any(|e| e.name == s.name && e.line_start == s.line_start)
+        {
             existing.symbols.push(s.clone());
         }
     }
@@ -216,13 +220,7 @@ fn summarize_content(path: &str, lines: &[&str], symbols: &[SymbolRef]) -> Strin
                 .join(", ")
         )
     };
-    format!(
-        "已读 `{}`（{} 行，{}）{}",
-        path,
-        lines.len(),
-        ext,
-        sym
-    )
+    format!("已读 `{}`（{} 行，{}）{}", path, lines.len(), ext, sym)
 }
 
 fn load_store(engine: &WorkflowEngine) -> DigestStore {

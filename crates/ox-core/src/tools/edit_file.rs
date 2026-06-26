@@ -12,7 +12,6 @@
 /// When replace_all is true, every occurrence is replaced.
 /// In multi mode, edits are applied sequentially — each edit sees the result
 /// of the previous one — and the file is only written if ALL edits succeed.
-
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -85,10 +84,12 @@ impl Tool for EditFileTool {
         // ── Resolve path ──
         let path_str = match args.get("path").and_then(|p| p.as_str()) {
             Some(p) => p.trim().replace('\\', "/"),
-            None => return ToolOutput::error(
-                "❌ Missing required parameter: 'path'.\n\
+            None => {
+                return ToolOutput::error(
+                    "❌ Missing required parameter: 'path'.\n\
                  Usage: {\"path\": \"<relative-path>\", \"old_string\": \"<exact text>\", \"new_string\": \"<replacement>\"}",
-            ),
+                );
+            }
         };
 
         let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
@@ -97,10 +98,11 @@ impl Tool for EditFileTool {
             ctx.working_dir.join(&path_str)
         };
 
-        let path = match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
-            Ok(p) => p,
-            Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
-        };
+        let path =
+            match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
+                Ok(p) => p,
+                Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
+            };
 
         // ── Determine mode: single or multi ──
         let is_multi = args.get("edits").is_some();
@@ -124,19 +126,24 @@ impl EditFileTool {
     ) -> ToolOutput {
         let old_string = match args.get("old_string").and_then(|s| s.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
-            _ => return ToolOutput::error(
-                "❌ Missing required parameter: 'old_string'. Must be the EXACT text to find in the file.",
-            ),
+            _ => {
+                return ToolOutput::error(
+                    "❌ Missing required parameter: 'old_string'. Must be the EXACT text to find in the file.",
+                );
+            }
         };
 
         let new_string = match args.get("new_string").and_then(|s| s.as_str()) {
             Some(s) => s.to_string(),
-            None => return ToolOutput::error(
-                "❌ Missing required parameter: 'new_string'. Use empty string \"\" to delete.",
-            ),
+            None => {
+                return ToolOutput::error(
+                    "❌ Missing required parameter: 'new_string'. Use empty string \"\" to delete.",
+                );
+            }
         };
 
-        let replace_all = args.get("replace_all")
+        let replace_all = args
+            .get("replace_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
@@ -144,7 +151,11 @@ impl EditFileTool {
             return ToolOutput::error(e);
         }
 
-        let edit = SingleEdit { old_string, new_string, replace_all };
+        let edit = SingleEdit {
+            old_string,
+            new_string,
+            replace_all,
+        };
         let edits = vec![edit];
 
         self.apply_edits(path, &edits, ctx).await
@@ -158,33 +169,44 @@ impl EditFileTool {
     ) -> ToolOutput {
         let edits_json = match args.get("edits").and_then(|e| e.as_array()) {
             Some(arr) if !arr.is_empty() => arr,
-            _ => return ToolOutput::error(
-                "❌ 'edits' must be a non-empty array of {{old_string, new_string, replace_all?}} objects.",
-            ),
+            _ => {
+                return ToolOutput::error(
+                    "❌ 'edits' must be a non-empty array of {{old_string, new_string, replace_all?}} objects.",
+                );
+            }
         };
 
         let mut edits: Vec<SingleEdit> = Vec::with_capacity(edits_json.len());
         for (i, edit_val) in edits_json.iter().enumerate() {
             let old_str = match edit_val.get("old_string").and_then(|s| s.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
-                _ => return ToolOutput::error(format!(
-                    "❌ edits[{i}]: missing or empty 'old_string'."
-                )),
+                _ => {
+                    return ToolOutput::error(format!(
+                        "❌ edits[{i}]: missing or empty 'old_string'."
+                    ));
+                }
             };
             let new_str = match edit_val.get("new_string").and_then(|s| s.as_str()) {
                 Some(s) => s.to_string(),
-                None => return ToolOutput::error(format!(
-                    "❌ edits[{i}]: missing 'new_string'. Use \"\" to delete."
-                )),
+                None => {
+                    return ToolOutput::error(format!(
+                        "❌ edits[{i}]: missing 'new_string'. Use \"\" to delete."
+                    ));
+                }
             };
-            let repl_all = edit_val.get("replace_all")
+            let repl_all = edit_val
+                .get("replace_all")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
             if let Err(e) = content_validation::validate_content(&new_str) {
                 return ToolOutput::error(format!("edits[{i}]: {e}"));
             }
-            edits.push(SingleEdit { old_string: old_str, new_string: new_str, replace_all: repl_all });
+            edits.push(SingleEdit {
+                old_string: old_str,
+                new_string: new_str,
+                replace_all: repl_all,
+            });
         }
 
         self.apply_edits(path, &edits, ctx).await
@@ -199,20 +221,25 @@ impl EditFileTool {
     ) -> ToolOutput {
         let path_clone = path.to_path_buf();
         let display_path = path.display().to_string();
-        let edits_clone: Vec<SingleEdit> = edits.iter().map(|e| SingleEdit {
-            old_string: e.old_string.clone(),
-            new_string: e.new_string.clone(),
-            replace_all: e.replace_all,
-        }).collect();
+        let edits_clone: Vec<SingleEdit> = edits
+            .iter()
+            .map(|e| SingleEdit {
+                old_string: e.old_string.clone(),
+                new_string: e.new_string.clone(),
+                replace_all: e.replace_all,
+            })
+            .collect();
 
         let result = tokio::task::spawn_blocking(move || {
             // Phase 1: Read file
             let content = match std::fs::read_to_string(&path_clone) {
                 Ok(c) => c,
-                Err(e) => return Err(format!(
-                    "❌ Cannot read {}: {e}\n💡 Check the path with file_list or file_read.",
-                    path_clone.display()
-                )),
+                Err(e) => {
+                    return Err(format!(
+                        "❌ Cannot read {}: {e}\n💡 Check the path with file_list or file_read.",
+                        path_clone.display()
+                    ));
+                }
             };
 
             // Phase 2: Apply each edit sequentially
@@ -239,45 +266,55 @@ impl EditFileTool {
             // Phase 3: Write file
             match std::fs::write(&path_clone, &current) {
                 Ok(()) => {
-                    let old_lines: usize = edits_clone.iter()
+                    let old_lines: usize = edits_clone
+                        .iter()
                         .map(|e| e.old_string.lines().count())
                         .sum();
-                    let new_lines: usize = edits_clone.iter()
+                    let new_lines: usize = edits_clone
+                        .iter()
                         .map(|e| e.new_string.lines().count())
                         .sum();
 
                     let msg = if edits_clone.len() == 1 && edits_clone[0].replace_all {
                         format!(
                             "✅ Patched {} (replaced all occurrences, {} → {} lines)",
-                            path_clone.display(), old_lines, new_lines
+                            path_clone.display(),
+                            old_lines,
+                            new_lines
                         )
                     } else if edits_clone.len() == 1 {
                         format!(
                             "✅ Patched {} ({} → {} lines)",
-                            path_clone.display(), old_lines, new_lines
+                            path_clone.display(),
+                            old_lines,
+                            new_lines
                         )
                     } else {
                         format!(
                             "✅ Patched {} ({} edits applied, {} → {} lines)",
-                            path_clone.display(), edits_clone.len(), old_lines, new_lines
+                            path_clone.display(),
+                            edits_clone.len(),
+                            old_lines,
+                            new_lines
                         )
                     };
                     Ok(msg)
                 }
-                Err(e) => Err(format!(
-                    "❌ Failed to write {}: {e}",
-                    path_clone.display()
-                )),
+                Err(e) => Err(format!("❌ Failed to write {}: {e}", path_clone.display())),
             }
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(msg)) => {
                 // ── AST syntax check after edit ──
                 let ast_warning = {
-                    let knowledge = Arc::clone(&ctx.knowledge);
+                    let knowledge = ctx.knowledge.clone();
                     let check_path = path.to_path_buf();
                     tokio::spawn(async move {
+                        let Some(ref knowledge) = knowledge else {
+                            return None;
+                        };
                         let mut engine = match knowledge.try_write() {
                             Ok(e) => e,
                             Err(_) => return None,
@@ -287,11 +324,13 @@ impl EditFileTool {
                         } else {
                             None
                         }
-                    }).await
+                    })
+                    .await
                 };
                 let ast_suffix = match ast_warning {
                     Ok(Some(errors)) => {
-                        let mut warn = format!("\n\n⚠️ AST Syntax Check: {} issue(s):", errors.len());
+                        let mut warn =
+                            format!("\n\n⚠️ AST Syntax Check: {} issue(s):", errors.len());
                         for (i, err) in errors.iter().take(5).enumerate() {
                             warn.push_str(&format!("\n   {}. {}", i + 1, err.description));
                         }
@@ -358,7 +397,8 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
     let file_lines: Vec<&str> = content.lines().collect();
 
     // Trim signatures — only non-blank lines
-    let old_sig: Vec<&str> = old_lines.iter()
+    let old_sig: Vec<&str> = old_lines
+        .iter()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
@@ -405,10 +445,15 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
     let threshold = if n_sig >= 3 { n_sig - 1 } else { n_sig };
     if best_score >= threshold {
         if !edit.replace_all && dupes.len() > 1 {
-            let locations: Vec<String> = dupes.iter()
+            let locations: Vec<String> = dupes
+                .iter()
                 .enumerate()
                 .map(|(idx, (s, _))| {
-                    let preview = file_lines[*s.min(&(n_file - 1))].trim().chars().take(80).collect::<String>();
+                    let preview = file_lines[*s.min(&(n_file - 1))]
+                        .trim()
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
                     format!("  {}. Line {}: {:.80}", idx + 1, s + 1, preview)
                 })
                 .collect();
@@ -416,7 +461,9 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
                 "❌ Search matched {n} locations in {path} (after whitespace normalization).\n\n\
                  Options:\n{locs}\n\n\
                  💡 Fix: Add more unique context, or set replace_all: true.",
-                n = dupes.len(), path = display_path, locs = locations.join("\n"),
+                n = dupes.len(),
+                path = display_path,
+                locs = locations.join("\n"),
             ));
         }
 
@@ -448,16 +495,24 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
                         break;
                     }
                 }
-                if !found { break; }
+                if !found {
+                    break;
+                }
             }
 
             for (start, end) in positions.into_iter().rev() {
                 let rl: Vec<&str> = current.lines().collect();
                 let new_lines: Vec<&str> = new.lines().collect();
                 let mut out: Vec<String> = Vec::new();
-                for i in 0..start { out.push(rl[i].to_string()); }
-                for nl in &new_lines { out.push(nl.to_string()); }
-                for i in end..rl.len() { out.push(rl[i].to_string()); }
+                for i in 0..start {
+                    out.push(rl[i].to_string());
+                }
+                for nl in &new_lines {
+                    out.push(nl.to_string());
+                }
+                for i in end..rl.len() {
+                    out.push(rl[i].to_string());
+                }
                 current = out.join("\n");
             }
             tracing::info!("[EDIT_FILE] Trimmed replace_all: applied replacements");
@@ -466,12 +521,21 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
             // Single replacement: replace lines best_start..best_end with new
             let new_lines: Vec<&str> = new.lines().collect();
             let mut out: Vec<String> = Vec::new();
-            for i in 0..best_start { out.push(file_lines[i].to_string()); }
-            for nl in &new_lines { out.push(nl.to_string()); }
-            for i in best_end..n_file { out.push(file_lines[i].to_string()); }
+            for i in 0..best_start {
+                out.push(file_lines[i].to_string());
+            }
+            for nl in &new_lines {
+                out.push(nl.to_string());
+            }
+            for i in best_end..n_file {
+                out.push(file_lines[i].to_string());
+            }
             tracing::info!(
                 "[EDIT_FILE] Trimmed match at lines {}-{} (score: {}/{}), applied replacement",
-                best_start + 1, best_end, best_score, n_sig
+                best_start + 1,
+                best_end,
+                best_score,
+                n_sig
             );
             Ok(out.join("\n"))
         }
@@ -486,14 +550,23 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
                 for (i, line) in file_lines.iter().enumerate() {
                     let t = line.trim();
                     if t.contains(search_first) || search_first.contains(t) {
-                        similar.push(format!("  Line {}: {}", i + 1, t.chars().take(80).collect::<String>()));
-                        if similar.len() >= 5 { break; }
+                        similar.push(format!(
+                            "  Line {}: {}",
+                            i + 1,
+                            t.chars().take(80).collect::<String>()
+                        ));
+                        if similar.len() >= 5 {
+                            break;
+                        }
                     }
                 }
                 let hint = if similar.is_empty() {
                     "\n🔍 No similar lines found — the content may have changed.\n".to_string()
                 } else {
-                    format!("\n🔍 Lines containing similar text:\n{}\n", similar.join("\n"))
+                    format!(
+                        "\n🔍 Lines containing similar text:\n{}\n",
+                        similar.join("\n")
+                    )
                 };
                 Err(format!(
                     "❌ old_string not found in {}.\n\n\
@@ -572,14 +645,19 @@ fn fuzzy_relative_indent_match(
         }
     }
 
-    let threshold = if n_search >= 3 { n_search - 1 } else { n_search };
+    let threshold = if n_search >= 3 {
+        n_search - 1
+    } else {
+        n_search
+    };
 
     if best_score < threshold {
         return Err("Fuzzy match below threshold".to_string());
     }
 
     if !replace_all && duplicate_positions.len() > 1 {
-        let locations: Vec<String> = duplicate_positions.iter()
+        let locations: Vec<String> = duplicate_positions
+            .iter()
             .enumerate()
             .map(|(idx, (s, _))| {
                 let preview = file_lines[*s.min(&(file_lines.len() - 1))]
@@ -680,7 +758,10 @@ fn fuzzy_relative_indent_match(
 
         tracing::info!(
             "[EDIT_FILE] Fuzzy match at lines {}-{} (score: {}/{}), applied replacement",
-            best_start + 1, best_end, best_score, n_search
+            best_start + 1,
+            best_end,
+            best_score,
+            n_search
         );
         Ok(result.join("\n"))
     }
@@ -747,7 +828,8 @@ fn find_locations(content: &str, needle: &str) -> Vec<String> {
     while let Some(found) = content[pos..].find(needle) {
         let abs = pos + found;
         let line_num = content[..abs].lines().count() + 1; // 1-based
-        let preview: String = content.lines()
+        let preview: String = content
+            .lines()
             .nth(line_num - 1)
             .unwrap_or("")
             .chars()
@@ -755,7 +837,9 @@ fn find_locations(content: &str, needle: &str) -> Vec<String> {
             .collect();
         locations.push(format!("  Line {}: …{}…", line_num, preview));
         pos = abs + 1;
-        if locations.len() >= 10 { break; }
+        if locations.len() >= 10 {
+            break;
+        }
     }
     locations
 }

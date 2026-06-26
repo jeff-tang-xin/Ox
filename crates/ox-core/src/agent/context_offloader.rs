@@ -1,14 +1,13 @@
+use chrono::Utc;
+use std::fs;
 /// Context Offloading - Save verbose tool outputs to external files
-/// 
+///
 /// Inspired by TencentDB-Agent-Memory's approach:
 /// - Complete results saved to .ox/refs/{task_id}_{step}.md
 /// - Message context only keeps summary + node_id reference
 /// - Reduces token usage by 60%+ for long-running tasks
 /// - Maintains full traceability via node_id lookup
-
 use std::path::{Path, PathBuf};
-use std::fs;
-use chrono::Utc;
 
 /// Represents a tool execution result with offloading support
 #[derive(Debug, Clone)]
@@ -64,12 +63,12 @@ impl ContextOffloader {
     /// Create a new context offloader
     pub fn new(working_dir: &Path, task_id: &str) -> Self {
         let refs_dir = working_dir.join(".ox").join("refs");
-        
+
         // Ensure refs directory exists
         if let Err(e) = fs::create_dir_all(&refs_dir) {
             tracing::warn!("Failed to create refs directory: {}", e);
         }
-        
+
         Self {
             refs_dir,
             task_id: task_id.to_string(),
@@ -78,7 +77,7 @@ impl ContextOffloader {
     }
 
     /// Process a tool result and decide whether to offload
-    /// 
+    ///
     /// Offloading criteria:
     /// - Content length > threshold (default: 2000 chars)
     /// - Contains file paths or code blocks
@@ -92,21 +91,23 @@ impl ContextOffloader {
         threshold: usize,
     ) -> OffloadedResult {
         let should_offload = self.should_offload(tool_name, tool_args, content, threshold);
-        
+
         if should_offload {
             self.offload_result(tool_name, content, step_index)
         } else {
             // Keep in context without offloading
-            OffloadedResult::new(
-                content.to_string(),
-                format!("inline_{}", step_index),
-                None,
-            )
+            OffloadedResult::new(content.to_string(), format!("inline_{}", step_index), None)
         }
     }
 
     /// Determine if a result should be offloaded
-    fn should_offload(&self, tool_name: &str, tool_args: &str, content: &str, threshold: usize) -> bool {
+    fn should_offload(
+        &self,
+        tool_name: &str,
+        tool_args: &str,
+        content: &str,
+        threshold: usize,
+    ) -> bool {
         // Never offload recall results — they're already retrieving offloaded content,
         // offloading them again would create a pointless feedback loop.
         if tool_name == "recall" {
@@ -134,8 +135,9 @@ impl ContextOffloader {
                 content.len() > 8000 || content.lines().count() > 100
             }
             "file_read" => {
-                // Large file reads — preserve most file contents for LLM
-                content.len() > 8000
+                // mod.rs passes usize::MAX to disable offload; only ref above file_read 512KB gate
+                threshold != usize::MAX
+                    && content.len() > crate::tools::file_read::INLINE_CONTENT_THRESHOLD
             }
             _ => false,
         }
@@ -155,7 +157,8 @@ impl ContextOffloader {
 
         // Generate summary (first 200 chars + line count) - safe UTF-8 truncation
         let summary = if content.len() > 200 {
-            let boundary = content.char_indices()
+            let boundary = content
+                .char_indices()
                 .take_while(|(i, _)| *i < 200)
                 .last()
                 .map(|(i, c)| i + c.len_utf8())
@@ -186,7 +189,11 @@ impl ContextOffloader {
         );
 
         if let Err(e) = fs::write(&ref_path, &file_content) {
-            tracing::error!("Failed to write offloaded result to {}: {}", ref_path.display(), e);
+            tracing::error!(
+                "Failed to write offloaded result to {}: {}",
+                ref_path.display(),
+                e
+            );
             // Fallback: keep in context
             return OffloadedResult::new(
                 content.to_string(),
@@ -207,7 +214,11 @@ impl ContextOffloader {
             .with_ref(&ref_path.display().to_string())
             .with_description(&summary);
         self.canvas.add_node(canvas_node);
-        tracing::debug!("[CANVAS] Added node {} to task canvas ({} total nodes)", node_id, self.canvas.nodes.len());
+        tracing::debug!(
+            "[CANVAS] Added node {} to task canvas ({} total nodes)",
+            node_id,
+            self.canvas.nodes.len()
+        );
 
         OffloadedResult::new(summary, node_id, Some(ref_path))
     }
@@ -242,7 +253,11 @@ impl ContextOffloader {
                     Some(content)
                 }
                 Err(e) => {
-                    tracing::error!("Failed to read offloaded content {}: {}", ref_path.display(), e);
+                    tracing::error!(
+                        "Failed to read offloaded content {}: {}",
+                        ref_path.display(),
+                        e
+                    );
                     None
                 }
             }
@@ -262,7 +277,8 @@ impl ContextOffloader {
             .map_err(|e| format!("Failed to read refs dir: {}", e))?
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
-                entry.file_name()
+                entry
+                    .file_name()
                     .to_string_lossy()
                     .starts_with(&self.task_id)
             })
@@ -270,7 +286,8 @@ impl ContextOffloader {
 
         // Sort by modification time (oldest first)
         entries.sort_by_key(|entry| {
-            entry.metadata()
+            entry
+                .metadata()
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .unwrap_or_else(|| std::time::SystemTime::UNIX_EPOCH)
@@ -289,7 +306,11 @@ impl ContextOffloader {
         }
 
         if deleted > 0 {
-            tracing::info!("Cleaned up {} old references (kept {})", deleted, keep_count);
+            tracing::info!(
+                "Cleaned up {} old references (kept {})",
+                deleted,
+                keep_count
+            );
         }
 
         Ok(deleted)
@@ -305,10 +326,10 @@ mod tests {
     fn test_offload_large_content() {
         let temp_dir = TempDir::new().unwrap();
         let mut offloader = ContextOffloader::new(temp_dir.path(), "test_task");
-        
+
         let large_content = "Line 1\n".repeat(100);
         let result = offloader.process_result("some_tool", "", &large_content, 1, 500);
-        
+
         assert!(result.is_offloaded);
         assert!(result.ref_path.is_some());
         assert!(result.ref_path.as_ref().unwrap().exists());
@@ -318,10 +339,10 @@ mod tests {
     fn test_keep_small_content() {
         let temp_dir = TempDir::new().unwrap();
         let mut offloader = ContextOffloader::new(temp_dir.path(), "test_task");
-        
+
         let small_content = "Short result";
         let result = offloader.process_result("file_write", "", small_content, 1, 2000);
-        
+
         assert!(!result.is_offloaded);
         assert!(result.ref_path.is_none());
         assert_eq!(result.summary, small_content);
@@ -331,10 +352,10 @@ mod tests {
     fn test_retrieve_content() {
         let temp_dir = TempDir::new().unwrap();
         let mut offloader = ContextOffloader::new(temp_dir.path(), "test_task");
-        
+
         let content = "Test content to retrieve";
         let result = offloader.process_result("file_read", "", content, 1, 10);
-        
+
         if result.is_offloaded {
             let retrieved = offloader.retrieve_full_content(&result.node_id);
             assert!(retrieved.is_some());

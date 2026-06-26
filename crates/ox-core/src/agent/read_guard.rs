@@ -58,44 +58,18 @@ pub fn check(
             if path.is_empty() {
                 return Ok(());
             }
-            let offset = args
-                .get("offset")
-                .and_then(|o| o.as_u64())
-                .unwrap_or(0);
-            // Implement: one fresh read per file even if review already digested it.
-            if crate::agent::phase::fix_impl_session(engine) && offset == 0 {
-                if !engine.impl_file_already_read(path) {
-                    return Ok(());
-                }
-            }
+            let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
             if path_already_read(engine, path) {
-                // Offset reads fetch a different line range (prompt promises this).
                 if offset > 0 {
                     return Ok(());
                 }
-                if crate::agent::phase::fix_impl_session(engine) {
-                    if let Some(d) = crate::agent::tool_digest::get_digest(engine, path) {
-                        let symbols = if d.symbols.is_empty() {
-                            String::new()
-                        } else {
-                            d.symbols
-                                .iter()
-                                .take(4)
-                                .map(|s| format!("{}@L{}-{}", s.name, s.line_start, s.line_end))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        };
-                        return Err(format!(
-                            "文件 `{path}` 审查期已读过（digest 在 [WORKSPACE]）。\
-                             实施阶段请**直接 edit_file**；符号行号: {symbols}。\
-                             若必须续读指定行段，file_read 带 offset>0。"
-                        ));
-                    }
+                if crate::agent::workflow_session::is_implementation_phase(engine)
+                    && !engine.impl_file_already_read(path)
+                {
+                    return Ok(());
                 }
-                return Err(format!(
-                    "文件 `{path}` 本轮已读过。请使用 [WORKSPACE].file_digests / 上条 ToolResult，\
-                     勿重复 file_read；需要更多行时用 file_read 并设置 offset>0。"
-                ));
+                // Allow re-read but log — LLM may need fresh context after compaction
+                tracing::info!("[READ_GUARD] allow re-read: file_read:{}", path);
             }
         }
         "shell_exec" => {
@@ -115,29 +89,20 @@ pub fn check(
                 }
             }
         }
-        "find_symbol" | "code_search" | "file_search" | "recall" | "memory_search" => {
-            if crate::agent::phase::fix_impl_session(engine)
-                && matches!(tool_name, "code_search" | "file_search")
+        "find_symbol" | "code_search" | "file_search" => {
+            if matches!(tool_name, "code_search" | "file_search" | "file_list")
+                && engine.execute_report_already_delivered()
+                && crate::agent::phase::get(engine)
+                    != crate::agent::phase::SingleFlowPhase::Implement
             {
                 return Err(format!(
-                    "实施阶段禁止广泛探索 `{tool_name}`。架构/约定用 `memory_search`；\
-                     定位符号用 `find_symbol`；改代码前按 [WORKSPACE] 先 `file_read`。"
-                ));
-            }
-            if engine.execute_report_already_delivered()
-                && crate::agent::findings::load_or_migrate(engine)
-                    .is_some_and(|s| !s.findings.is_empty())
-                && !crate::agent::phase::fix_impl_session(engine)
-            {
-                return Err(format!(
-                    "审查报告已提交，禁止 `{tool_name}`。补全 ## Done 或等待用户说「修复」进入实施。"
+                    "审查报告已提交 — 禁止 {tool_name}；进入实施后可用 find_symbol。"
                 ));
             }
             if let Some(query) = symbol_query_key(tool_name, args) {
                 if symbol_already_queried(engine, &query) {
-                    return Err(format!(
-                        "符号/查询 `{query}` 本轮已搜过。请使用 [STEP_MEMORY] / 上条 ToolResult，勿重复 {tool_name}。"
-                    ));
+                    // Don't block — just warn. LLM may have new context that makes retry useful.
+                    tracing::info!("[READ_GUARD] allow retry: {}:{}", tool_name, query);
                 }
             }
         }
@@ -207,11 +172,7 @@ pub fn cached_file_read_response(engine: &WorkflowEngine, path: &str) -> Option<
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let impl_hint = if crate::agent::phase::fix_impl_session(engine) {
-            "\n💡 实施阶段：用以上行号直接 edit_file；需关联符号可 find_symbol，勿 code_search。"
-        } else {
-            "\n💡 需要更多行: file_read {\"path\":\"…\", \"offset\":N, \"limit\":200}"
-        };
+        let impl_hint = "\n💡 需要更多行: file_read {\"path\":\"…\", \"offset\":N, \"limit\":200}";
         format!(
             "✅ `{path}` 本轮已读过（返回 digest，未重复 IO）\n\
              摘要: {}\n\
@@ -244,6 +205,15 @@ pub fn provenance_paths(engine: &WorkflowEngine) -> std::collections::HashSet<St
         .get_variable(TURN_FILES_READ_KEY)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    if crate::agent::phase::fix_impl_session(engine) {
+        let impl_reads: std::collections::HashSet<String> = engine
+            .get_variable("_impl_files_read")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        for path in impl_reads {
+            set.insert(path);
+        }
+    }
     for d in crate::agent::tool_digest::all_digests(engine) {
         set.insert(plan_tracker::normalize_path(&d.path));
     }
@@ -262,11 +232,12 @@ mod tests {
     }
 
     #[test]
-    fn blocks_duplicate_file_read() {
+    fn allows_duplicate_file_read_retry() {
         let e = engine();
         record_file_read(&e, "src/a.rs");
         let args = serde_json::json!({"path": "src/a.rs"});
-        assert!(check("file_read", &args, &e).is_err());
+        // Now allowed — LLM may need fresh context after compaction
+        assert!(check("file_read", &args, &e).is_ok());
     }
 
     #[test]
@@ -279,7 +250,7 @@ mod tests {
 
     #[test]
     fn blocks_code_search_after_review_report() {
-        use crate::agent::findings::{self, Finding, FindingsStore, FindingStatus, Severity};
+        use crate::agent::findings::{self, Finding, FindingStatus, FindingsStore, Severity};
         let e = engine();
         e.mark_execute_report_delivered();
         findings::save(
@@ -293,6 +264,7 @@ mod tests {
                     symbol: String::new(),
                     issue: "i".into(),
                     recommendation: String::new(),
+                    fix_plan: String::new(),
                     status: FindingStatus::Open,
                     user_notes: vec![],
                     dispute: None,
@@ -306,11 +278,12 @@ mod tests {
     }
 
     #[test]
-    fn blocks_duplicate_find_symbol() {
+    fn allows_duplicate_find_symbol_retry() {
         let e = engine();
         let args = serde_json::json!({"query": "MaintainDeliveryRequest"});
         record_symbol_query(&e, "find_symbol", &args);
-        assert!(check("find_symbol", &args, &e).is_err());
+        // Now allowed — LLM may have new context that justifies retry
+        assert!(check("find_symbol", &args, &e).is_ok());
     }
 
     #[test]
@@ -327,29 +300,28 @@ mod tests {
         use crate::agent::phase::{self, SingleFlowPhase};
         let e = engine();
         record_file_read(&e, "src/Foo.java");
-        crate::agent::tool_digest::record_read(
-            &e,
-            "src/Foo.java",
-            "class Foo {}",
-            0,
-            Some(1),
-        );
+        crate::agent::tool_digest::record_read(&e, "src/Foo.java", "class Foo {}", 0, Some(1));
         e.set_variable(
             phase::PHASE_STATE_KEY,
             SingleFlowPhase::Implement.as_str().to_string(),
         );
-        assert!(check(
-            "file_read",
-            &serde_json::json!({"path": "src/Foo.java"}),
-            &e
-        )
-        .is_ok());
+        assert!(
+            check(
+                "file_read",
+                &serde_json::json!({"path": "src/Foo.java"}),
+                &e
+            )
+            .is_ok()
+        );
         e.record_impl_file_read("src/Foo.java", "{}");
-        assert!(check(
-            "file_read",
-            &serde_json::json!({"path": "src/Foo.java"}),
-            &e
-        )
-        .is_err());
+        // Allow re-read — LLM may need fresh context after compaction
+        assert!(
+            check(
+                "file_read",
+                &serde_json::json!({"path": "src/Foo.java"}),
+                &e
+            )
+            .is_ok()
+        );
     }
 }

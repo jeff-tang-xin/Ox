@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 强制执行的规则配置 (Enforcement Rules)
-/// 
+///
 /// 这些规则由系统代码直接校验，违反时将直接拦截工具调用并反馈给 LLM。
 /// 它们是从系统级 Skills 中提取的“硬约束”。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,10 +20,10 @@ pub struct EnforcementRules {
     #[serde(default = "default_true")]
     pub steps_before_shell: bool,
 
-    /// 规则 3: 编辑前必须先读取文件 (Read Before Edit)
-    /// 检查 LLM 在调用 file_write/edit_file 前是否通过 file_read 读取过目标文件。
-    /// 防止 LLM 在没有阅读的情况下猜测文件内容。
-    #[serde(default = "default_true")]
+    /// 规则 3: 编辑前必须先读取文件 (Read Before Edit) — 默认关闭。
+    /// 关闭后允许直接编辑（"直接动手"），不再因未读文件而拦截。
+    /// 如需恢复"改前先读"的硬拦截，可在 config.toml 显式设为 true。
+    #[serde(default)]
     pub read_before_edit: bool,
 
     /// 规则 4: 修改前检查调用方 (Impact Analysis)
@@ -37,20 +37,24 @@ pub struct EnforcementRules {
     /// 自动跳过 plan_before_edit 规则。设为 0 可禁用此白名单。
     #[serde(default = "default_trivial_threshold")]
     pub trivial_edit_threshold: usize,
-    
+
     /// 自定义计划检测模式（可选）
     /// 用户可以添加额外的正则表达式模式来检测计划意图
     #[serde(default)]
     pub custom_plan_patterns: Vec<String>,
-    
+
     /// 自定义步骤检测模式（可选）
     /// 用户可以添加额外的正则表达式模式来检测步骤列表
     #[serde(default)]
     pub custom_step_patterns: Vec<String>,
 }
 
-fn default_true() -> bool { true }
-fn default_trivial_threshold() -> usize { 50 }
+fn default_true() -> bool {
+    true
+}
+fn default_trivial_threshold() -> usize {
+    50
+}
 
 impl Default for EnforcementRules {
     fn default() -> Self {
@@ -58,7 +62,7 @@ impl Default for EnforcementRules {
             enabled: true,
             plan_before_edit: true,
             steps_before_shell: true,
-            read_before_edit: true,
+            read_before_edit: false,
             impact_analysis: true,
             trivial_edit_threshold: default_trivial_threshold(),
             custom_plan_patterns: vec![],

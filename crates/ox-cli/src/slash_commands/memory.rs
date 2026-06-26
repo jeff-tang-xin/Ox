@@ -1,12 +1,11 @@
-/// Memory management commands: /remember, /forget, /memory
-
-use crate::terminal::app::App as AppState;
 use crate::slash_commands::{CommandMeta, CommandResult};
+/// Memory management commands: /remember, /forget, /memory
+use crate::terminal::app::App as AppState;
 use crate::terminal::output_pane::OutputLine;
-use ox_core::message::Session;
-use ox_core::runtime::RuntimeEnvironment;
 use ox_core::config::OxConfig;
 use ox_core::cost::CostTracker;
+use ox_core::message::Session;
+use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
 use std::sync::Arc;
 
@@ -42,7 +41,8 @@ pub fn handle_remember(
 ) -> CommandResult {
     let content = args.trim();
     if content.is_empty() {
-        app.output.push_system("Usage: /remember <content>  (stores as Style memory)");
+        app.output
+            .push_system("Usage: /remember <content>  (stores as Style memory)");
         return CommandResult::Success;
     }
 
@@ -73,7 +73,8 @@ pub fn handle_forget(
 ) -> CommandResult {
     let keyword = args.trim();
     if keyword.is_empty() {
-        app.output.push_system("Usage: /forget <keyword>  (deletes matching memories)");
+        app.output
+            .push_system("Usage: /forget <keyword>  (deletes matching memories)");
         return CommandResult::Success;
     }
 
@@ -108,8 +109,10 @@ pub fn handle_memory(
         "stats" | "s" | "" => {}
         _ => {
             app.output.push_system("Usage: /memory [stats|promote]");
-            app.output.push_system("  stats - Show memory statistics (default)");
-            app.output.push_system("  promote - Trigger L0-L3 memory promotion pipeline");
+            app.output
+                .push_system("  stats - Show memory statistics (default)");
+            app.output
+                .push_system("  promote - Trigger L0-L3 memory promotion pipeline");
             return CommandResult::Success;
         }
     }
@@ -126,15 +129,14 @@ pub fn handle_memory(
         )));
         let nodes = engine.retrieve_memory_nodes("", Some(&rt_env.project_id), 8);
         if nodes.is_empty() {
-            app.output.push_system("No memories in knowledge engine yet.");
+            app.output
+                .push_system("No memories in knowledge engine yet.");
         } else {
             app.output.push_system("Recent knowledge:");
             for node in &nodes {
                 let preview: String = node.content.chars().take(100).collect();
-                app.output.push_line(OutputLine::System(format!(
-                    "  [L{}] {preview}",
-                    node.depth
-                )));
+                app.output
+                    .push_line(OutputLine::System(format!("  [L{}] {preview}", node.depth)));
             }
         }
     } else {
@@ -145,7 +147,8 @@ pub fn handle_memory(
 }
 
 fn handle_promote(app: &mut AppState, rt_env: &mut RuntimeEnvironment) -> CommandResult {
-    app.output.push_system("🚀 Starting L0-L3 memory promotion pipeline...");
+    app.output
+        .push_system("🚀 Starting L0-L3 memory promotion pipeline...");
 
     let Some(ref ke) = app.knowledge_engine else {
         app.output.push_system("Knowledge engine not available.");
@@ -160,7 +163,8 @@ fn handle_promote(app: &mut AppState, rt_env: &mut RuntimeEnvironment) -> Comman
                 ));
             }
             Err(e) => {
-                app.output.push_system(&format!("⚠️ Knowledge consolidation failed: {e}"));
+                app.output
+                    .push_system(&format!("⚠️ Knowledge consolidation failed: {e}"));
             }
         }
     } else {

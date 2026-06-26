@@ -126,7 +126,12 @@ impl LlmProvider for AnthropicProvider {
                 format!("Anthropic API error [{status}]: {body_text}")
             };
 
-            tracing::error!("[LLM ERROR] {} | URL: {} | Model: {}", err_msg, request_url, self.model);
+            tracing::error!(
+                "[LLM ERROR] {} | URL: {} | Model: {}",
+                err_msg,
+                request_url,
+                self.model
+            );
             let _ = tx.send(LlmStreamEvent::Error(err_msg));
             return Ok(());
         }

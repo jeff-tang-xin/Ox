@@ -48,10 +48,9 @@ pub fn update_feedback_metrics(app: &mut App, metrics_path: &std::path::Path) {
         return;
     }
 
-    let accept_rate = app.ema_manager.calculate_accept_rate(
-        app.total_file_writes,
-        app.accepted_file_writes,
-    );
+    let accept_rate = app
+        .ema_manager
+        .calculate_accept_rate(app.total_file_writes, app.accepted_file_writes);
 
     if app.total_file_writes % 10 == 0 {
         let metric_name = "code_accept_rate".to_string();

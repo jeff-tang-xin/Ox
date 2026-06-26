@@ -1,11 +1,11 @@
 //! Feedback commands: /feedback
 
-use crate::terminal::app::App as AppState;
 use crate::slash_commands::{CommandMeta, CommandResult};
-use ox_core::message::{Message, Session};
-use ox_core::runtime::RuntimeEnvironment;
+use crate::terminal::app::App as AppState;
 use ox_core::config::OxConfig;
 use ox_core::cost::CostTracker;
+use ox_core::message::{Message, Session};
+use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
 use std::sync::Arc;
 
@@ -55,7 +55,8 @@ pub fn handle_feedback(
             app.output.push_system("✅ Feedback noted: positive.");
         }
         "unsafe" => {
-            app.output.push_system("🔒 Safety violation noted. Reviewing constraints.");
+            app.output
+                .push_system("🔒 Safety violation noted. Reviewing constraints.");
             tracing::warn!("[SAFETY VIOLATION] Reported by user");
         }
         _ => {

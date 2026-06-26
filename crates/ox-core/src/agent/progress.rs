@@ -85,7 +85,10 @@ impl WorkflowProgress {
 
     /// Get the directory path for this requirement
     pub fn get_requirement_dir(&self, project_root: &Path) -> PathBuf {
-        project_root.join(".ox").join("spec").join(&self.requirement_name)
+        project_root
+            .join(".ox")
+            .join("spec")
+            .join(&self.requirement_name)
     }
 }
 

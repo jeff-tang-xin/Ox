@@ -6,22 +6,11 @@
 
 use ox_core::agent::AgentToUiEvent;
 use ox_core::context::{self, ContextBuilder, TurnContext, UserIntent};
-use ox_core::knowledge::retrieval;
 use ox_core::message::Message;
 use ox_core::runtime::RuntimeEnvironment;
 use ox_core::tools::ToolRegistry;
-use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
-
-/// Max wait for knowledge read lock (poll while background embed holds write between chunks).
-const KNOWLEDGE_READ_LOCK_TIMEOUT: Duration = Duration::from_secs(8);
-/// Max time for hybrid retrieval (query embed + vector search).
-const KNOWLEDGE_RETRIEVAL_TIMEOUT: Duration = Duration::from_secs(5);
-/// Max wait for lazy-index write lock before skipping on-demand embed.
-const LAZY_INDEX_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Specifies which kind of turn is being prepared — affects how user input is handled.
 #[derive(Debug, Clone)]
@@ -63,6 +52,7 @@ pub async fn prepare_turn(
     workflow_engine: &Option<Arc<tokio::sync::Mutex<ox_core::agent::engine::WorkflowEngine>>>,
     session_id: &str,
     status_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    gitnexus: Option<Arc<ox_core::mcp::GitNexusService>>,
 ) -> PreTurnResult {
     // The actual user text to use (differs for onboarding/slash commands)
     let effective_text = match &variant {
@@ -72,8 +62,7 @@ pub async fn prepare_turn(
     };
 
     // 1. Workflow step info
-    let (step_memory_layers, step_prompt, step_idx) =
-        get_workflow_step_info(workflow_engine);
+    let (step_prompt, step_idx) = get_workflow_step_info(workflow_engine);
 
     let workflow_active = workflow_engine
         .as_ref()
@@ -81,129 +70,21 @@ pub async fn prepare_turn(
         .map(|e| e.is_workflow_active())
         .unwrap_or(false);
 
-    // 1b. L0→L3 promotion when workflow phase changes (before retrieval).
-    if let (Some(k_engine), Some(wf)) = (knowledge_engine, workflow_engine) {
-        if let Ok(engine) = wf.try_lock() {
-            ox_core::knowledge::consolidation::maybe_on_phase_change(k_engine, &engine).await;
-        }
-    }
-
-    let current_task_anchor = workflow_engine
-        .as_ref()
-        .and_then(|wf| wf.try_lock().ok())
-        .and_then(|e| {
-            ox_core::agent::user_round::get_turn_user_input(&e).or_else(|| {
-                e.get_variable("_current_user_request")
-                    .filter(|s| !s.trim().is_empty())
-            })
-        });
-
-    // 2. Knowledge retrieval FIRST — use already-indexed subset even if lazy embed pending.
-    let _ = status_tx.send(AgentToUiEvent::Status(
-        "🔍 Retrieving knowledge...".to_string(),
-    ));
-
-    let knowledge_context_str = if let Some(k_engine) = knowledge_engine {
-        if let Some(engine_guard) =
-            ox_core::knowledge::acquire_read_with_backoff(k_engine, KNOWLEDGE_READ_LOCK_TIMEOUT).await
-        {
-            let query = effective_text.clone();
-            let sid = session_id.to_string();
-            let layers = step_memory_layers.clone();
-            let step_layers = !layers.is_empty();
-            let task_anchor = current_task_anchor.clone();
-            match tokio::time::timeout(KNOWLEDGE_RETRIEVAL_TIMEOUT, async {
-                tokio::task::block_in_place(|| {
-                    if step_layers {
-                        retrieval::run_retrieval_for_step(
-                            &engine_guard,
-                            &query,
-                            &sid,
-                            3000,
-                            &layers,
-                        )
-                    } else {
-                        retrieval::run_retrieval(&engine_guard, &query, &sid, 3000)
-                    }
-                })
-            })
-            .await
-            {
-                Ok(Ok(inj)) => {
-                    retrieval::format_context_for_prompt(&inj, task_anchor.as_deref())
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("[PRE-TURN] Knowledge retrieval failed: {}", e);
-                    String::new()
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "[PRE-TURN] Knowledge retrieval timed out — proceeding without RAG context"
-                    );
-                    String::new()
-                }
-            }
-        } else {
-            tracing::warn!(
-                "[PRE-TURN] Knowledge read lock busy — skipping retrieval (indexer may be embedding)"
-            );
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
-    // 2b. Lazy index after retrieval — findings paths first, then query/explored paths.
-    if config.embedding.lazy_index {
-        if let Some(k_engine) = knowledge_engine {
-            let paths = collect_lazy_index_paths(&effective_text, workflow_engine);
-            if !paths.is_empty() {
-                let max = config.embedding.lazy_index_max_files_per_turn.max(1);
-                let _ = status_tx.send(AgentToUiEvent::Status(format!(
-                    "📇 Indexing {} path(s)…",
-                    paths.len().min(max)
-                )));
-                match tokio::time::timeout(LAZY_INDEX_WRITE_LOCK_TIMEOUT, k_engine.write()).await
-                {
-                    Ok(mut engine) => {
-                        let path_count = paths.len().min(max);
-                        let result = tokio::task::block_in_place(|| {
-                            engine.ensure_paths_indexed(&paths, max)
-                        });
-                        if let Ok(n) = result {
-                            if n > 0 {
-                                tracing::info!(
-                                    "[PRE-TURN] Lazy-indexed {n} symbols from {path_count} paths",
-                                );
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "[PRE-TURN] Lazy index skipped — knowledge engine busy (background indexing)"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Git + Dir context + System prompt + Context builder (spawn_blocking for I/O)
+    // 2. Git + Dir context + System prompt + Context builder (spawn_blocking for I/O)
     let _ = status_tx.send(AgentToUiEvent::Status(
         "📊 Gathering context...".to_string(),
     ));
     let tr = Arc::clone(tool_registry);
     let rt_env_clone = rt_env.clone();
     let behavior_rules = config.behavior_rules.clone();
+    let unified_tool_mode = config.agent.unified_tool_mode;
     let compressed_cache_clone = compressed_cache.clone();
     let messages_clone = session_messages.to_vec();
     let context_builder_clone = context_builder.clone();
     let step_prompt_clone = step_prompt.clone();
     let user_text_clone = effective_text.clone();
-    let knowledge_ctx = knowledge_context_str;
-    let use_refined = config.context.use_refined_context
-        && !workflow_active
-        && session_messages.len() < 40;
+    let use_refined =
+        config.context.use_refined_context && !workflow_active && session_messages.len() < 40;
     let system_prompt_variant = match &variant {
         TurnVariant::Onboarding { .. } => UserIntent::Exploration,
         _ => UserIntent::General,
@@ -232,6 +113,7 @@ pub async fn prepare_turn(
             &turn_ctx,
             step_prompt_clone.as_deref(),
             step_idx,
+            unified_tool_mode,
         );
 
         let effective_messages = if let Some((cached, prev_count)) = compressed_cache_clone {
@@ -247,6 +129,15 @@ pub async fn prepare_turn(
         } else {
             messages_clone
         };
+        // Trim old rounds: keep messages after the LAST [ROUND_BOUNDARY], plus a
+        // short read-only "tail bridge" of the immediately-previous round so
+        // related follow-ups still have real prior context (not just a recap).
+        let (effective_messages, trimmed_to_current_round) =
+            truncate_before_last_round_boundary(effective_messages);
+        // Once we've scoped to the current round, keep FULL fidelity (real tool
+        // outputs) — collapsing the current round into a lossy "refined" text
+        // summary is what makes the model forget what it just read.
+        let use_refined = use_refined && !trimmed_to_current_round;
 
         let mut turn_messages = crate::helpers::build_context_with_option(
             &context_builder_clone,
@@ -257,11 +148,36 @@ pub async fn prepare_turn(
             use_refined,
         );
 
-        // Inject knowledge + background info as one compact system message
-        let mut bg_parts = Vec::new();
-        if !knowledge_ctx.is_empty() {
-            bg_parts.push(knowledge_ctx);
+        // ── One-time project context (new session only) ──
+        let is_new_session = effective_messages.len() <= 2;
+        if is_new_session {
+            let lang = &rt_env_clone.project_language;
+            let lang_label = if lang.is_empty() { "未知" } else { lang };
+            let proj_root = rt_env_clone
+                .project_root
+                .as_deref()
+                .unwrap_or(&rt_env_clone.working_dir);
+            let proj_name = proj_root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let mut proj_ctx = format!(
+                "[PROJECT]\n项目: {proj_name} | 语言/框架: {lang_label}\n路径: {}",
+                proj_root.display()
+            );
+            if let Some(ref dir) = dir_tree {
+                let dir_slim: String = dir.lines().take(30).collect::<Vec<_>>().join("\n");
+                if !dir_slim.is_empty() {
+                    proj_ctx.push_str(&format!("\n关键目录:\n{dir_slim}"));
+                }
+            }
+            proj_ctx.push_str("\n\n行动链: find_symbol 定位 → file_read 精准读 → deliver(plan) 确认 → edit/shell 实施 → finish");
+            proj_ctx.push_str("\n📚 项目 skill: load_skill(name) 加载项目规范。写代码前先看规范，匹配既有命名/包结构/模式。");
+            turn_messages.insert(1, Message::system(&proj_ctx));
         }
+
+        // Inject background info as one compact system message
+        let mut bg_parts = Vec::new();
         if let Some(ref log) = git_log {
             bg_parts.push(format!("【参考-Git日志】\n{}", log));
         }
@@ -306,6 +222,15 @@ pub async fn prepare_turn(
                     }
                 }
             }
+            // ── Seamless semantic pre-retrieval (Normal turns only) ──
+            // Ground the LLM in the code graph before it starts reasoning, using
+            // the user's own words. Latency-safe: only when the graph is already
+            // running and clean; bounded by a short timeout.
+            if matches!(variant, TurnVariant::Normal) {
+                if let Some(hint) = build_codegraph_hint(&gitnexus, &effective_text).await {
+                    turn_messages.push(Message::system(&hint));
+                }
+            }
             PreTurnResult {
                 turn_messages,
                 planning,
@@ -336,130 +261,116 @@ pub async fn prepare_turn(
     }
 }
 
-/// Lazy-embed session paths before a workflow auto-spawn (mirrors pre_turn step 1b).
-pub async fn lazy_index_for_workflow_step(
-    config: &ox_core::config::OxConfig,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>>,
-    workflow_engine: &Option<Arc<tokio::sync::Mutex<ox_core::agent::engine::WorkflowEngine>>>,
-    query_hint: &str,
-    status_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-) {
-    if !config.embedding.lazy_index {
-        return;
-    }
-    let Some(k_engine) = knowledge_engine else {
-        return;
+/// Last N messages of the previous round to carry over as read-only context.
+const PREV_ROUND_TAIL_BRIDGE: usize = 6;
+
+/// Trim messages before the last [ROUND_BOUNDARY] to prevent old task context
+/// from leaking into new tasks, while keeping a short read-only tail of the
+/// immediately-previous round so related follow-ups have real prior context.
+///
+/// Returns `(messages, trimmed)` where `trimmed` is true when we actually
+/// scoped down to the current round (so callers can keep full fidelity instead
+/// of collapsing into a refined summary).
+fn truncate_before_last_round_boundary(messages: Vec<Message>) -> (Vec<Message>, bool) {
+    let last_boundary = messages.iter().rposition(
+        |m| matches!(m, Message::System { content } if content.starts_with("[ROUND_BOUNDARY]")),
+    );
+    let Some(pos) = last_boundary else {
+        return (messages, false);
     };
-    let paths = collect_lazy_index_paths(query_hint, workflow_engine);
-    if paths.is_empty() {
-        return;
+    // Boundary at the very front (pos <= 1) means nothing to trim.
+    if pos <= 1 {
+        return (messages, false);
     }
-    let max = config.embedding.lazy_index_max_files_per_turn.max(1);
-    let _ = status_tx.send(AgentToUiEvent::Status(format!(
-        "📇 Indexing {} path(s) for workflow step…",
-        paths.len().min(max)
-    )));
-    match tokio::time::timeout(LAZY_INDEX_WRITE_LOCK_TIMEOUT, k_engine.write()).await {
-        Ok(mut engine) => {
-            if let Ok(n) = tokio::task::block_in_place(|| engine.ensure_paths_indexed(&paths, max))
-            {
-                if n > 0 {
-                    tracing::info!("[WORKFLOW-SPAWN] Lazy-indexed {n} symbols");
-                }
-            }
-        }
-        Err(_) => {
-            tracing::warn!("[WORKFLOW-SPAWN] Lazy index skipped — knowledge engine busy");
-        }
+
+    let system = messages[0].clone();
+    // Bridge: last few messages of the previous round, marked HISTORICAL.
+    let tail_start = pos.saturating_sub(PREV_ROUND_TAIL_BRIDGE).max(1);
+    let bridge = &messages[tail_start..pos];
+
+    let mut result = Vec::with_capacity(messages.len() - tail_start + 2);
+    result.push(system);
+    if !bridge.is_empty() {
+        result.push(Message::system(
+            "[PREV_ROUND_TAIL]\n以下为上一轮末尾片段（HISTORICAL — 只读参考，勿当作本轮待办或重复执行）：",
+        ));
+        result.extend_from_slice(bridge);
     }
+    result.extend_from_slice(&messages[pos..]); // boundary + current round
+    (result, true)
 }
 
-/// Extract workflow step information (memory layers, step prompt, step index).
+/// Run a semantic code-graph query on the user's raw input and format it as a
+/// compact `[CODE_GRAPH_HINT]` block to pre-ground the LLM.
+///
+/// Strictly latency-safe, mirroring `find_symbol` enrichment: returns `None`
+/// unless the GitNexus server is already running AND the index is clean. It
+/// never spawns, restarts, or reindexes, and is bounded by a short timeout so a
+/// slow graph can't stall the turn start.
+async fn build_codegraph_hint(
+    gitnexus: &Option<Arc<ox_core::mcp::GitNexusService>>,
+    user_text: &str,
+) -> Option<String> {
+    let svc = gitnexus.as_ref()?;
+    let q = user_text.trim();
+    // Skip trivial inputs (confirmations like "ok"/"继续") — no useful semantics.
+    if q.chars().count() < 6 {
+        return None;
+    }
+    if !svc.is_ready().await {
+        return None; // not ready → no latency, no hint
+    }
+    if svc.is_dirty() {
+        return None; // pending reindex → keep turn start fast
+    }
+
+    let mut params = ox_core::mcp::gitnexus::QueryParams::new(q);
+    params.limit = Some(5);
+    let res = tokio::time::timeout(std::time::Duration::from_secs(6), svc.query(&params))
+        .await
+        .ok()?
+        .ok()?;
+    if res.is_error {
+        return None;
+    }
+    let text = res.text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let body = truncate_on_line_boundary(text, 1800);
+    Some(format!(
+        "[CODE_GRAPH_HINT]\n🔗 代码图谱预检索（按你的问题语义检索，仅供定位参考，非完整答案）:\n{body}\n\n（要更深的调用关系/影响面，用 code_graph 继续查；与代码不符以实际 file_read 为准）"
+    ))
+}
+
+/// Cap text to ~`max_chars` on a **line** boundary so the LLM never sees a
+/// half-written entry; appends a clear truncation marker.
+fn truncate_on_line_boundary(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let mut end = max_chars;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let window = &text[..end];
+    let kept = match window.rfind('\n') {
+        Some(nl) if nl > 0 => &window[..nl],
+        _ => window,
+    };
+    format!("{}\n…（已截断；用 code_graph 查看完整）", kept.trim_end())
+}
+
+/// Extract workflow step information (step prompt, step index).
 fn get_workflow_step_info(
     workflow_engine: &Option<Arc<tokio::sync::Mutex<ox_core::agent::engine::WorkflowEngine>>>,
-) -> (Vec<String>, Option<String>, usize) {
+) -> (Option<String>, usize) {
     if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
-            let step = engine.current_step();
-            let layers = step
-                .map(|s| s.memory_layers.clone())
-                .unwrap_or_default();
-            // Use substituted prompt ({PREVIOUS_OUTPUT} filled in)
             let prompt = engine.get_step_system_prompt();
             let idx = engine.get_current_step_index();
-            return (layers, prompt, idx);
+            return (prompt, idx);
         }
     }
-    (Vec::new(), None, 0)
-}
-
-/// Paths to lazy-embed: findings files first, then query paths + explored file_read targets.
-pub fn collect_lazy_index_paths(
-    query: &str,
-    workflow_engine: &Option<Arc<tokio::sync::Mutex<ox_core::agent::engine::WorkflowEngine>>>,
-) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let mut paths = Vec::new();
-
-    let mut add = |p: String| {
-        let p = p.trim().trim_matches('"').to_string();
-        if p.is_empty() || !seen.insert(p.clone()) {
-            return;
-        }
-        paths.push(PathBuf::from(p));
-    };
-
-    if let Some(wf) = workflow_engine {
-        if let Ok(engine) = wf.try_lock() {
-            if let Some(store) = ox_core::agent::findings::load_or_migrate(&engine) {
-                for idx in &store.active_indices {
-                    if let Some(f) = store.get(*idx) {
-                        if !f.file.is_empty() {
-                            add(f.file.clone());
-                        }
-                    }
-                }
-                for f in &store.findings {
-                    if !f.file.is_empty() {
-                        add(f.file.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    for p in retrieval::extract_file_paths(query) {
-        add(p);
-    }
-
-    if let Some(wf) = workflow_engine {
-        if let Ok(engine) = wf.try_lock() {
-            if let Some(intent_raw) = engine.get_variable("_step0_output") {
-                if let Some(json) = ox_core::agent::engine::extract_json_block(&intent_raw) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
-                        if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
-                            for f in files {
-                                if let Some(s) = f.as_str() {
-                                    add(s.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(explored_json) = engine.get_variable("_explored_paths") {
-                if let Ok(set) = serde_json::from_str::<HashSet<String>>(&explored_json) {
-                    for key in set {
-                        if let Some((_tool, path)) = key.split_once(':') {
-                            if path.contains('.') {
-                                add(path.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    paths
+    (None, 0)
 }

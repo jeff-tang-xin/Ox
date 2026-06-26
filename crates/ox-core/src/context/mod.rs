@@ -1,15 +1,21 @@
 pub mod compressed_store;
 mod effort;
+pub mod refinement;
 pub mod skill_prompts;
 mod spec;
 mod system_prompt;
-pub mod refinement;
 
 pub use effort::{EffortLevel, estimate_effort};
+pub use refinement::{
+    MemorySummary, RefinedTurn, build_refined_context, generate_memory_summary,
+    refine_assistant_response, refine_conversation,
+};
 pub use skill_prompts::SKILL_CREATION_PROMPT;
 pub use spec::{TASK_TYPE_PROMPT, load_spec, save_spec, spec_exists};
-pub use system_prompt::{build_system_prompt, build_system_prompt_with_context, build_system_prompt_with_step, TurnContext, gather_git_context, gather_diff_context, gather_dir_context};
-pub use refinement::{RefinedTurn, refine_conversation, build_refined_context, refine_assistant_response, generate_memory_summary, MemorySummary};
+pub use system_prompt::{
+    TurnContext, build_system_prompt, build_system_prompt_with_context,
+    build_system_prompt_with_step, gather_diff_context, gather_dir_context, gather_git_context,
+};
 
 use crate::llm::tokenizer::estimate_tokens;
 use crate::message::Message;
@@ -30,34 +36,62 @@ pub enum UserIntent {
 /// Detect user intent from their query.
 pub fn detect_intent(query: &str) -> UserIntent {
     let query_lower = query.to_lowercase();
-    
+
     // Exploration keywords
     let exploration_keywords = [
-        "show me", "list", "what files", "project structure", "directory",
-        "explore", "browse", "overview", "structure"
+        "show me",
+        "list",
+        "what files",
+        "project structure",
+        "directory",
+        "explore",
+        "browse",
+        "overview",
+        "structure",
     ];
     if exploration_keywords.iter().any(|k| query_lower.contains(k)) {
         return UserIntent::Exploration;
     }
-    
+
     // Code understanding keywords
     let understanding_keywords = [
-        "how does", "explain", "what is", "understand", "logic",
-        "implementation", "work", "function", "method"
+        "how does",
+        "explain",
+        "what is",
+        "understand",
+        "logic",
+        "implementation",
+        "work",
+        "function",
+        "method",
     ];
-    if understanding_keywords.iter().any(|k| query_lower.contains(k)) {
+    if understanding_keywords
+        .iter()
+        .any(|k| query_lower.contains(k))
+    {
         return UserIntent::CodeUnderstanding;
     }
-    
+
     // Code modification keywords
     let modification_keywords = [
-        "add", "create", "modify", "change", "update", "fix",
-        "implement", "refactor", "delete", "remove"
+        "add",
+        "create",
+        "modify",
+        "change",
+        "update",
+        "fix",
+        "implement",
+        "refactor",
+        "delete",
+        "remove",
     ];
-    if modification_keywords.iter().any(|k| query_lower.contains(k)) {
+    if modification_keywords
+        .iter()
+        .any(|k| query_lower.contains(k))
+    {
         return UserIntent::CodeModification;
     }
-    
+
     UserIntent::General
 }
 
@@ -65,20 +99,20 @@ pub fn detect_intent(query: &str) -> UserIntent {
 /// This helps identify which files the user is currently working on.
 pub fn extract_recent_files(history: &[Message], max_files: usize) -> Vec<String> {
     use regex::Regex;
-    
+
     let mut files = Vec::new();
     let file_pattern = Regex::new(r"[\w./-]+\.(rs|toml|json|md|py|js|ts|go|css|html)").unwrap();
-    
+
     // Scan recent messages (last 10) for file paths
     let recent_messages = history.iter().rev().take(10);
-    
+
     for msg in recent_messages {
         let content = match msg {
             Message::User { content } | Message::Assistant { content, .. } => content,
             Message::ToolResult { content, .. } => content,
             _ => continue,
         };
-        
+
         for mat in file_pattern.find_iter(content) {
             let file_path = mat.as_str().to_string();
             if !files.contains(&file_path) && files.len() < max_files {
@@ -86,7 +120,7 @@ pub fn extract_recent_files(history: &[Message], max_files: usize) -> Vec<String
             }
         }
     }
-    
+
     files
 }
 
@@ -129,8 +163,10 @@ impl ContextBuilder {
 
     /// Validate that ratios sum to 1.0 (with epsilon tolerance)
     fn validate_ratios(&self) -> bool {
-        let sum = self.system_prompt_ratio + self.memory_ratio + 
-                  self.history_ratio + self.reply_reserve_ratio;
+        let sum = self.system_prompt_ratio
+            + self.memory_ratio
+            + self.history_ratio
+            + self.reply_reserve_ratio;
         (sum - 1.0).abs() < 0.001
     }
 
@@ -139,7 +175,7 @@ impl ContextBuilder {
     pub fn from_config(config: &crate::config::ContextConfig) -> Self {
         let user_ratio_sum =
             config.history_ratio + config.memory_ratio + config.system_prompt_ratio;
-        
+
         // Clamp reply_reserve to [0.0, 1.0] and normalize if ratios > 1.0
         let reply_reserve = if user_ratio_sum >= 1.0 {
             tracing::warn!("ContextConfig ratios sum to >= 1.0, clamping reply_reserve to 0");
@@ -154,7 +190,7 @@ impl ContextBuilder {
             history_ratio: config.history_ratio.clamp(0.0, 1.0),
             reply_reserve_ratio: reply_reserve.clamp(0.0, 1.0),
         };
-        
+
         // Debug validate (doesn't enforce, but warns)
         if !builder.validate_ratios() {
             tracing::warn!(
@@ -165,7 +201,7 @@ impl ContextBuilder {
                 builder.reply_reserve_ratio
             );
         }
-        
+
         builder
     }
 
@@ -187,7 +223,12 @@ impl ContextBuilder {
     }
 
     /// Adjust budgets based on user intent and conversation length.
-    pub fn budgets_for_intent(&self, context_window: u32, intent: UserIntent, msg_count: usize) -> TokenBudgets {
+    pub fn budgets_for_intent(
+        &self,
+        context_window: u32,
+        intent: UserIntent,
+        msg_count: usize,
+    ) -> TokenBudgets {
         // Dynamic adjustment based on conversation length
         let (mem_r, hist_r) = if msg_count < 20 {
             // Short: give more to history, reply reserve is still large
@@ -202,33 +243,27 @@ impl ContextBuilder {
         let reply = (1.0 - self.system_prompt_ratio - mem_r - hist_r).max(0.5);
 
         match intent {
-            UserIntent::Exploration => {
-                TokenBudgets {
-                    system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
-                    memory: (context_window as f32 * 0.01) as u32,
-                    history: (context_window as f32 * 0.15) as u32,
-                    reply_reserve: (context_window as f32 * 0.83) as u32,
-                    total: context_window,
-                }
-            }
-            UserIntent::CodeUnderstanding | UserIntent::CodeModification => {
-                TokenBudgets {
-                    system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
-                    memory: (context_window as f32 * mem_r) as u32,
-                    history: (context_window as f32 * hist_r) as u32,
-                    reply_reserve: (context_window as f32 * reply) as u32,
-                    total: context_window,
-                }
-            }
-            UserIntent::General => {
-                TokenBudgets {
-                    system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
-                    memory: (context_window as f32 * mem_r) as u32,
-                    history: (context_window as f32 * hist_r) as u32,
-                    reply_reserve: (context_window as f32 * reply) as u32,
-                    total: context_window,
-                }
-            }
+            UserIntent::Exploration => TokenBudgets {
+                system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
+                memory: (context_window as f32 * 0.01) as u32,
+                history: (context_window as f32 * 0.15) as u32,
+                reply_reserve: (context_window as f32 * 0.83) as u32,
+                total: context_window,
+            },
+            UserIntent::CodeUnderstanding | UserIntent::CodeModification => TokenBudgets {
+                system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
+                memory: (context_window as f32 * mem_r) as u32,
+                history: (context_window as f32 * hist_r) as u32,
+                reply_reserve: (context_window as f32 * reply) as u32,
+                total: context_window,
+            },
+            UserIntent::General => TokenBudgets {
+                system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
+                memory: (context_window as f32 * mem_r) as u32,
+                history: (context_window as f32 * hist_r) as u32,
+                reply_reserve: (context_window as f32 * reply) as u32,
+                total: context_window,
+            },
         }
     }
 
@@ -250,7 +285,7 @@ impl ContextBuilder {
         // 1. System prompt + Memory context (merged into ONE system message for MiniMax compatibility).
         // 🚨 FIX: Check if history already starts with a system message (e.g., compression notice)
         let has_leading_system = matches!(history.first(), Some(Message::System { .. }));
-        
+
         let combined_system = if !memory_context.is_empty() {
             format!(
                 "{}\n\n{}",
@@ -260,7 +295,7 @@ impl ContextBuilder {
         } else {
             system_prompt.to_string()
         };
-        
+
         // If history already has a system message, merge it with our system prompt
         if has_leading_system {
             if let Some(Message::System { content }) = history.first() {
@@ -294,21 +329,29 @@ impl ContextBuilder {
         let mut selected_indices: Vec<usize> = Vec::new();
         let mut skipped_indices: Vec<usize> = Vec::new();
 
-        // Phase 1: Fill with high-priority messages (user messages, assistant plans)
-        // These are the conversation backbone — must keep
+        // Phase 1: Fill with high-priority messages (user messages, assistant plans).
+        // These are the conversation backbone and must not disappear just because
+        // a recent tool result is huge. Large low-priority messages are skipped;
+        // large high-priority messages are kept as anchors even if they exceed
+        // the budget, because dropping the latest user request makes the model
+        // look "forgetful".
         for (i, msg) in history.iter().enumerate().skip(start_idx).rev() {
             let msg_tokens = estimate_message_tokens(msg);
-            if used_tokens + msg_tokens > history_budget {
-                break;
-            }
             let is_high_prio = matches!(msg, Message::User { .. })
                 || matches!(msg, Message::Assistant { content, .. } if content.contains("## Plan") || content.contains("## Done"));
+
             if is_high_prio {
-                used_tokens += msg_tokens;
                 selected_indices.push(i);
-            } else {
-                skipped_indices.push(i);
+                used_tokens = used_tokens.saturating_add(msg_tokens);
+                continue;
             }
+
+            if used_tokens + msg_tokens > history_budget {
+                skipped_indices.push(i);
+                continue;
+            }
+
+            skipped_indices.push(i);
         }
 
         // Phase 2: Fill remaining budget with regular messages (tool results, etc.)
@@ -317,7 +360,8 @@ impl ContextBuilder {
             let min_idx = *selected_indices.iter().min().unwrap();
             let max_idx = *selected_indices.iter().max().unwrap();
             for i in skipped_indices {
-                if i >= min_idx && i <= max_idx
+                if i >= min_idx
+                    && i <= max_idx
                     && used_tokens + estimate_message_tokens(&history[i]) <= history_budget
                 {
                     used_tokens += estimate_message_tokens(&history[i]);
@@ -361,7 +405,7 @@ impl ContextBuilder {
 
         // 1. System prompt + Memory context (merged into ONE system message for MiniMax compatibility).
         let has_leading_system = matches!(history.first(), Some(Message::System { .. }));
-        
+
         let combined_system = if !memory_context.is_empty() {
             format!(
                 "{}\n\n{}",
@@ -371,7 +415,7 @@ impl ContextBuilder {
         } else {
             system_prompt.to_string()
         };
-        
+
         // If history already has a system message, merge it with our system prompt
         if has_leading_system {
             if let Some(Message::System { content }) = history.first() {
@@ -387,7 +431,7 @@ impl ContextBuilder {
 
         // 2. Build refined context from recent turns
         let refined_context = build_refined_context(history, max_turns);
-        
+
         // Add the refined context as a single user message
         if !refined_context.is_empty() {
             result.push(Message::user(format!(
@@ -439,10 +483,11 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     }
 
     // 🔍 DIAGNOSTIC: Log validation results before sanitization
-    let orphaned_results: Vec<_> = result_call_ids.iter()
+    let orphaned_results: Vec<_> = result_call_ids
+        .iter()
         .filter(|id| !assistant_call_ids.contains(*id))
         .collect();
-    
+
     if !orphaned_results.is_empty() {
         tracing::warn!(
             "[TOOL_PAIR_SANITIZATION] Found {} orphaned ToolResult(s) with IDs: {:?}",
@@ -451,10 +496,11 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
         );
     }
 
-    let orphaned_calls: Vec<_> = assistant_call_ids.iter()
+    let orphaned_calls: Vec<_> = assistant_call_ids
+        .iter()
         .filter(|id| !result_call_ids.contains(*id))
         .collect();
-    
+
     if !orphaned_calls.is_empty() {
         tracing::warn!(
             "[TOOL_PAIR_SANITIZATION] Found {} orphaned tool_call(s) with IDs: {:?}",
@@ -499,7 +545,7 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     // IMPORTANT: We should NOT delete the entire Assistant message if it has text content.
     // Instead, we only remove the orphaned tool_calls from the tool_calls array.
     let mut removed_orphaned_calls = 0usize;
-    
+
     for msg in messages.iter_mut() {
         if let Message::Assistant { tool_calls, .. } = msg {
             // Keep only tool_calls that have matching ToolResults (using UPDATED set)
@@ -507,7 +553,7 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
             tool_calls.retain(|tc| updated_result_call_ids.contains(&tc.id));
             let removed = original_count - tool_calls.len();
             removed_orphaned_calls += removed;
-            
+
             if removed > 0 {
                 tracing::debug!(
                     "[TOOL_PAIR_SANITIZATION] Removed {} orphaned tool_call(s) from Assistant message",
@@ -516,7 +562,7 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
             }
         }
     }
-    
+
     if removed_orphaned_calls > 0 {
         tracing::info!(
             "[TOOL_PAIR_SANITIZATION] Total removed {} orphaned tool_call(s) from Assistant messages",
@@ -527,7 +573,7 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     // 🚨 FINAL VALIDATION: Double-check after sanitization
     let mut final_assistant_ids = std::collections::HashSet::new();
     let mut final_result_ids = std::collections::HashSet::new();
-    
+
     for msg in messages.iter() {
         match msg {
             Message::Assistant { tool_calls, .. } => {
@@ -541,7 +587,7 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
             _ => {}
         }
     }
-    
+
     // Remove any remaining orphaned ToolResults (safety net)
     let before_final = messages.len();
     messages.retain(|m| {
@@ -560,7 +606,12 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
 
     // Remove empty Assistant messages (no content + no tool_calls after sanitization)
     messages.retain(|m| {
-        if let Message::Assistant { content, tool_calls, .. } = m {
+        if let Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } = m
+        {
             !(content.is_empty() && tool_calls.is_empty())
         } else {
             true
@@ -576,7 +627,7 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
             );
         }
     }
-    
+
     // 🔍 ENHANCED VALIDATION: Verify message order and fix if needed
     // OpenAI API requires strict ordering: Assistant with tool_calls must be immediately followed by ToolResults
     let mut i = 0;
@@ -585,17 +636,17 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
             if !tool_calls.is_empty() {
                 let expected_count = tool_calls.len();
                 let expected_ids: Vec<_> = tool_calls.iter().map(|tc| tc.id.clone()).collect();
-                
+
                 // Check if the next N messages are ToolResults in the correct order
                 let mut is_valid_sequence = true;
                 let mut found_ids = Vec::new();
-                
+
                 for j in 1..=expected_count {
                     if i + j >= messages.len() {
                         is_valid_sequence = false;
                         break;
                     }
-                    
+
                     if let Message::ToolResult { tool_call_id, .. } = &messages[i + j] {
                         found_ids.push(tool_call_id.clone());
                     } else {
@@ -603,38 +654,37 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
                         break;
                     }
                 }
-                
+
                 // Verify IDs match
                 if is_valid_sequence && found_ids != expected_ids {
                     is_valid_sequence = false;
                 }
-                
+
                 if !is_valid_sequence {
                     tracing::warn!(
                         "[TOOL_PAIR_SANITIZATION] ⚠️ ORDER VIOLATION at index {}: Assistant has {} tool_calls but following messages are not valid ToolResults",
-                        i, expected_count
+                        i,
+                        expected_count
                     );
-                    tracing::warn!(
-                        "[TOOL_PAIR_SANITIZATION] Expected IDs: {:?}",
-                        expected_ids
-                    );
-                    
+                    tracing::warn!("[TOOL_PAIR_SANITIZATION] Expected IDs: {:?}", expected_ids);
+
                     // FIX: Remove all tool_calls from this Assistant message since we can't guarantee proper ordering
                     if let Message::Assistant { tool_calls, .. } = &mut messages[i] {
                         let removed = tool_calls.len();
                         tool_calls.clear();
                         tracing::warn!(
                             "[TOOL_PAIR_SANITIZATION] Removed {} tool_calls from Assistant at index {} to fix ordering issue",
-                            removed, i
+                            removed,
+                            i
                         );
                     }
-                    
+
                     // Mark corresponding ToolResults for removal (they're now orphaned)
                     let indices_to_remove: Vec<usize> = (i + 1..i + 1 + expected_count)
                         .filter(|&idx| idx < messages.len())
                         .filter(|&idx| matches!(&messages[idx], Message::ToolResult { .. }))
                         .collect();
-                    
+
                     // Remove in reverse order to maintain indices
                     for idx in indices_to_remove.into_iter().rev() {
                         messages.remove(idx);
@@ -863,24 +913,42 @@ fn deduplicate_file_reads(messages: &mut Vec<Message>) {
         last_occurrence.insert(path.clone(), *idx);
     }
 
-    let mut seen: HashMap<String, usize> = HashMap::new();
     let mut replaced = 0;
     for &(idx, ref path) in &file_reads {
-        let count = seen.entry(path.clone()).or_insert(0);
-        *count += 1;
-        if *count > 1 {
-            // Find the corresponding ToolResult for this file_read
+        let Some(last_idx) = last_occurrence.get(path).copied() else {
+            continue;
+        };
+        if idx != last_idx {
+            // Find the corresponding ToolResult for this older file_read. The
+            // latest read must stay intact; otherwise the model reasons from
+            // stale file contents after edits or re-reads.
             let msg = &messages[idx];
             let tool_call_id = if let Message::Assistant { tool_calls, .. } = msg {
-                tool_calls.iter()
-                    .find(|tc| tc.name == "file_read")
+                tool_calls
+                    .iter()
+                    .find(|tc| {
+                        tc.name == "file_read"
+                            && serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                .ok()
+                                .and_then(|args| {
+                                    args.get("path").and_then(|p| p.as_str()).map(str::to_owned)
+                                })
+                                .as_deref()
+                                == Some(path.as_str())
+                    })
                     .map(|tc| tc.id.clone())
-            } else { None };
+            } else {
+                None
+            };
 
             if let Some(tc_id) = tool_call_id {
                 // Replace the ToolResult with a compact summary
                 for msg in messages.iter_mut() {
-                    if let Message::ToolResult { tool_call_id, content } = msg {
+                    if let Message::ToolResult {
+                        tool_call_id,
+                        content,
+                    } = msg
+                    {
                         if tool_call_id == &tc_id {
                             let line_count = content.lines().count();
                             *content = format!(
@@ -905,23 +973,27 @@ pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
     if messages.len() < 5 {
         return; // Only apply to longer conversations
     }
-    
+
     let original_count = messages.len();
     let mut filtered = Vec::with_capacity(messages.len());
     let mut i = 0;
-    
+
     while i < messages.len() {
         let current_msg = &messages[i];
-        
+
         // Check if this is a ToolResult with "Infinite Loop Detected"
         if let Message::ToolResult { content, .. } = current_msg {
             if content.contains("Infinite Loop Detected") {
                 // Look ahead to see if there are more infinite loop errors
                 let mut consecutive_errors = 1;
                 let mut j = i + 1;
-                
+
                 while j < messages.len() {
-                    if let Message::ToolResult { content: next_content, .. } = &messages[j] {
+                    if let Message::ToolResult {
+                        content: next_content,
+                        ..
+                    } = &messages[j]
+                    {
                         if next_content.contains("Infinite Loop Detected") {
                             consecutive_errors += 1;
                             j += 1;
@@ -932,7 +1004,7 @@ pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
                         break;
                     }
                 }
-                
+
                 if consecutive_errors > 1 {
                     // Keep only the LAST infinite loop error (most relevant)
                     tracing::info!(
@@ -944,16 +1016,22 @@ pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
                     continue;
                 }
             }
-            
+
             // Check for repeated "File Not Found" errors
             if content.contains("File Not Found") || content.contains("No file with ID") {
                 // Look ahead for similar errors
                 let mut consecutive_not_found = 1;
                 let mut j = i + 1;
-                
+
                 while j < messages.len() {
-                    if let Message::ToolResult { content: next_content, .. } = &messages[j] {
-                        if next_content.contains("File Not Found") || next_content.contains("No file with ID") {
+                    if let Message::ToolResult {
+                        content: next_content,
+                        ..
+                    } = &messages[j]
+                    {
+                        if next_content.contains("File Not Found")
+                            || next_content.contains("No file with ID")
+                        {
                             consecutive_not_found += 1;
                             j += 1;
                         } else {
@@ -963,7 +1041,7 @@ pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
                         break;
                     }
                 }
-                
+
                 if consecutive_not_found > 2 {
                     // Keep only the first and last "File Not Found" errors
                     tracing::info!(
@@ -979,12 +1057,12 @@ pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
                 }
             }
         }
-        
+
         // Keep this message as-is
         filtered.push(current_msg.clone());
         i += 1;
     }
-    
+
     let removed_count = original_count - filtered.len();
     if removed_count > 0 {
         tracing::info!(

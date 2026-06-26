@@ -36,8 +36,8 @@ pub fn legacy_architecture_path(project_root: &Path) -> PathBuf {
 pub fn needs_project_onboarding(project_root: &Path) -> bool {
     let dir = skills_dir(project_root);
     let has_conventions = dir.join(SKILL_CONVENTIONS).is_file();
-    let has_business = dir.join(SKILL_BUSINESS).is_file()
-        || dir.join(SKILL_ARCHITECTURE_LEGACY).is_file();
+    let has_business =
+        dir.join(SKILL_BUSINESS).is_file() || dir.join(SKILL_ARCHITECTURE_LEGACY).is_file();
     !has_conventions || !has_business
 }
 
@@ -144,7 +144,7 @@ pub fn onboarding_system_directive(greenfield: bool) -> String {
          | project-conventions.md | 在本项目里代码怎么写、怎么构建、怎么验证？ | 业务介绍、模块职责 |\n\
          | project-business-guide.md | 项目做什么？术语/流程？改功能看哪？ | 构建命令、格式化工具 |\n\
          \n\
-         **流程**：project_detect → file_list（单层逐层）→ file_read 关键配置/入口 → **分别** file_write → `## Done`。\n\
+         **流程**：所有动作都走 `complete_and_check({{\"action\":\"...\",\"params\":{{...}}}})`：project_detect → file_list（单层逐层）→ file_read 关键配置/入口 → **分别** file_write → finish(content=\"## Done...\")。\n\
          **技术栈**：只写 project_detect 与配置文件**实际检测到**的内容，不要默认某一语言。\n\
          **禁止**：四步工作流 JSON；通用编程常识；臆造路径/命令；两篇混写。\n\
          **篇幅**：每个 Skill ≤1500 字；大仓库用要点，避免 file_write 被模型截断。{greenfield_note}"
@@ -162,7 +162,7 @@ pub fn build_onboarding_user_prompt(project_root: &Path) -> String {
     };
 
     format!(
-        r#"{mode}
+        r####"{mode}
 首次进入目录 `{root}`。请分析**当前实际文件**并创建两份 Skill（任意技术栈通用）。
 
 ## 核心区分
@@ -221,18 +221,19 @@ scope: project
 - **模块职责表**（包/module/目录 → 职责）
 - **Agent 指引**：加功能 / 修 bug 时优先打开的路径
 
-## 探索顺序
-1. `project_detect()` — 记录检测到的语言与工具
-2. `file_list` 单层逐层
-3. `file_read`：README、构建配置（如 pom.xml / package.json / pyproject.toml / go.mod / Cargo.toml）、应用入口
-4. 按需 `code_search` / `find_symbol`
-5. 分别 `file_write` 两个文件
+## 探索顺序（唯一工具出口）
+每一步都必须调用 `complete_and_check`，不要输出裸工具名或旧式函数调用。
+1. `complete_and_check({{"action":"project_detect","params":{{}}}})` — 记录检测到的语言与工具
+2. `complete_and_check({{"action":"file_list","params":{{"path":"."}}}})`，再按实际目录单层逐层 list
+3. `complete_and_check({{"action":"file_read","params":{{"path":"README.md","offset":0,"limit":120}}}})`：README、构建配置（如 pom.xml / package.json / pyproject.toml / go.mod / Cargo.toml）、应用入口
+4. 按需 `complete_and_check({{"action":"code_search","params":{{"query":"..."}}}})` / `complete_and_check({{"action":"find_symbol","params":{{"name":"..."}}}})`
+5. 分别 `complete_and_check({{"action":"file_write","params":{{"path":".ox/skills/project-conventions.md","content":"..."}}}})` 和 `complete_and_check({{"action":"file_write","params":{{"path":".ox/skills/project-business-guide.md","content":"..."}}}})`
 
 ## 空项目特别说明
 若几乎无源码：规范中写明当前状态、建议的初始化步骤占位；业务中写明「新项目，业务待定义」及未来模块规划占位。**禁止编造不存在的文件或命令。**
 
 ## 完成
-两个文件写入后输出 `## Done` 并列出路径。
+两个文件写入后调用 `complete_and_check({{"action":"finish","params":{{"content":"## Done\n已创建 .ox/skills/project-conventions.md 与 .ox/skills/project-business-guide.md"}}}})` 并列出路径。
 
 ## 大仓库注意（Java 多模块等）
 - 每个 Skill **控制在 1500 字以内**；用要点，不要贴大段代码
@@ -242,7 +243,7 @@ scope: project
 
 ## 去重（禁止另建同义 Skill）
 - 只允许上述两个固定文件名；不要创建 project-coding-standards、project-architecture-patterns 等别名
-- 后续更新用 edit_file，或 file_write 同一文件并设 `"merge": true`"#
+- 后续更新用 edit_file，或 file_write 同一文件并设 `"merge": true`"####
     )
 }
 
@@ -306,6 +307,19 @@ mod tests {
         assert!(!is_onboarding_turn(&[Message::user("hi")]));
     }
 
+    #[test]
+    fn onboarding_prompt_uses_unified_tool_calls() {
+        let dir = std::env::temp_dir().join(format!("ox_onboard_prompt_{}", std::process::id()));
+        let prompt = build_onboarding_user_prompt(&dir);
+        let directive = onboarding_system_directive(false);
+
+        assert!(prompt.contains("complete_and_check"));
+        assert!(directive.contains("complete_and_check"));
+        assert!(prompt.contains("\"action\":\"project_detect\""));
+        assert!(prompt.contains("\"action\":\"file_write\""));
+        assert!(prompt.contains("\"action\":\"finish\""));
+        assert!(!prompt.contains("project_detect()"));
+    }
     #[test]
     fn turn_signals_onboarding_done_detects_assistant() {
         let msgs = vec![Message::Assistant {

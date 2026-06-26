@@ -4,7 +4,7 @@ use ox_core::context::ContextBuilder;
 use ox_core::message::Message;
 
 /// Build context with optional refinement based on configuration.
-/// 
+///
 /// If `use_refined` is true, uses the refined context format:
 /// "User: ... Assistant: ... [tools]"
 /// Otherwise uses the standard context format.

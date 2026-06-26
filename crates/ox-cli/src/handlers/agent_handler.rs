@@ -10,16 +10,18 @@ use ox_core::agent::AgentToUiEvent;
 use ox_core::config::OxConfig;
 use ox_core::context::ContextBuilder;
 use ox_core::cost::CostTracker;
-use ox_core::knowledge::{format_memory_context, KnowledgeEngine};
+use ox_core::knowledge::{KnowledgeEngine, format_memory_context};
 use ox_core::llm::LlmProvider;
 use ox_core::message::{Message, Session};
 use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
 use ox_core::tools::{ToolContext, ToolRegistry};
 
-use crate::terminal::app::{App, FindingsPanelState, ParkFollowUpTag, PendingConfirmation, PendingSkillDraft};
-use crate::terminal::output_pane::OutputLine;
 use crate::helpers;
+use crate::terminal::app::{
+    App, FindingsPanelState, ParkFollowUpTag, PendingConfirmation, PendingSkillDraft,
+};
+use crate::terminal::output_pane::OutputLine;
 
 /// Cancel a running agent (if any), reset interrupt token, bump turn id. Returns the new turn id.
 pub fn prepare_agent_spawn(
@@ -54,6 +56,8 @@ pub fn handle_text_chunk(app: &mut App, text: &str) {
     if text.trim().is_empty() {
         return;
     }
+    // Clear stale gate confirmation state — LLM is responding, gate is resolved.
+    app.workflow_awaiting_confirmation = None;
     app.output.collapse_thinking();
     app.output.push_streaming_chunk(text);
     if !app.user_scrolled {
@@ -70,11 +74,21 @@ pub fn handle_reasoning_chunk(app: &mut App, text: &str) {
 
 /// Handle a single ToolStart event.
 pub fn handle_tool_start(app: &mut App, name: &str, detail: &Option<String>) {
+    // Suppress verbose ToolStart for complete_and_check delegates —
+    // the ToolResult already includes action info in compact format.
+    if name.starts_with("complete_and_check:") {
+        app.output.note_tool_activity(name);
+        return;
+    }
     app.output.note_tool_activity(name);
     if detail.is_some() {
         let mut updated = false;
         for line in app.output.lines.iter_mut().rev() {
-            if let OutputLine::Tool { name: n, detail: d_ref } = line {
+            if let OutputLine::Tool {
+                name: n,
+                detail: d_ref,
+            } = line
+            {
                 if *n == name {
                     *d_ref = detail.clone();
                     updated = true;
@@ -120,7 +134,8 @@ pub fn handle_tool_result(
     if name == "file_write" && !is_error {
         if let Some(path_str) = helpers::extract_file_path_from_output(output) {
             if let Ok(path) = std::path::PathBuf::from(&path_str).canonicalize() {
-                if let Some(content) = helpers::extract_last_file_write_content(&target_session.messages)
+                if let Some(content) =
+                    helpers::extract_last_file_write_content(&target_session.messages)
                 {
                     app.override_detector.register_write(path.clone(), &content);
                     app.total_file_writes += 1;
@@ -175,7 +190,7 @@ pub fn handle_turn_done(
     has_provider: bool,
     rt_env: &mut RuntimeEnvironment,
     tool_registry: &Arc<ToolRegistry>,
-    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
     cost_tracker: &mut CostTracker,
     model_name: &str,
     compressed_cache: &Option<(Vec<Message>, usize)>,
@@ -209,9 +224,8 @@ pub fn handle_turn_done(
                 != ox_core::agent::phase::SingleFlowPhase::AwaitUser
             {
                 // Already in implement / complete — don't re-open the confirm UI.
-            } else if let Some(panel) = findings_panel_from_engine(&engine) {
-                app.findings_panel = Some(panel);
-                app.workflow_awaiting_confirmation = Some(4);
+            } else {
+                // Findings shown as markdown in chat — no panel.
                 let card = ox_core::agent::findings::load_or_migrate(&engine)
                     .filter(|s| !s.findings.is_empty())
                     .map(|s| ox_core::agent::presentation::format_findings_card(&s));
@@ -230,9 +244,7 @@ pub fn handle_turn_done(
                         .get_variable("_current_user_request")
                         .filter(|s| !s.trim().is_empty())
                         .unwrap_or_else(|| "（进行中的任务）".to_string());
-                    Some(ox_core::agent::user_round::format_interrupt_boundary_message(
-                        &task,
-                    ))
+                    Some(ox_core::agent::user_round::format_interrupt_boundary_message(&task))
                 } else {
                     None
                 }
@@ -267,16 +279,20 @@ pub fn handle_turn_done(
     for msg in new_messages {
         if let Message::Assistant { content, .. } = msg {
             // Match ## Plan
-            if let Some(plan_start) = content
-                .find("\n## Plan")
-                .or_else(|| if content.starts_with("## Plan") { Some(0) } else { None })
-            {
-                let plan_start =
-                    if content.starts_with("## Plan") { 0 } else { plan_start + 1 };
+            if let Some(plan_start) = content.find("\n## Plan").or_else(|| {
+                if content.starts_with("## Plan") {
+                    Some(0)
+                } else {
+                    None
+                }
+            }) {
+                let plan_start = if content.starts_with("## Plan") {
+                    0
+                } else {
+                    plan_start + 1
+                };
                 let plan_text = &content[plan_start..];
-                let plan_end = plan_text
-                    .find("\n## Done")
-                    .unwrap_or(plan_text.len());
+                let plan_end = plan_text.find("\n## Done").unwrap_or(plan_text.len());
                 for line in plan_text[..plan_end].lines().skip(1) {
                     let t = line.trim();
                     if t.starts_with("- File:") || t.starts_with("- **File:**") {
@@ -290,12 +306,18 @@ pub fn handle_turn_done(
                 }
             }
             // Match ## Done
-            if let Some(done_start) = content
-                .find("\n## Done")
-                .or_else(|| if content.starts_with("## Done") { Some(0) } else { None })
-            {
-                let done_start =
-                    if content.starts_with("## Done") { 0 } else { done_start + 1 };
+            if let Some(done_start) = content.find("\n## Done").or_else(|| {
+                if content.starts_with("## Done") {
+                    Some(0)
+                } else {
+                    None
+                }
+            }) {
+                let done_start = if content.starts_with("## Done") {
+                    0
+                } else {
+                    done_start + 1
+                };
                 let done_text = &content[done_start..];
                 for line in done_text.lines().skip(1).take(6) {
                     let t = line.trim();
@@ -379,38 +401,42 @@ pub fn handle_turn_done(
             .iter()
             .map(|f| f.rsplit('/').next().unwrap_or(f))
             .collect();
-        app.output
-            .push_line(OutputLine::System(format!("{status} Done: {}", names.join(", "))));
+        app.output.push_line(OutputLine::System(format!(
+            "{status} Done: {}",
+            names.join(", ")
+        )));
     } else if !plan_files.is_empty() {
-        app.output
-            .push_line(OutputLine::System("⏳ Awaiting verification...".to_string()));
+        app.output.push_line(OutputLine::System(
+            "⏳ Awaiting verification...".to_string(),
+        ));
     }
 
     // Auto-reload skills after modifying .ox/skills/
     if done_files.iter().any(|f| f.contains(".ox/skills/")) {
         let _ = tool_registry.reload_skills(rt_env);
         let count = tool_registry.get_skills_list().len();
-        app.output
-            .push_system(&format!("🧠 Skills reloaded ({} skill(s) now active)", count));
+        app.output.push_system(&format!(
+            "🧠 Skills reloaded ({} skill(s) now active)",
+            count
+        ));
     }
 
     // Token usage + cost display
     let total_tokens = usage.prompt_tokens + usage.completion_tokens;
     let cost_this_turn = ox_core::cost::estimate_cost(model_name, usage);
-    let context_info =
-        if let Some((compressed_msgs, source_count)) = compressed_cache {
-            let current_total = target_session.messages.len();
-            let recent_msgs = current_total.saturating_sub(*source_count);
-            format!(
-                " | Context: {} compressed + {} recent = {} total msgs",
-                compressed_msgs.len(),
-                recent_msgs,
-                current_total
-            )
-        } else {
-            let current_total = target_session.messages.len();
-            format!(" | Context: {} msgs (no compression)", current_total)
-        };
+    let context_info = if let Some((compressed_msgs, source_count)) = compressed_cache {
+        let current_total = target_session.messages.len();
+        let recent_msgs = current_total.saturating_sub(*source_count);
+        format!(
+            " | Context: {} compressed + {} recent = {} total msgs",
+            compressed_msgs.len(),
+            recent_msgs,
+            current_total
+        )
+    } else {
+        let current_total = target_session.messages.len();
+        format!(" | Context: {} msgs (no compression)", current_total)
+    };
     app.output.push_line(OutputLine::System(format!(
         "\n💰 Token Usage: {} prompt + {} completion = {} total | Cost: ${:.4}{}",
         usage.prompt_tokens, usage.completion_tokens, total_tokens, cost_this_turn, context_info
@@ -422,14 +448,56 @@ pub fn handle_turn_done(
             tracing::error!("Failed to persist message: {e}");
         }
     }
+
+    // Terminate a successfully completed round with an explicit, machine-detectable
+    // boundary. Without it, a finished round left only a trail of tool results
+    // (e.g. `file_read` dumps) as the tail, so on later turns the LLM could not tell
+    // from message history whether that work had completed — and re-explored or
+    // treated stale results as pending. Only on genuine finish (workflow complete,
+    // not interrupted); timeouts/aborts leave the workflow active and get no marker.
+    if interrupt_boundary.is_none() {
+        let completed_task = app.workflow_engine.as_ref().and_then(|wf| {
+            wf.try_lock()
+                .ok()
+                .filter(|e| e.is_workflow_complete())
+                .map(|e| e.get_variable("_current_user_request").unwrap_or_default())
+        });
+        if let Some(task) = completed_task {
+            let already = matches!(
+                target_session.messages.last(),
+                Some(Message::System { content })
+                    if ox_core::agent::user_round::is_complete_boundary(content)
+            );
+            if !already {
+                let summary = new_messages
+                    .iter()
+                    .rev()
+                    .find_map(|m| match m {
+                        Message::Assistant { content, .. } if !content.trim().is_empty() => {
+                            Some(content.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let marker =
+                    ox_core::agent::user_round::format_complete_boundary_message(&task, &summary);
+                if let Err(e) = target_session.append_message(Message::system(marker)) {
+                    tracing::error!("Failed to persist completion boundary: {e}");
+                }
+            }
+        }
+    }
     cost_tracker.record(model_name, usage);
 
     // Async: store turn summary + extract facts via KnowledgeEngine
-    let knowledge_for_turn = Arc::clone(knowledge_engine);
+    let knowledge_for_turn = knowledge_engine.clone();
     let new_msgs_for_store = new_messages.to_vec();
     let pid_for_store = rt_env.project_id.clone();
     let lang_for_store = rt_env.project_language.clone();
     tokio::spawn(async move {
+        let Some(ref knowledge_for_turn) = knowledge_for_turn else {
+            return;
+        };
         let mut engine = knowledge_for_turn.write().await;
         if let Some(summary) =
             ox_core::context::refinement::generate_memory_summary(&new_msgs_for_store)
@@ -477,10 +545,7 @@ pub fn handle_turn_done(
         0.5
     };
     let tool_success_rate = helpers::calculate_tool_success_rate(&target_session.messages);
-    let code_accept_rate = app
-        .ema_manager
-        .get_value("code_accept_rate")
-        .unwrap_or(0.8);
+    let code_accept_rate = app.ema_manager.get_value("code_accept_rate").unwrap_or(0.8);
     let has_explicit = app.explicit_feedback_count >= 5;
     let _satisfaction_score = app.rollback_manager.calculate_satisfaction_score(
         explicit_rate,
@@ -519,8 +584,10 @@ pub fn handle_turn_done(
     let interjections_vec: Vec<String> = interjection_buf.drain();
     if !interjections_vec.is_empty() {
         for inj_text in &interjections_vec {
-            app.output
-                .push_line(OutputLine::System(format!("💬 (fallback queued) {}", inj_text.trim())));
+            app.output.push_line(OutputLine::System(format!(
+                "💬 (fallback queued) {}",
+                inj_text.trim()
+            )));
         }
         if let Some(last) = interjections_vec.last() {
             let mut resume = false;
@@ -610,11 +677,7 @@ pub fn handle_turn_done(
 }
 
 /// Handle Error event.
-pub fn handle_error(
-    app: &mut App,
-    err: &str,
-    background_session: &mut Option<Session>,
-) {
+pub fn handle_error(app: &mut App, err: &str, background_session: &mut Option<Session>) {
     app.output.finalize_streaming();
     app.output.push_error(&format!("{err}"));
     if background_session.is_some() {
@@ -648,18 +711,102 @@ pub fn handle_status(app: &mut App, status: String) {
 /// Handle formatted plan ready for user review.
 pub fn handle_plan_review_ready(app: &mut App, markdown: &str) {
     app.output.finalize_streaming();
-    app.output.push_line(OutputLine::Markdown(markdown.to_string()));
+    app.output
+        .push_line(OutputLine::Markdown(markdown.to_string()));
     if !app.user_scrolled {
         app.scroll_to_bottom();
     }
     app.dirty = true;
 }
 
+/// Handle `complete_and_check` deliver preview — business gate (non-findings).
+pub fn handle_deliver_preview(app: &mut App, tool_call_id: &str, kind: &str, content: &str) {
+    app.output.finalize_streaming();
+    if kind != "findings" && !content.is_empty() {
+        app.output
+            .push_line(OutputLine::Markdown(content.to_string()));
+    }
+    if kind != "findings" {
+        app.unified_gate = Some(crate::terminal::app::UnifiedGatePending::Deliver {
+            tool_call_id: tool_call_id.to_string(),
+            kind: kind.to_string(),
+        });
+        app.workflow_awaiting_confirmation = Some(crate::terminal::app::UNIFIED_GATE_DELIVER_STEP);
+        app.status = format!("⏸ 交付门禁 ({kind})：c 确认 · 可输入讨论");
+    }
+    if !app.user_scrolled {
+        app.scroll_to_bottom();
+    }
+    app.dirty = true;
+}
+
+/// Handle `complete_and_check` finish preview — user must ack end/continue.
+pub fn handle_finish_preview(app: &mut App, tool_call_id: &str, summary: &str) {
+    app.output.finalize_streaming();
+    if !summary.is_empty() {
+        app.output
+            .push_line(OutputLine::Markdown(summary.to_string()));
+    }
+    app.unified_gate = Some(crate::terminal::app::UnifiedGatePending::Finish {
+        tool_call_id: tool_call_id.to_string(),
+    });
+    app.workflow_awaiting_confirmation = Some(crate::terminal::app::UNIFIED_GATE_FINISH_STEP);
+    app.status = "⏸ finish 门禁：f 结束本轮 · c 继续".to_string();
+    if !app.user_scrolled {
+        app.scroll_to_bottom();
+    }
+    app.dirty = true;
+}
+
+/// Send unified deliver business ack to suspended agent.
+pub fn send_unified_deliver_ack(app: &mut App) -> bool {
+    use ox_core::agent::ui_event::{BusinessGateKind, UiToAgentEvent};
+    if let Some(tx) = &app.ui_to_agent_tx {
+        if tx
+            .send(UiToAgentEvent::BusinessAck {
+                kind: BusinessGateKind::Deliver,
+            })
+            .is_ok()
+        {
+            app.clear_workflow_confirmation();
+            app.status = "已确认交付 — agent 继续".to_string();
+            app.dirty = true;
+            return true;
+        }
+    }
+    false
+}
+
+/// Send finish gate ack (`finished` = user ends turn).
+pub fn send_unified_finish_ack(app: &mut App, finished: bool) -> bool {
+    use ox_core::agent::ui_event::UiToAgentEvent;
+    if let Some(tx) = &app.ui_to_agent_tx {
+        if tx
+            .send(UiToAgentEvent::FinishAck {
+                finished,
+                note: None,
+            })
+            .is_ok()
+        {
+            app.clear_workflow_confirmation();
+            app.status = if finished {
+                "用户确认结束本轮".to_string()
+            } else {
+                "继续本轮 — agent 恢复".to_string()
+            };
+            app.dirty = true;
+            return true;
+        }
+    }
+    false
+}
+
 /// Handle workflow paused for user confirmation.
 pub fn handle_workflow_awaiting_confirmation(app: &mut App, step_idx: usize, message: &str) {
     app.output.finalize_streaming();
     if !message.is_empty() {
-        app.output.push_line(OutputLine::Markdown(message.to_string()));
+        app.output
+            .push_line(OutputLine::Markdown(message.to_string()));
     }
     app.workflow_awaiting_confirmation = Some(step_idx);
     if step_idx == 4 {
@@ -682,8 +829,12 @@ pub fn handle_workflow_awaiting_confirmation(app: &mut App, step_idx: usize, mes
 /// Map typed menu keywords to input tag (when user types 意见/新任务 instead of 1/2/3).
 pub fn park_tag_from_menu_answer(answer: &str) -> Option<ParkFollowUpTag> {
     match answer.trim() {
-        "1" | "继续" | "continue" | "resume" | "执行" | "修复" => Some(ParkFollowUpTag::Continue),
-        "2" | "意见" | "反馈" | "澄清" | "说明" | "feedback" => Some(ParkFollowUpTag::Feedback),
+        "1" | "继续" | "continue" | "resume" | "执行" | "修复" => {
+            Some(ParkFollowUpTag::Continue)
+        }
+        "2" | "意见" | "反馈" | "澄清" | "说明" | "feedback" => {
+            Some(ParkFollowUpTag::Feedback)
+        }
         "3" | "新任务" | "new" | "/new" => Some(ParkFollowUpTag::NewTask),
         _ => None,
     }
@@ -700,33 +851,11 @@ fn findings_panel_from_engine(
     })
 }
 
-/// Refresh the TUI findings panel from engine state.
-pub fn refresh_findings_panel(app: &mut App, engine: &ox_core::agent::engine::WorkflowEngine) {
-    app.findings_panel = findings_panel_from_engine(engine);
-}
-
-/// Toggle finding #N in scope (findings panel shortcut).
+// Panel removed — findings are shown as markdown in chat.
+pub fn refresh_findings_panel(_app: &mut App, _engine: &ox_core::agent::engine::WorkflowEngine) {}
 pub fn toggle_finding_in_panel(app: &mut App, n: u32) {
-    let Some(wf) = app.workflow_engine.clone() else {
-        return;
-    };
-    let Ok(mut engine) = wf.try_lock() else {
-        return;
-    };
-    use ox_core::agent::workflow_command::{self, CommandOutcome, WorkflowCommand};
-    let msg = if let CommandOutcome::Applied(msg) =
-        workflow_command::apply_with_cwd(&mut engine, WorkflowCommand::ToggleFinding(n), None)
-    {
-        msg
-    } else {
-        None
-    };
-    let panel = findings_panel_from_engine(&engine);
-    drop(engine);
-    if let Some(text) = msg {
-        app.output.push_system(&text);
-    }
-    app.findings_panel = panel;
+    // Just show a brief status — no panel to toggle.
+    app.output.push_system(&format!("已切换 finding #{n} 范围"));
     app.dirty = true;
 }
 
@@ -828,8 +957,7 @@ pub fn apply_workflow_slash(
         app.clear_workflow_confirmation();
     } else if enter_discuss {
         enter_findings_discuss_mode(app);
-    } else if let Some(p) = panel {
-        app.findings_panel = Some(p);
+    } else if panel.is_some() {
         app.park_follow_up_tag = None;
         app.workflow_awaiting_confirmation = Some(4);
     }
@@ -852,9 +980,8 @@ pub fn enter_findings_discuss_mode(app: &mut App) {
             ox_core::agent::workflow_session::enter_feedback_discuss(&engine);
         }
     }
-    app.output.push_system(
-        "💬 讨论模式（只读）— 在下方输入意见或问题，不会修改代码、不会进入实施。",
-    );
+    app.output
+        .push_system("💬 讨论模式（只读）— 在下方输入意见或问题，不会修改代码、不会进入实施。");
     app.dirty = true;
 }
 
@@ -862,7 +989,8 @@ pub fn enter_findings_discuss_mode(app: &mut App) {
 pub fn enter_findings_new_task_mode(app: &mut App) {
     app.clear_workflow_confirmation();
     app.park_follow_up_tag = Some(ParkFollowUpTag::NewTask);
-    app.output.push_system("🆕 新任务 — 在下方描述新需求（Enter 提交后将结束当前 workflow）。");
+    app.output
+        .push_system("🆕 新任务 — 在下方描述新需求（Enter 提交后将结束当前 workflow）。");
     app.dirty = true;
 }
 
@@ -873,9 +1001,8 @@ pub fn handle_park_menu_shortcut(app: &mut App, choice: char) {
             app.workflow_awaiting_confirmation = None;
             app.findings_panel = None;
             app.park_follow_up_tag = Some(ParkFollowUpTag::Continue);
-            app.output.push_system(
-                "🔧 继续修复 — 说明范围（如「修复 1,2」）或输入 /confirm 确认实施。",
-            );
+            app.output
+                .push_system("🔧 继续修复 — 说明范围（如「修复 1,2」）或输入 /confirm 确认实施。");
             app.dirty = true;
         }
         '2' => enter_findings_discuss_mode(app),
@@ -927,11 +1054,7 @@ pub fn handle_tool_output_chunk(app: &mut App, chunk: &str) {
 }
 
 /// Handle BudgetExceeded event.
-pub fn handle_budget_exceeded(
-    app: &mut App,
-    total_tokens: u32,
-    estimated_cost: String,
-) {
+pub fn handle_budget_exceeded(app: &mut App, total_tokens: u32, estimated_cost: String) {
     app.output.push_line(OutputLine::System(format!(
         "Token limit reached: {} tokens, est. cost: {}. Continue? [Y/N]",
         total_tokens, estimated_cost
@@ -972,7 +1095,8 @@ pub fn handle_working_dir_changed(
     new_dir: std::path::PathBuf,
     has_provider: bool,
     config: &OxConfig,
-    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
+    gitnexus: Option<Arc<ox_core::mcp::GitNexusService>>,
 ) -> Option<Arc<ToolContext>> {
     use ox_core::runtime;
 
@@ -982,8 +1106,10 @@ pub fn handle_working_dir_changed(
             new_dir,
             project_changed,
         } => {
-            app.output
-                .push_line(OutputLine::System(format!("Working directory: {}", new_dir.display())));
+            app.output.push_line(OutputLine::System(format!(
+                "Working directory: {}",
+                new_dir.display()
+            )));
             helpers::refresh_header_info(app, rt_env, has_provider);
 
             let working_dir_str = new_dir.to_string_lossy().to_string();
@@ -991,18 +1117,19 @@ pub fn handle_working_dir_changed(
                 tracing::warn!("Failed to update session working dir: {}", e);
             }
 
-            let new_tool_ctx = Arc::new(ToolContext::new(
-                rt_env.clone(),
-                new_dir.clone(),
-                Arc::new(config.clone()),
-                Arc::clone(knowledge_engine),
-            ));
+            let new_tool_ctx = Arc::new(
+                ToolContext::new(
+                    rt_env.clone(),
+                    new_dir.clone(),
+                    Arc::new(config.clone()),
+                    knowledge_engine.clone(),
+                )
+                .with_gitnexus(gitnexus),
+            );
 
             if project_changed {
-                app.output.push_system(&format!(
-                    "Project boundary changed: {}",
-                    new_dir.display()
-                ));
+                app.output
+                    .push_system(&format!("Project boundary changed: {}", new_dir.display()));
             }
 
             Some(new_tool_ctx)
@@ -1018,7 +1145,7 @@ pub fn handle_workflow_completed(
     provider: &Option<Arc<dyn LlmProvider>>,
     rt_env: &RuntimeEnvironment,
     agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    knowledge_engine: &Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>>,
     task_description: String,
     execution_summary: String,
     agent_config: &Arc<ox_core::config::AgentConfig>,
@@ -1032,18 +1159,14 @@ pub fn handle_workflow_completed(
     );
 
     // Memory episode + consolidation
-    let ke = Arc::clone(knowledge_engine);
+    let ke = knowledge_engine.clone();
     let pid = rt_env.project_id.clone();
     let task = task_description.clone();
     let summary = execution_summary.clone();
     tokio::spawn(async move {
+        let Some(ref ke) = ke else { return };
         let mut engine = ke.write().await;
-        let _ = engine.record_workflow_episode(
-            "current",
-            Some(&pid),
-            &task,
-            &summary,
-        );
+        let _ = engine.record_workflow_episode("current", Some(&pid), &task, &summary);
         if let Err(e) = engine.run_consolidation("current", Some(&pid)) {
             tracing::warn!("[KNOWLEDGE] Consolidation failed: {e}");
         }
@@ -1058,10 +1181,9 @@ pub fn handle_workflow_completed(
         return;
     };
 
-    let threshold =
-        ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clamp_threshold(
-            agent_config.skill_reflect_rounds,
-        );
+    let threshold = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clamp_threshold(
+        agent_config.skill_reflect_rounds,
+    );
     let root = rt_env.effective_project_root();
     let pending = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::load(&root, threshold);
     let next_round = pending.round_count() + 1;
@@ -1084,18 +1206,14 @@ pub fn handle_workflow_completed(
             "🧠 正在分析本次任务经验…".to_string(),
         ));
 
-        let reflector = match ox_core::agent::auto_reflect::AutoReflector::new(
-            provider,
-            &project_root,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.send(AgentToUiEvent::Error(format!(
-                    "Skill 反思初始化失败: {e}"
-                )));
-                return;
-            }
-        };
+        let reflector =
+            match ox_core::agent::auto_reflect::AutoReflector::new(provider, &project_root) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(AgentToUiEvent::Error(format!("Skill 反思初始化失败: {e}")));
+                    return;
+                }
+            };
 
         match reflector
             .reflect_on_workflow(&task_desc, &exec_summary, &messages)
@@ -1106,9 +1224,10 @@ pub fn handle_workflow_completed(
                 content,
                 description,
             }) => {
-                let threshold = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clamp_threshold(
-                    reflect_rounds,
-                );
+                let threshold =
+                    ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clamp_threshold(
+                        reflect_rounds,
+                    );
                 let mut buffer = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::load(
                     &project_root,
                     threshold,
@@ -1153,21 +1272,14 @@ pub fn handle_workflow_completed(
                 )));
             }
             Err(e) => {
-                let _ = tx.send(AgentToUiEvent::Error(format!(
-                    "Skill 反思失败: {e}"
-                )));
+                let _ = tx.send(AgentToUiEvent::Error(format!("Skill 反思失败: {e}")));
             }
         }
     });
 }
 
 /// Present skill draft for user review (or queue if agent is busy).
-pub fn present_skill_draft(
-    app: &mut App,
-    skill_id: String,
-    content: String,
-    description: String,
-) {
+pub fn present_skill_draft(app: &mut App, skill_id: String, content: String, description: String) {
     let draft = PendingSkillDraft {
         skill_id,
         content,

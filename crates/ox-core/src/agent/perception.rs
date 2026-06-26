@@ -18,6 +18,9 @@ pub struct FindingItem {
     pub issue: String,
     #[serde(default)]
     pub recommendation: String,
+    /// Concrete fix plan (lines + how + code sketch), carried into implementation.
+    #[serde(default)]
+    pub fix_plan: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,10 +33,7 @@ pub struct PerceptionFindings {
 pub fn save(engine: &super::engine::WorkflowEngine, findings: &PerceptionFindings) {
     if let Ok(json) = serde_json::to_string(findings) {
         engine.set_variable(FINDINGS_KEY, json);
-        tracing::info!(
-            "[PERCEPTION] frozen {} finding(s)",
-            findings.findings.len()
-        );
+        tracing::info!("[PERCEPTION] frozen {} finding(s)", findings.findings.len());
     }
 }
 
@@ -86,6 +86,11 @@ pub fn extract_from_text(text: &str) -> Option<PerceptionFindings> {
                 .to_string(),
             recommendation: obj
                 .get("recommendation")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            fix_plan: obj
+                .get("fix_plan")
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -252,11 +257,7 @@ impl FindingsStreamFilter {
         if visible.len() > self.visible_len {
             let delta = visible[self.visible_len..].to_string();
             self.visible_len = visible.len();
-            if delta.is_empty() {
-                None
-            } else {
-                Some(delta)
-            }
+            if delta.is_empty() { None } else { Some(delta) }
         } else if visible.len() < self.visible_len {
             self.visible_len = visible.len();
             None
@@ -322,9 +323,9 @@ fn prose_covers_findings(prose: &str, f: &PerceptionFindings) -> bool {
     if structured >= n {
         return true;
     }
-    f.findings.iter().all(|item| {
-        !item.issue.is_empty() && prose.contains(item.issue.as_str())
-    })
+    f.findings
+        .iter()
+        .all(|item| !item.issue.is_empty() && prose.contains(item.issue.as_str()))
 }
 
 fn format_severity(sev: &str) -> String {
@@ -499,11 +500,14 @@ F1 - 问题A
     fn stream_filter_flush_no_duplicate_appendix() {
         let mut f = FindingsStreamFilter::new();
         assert!(f.push("## 完成\n").unwrap().contains("完成"));
-        assert!(f
-            .push(r#"```json
+        assert!(
+            f.push(
+                r#"```json
 {"findings_summary":"s","findings":[{"index":1,"issue":"i","recommendation":"r"}]}
-```"#)
-            .is_none());
+```"#
+            )
+            .is_none()
+        );
         assert!(f.flush_tail().is_none());
     }
 
@@ -561,13 +565,17 @@ F1 - 问题A
     fn stream_filter_suppresses_bare_findings_json() {
         let mut f = FindingsStreamFilter::new();
         assert!(f.push("## 审查\n").unwrap().contains("审查"));
-        assert!(f
-            .push("\n{\n  \"findings_summary\": \"s\",\n  \"findings\": [\n")
-            .is_none());
-        assert!(f
-            .push(r#"{"index":1,"issue":"i","recommendation":"r"}]}
-"#)
-            .is_none());
+        assert!(
+            f.push("\n{\n  \"findings_summary\": \"s\",\n  \"findings\": [\n")
+                .is_none()
+        );
+        assert!(
+            f.push(
+                r#"{"index":1,"issue":"i","recommendation":"r"}]}
+"#
+            )
+            .is_none()
+        );
         let tail = f.flush_tail();
         assert!(
             tail.is_none() || !tail.unwrap().contains("\"findings\""),
@@ -606,6 +614,7 @@ F1 - 问题A
                 target: "A".into(),
                 issue: "bug".into(),
                 recommendation: "fix".into(),
+                fix_plan: String::new(),
             }],
         };
         let t = to_plan_tracker(&f);

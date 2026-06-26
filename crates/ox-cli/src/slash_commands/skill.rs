@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-use crate::terminal::app::App as AppState;
-use ox_core::runtime::RuntimeEnvironment;
 use crate::slash_commands::CommandMeta;
+use crate::terminal::app::App as AppState;
 use ox_core::message::Session;
+use ox_core::runtime::RuntimeEnvironment;
+use std::path::PathBuf;
 
 /// /skill 命令元数据
 pub const SKILL_COMMAND: CommandMeta = CommandMeta {
@@ -23,12 +23,12 @@ pub fn handle_skill_command(
     _trust_manager: &std::sync::Arc<std::sync::Mutex<ox_core::safety::TrustManager>>,
 ) -> crate::slash_commands::CommandResult {
     let parts: Vec<&str> = args.split_whitespace().collect();
-    
+
     if parts.is_empty() {
         show_skill_help(app);
         return crate::slash_commands::CommandResult::Success;
     }
-    
+
     match parts[0] {
         "list" => {
             handle_skill_list(app, rt_env);
@@ -44,12 +44,16 @@ pub fn handle_skill_command(
         }
         "create" => {
             if parts.len() < 2 {
-                app.output.push_system("Usage: /skill create <id> [description]");
+                app.output
+                    .push_system("Usage: /skill create <id> [description]");
             } else {
                 let id = parts[1];
                 let desc = if parts.len() > 2 {
                     // 使用安全的字符边界检查
-                    parts.get(2..).map(|p| p.join(" ")).unwrap_or_else(|| "Custom skill".to_string())
+                    parts
+                        .get(2..)
+                        .map(|p| p.join(" "))
+                        .unwrap_or_else(|| "Custom skill".to_string())
                 } else {
                     "Custom skill".to_string()
                 };
@@ -59,8 +63,10 @@ pub fn handle_skill_command(
         }
         "create-llm" => {
             if parts.len() < 2 {
-                app.output.push_system("Usage: /skill create-llm <description>");
-                app.output.push_system("Example: /skill create-llm Rust error handling best practices");
+                app.output
+                    .push_system("Usage: /skill create-llm <description>");
+                app.output
+                    .push_system("Example: /skill create-llm Rust error handling best practices");
                 crate::slash_commands::CommandResult::Success
             } else {
                 let desc = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
@@ -100,32 +106,33 @@ fn show_skill_help(app: &mut AppState) {
          /skill create rust-error-handling \"Best practices for error handling\"\n\
          /skill create-llm Rust async patterns\n\
          /skill reflect\n\
-         /skill show think-before-coding"
+         /skill show think-before-coding",
     );
 }
 
 /// 列出所有 Skills
 fn handle_skill_list(app: &mut AppState, rt_env: &RuntimeEnvironment) {
     use ox_core::skill::SkillLoader;
-    
+
     let loader = SkillLoader::new(
         rt_env.ox_home_dir.join("skills"),
-        rt_env.working_dir.join(".ox").join("skills")
+        rt_env.working_dir.join(".ox").join("skills"),
     );
-    
+
     match loader.load_enabled_skills() {
         Ok(skills) => {
             if skills.is_empty() {
                 app.output.push_system("No skills available.");
                 return;
             }
-            
+
             let skills = loader.load_enabled_skills().unwrap_or_default();
-            let summary = skills.iter()
+            let summary = skills
+                .iter()
                 .map(|s| format!("  - {} [{}] - {}", s.id, s.scope, s.description))
                 .collect::<Vec<_>>()
                 .join("\n");
-            
+
             app.output.push_system(&format!(
                 "📚 Available Skills ({} total):\n\n{}",
                 skills.len(),
@@ -133,7 +140,8 @@ fn handle_skill_list(app: &mut AppState, rt_env: &RuntimeEnvironment) {
             ));
         }
         Err(e) => {
-            app.output.push_system(&format!("❌ Failed to load skills: {}", e));
+            app.output
+                .push_system(&format!("❌ Failed to load skills: {}", e));
         }
     }
 }
@@ -141,13 +149,15 @@ fn handle_skill_list(app: &mut AppState, rt_env: &RuntimeEnvironment) {
 /// 显示 Skill 详情
 fn handle_skill_show(app: &mut AppState, id: &str, rt_env: &RuntimeEnvironment) {
     let skill_path = find_skill_file(id, rt_env);
-    
+
     match skill_path.and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(content) => {
-            app.output.push_system(&format!("📄 Skill: {}\n\n{}", id, content));
+            app.output
+                .push_system(&format!("📄 Skill: {}\n\n{}", id, content));
         }
         None => {
-            app.output.push_system(&format!("❌ Skill not found: {}", id));
+            app.output
+                .push_system(&format!("❌ Skill not found: {}", id));
         }
     }
 }
@@ -155,15 +165,16 @@ fn handle_skill_show(app: &mut AppState, id: &str, rt_env: &RuntimeEnvironment) 
 /// 创建 Skill 模板
 fn handle_skill_create(app: &mut AppState, id: &str, desc: &str, rt_env: &mut RuntimeEnvironment) {
     let skills_dir = rt_env.working_dir.join(".ox").join("skills");
-    
+
     // 创建目录
     if let Err(e) = std::fs::create_dir_all(&skills_dir) {
-        app.output.push_system(&format!("❌ Failed to create skills directory: {}", e));
+        app.output
+            .push_system(&format!("❌ Failed to create skills directory: {}", e));
         return;
     }
-    
+
     let skill_path = skills_dir.join(format!("{}.md", id));
-    
+
     // 检查是否已存在
     if skill_path.exists() {
         app.output.push_system(&format!(
@@ -177,7 +188,7 @@ fn handle_skill_create(app: &mut AppState, id: &str, desc: &str, rt_env: &mut Ru
         ));
         return;
     }
-    
+
     // 生成模板
     let name = id.replace('-', " ");
     let template = format!(
@@ -198,9 +209,14 @@ fn handle_skill_create(app: &mut AppState, id: &str, desc: &str, rt_env: &mut Ru
          ```\n",
         id,
         desc,
-        name.chars().next().unwrap_or(' ').to_uppercase().collect::<String>() + name.get(1..).unwrap_or("")
+        name.chars()
+            .next()
+            .unwrap_or(' ')
+            .to_uppercase()
+            .collect::<String>()
+            + name.get(1..).unwrap_or("")
     );
-    
+
     // 保存文件
     match std::fs::write(&skill_path, &template) {
         Ok(_) => {
@@ -211,7 +227,8 @@ fn handle_skill_create(app: &mut AppState, id: &str, desc: &str, rt_env: &mut Ru
             ));
         }
         Err(e) => {
-            app.output.push_system(&format!("❌ Failed to create Skill: {}", e));
+            app.output
+                .push_system(&format!("❌ Failed to create Skill: {}", e));
         }
     }
 }
@@ -219,34 +236,43 @@ fn handle_skill_create(app: &mut AppState, id: &str, desc: &str, rt_env: &mut Ru
 /// 删除 Skill
 fn handle_skill_delete(app: &mut AppState, id: &str, rt_env: &RuntimeEnvironment) {
     let skill_path = find_skill_file(id, rt_env);
-    
+
     match skill_path {
         Some(path) => {
             if let Err(e) = std::fs::remove_file(&path) {
-                app.output.push_system(&format!("❌ Failed to delete: {}", e));
+                app.output
+                    .push_system(&format!("❌ Failed to delete: {}", e));
             } else {
-                app.output.push_system(&format!("🗑️ Deleted Skill: {}\n\nNote: Skills will be reloaded on next agent run.", id));
+                app.output.push_system(&format!(
+                    "🗑️ Deleted Skill: {}\n\nNote: Skills will be reloaded on next agent run.",
+                    id
+                ));
             }
         }
         None => {
-            app.output.push_system(&format!("❌ Skill not found: {}", id));
+            app.output
+                .push_system(&format!("❌ Skill not found: {}", id));
         }
     }
 }
 
 /// 使用 LLM 辅助创建 Skill
-fn handle_skill_create_llm(app: &mut AppState, description: &str, _rt_env: &RuntimeEnvironment) -> crate::slash_commands::CommandResult {
+fn handle_skill_create_llm(
+    app: &mut AppState,
+    description: &str,
+    _rt_env: &RuntimeEnvironment,
+) -> crate::slash_commands::CommandResult {
     use ox_core::context::SKILL_CREATION_PROMPT;
-    
+
     // 构建 prompt
     let prompt = SKILL_CREATION_PROMPT.replace("{task_description}", description);
-    
+
     // 显示提示信息
     app.output.push_system(&format!(
         "🤖 Generating Skill for: {}\n\nPlease wait for LLM to generate content...",
         description
     ));
-    
+
     // 返回 LLM 请求，由主流程处理
     crate::slash_commands::CommandResult::LlmRequest {
         prompt,
@@ -258,32 +284,33 @@ fn handle_skill_create_llm(app: &mut AppState, description: &str, _rt_env: &Runt
 /// 反思最近的任务并创建 Skill
 fn handle_skill_reflect(app: &mut AppState, _rt_env: &RuntimeEnvironment) {
     use ox_core::context::SKILL_CREATION_PROMPT;
-    
-    app.output.push_system("🤔 Analyzing conversation context for reusable patterns...");
-    
+
+    app.output
+        .push_system("🤔 Analyzing conversation context for reusable patterns...");
+
     // TODO: 完整的 LLM 集成逻辑
-    // 
+    //
     // 设计原则：让 LLM 自主决定需要什么上下文
-    // 
+    //
     // 方案 A: 提供 session 历史，让 LLM 自己分析
     //   - 优点：简单直接
     //   - 缺点：可能 token 过多
-    // 
+    //
     // 方案 B: 先调用 memory_search 获取相关记忆，再让 LLM 总结
     //   - 优点：更精准，token 更少
     //   - 缺点：需要额外调用
-    // 
+    //
     // 推荐：方案 A（简单优先），如果 token 超限再考虑方案 B
-    
+
     let task_description = "Review the conversation context and identify any reusable patterns, best practices, or lessons learned that could be valuable as a Skill. Focus on what worked well and could help in future similar tasks.";
-    
+
     let prompt = SKILL_CREATION_PROMPT.replace("{task_description}", task_description);
-    
+
     // 4. 调用 LLM (需要访问 llm_provider 和 session)
     // 5. 解析返回的 Markdown 内容
     // 6. 提取 Skill ID、name、description
     // 7. 保存到 .ox/skills/
-    
+
     app.output.push_system(&format!(
         "⚠️ Reflection logic pending full implementation.\n\
          Prompt template ready (first 5 lines):\n\
@@ -296,20 +323,22 @@ fn handle_skill_reflect(app: &mut AppState, _rt_env: &RuntimeEnvironment) {
 /// 查找 Skill 文件（优先项目级，其次全局级）
 fn find_skill_file(id: &str, rt_env: &RuntimeEnvironment) -> Option<PathBuf> {
     let filename = format!("{}.md", id);
-    
+
     // 先查项目级
-    let project_path = rt_env.working_dir.join(".ox").join("skills").join(&filename);
+    let project_path = rt_env
+        .working_dir
+        .join(".ox")
+        .join("skills")
+        .join(&filename);
     if project_path.exists() {
         return Some(project_path);
     }
-    
+
     // 再查全局级
     let global_path = rt_env.ox_home_dir.join("skills").join(&filename);
     if global_path.exists() {
         return Some(global_path);
     }
-    
+
     None
 }
-
-

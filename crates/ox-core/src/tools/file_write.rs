@@ -1,9 +1,9 @@
+use super::{SafetyLevel, Tool, ToolContext, ToolOutput, content_validation};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use super::{SafetyLevel, Tool, ToolContext, ToolOutput, content_validation};
 
 pub struct FileWriteTool;
 
@@ -52,9 +52,11 @@ impl Tool for FileWriteTool {
         // ── Resolve path (path-only) ──
         let path_str = match args.get("path").and_then(|p| p.as_str()) {
             Some(p) if !p.is_empty() => p.trim().replace('\\', "/"),
-            _ => return ToolOutput::error(
-                "❌ Missing or empty 'path' parameter.\nUsage: {\"path\": \"src/output.rs\", \"content\": \"...\"}",
-            ),
+            _ => {
+                return ToolOutput::error(
+                    "❌ Missing or empty 'path' parameter.\nUsage: {\"path\": \"src/output.rs\", \"content\": \"...\"}",
+                );
+            }
         };
         let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
             std::path::PathBuf::from(&path_str)
@@ -76,12 +78,12 @@ impl Tool for FileWriteTool {
 
         // Validate path for platform-specific invalid characters
         let path_str = path.to_string_lossy();
-        
+
         // 🚨 WORKFLOW VALIDATION: Check if file is being created in correct location during Spec Mode
         // When in workflow mode, files should be in .ox/{requirement_name}/ not directly in .ox/
         let relative_path = path.strip_prefix(&ctx.working_dir).unwrap_or(&path);
         let rel_str = relative_path.to_string_lossy().into_owned();
-        
+
         // Check if file is being written directly to .ox/ without subdirectory
         // Pattern: ".ox/something.md" (wrong) vs ".ox/name/something.md" (correct)
         if rel_str.starts_with(".ox/") {
@@ -94,7 +96,7 @@ impl Tool for FileWriteTool {
                 );
             }
         }
-        
+
         if cfg!(windows) {
             // Strip Windows UNC prefix if present (\\?\ or \\?\UNC\)
             let clean_path = if path_str.starts_with("\\\\?\\") {
@@ -165,17 +167,16 @@ impl Tool for FileWriteTool {
         }
 
         // Get encoding parameter
-        let encoding = args
-            .get("encoding")
-            .and_then(|e| e.as_str())
-            .map(|e| match e.to_lowercase().as_str() {
+        let encoding = args.get("encoding").and_then(|e| e.as_str()).map(|e| {
+            match e.to_lowercase().as_str() {
                 "gbk" | "gb2312" => encoding_rs::GBK,
                 "gb18030" => encoding_rs::GB18030,
                 "utf-16le" => encoding_rs::UTF_16LE,
                 "utf-16be" => encoding_rs::UTF_16BE,
                 "latin1" | "iso-8859-1" => encoding_rs::WINDOWS_1252,
                 _ => encoding_rs::UTF_8,
-            });
+            }
+        });
 
         // ── Skill dedup: .ox/skills/*.md ──
         let mut path = path;
@@ -211,8 +212,7 @@ impl Tool for FileWriteTool {
                     }
                 }
                 crate::skill::dedup::SkillWritePlan::MergeIntoExisting {
-                    merged_markdown,
-                    ..
+                    merged_markdown, ..
                 } => {
                     content = merged_markdown;
                     skill_write_notice =
@@ -269,12 +269,15 @@ impl Tool for FileWriteTool {
         }
 
         // Report progress before blocking I/O
-        tracing::info!("[FILE_WRITE] Starting write operation for: {:?}", display_path);
+        tracing::info!(
+            "[FILE_WRITE] Starting write operation for: {:?}",
+            display_path
+        );
         ctx.report_progress("Starting file write...".to_string(), Some(10));
 
         // Write file with automatic strategy selection
         let temp_path = create_temp_path(&path);
-        
+
         // Run blocking file I/O on a dedicated thread to avoid blocking the Tokio runtime.
         let path_clone = path.clone();
         let display_path_clone = display_path.clone();
@@ -282,19 +285,31 @@ impl Tool for FileWriteTool {
         let is_large_file_clone = is_large_file;
         let chunk_size = CHUNK_SIZE;
         let temp_path_clone = temp_path.clone();
-        
-        tracing::info!("[FILE_WRITE] Spawning blocking task for: {:?}", display_path_clone);
+
+        tracing::info!(
+            "[FILE_WRITE] Spawning blocking task for: {:?}",
+            display_path_clone
+        );
         let result = tokio::task::spawn_blocking(move || {
-            tracing::info!("[FILE_WRITE] Blocking task started, writing file: {:?}", path_clone);
-            
+            tracing::info!(
+                "[FILE_WRITE] Blocking task started, writing file: {:?}",
+                path_clone
+            );
+
             // Execute the write operation (blocking I/O)
             if is_large_file_clone {
-                chunked_write_sync(&temp_path_clone, &path_clone, &content_bytes_clone, chunk_size)
+                chunked_write_sync(
+                    &temp_path_clone,
+                    &path_clone,
+                    &content_bytes_clone,
+                    chunk_size,
+                )
             } else {
                 atomic_write_sync(&temp_path_clone, &path_clone, &content_bytes_clone)
             }
-        }).await;
-        
+        })
+        .await;
+
         // Handle spawn_blocking result
         let final_result = match result {
             Ok(Ok(bytes)) => Ok(bytes),
@@ -313,7 +328,7 @@ impl Tool for FileWriteTool {
                 } else {
                     String::new()
                 };
-                
+
                 let encoding_name = match encoding {
                     Some(enc) => enc.name(),
                     None => "UTF-8",
@@ -321,9 +336,12 @@ impl Tool for FileWriteTool {
 
                 // ── AST syntax check: parse the written file and warn on errors ──
                 let ast_warning = {
-                    let knowledge = Arc::clone(&ctx.knowledge);
+                    let knowledge = ctx.knowledge.clone();
                     let check_path = display_path.clone();
                     tokio::spawn(async move {
+                        let Some(ref knowledge) = knowledge else {
+                            return None;
+                        };
                         let mut engine = match knowledge.try_write() {
                             Ok(e) => e,
                             Err(_) => return None,
@@ -334,11 +352,15 @@ impl Tool for FileWriteTool {
                         } else {
                             None
                         }
-                    }).await
+                    })
+                    .await
                 };
                 let ast_warning = match ast_warning {
                     Ok(Some(errors)) => {
-                        let mut warn = format!("\n\n⚠️ AST Syntax Check: {} issue(s) detected:", errors.len());
+                        let mut warn = format!(
+                            "\n\n⚠️ AST Syntax Check: {} issue(s) detected:",
+                            errors.len()
+                        );
                         for (i, err) in errors.iter().take(5).enumerate() {
                             warn.push_str(&format!("\n   {}. {}", i + 1, err.description));
                         }
@@ -438,8 +460,8 @@ fn chunked_write_sync(
     chunk_size: usize,
 ) -> Result<usize, String> {
     let total_bytes = content.len();
-    let mut file = fs::File::create(temp_path)
-        .map_err(|e| format!("Cannot create temporary file: {}", e))?;
+    let mut file =
+        fs::File::create(temp_path).map_err(|e| format!("Cannot create temporary file: {}", e))?;
 
     let mut offset = 0;
     while offset < total_bytes {
@@ -456,9 +478,7 @@ fn chunked_write_sync(
         .map_err(|e| format!("Failed to sync to disk: {}", e))?;
     drop(file);
 
-    fs::rename(temp_path, target)
-        .map_err(|e| format!("Failed to finalize file: {}", e))?;
+    fs::rename(temp_path, target).map_err(|e| format!("Failed to finalize file: {}", e))?;
 
     Ok(total_bytes)
 }
-

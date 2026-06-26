@@ -80,6 +80,10 @@ pub struct Finding {
     pub issue: String,
     #[serde(default)]
     pub recommendation: String,
+    /// Concrete fix: which lines, how to change them, code sketch. Captured during
+    /// review so the Implement phase inherits the plan instead of re-analyzing.
+    #[serde(default)]
+    pub fix_plan: String,
     #[serde(default)]
     pub status: FindingStatus,
     #[serde(default)]
@@ -102,11 +106,7 @@ pub struct FindingsStore {
 
 impl FindingsStore {
     pub fn from_perception(p: &PerceptionFindings) -> Self {
-        let findings = p
-            .findings
-            .iter()
-            .map(finding_from_item)
-            .collect();
+        let findings = p.findings.iter().map(finding_from_item).collect();
         Self {
             summary: p.findings_summary.clone(),
             findings,
@@ -221,10 +221,19 @@ impl FindingsStore {
                 file: f.file.clone(),
                 action: "edit".to_string(),
                 target: f.symbol.clone(),
-                desc: if f.recommendation.is_empty() {
-                    f.issue.clone()
-                } else {
-                    format!("{} → {}", f.issue, f.recommendation)
+                desc: {
+                    let base = if f.recommendation.is_empty() {
+                        f.issue.clone()
+                    } else {
+                        format!("{} → {}", f.issue, f.recommendation)
+                    };
+                    // Carry the concrete fix plan into the step so the Implement
+                    // phase can edit directly instead of re-analyzing the code.
+                    if f.fix_plan.trim().is_empty() {
+                        base
+                    } else {
+                        format!("{base}\n方案: {}", f.fix_plan)
+                    }
                 },
                 verify: String::new(),
                 status: match f.status {
@@ -380,13 +389,16 @@ pub fn synthesize_from_review_prose(report: &str) -> Option<FindingsStore> {
 
 /// Ensure findings exist after review output — JSON preferred, prose fallback.
 pub fn ensure_from_review_output(engine: &WorkflowEngine, output: &str) {
+    // Try structured JSON first — always apply if found (even if findings already exist).
     if let Some(p) = perception::extract_from_text(output) {
         perception::save(engine, &p);
         sync_from_perception(engine, &p);
         return;
     }
+    // Try prose synthesis — only if no findings exist yet.
+    // (We already tried JSON above, so this is a last-resort fallback.)
     if load(engine).is_some_and(|s| !s.findings.is_empty()) {
-        return;
+        return; // Keep existing findings if LLM didn't provide structured JSON
     }
     if let Some(store) = synthesize_from_review_prose(output) {
         save(engine, &store);
@@ -412,6 +424,7 @@ fn finding_from_plan_step(s: &PlanStep) -> Finding {
         symbol: s.target.clone(),
         issue: s.desc.clone(),
         recommendation: String::new(),
+        fix_plan: String::new(),
         status: FindingStatus::Open,
         user_notes: Vec::new(),
         dispute: None,
@@ -450,6 +463,7 @@ fn finding_from_item(item: &FindingItem) -> Finding {
         symbol: item.target.clone(),
         issue: item.issue.clone(),
         recommendation: item.recommendation.clone(),
+        fix_plan: item.fix_plan.clone(),
         status: FindingStatus::Open,
         user_notes: Vec::new(),
         dispute: None,
@@ -473,6 +487,7 @@ mod tests {
                     symbol: String::new(),
                     issue: "i1".into(),
                     recommendation: String::new(),
+                    fix_plan: String::new(),
                     status: FindingStatus::Open,
                     user_notes: vec![],
                     dispute: None,
@@ -485,6 +500,7 @@ mod tests {
                     symbol: String::new(),
                     issue: "i2".into(),
                     recommendation: String::new(),
+                    fix_plan: String::new(),
                     status: FindingStatus::Open,
                     user_notes: vec![],
                     dispute: None,
@@ -516,6 +532,7 @@ mod tests {
                 symbol: String::new(),
                 issue: "x".into(),
                 recommendation: String::new(),
+                fix_plan: String::new(),
                 status: FindingStatus::Scoped,
                 user_notes: vec![],
                 dispute: None,

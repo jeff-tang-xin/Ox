@@ -50,7 +50,10 @@ impl Tool for WebFetchTool {
                 );
             }
         };
-        let max_chars = args.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(10000) as usize;
+        let max_chars = args
+            .get("max_chars")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10000) as usize;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))

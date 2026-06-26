@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 const MAX_ENTRIES: usize = 80;
+const MAX_DECISIONS: usize = 24;
 const MAX_SUMMARY_CHARS: usize = 6_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +17,8 @@ pub struct TurnMemoryEntry {
 pub struct TurnMemory {
     pub user_task: String,
     pub entries: Vec<TurnMemoryEntry>,
+    #[serde(default)]
+    pub decisions: Vec<String>,
     pub iterations: u32,
 }
 
@@ -24,15 +27,23 @@ impl TurnMemory {
         Self {
             user_task: user_task.into(),
             entries: Vec::new(),
+            decisions: Vec::new(),
             iterations: 0,
-            }
+        }
     }
 
     pub fn record(&mut self, tool: &str, target: &str, outcome: &str) {
         let key = format!("{}:{}", tool, target);
-        if let Some(existing) = self.entries.iter_mut().find(|e| {
-            format!("{}:{}", e.tool, e.target) == key
-        }) {
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|e| format!("{}:{}", e.tool, e.target) == key)
+        {
+            // Do not let coarse progress reconstruction ("ok") erase a richer
+            // result excerpt captured from the actual ToolResult.
+            if outcome == "ok" && existing.outcome.starts_with("ok — ") {
+                return;
+            }
             existing.outcome = outcome.to_string();
             return;
         }
@@ -66,23 +77,41 @@ impl TurnMemory {
         if !ok {
             return "error".to_string();
         }
-        if matches!(tool, "shell_exec" | "git_status" | "git_diff") {
-            if let Some(raw) = result_content {
+        if let Some(raw) = result_content {
+            if matches!(
+                tool,
+                "file_read"
+                    | "find_symbol"
+                    | "code_search"
+                    | "file_search"
+                    | "code_graph"
+                    | "shell_exec"
+                    | "git_status"
+                    | "git_diff"
+            ) {
                 let content = crate::agent::exploration_snapshot::extract_data_content(raw);
-                let excerpt: String = content.chars().take(160).collect();
-                if excerpt.is_empty() {
-                    "ok".to_string()
-                } else {
-                    format!("ok — {excerpt}")
+                let excerpt = compact_result_excerpt(&content, 360);
+                if !excerpt.is_empty() {
+                    return format!("ok — {excerpt}");
                 }
-            } else {
-                "ok".to_string()
             }
-        } else {
-            "ok".to_string()
         }
+        "ok".to_string()
     }
 
+    pub fn record_decision(&mut self, note: impl AsRef<str>) {
+        let note = compact_result_excerpt(note.as_ref(), 420);
+        if note.trim().is_empty() {
+            return;
+        }
+        if self.decisions.last().is_some_and(|last| last == &note) {
+            return;
+        }
+        if self.decisions.len() >= MAX_DECISIONS {
+            self.decisions.remove(0);
+        }
+        self.decisions.push(note);
+    }
     pub fn merge_from(&mut self, other: TurnMemory) {
         if self.user_task.is_empty() && !other.user_task.is_empty() {
             self.user_task = other.user_task;
@@ -90,6 +119,9 @@ impl TurnMemory {
         self.iterations = self.iterations.max(other.iterations);
         for e in other.entries {
             self.record(&e.tool, &e.target, &e.outcome);
+        }
+        for d in other.decisions {
+            self.record_decision(d);
         }
     }
 
@@ -100,6 +132,14 @@ impl TurnMemory {
         })
     }
 
+    /// Unique tool names used this turn (for round memory checkpoint).
+    pub fn tool_names_summary(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.entries.iter().map(|e| e.tool.clone()).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn bump_iteration(&mut self) {
         self.iterations += 1;
     }
@@ -107,15 +147,19 @@ impl TurnMemory {
     pub fn format_injection_slim(&self, iteration: u32) -> String {
         let mut out = format!(
             "[TURN_MEMORY — IMPLEMENT]\n\
-             iteration {} | 工具 {} 次",
+             这是你在当前用户请求中的连续工作记忆，不是新任务，也不是外部建议。\n\
+             iteration {} | 你已执行工具 {} 次",
             iteration + 1,
             self.entries.len()
         );
         for e in self.entries.iter().rev().take(8).rev() {
-            out.push_str(&format!(
-                "\n  • {}({}) → {}",
-                e.tool, e.target, e.outcome
-            ));
+            out.push_str(&format!("\n  • {}({}) → {}", e.tool, e.target, e.outcome));
+        }
+        if !self.decisions.is_empty() {
+            out.push_str("\n你刚才形成的判断（非原始 think 摘要）:");
+            for d in self.decisions.iter().rev().take(4).rev() {
+                out.push_str(&format!("\n  - {d}"));
+            }
         }
         out
     }
@@ -134,7 +178,7 @@ impl TurnMemory {
         if self.entries.is_empty() {
             out.push_str("\n（本轮尚无工具记录）");
         } else {
-            out.push_str("\n【本轮已执行 — 勿重复】");
+            out.push_str("\n【你在本轮已经执行过 — 勿重复】");
             for e in &self.entries {
                 let icon = if e.outcome == "ok" { "✅" } else { "⚠️" };
                 out.push_str(&format!(
@@ -143,7 +187,13 @@ impl TurnMemory {
                 ));
             }
         }
-        out.push_str("\n基于以上**本轮**记录继续；历史对话/知识库中的任务勿重复执行。");
+        if !self.decisions.is_empty() {
+            out.push_str("\n【你在本轮已经形成的判断 — 用于承接上下文，非原始 think】");
+            for d in self.decisions.iter().rev().take(8).rev() {
+                out.push_str(&format!("\n  - {d}"));
+            }
+        }
+        out.push_str("\n基于以上你自己在**本轮**已经完成的动作和判断继续；不要把它当成外部建议，也不要重复执行。");
         if out.len() > MAX_SUMMARY_CHARS {
             out.chars().take(MAX_SUMMARY_CHARS).collect()
         } else {
@@ -152,8 +202,13 @@ impl TurnMemory {
     }
 
     /// Rebuild entries from message history (fixes amnesia when compaction drops tool results).
-    pub fn sync_from_messages(&mut self, messages: &[crate::message::Message], include_writes: bool) {
-        let progress = crate::agent::context_injector::build_tool_progress(messages, include_writes);
+    pub fn sync_from_messages(
+        &mut self,
+        messages: &[crate::message::Message],
+        include_writes: bool,
+    ) {
+        let progress =
+            crate::agent::context_injector::build_tool_progress(messages, include_writes);
         for line in progress.lines() {
             let line = line.trim();
             if let Some((tool, target, ok)) = parse_progress_line(line) {
@@ -163,13 +218,35 @@ impl TurnMemory {
     }
 }
 
+fn compact_result_excerpt(content: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("──") {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(" | ");
+        }
+        out.push_str(trimmed);
+        if out.chars().count() >= max_chars {
+            break;
+        }
+    }
+    if out.chars().count() > max_chars {
+        let mut clipped: String = out.chars().take(max_chars).collect();
+        clipped.push('…');
+        clipped
+    } else {
+        out
+    }
+}
 fn parse_progress_line(line: &str) -> Option<(String, String, bool)> {
     if let Some(outcome) = line.strip_prefix("project_detect → ") {
-        return Some((
-            "project_detect".into(),
-            "-".into(),
-            outcome == "成功",
-        ));
+        return Some(("project_detect".into(), "-".into(), outcome == "成功"));
     }
     for tool in [
         "file_list",
@@ -182,11 +259,7 @@ fn parse_progress_line(line: &str) -> Option<(String, String, bool)> {
         let prefix = format!("{tool}(");
         if let Some(rest) = line.strip_prefix(&prefix) {
             if let Some((target, outcome)) = rest.split_once(") → ") {
-                return Some((
-                    tool.to_string(),
-                    target.to_string(),
-                    outcome == "成功",
-                ));
+                return Some((tool.to_string(), target.to_string(), outcome == "成功"));
             }
         }
     }
@@ -233,7 +306,10 @@ pub fn compact_turn_messages(messages: &mut Vec<crate::message::Message>, keep_t
 
     // Ensure tail starts with a valid assistant+tool pair boundary
     while !tail.is_empty() {
-        if matches!(tail.first(), Some(crate::message::Message::ToolResult { .. })) {
+        if matches!(
+            tail.first(),
+            Some(crate::message::Message::ToolResult { .. })
+        ) {
             tail.remove(0);
         } else {
             break;
@@ -277,6 +353,24 @@ mod tests {
     }
 
     #[test]
+    fn decision_memory_records_and_injects() {
+        let mut tm = TurnMemory::new("fix bug");
+        tm.record_decision("选择动作: file_read; 可见依据: 需要确认调用关系");
+        tm.record_decision("工具观察: file_read(a.rs) 成功; 关键结果: fn handle");
+        let injected = tm.format_injection(0);
+        assert!(injected.contains("你在本轮已经形成的判断"));
+        assert!(injected.contains("file_read"));
+    }
+
+    #[test]
+    fn legacy_turn_memory_json_defaults_decisions() {
+        let legacy = r#"{"user_task":"fix bug","entries":[],"iterations":2}"#;
+        let tm = turn_memory_from_json(legacy).expect("legacy turn memory should load");
+        assert!(tm.decisions.is_empty());
+        assert_eq!(tm.iterations, 2);
+    }
+
+    #[test]
     fn compact_preserves_tail() {
         let mut msgs = vec![Message::system("sys")];
         for i in 0..30 {
@@ -289,6 +383,9 @@ mod tests {
         }
         compact_turn_messages(&mut msgs, 8);
         assert!(msgs.len() < 30);
-        assert!(msgs.iter().any(|m| matches!(m, Message::System { content } if content.contains("COMPACTED"))));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, Message::System { content } if content.contains("COMPACTED")))
+        );
     }
 }

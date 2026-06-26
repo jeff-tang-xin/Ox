@@ -1,8 +1,6 @@
 //! Skill deduplication — canonical names, alias redirect, merge-on-update.
 
-use super::policy::{
-    PROJECT_ARCHITECTURE_LEGACY, PROJECT_BUSINESS, PROJECT_CONVENTIONS,
-};
+use super::policy::{PROJECT_ARCHITECTURE_LEGACY, PROJECT_BUSINESS, PROJECT_CONVENTIONS};
 use std::path::{Path, PathBuf};
 
 /// Max recommended project extension skills (excluding mandatory two + legacy).
@@ -42,9 +40,7 @@ pub enum SkillWritePlan {
         merged_markdown: String,
     },
     /// Block — use edit_file or explicit merge.
-    RejectDuplicate {
-        message: String,
-    },
+    RejectDuplicate { message: String },
 }
 
 /// Parse `.ox/skills/{id}.md` from a relative path; None if not a project skill path.
@@ -54,9 +50,7 @@ pub fn parse_project_skill_rel_path(rel: &str) -> Option<String> {
     if !rel.starts_with(".ox/skills/") || !rel.ends_with(".md") {
         return None;
     }
-    let id = rel
-        .strip_prefix(".ox/skills/")?
-        .strip_suffix(".md")?;
+    let id = rel.strip_prefix(".ox/skills/")?.strip_suffix(".md")?;
     if id.is_empty() || id.contains('/') {
         return None;
     }
@@ -200,9 +194,7 @@ pub fn merge_skill_markdown(existing: &str, incoming: &str) -> String {
     let (_, incoming_body) = split_frontmatter(incoming);
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let header = meta.unwrap_or_else(|| {
-        format!(
-            "---\nname: merged-skill\ndescription: merged\nscope: project\n---"
-        )
+        format!("---\nname: merged-skill\ndescription: merged\nscope: project\n---")
     });
     format!(
         "{header}\n\n{}\n\n---\n## 更新 ({date})\n\n{}\n",
@@ -280,11 +272,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("ox_dedup_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join(".ox/skills")).unwrap();
-        fs::write(
-            tmp.join(".ox/skills/custom.md"),
-            "---\nname: c\n---\n\nold",
-        )
-        .unwrap();
+        fs::write(tmp.join(".ox/skills/custom.md"), "---\nname: c\n---\n\nold").unwrap();
         let plan = plan_skill_write(&tmp, "custom", "---\nname: c\n---\n\nnew", false, false);
         assert!(matches!(plan, SkillWritePlan::RejectDuplicate { .. }));
         let _ = fs::remove_dir_all(&tmp);

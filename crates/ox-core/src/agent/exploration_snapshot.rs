@@ -26,11 +26,11 @@ pub struct ExplorationEntry {
 }
 
 const MAX_ENTRIES: usize = 40;
-/// Below this size, keep the full payload inline (no disk ref).
-const INLINE_MAX_CHARS: usize = 6_000;
-/// Source files with at most this many lines stay inline even when char count exceeds INLINE_MAX_CHARS.
-const FULL_FILE_MAX_LINES: usize = 300;
-/// Default preview size for prompt injection.
+/// `file_read` results below 512KB stay inline (aligned with on-disk read gate).
+const FILE_READ_INLINE_MAX_CHARS: usize = crate::tools::file_read::INLINE_CONTENT_THRESHOLD;
+/// Other exploration tools: smaller inline budget.
+const DEFAULT_INLINE_MAX_CHARS: usize = 6_000;
+/// Default preview size for prompt injection when content is offloaded to disk.
 const PREVIEW_MAX_CHARS: usize = 3_500;
 /// Total prompt budget for the formatted snapshot block.
 const MAX_TOTAL_INJECT_CHARS: usize = 24_000;
@@ -90,12 +90,25 @@ pub fn extract_data_content(formatted: &str) -> String {
 
 /// Derive a stable target key from tool arguments (path, query, skill name, etc.).
 pub fn target_from_tool_args(tool: &str, arguments: &str) -> String {
+    if tool == crate::agent::unified_action::TOOL_NAME {
+        if let Ok(req) = crate::agent::unified_action::parse_request(arguments) {
+            if let Some(inner) = crate::agent::unified_action::action_to_tool_name(&req.action) {
+                return target_from_tool_args(inner, &req.params.to_string());
+            }
+            return req.action;
+        }
+        return "complete_and_check".into();
+    }
     let v = serde_json::from_str::<serde_json::Value>(arguments).ok();
     match tool {
         "file_list" | "file_read" | "file_write" | "edit_file" => {
             let path = v
                 .as_ref()
-                .and_then(|j| j.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                .and_then(|j| {
+                    j.get("path")
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_else(|| ".".into());
             if tool == "file_read" {
                 let offset = v
@@ -128,7 +141,11 @@ pub fn target_from_tool_args(tool: &str, arguments: &str) -> String {
             })
             .unwrap_or_default(),
         "load_skill" => v
-            .and_then(|j| j.get("name").and_then(|p| p.as_str()).map(|s| s.to_string()))
+            .and_then(|j| {
+                j.get("name")
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_default(),
         "shell_exec" => v
             .and_then(|j| {
@@ -145,8 +162,8 @@ pub fn target_from_tool_args(tool: &str, arguments: &str) -> String {
 
 fn inline_threshold(tool: &str) -> usize {
     match tool {
-        "file_read" => INLINE_MAX_CHARS,
-        "file_list" | "project_detect" | "load_skill" => INLINE_MAX_CHARS,
+        "file_read" => FILE_READ_INLINE_MAX_CHARS,
+        "file_list" | "project_detect" | "load_skill" => DEFAULT_INLINE_MAX_CHARS,
         "shell_exec" => 2_000,
         "file_write" | "edit_file" | "delete_range" => 1_500,
         _ => 8_000,
@@ -160,7 +177,10 @@ pub fn file_path_from_target(target: &str) -> &str {
 
 fn persisted_body(stored: &str) -> &str {
     const SEP: &str = "\n---\n\n";
-    stored.find(SEP).map(|i| &stored[i + SEP.len()..]).unwrap_or(stored)
+    stored
+        .find(SEP)
+        .map(|i| &stored[i + SEP.len()..])
+        .unwrap_or(stored)
 }
 
 /// Load full payload previously written under `.ox/exploration/`.
@@ -177,8 +197,7 @@ pub fn find_file_read_entry<'a>(
     let norm = crate::agent::plan_tracker::normalize_path(path);
     entries.iter().find(|e| {
         e.tool == "file_read"
-            && crate::agent::plan_tracker::normalize_path(file_path_from_target(&e.target))
-                == norm
+            && crate::agent::plan_tracker::normalize_path(file_path_from_target(&e.target)) == norm
     })
 }
 
@@ -237,10 +256,7 @@ pub fn resolve_file_read_cache(
             }
         }
         if e.full_chars <= e.content.chars().count().saturating_add(80) {
-            return format!(
-                "✅ 【缓存】`{path}` 已探索过\n\n{}",
-                e.content
-            );
+            return format!("✅ 【缓存】`{path}` 已探索过\n\n{}", e.content);
         }
         return format!(
             "✅ 【缓存预览】`{path}` 已探索过（中间行已省略）。请用 file_read 并指定 offset 续读，或读 `{}`\n\n{}",
@@ -252,14 +268,8 @@ pub fn resolve_file_read_cache(
     format!("✅ 【缓存】`{path}` 已探索过（无快照条目）")
 }
 
-fn should_preview_only(tool: &str, content: &str, threshold: usize) -> bool {
-    if content.chars().count() <= threshold {
-        return false;
-    }
-    if tool == "file_read" && content.lines().count() <= FULL_FILE_MAX_LINES {
-        return false;
-    }
-    true
+fn should_preview_only(_tool: &str, content: &str, threshold: usize) -> bool {
+    content.chars().count() > threshold
 }
 
 fn exploration_ref_path(working_dir: &Path, tool: &str, target: &str) -> PathBuf {
@@ -278,7 +288,10 @@ fn exploration_ref_path(working_dir: &Path, tool: &str, target: &str) -> PathBuf
     } else {
         format!("{tool}_{safe}")
     };
-    working_dir.join(".ox").join("exploration").join(format!("{name}.md"))
+    working_dir
+        .join(".ox")
+        .join("exploration")
+        .join(format!("{name}.md"))
 }
 
 fn persist_full_content(
@@ -320,7 +333,12 @@ pub fn build_preview(tool: &str, target: &str, content: &str, max_chars: usize) 
 fn head_tail_preview(content: &str, max_chars: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
-    let head: String = lines.iter().take(40).copied().collect::<Vec<_>>().join("\n");
+    let head: String = lines
+        .iter()
+        .take(40)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
     let tail: String = lines
         .iter()
         .rev()
@@ -342,14 +360,30 @@ fn build_code_preview(content: &str, path: &str, max_chars: usize) -> String {
     let total = lines.len();
     let is_code = crate::source_paths::is_source_code_path(path);
 
-    let mut parts = vec![format!("({total} lines, {} chars)", content.chars().count())];
+    let mut parts = vec![format!(
+        "({total} lines, {} chars)",
+        content.chars().count()
+    )];
 
     if is_code {
         let sig_prefixes = [
-            "pub fn ", "fn ", "pub async fn ", "async fn ",
-            "pub struct ", "struct ", "pub enum ", "enum ",
-            "pub trait ", "trait ", "impl ", "pub mod ", "mod ",
-            "pub type ", "type ", "pub const ", "const ",
+            "pub fn ",
+            "fn ",
+            "pub async fn ",
+            "async fn ",
+            "pub struct ",
+            "struct ",
+            "pub enum ",
+            "enum ",
+            "pub trait ",
+            "trait ",
+            "impl ",
+            "pub mod ",
+            "mod ",
+            "pub type ",
+            "type ",
+            "pub const ",
+            "const ",
         ];
         let mut sigs: Vec<String> = Vec::new();
         for line in &lines {
@@ -367,7 +401,12 @@ fn build_code_preview(content: &str, path: &str, max_chars: usize) -> String {
         }
     }
 
-    let head: String = lines.iter().take(35).copied().collect::<Vec<_>>().join("\n");
+    let head: String = lines
+        .iter()
+        .take(35)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
     parts.push("【文件开头】".into());
     parts.push(head);
     if total > 55 {
@@ -539,13 +578,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let body = format!("{}\n", "line\n".repeat(1500));
+        let body = format!("{}\n", "line\n".repeat(110_000)); // > 512KB
         let mut entries = Vec::new();
         merge_entry(&mut entries, &dir, "file_read", "src/big.rs", &body);
 
         assert_eq!(entries.len(), 1);
         assert!(entries[0].ref_path.is_some());
-        assert!(entries[0].full_chars > INLINE_MAX_CHARS);
+        assert!(entries[0].full_chars > FILE_READ_INLINE_MAX_CHARS);
         assert!(entries[0].content.contains("lines"));
 
         let rel = entries[0].ref_path.as_ref().unwrap();
@@ -599,16 +638,16 @@ mod tests {
     }
 
     #[test]
-    fn small_line_count_java_stays_inline() {
+    fn medium_java_file_stays_inline_under_512kb() {
         let dir = temp_dir().join(format!("ox_explore_java_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
         let body = (0..189)
-            .map(|i| format!("    line {i} content padding to exceed inline char threshold;"))
+            .map(|i| format!("    line {i} content padding to exceed old inline char threshold;"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(body.chars().count() > INLINE_MAX_CHARS);
+        assert!(body.chars().count() < FILE_READ_INLINE_MAX_CHARS);
         assert_eq!(body.lines().count(), 189);
 
         let mut entries = Vec::new();
@@ -643,12 +682,13 @@ mod tests {
         fs::write(&full_path, &body).unwrap();
 
         let mut entries = Vec::new();
+        let huge = "x".repeat(crate::tools::file_read::INLINE_CONTENT_THRESHOLD + 1);
         merge_entry(
             &mut entries,
             &dir,
             "file_read",
             "src/Middle.java@0+200",
-            &(body.repeat(200)), // force preview + ref
+            &huge,
         );
         assert!(entries[0].ref_path.is_some());
 

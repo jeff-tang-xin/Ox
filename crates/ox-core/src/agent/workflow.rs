@@ -105,37 +105,15 @@ impl Workflow {
 
 pub const DEFAULT_WORKFLOW_ID: &str = "single_step";
 
-/// Minimal step directive during Implement — full [`TASK_PROMPT`] is omitted; `[WORKSPACE]` is authority.
+/// Minimal step directive during task — `[TURN_CONTEXT]` is the authority.
 pub const IMPLEMENT_TURN_STEP_HINT: &str = "\
-【实施阶段 — 同一会话接续审查】\n\
-上方 findings / 工具 digest 仍有效。以 [WORKSPACE]「本轮唯一动作」为唯一依据；\n\
-禁止重出审查报告或 findings JSON；直接 file_read（如需）→ edit_file。";
+【执行阶段】\n\
+按 [TURN_CONTEXT]「下一步」逐项 file_read → edit_file → 验证。";
 
 const TASK_PROMPT: &str = "\
-【单步 Agent — 同一会话内完成审查→确认→实施】
-
-用户请求: {USER_REQUEST}
-用户补充: {USER_GUIDANCE}
-
-生命周期（**一条 ReAct 链路**，非两次独立对话）:
-1. **审查** — 探索 + 产出 prose 报告 + findings JSON + `## Done`
-2. **门禁** — findings 入库后暂停工具；用户在面板选范围并确认（或输入讨论）
-3. **实施** — 收到 [PHASE_SWITCH] 后按 findings 逐项 edit_file → 验证 → completion_receipt + `## Done`
-
-规则:
-1. 每次 LLM 调用前读 [WORKSPACE]「本轮唯一动作」— **只做这一件事**
-2. [WORKSPACE].禁止 里的工具/行为一律不可用
-3. 阶段切换看 [PHASE_SWITCH]；**上方审查 findings 在实施阶段仍然有效**，勿重出报告
-4. 门禁阶段（await_user）禁止一切工具 — 仅文字回应用户讨论
-
-findings JSON（审查 Done 时附在 prose 后，供机器解析）:
-```json
-{{\"findings_summary\":\"…\",\"findings\":[{{\"index\":1,\"severity\":\"high\",\"file\":\"路径\",\"target\":\"符号\",\"issue\":\"…\",\"recommendation\":\"…\"}}]}}
-```
-
-completion_receipt（修复 Done 时）:
-{COMPLETION_RECEIPT_SCHEMA}
-";
+【任务】\n\
+用户请求: {USER_REQUEST}{USER_GUIDANCE}\n\
+遵循 [TURN_CONTEXT]「下一步」。finish 含 finding_json → 门禁确认；finish 不含 → 结束等用户。不确定就探索。";
 
 /// Single-step agent workflow — no Intent/Plan/Review pipeline.
 pub fn create_default_workflow() -> Workflow {
@@ -143,14 +121,6 @@ pub fn create_default_workflow() -> Workflow {
     workflow.add_step(
         WorkflowStep::new("task", "Task", "Complete the user's request")
             .with_prompt(TASK_PROMPT)
-            // allowed_tools left empty → registry exposes all built-in tools (no whitelist filter)
-            .with_memory_layers(&[
-                "WorkingMemory",
-                "AtomicMemory",
-                "EpisodicMemory",
-                "SemanticMemory",
-                "CodeSymbol",
-            ])
             .with_display_status("⚡ Agent"),
     );
     workflow

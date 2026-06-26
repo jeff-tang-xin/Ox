@@ -27,10 +27,23 @@ pub enum LlmStreamEvent {
 }
 
 /// Per-request overrides for `stream_chat` (e.g. workflow Plan JSON step needs more headroom).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
     /// When set, overrides the provider config `max_tokens` for this call only.
     pub max_tokens: Option<u32>,
+    /// Force tool selection (OpenAI-compatible `tool_choice`).
+    pub tool_choice: Option<ToolChoice>,
+    /// When false, model may only emit one tool call per turn.
+    pub parallel_tool_calls: Option<bool>,
+}
+
+/// OpenAI-compatible tool_choice values.
+#[derive(Debug, Clone)]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Function(String),
 }
 
 /// Trait for LLM providers (OpenAI, Anthropic, etc.).
@@ -218,6 +231,8 @@ pub fn create_provider_with_info(
             api_key,
             base_url,
             provider_cfg.max_tokens,
+            provider_cfg.temperature,
+            provider_cfg.top_p,
             disable_tools,
         )),
     };

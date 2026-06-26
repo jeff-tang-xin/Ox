@@ -1,3 +1,4 @@
+use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 /// load_skill — LLM-callable tool to load the FULL content of a skill on demand.
 ///
 /// At startup, only skill manifest (name + short description) is injected into
@@ -6,19 +7,21 @@
 ///
 /// The full content is then injected as `<ACTIVE_SKILL_MANUAL>` in the next
 /// system message by the agent loop, and removed after the task completes.
-
 use serde_json::{Value, json};
-use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
 pub struct LoadSkillTool;
 
 impl Default for LoadSkillTool {
-    fn default() -> Self { Self }
+    fn default() -> Self {
+        Self
+    }
 }
 
 #[async_trait::async_trait]
 impl Tool for LoadSkillTool {
-    fn name(&self) -> &str { "load_skill" }
+    fn name(&self) -> &str {
+        "load_skill"
+    }
 
     fn description(&self) -> &str {
         "Load the FULL instructions for an on-demand skill (builtin / global / project extension). \
@@ -39,12 +42,18 @@ impl Tool for LoadSkillTool {
         })
     }
 
-    fn safety_level(&self) -> SafetyLevel { SafetyLevel::Safe }
+    fn safety_level(&self) -> SafetyLevel {
+        SafetyLevel::Safe
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         let skill_name = match args.get("skill_name").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s,
-            _ => return ToolOutput::error("Missing required parameter: 'skill_name'. Use the skill ID from the Loaded Skills list."),
+            _ => {
+                return ToolOutput::error(
+                    "Missing required parameter: 'skill_name'. Use the skill ID from the Loaded Skills list.",
+                );
+            }
         };
 
         // Search through known skill directories
@@ -52,20 +61,29 @@ impl Tool for LoadSkillTool {
             // Project skills (.ox/skills/)
             ctx.working_dir.join(".ox").join("skills"),
             // Global skills (~/.ox/skills/)
-            dirs::home_dir().unwrap_or_default().join(".ox").join("skills"),
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".ox")
+                .join("skills"),
             // System skills (builtin)
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/skill/builtin"),
         ];
 
         for dir in &search_dirs {
-            if !dir.exists() { continue; }
+            if !dir.exists() {
+                continue;
+            }
             let file_path = dir.join(format!("{}.md", skill_name));
             if file_path.exists() {
                 match std::fs::read_to_string(&file_path) {
                     Ok(content) => {
                         // Strip YAML frontmatter if present
                         let body = strip_frontmatter(&content);
-                        tracing::info!("[load_skill] Loaded full manual for '{}' ({} chars)", skill_name, body.len());
+                        tracing::info!(
+                            "[load_skill] Loaded full manual for '{}' ({} chars)",
+                            skill_name,
+                            body.len()
+                        );
                         return ToolOutput::success(format!(
                             "<ACTIVE_SKILL_MANUAL>\n# {name}\n\n{body}\n\n</ACTIVE_SKILL_MANUAL>\n\n\
                              ✅ Full manual loaded. Follow the instructions above to complete the task. \
@@ -75,7 +93,10 @@ impl Tool for LoadSkillTool {
                         ));
                     }
                     Err(e) => {
-                        return ToolOutput::error(format!("Found skill file at {:?} but failed to read: {}", file_path, e));
+                        return ToolOutput::error(format!(
+                            "Found skill file at {:?} but failed to read: {}",
+                            file_path, e
+                        ));
                     }
                 }
             }

@@ -20,7 +20,7 @@ pub fn is_slim_phase(engine: &WorkflowEngine) -> bool {
 
 /// Compact keep-tail for in-turn message compression during Implement.
 pub fn compact_keep_tail() -> usize {
-    14
+    28
 }
 
 /// Fold review-era bulk before each LLM call in Implement phase.
@@ -62,13 +62,15 @@ fn is_explore_tool_result(content: &str) -> bool {
 
 fn fold_explore_tool_result(content: &str) -> String {
     let preview: String = content.chars().take(200).collect();
-    format!(
-        "（审查期工具结果已折叠 — 见 [WORKSPACE].file_digests / STEP_MEMORY）\n{preview}…"
-    )
+    format!("（审查期工具结果已折叠 — 见 [WORKSPACE].file_digests / STEP_MEMORY）\n{preview}…")
 }
 
 /// Recent tool lines only (Implement phase STEP_MEMORY).
-pub fn build_recent_tool_progress(messages: &[Message], include_writes: bool, max_lines: usize) -> String {
+pub fn build_recent_tool_progress(
+    messages: &[Message],
+    include_writes: bool,
+    max_lines: usize,
+) -> String {
     let full = crate::agent::context_injector::build_tool_progress(messages, include_writes);
     if full.is_empty() {
         return String::new();

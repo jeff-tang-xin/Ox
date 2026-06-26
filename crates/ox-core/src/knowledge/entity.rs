@@ -101,10 +101,7 @@ impl EntityKind {
     pub fn is_memory_layer(&self) -> bool {
         matches!(
             self,
-            Self::WorkingMemory
-                | Self::AtomicMemory
-                | Self::EpisodicMemory
-                | Self::SemanticMemory
+            Self::WorkingMemory | Self::AtomicMemory | Self::EpisodicMemory | Self::SemanticMemory
         )
     }
 
@@ -303,10 +300,7 @@ pub enum EntityMetadata {
     },
 
     /// Code Module: a module / package / namespace
-    CodeModule {
-        name: String,
-        path: String,
-    },
+    CodeModule { name: String, path: String },
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -560,13 +554,7 @@ impl Entity {
             EntityMetadata::WorkingMemory { session_id, .. } => session_id.clone(),
             _ => return None,
         };
-        let mut entity = Self::atomic_memory(
-            fact_content,
-            memory_type,
-            None,
-            "",
-            "LlmExtraction",
-        );
+        let mut entity = Self::atomic_memory(fact_content, memory_type, None, "", "LlmExtraction");
         // Link to the source WorkingMemory turn
         entity.relations.push(Relation {
             target_id: working.id.clone(),
@@ -585,7 +573,9 @@ impl Entity {
         task_description: &str,
     ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let anchor = project_id.map(|s| s.to_string()).unwrap_or_else(|| session_id.to_string());
+        let anchor = project_id
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| session_id.to_string());
         let now = chrono::Utc::now().timestamp();
         Self {
             id,
@@ -622,9 +612,8 @@ impl Entity {
             id,
             kind: EntityKind::SemanticMemory,
             content: content.to_string(),
-            coordinate: MemoryCoordinate::new(3, project_id, 384).with_tags(vec![
-                domain.to_string(),
-            ]),
+            coordinate: MemoryCoordinate::new(3, project_id, 384)
+                .with_tags(vec![domain.to_string()]),
             metadata: EntityMetadata::SemanticMemory {
                 project_id: project_id.to_string(),
                 version: 1,
@@ -650,8 +639,16 @@ impl Entity {
         parent: Option<&str>,
     ) -> Self {
         Self::code_symbol_with_doc(
-            _name, fq_name, symbol_type, language, file_path,
-            start_line, end_line, signature, parent, None,
+            _name,
+            fq_name,
+            symbol_type,
+            language,
+            file_path,
+            start_line,
+            end_line,
+            signature,
+            parent,
+            None,
         )
     }
 
@@ -669,12 +666,24 @@ impl Entity {
         doc_comment: Option<&str>,
     ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let sig_one_line: String = signature.lines().next().unwrap_or(signature).chars().take(512).collect();
+        let sig_one_line: String = signature
+            .lines()
+            .next()
+            .unwrap_or(signature)
+            .chars()
+            .take(512)
+            .collect();
         let mut content = format!(
             "[{symbol_type}] {fq_name} @ {file_path}:{start_line}-{end_line} :: {sig_one_line}"
         );
         if let Some(doc) = doc_comment {
-            let doc_trim: String = doc.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).take(3).collect::<Vec<_>>().join(" ");
+            let doc_trim: String = doc
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
             if !doc_trim.is_empty() {
                 let doc_short: String = doc_trim.chars().take(400).collect();
                 content.push_str(&format!(" | {doc_short}"));
@@ -777,8 +786,16 @@ impl Entity {
         let lower = self.content.to_lowercase();
         // Filter greetings and pure pleasantries
         let noise_patterns = [
-            "hello", "hi there", "thanks", "thank you", "you're welcome",
-            "ok", "okay", "sure", "got it", "understood",
+            "hello",
+            "hi there",
+            "thanks",
+            "thank you",
+            "you're welcome",
+            "ok",
+            "okay",
+            "sure",
+            "got it",
+            "understood",
         ];
         let trimmed = lower.trim();
         // Only filter if the WHOLE content is just a noise phrase
@@ -841,13 +858,13 @@ fn truncate_at_char_boundary(text: &str, max_chars: usize) -> String {
 /// Used in the "深度优先 + Token 预算" retrieval strategy.
 pub fn injection_priority(kind: EntityKind) -> u8 {
     match kind {
-        EntityKind::WorkingMemory => 0,   // Highest — current session context
-        EntityKind::CodeSymbol => 1,       // Very high — code the user is asking about
+        EntityKind::WorkingMemory => 0, // Highest — current session context
+        EntityKind::CodeSymbol => 1,    // Very high — code the user is asking about
         EntityKind::CodeFile => 2,
         EntityKind::CodeModule => 3,
-        EntityKind::SemanticMemory => 4,   // High — permanent patterns (but only if high match)
+        EntityKind::SemanticMemory => 4, // High — permanent patterns (but only if high match)
         EntityKind::AtomicMemory => 5,
-        EntityKind::EpisodicMemory => 6,   // Lower — unless directly relevant
+        EntityKind::EpisodicMemory => 6, // Lower — unless directly relevant
     }
 }
 
@@ -976,17 +993,32 @@ mod tests {
 
         let real = Entity::atomic_memory(
             "The auth module uses JWT with RS256",
-            "Fact", None, "en", "ToolObservation",
+            "Fact",
+            None,
+            "en",
+            "ToolObservation",
         );
         assert!(real.has_signal());
     }
 
     #[test]
     fn test_injection_priority_order() {
-        assert!(injection_priority(EntityKind::WorkingMemory) < injection_priority(EntityKind::CodeSymbol));
-        assert!(injection_priority(EntityKind::CodeSymbol) < injection_priority(EntityKind::SemanticMemory));
-        assert!(injection_priority(EntityKind::SemanticMemory) < injection_priority(EntityKind::AtomicMemory));
-        assert!(injection_priority(EntityKind::AtomicMemory) < injection_priority(EntityKind::EpisodicMemory));
+        assert!(
+            injection_priority(EntityKind::WorkingMemory)
+                < injection_priority(EntityKind::CodeSymbol)
+        );
+        assert!(
+            injection_priority(EntityKind::CodeSymbol)
+                < injection_priority(EntityKind::SemanticMemory)
+        );
+        assert!(
+            injection_priority(EntityKind::SemanticMemory)
+                < injection_priority(EntityKind::AtomicMemory)
+        );
+        assert!(
+            injection_priority(EntityKind::AtomicMemory)
+                < injection_priority(EntityKind::EpisodicMemory)
+        );
     }
 
     #[test]

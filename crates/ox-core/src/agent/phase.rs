@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::engine::WorkflowEngine;
 use super::findings;
 use super::task_intent::{self, TaskIntent};
-use super::workspace::{RequiredAction, WorkspaceMode, WorkflowWorkspace};
+use super::workspace::{RequiredAction, WorkflowWorkspace, WorkspaceMode};
 
 pub const PHASE_STATE_KEY: &str = "_workflow_phase";
 /// Legacy flag — set when entering Implement; kept for session helpers.
@@ -60,9 +60,7 @@ pub enum PhaseEvent {
     /// Findings JSON stored from review output.
     FindingsStored,
     /// ## Done passed all gates.
-    DoneGatePassed {
-        had_completion_receipt: bool,
-    },
+    DoneGatePassed { had_completion_receipt: bool },
     /// /fix 1,2 scope selection.
     ScopeSelected,
     /// Workflow reset (new task).
@@ -138,27 +136,46 @@ pub fn fix_impl_session(engine: &WorkflowEngine) -> bool {
 
 /// Scope-confirm gate: findings stored, tools blocked, same ReAct session suspended.
 pub fn is_scope_gate_active(engine: &WorkflowEngine) -> bool {
-    super::business_gate::is_pending_scope(engine)
-        && !crate::agent::workflow_session::is_feedback_discuss(engine)
+    if crate::agent::workflow_session::is_feedback_discuss(engine) {
+        return false;
+    }
+    if super::business_gate::is_pending_scope(engine) {
+        return true;
+    }
+    matches!(get(engine), SingleFlowPhase::AwaitUser)
+        && has_findings(engine)
+        && !super::business_gate::scope_implementation_unlocked(engine)
 }
 
 /// Per-iteration directive while [`is_scope_gate_active`].
-pub fn format_scope_gate_directive(engine: &WorkflowEngine) -> Option<String> {
+pub fn format_scope_gate_directive(
+    engine: &WorkflowEngine,
+    unified_tool_mode: bool,
+) -> Option<String> {
     if !is_scope_gate_active(engine) {
         return None;
     }
-    let scope = findings::load_or_migrate(engine)
+    let scope = super::findings::load_or_migrate(engine)
         .map(|s| s.scope_confirm_summary())
         .unwrap_or_default();
+    let action_rules = if unified_tool_mode {
+        "**此刻禁止：**\n\
+         • 一切 `complete_and_check` action（含 read/write）\n\
+         • assistant 纯文本交付\n\
+         • 重新提交 finding_json / 审查报告\n\n\
+         **用户讨论：** 通过 UI 介入（非 tool）；你收到 tool_result 后再 `finish(params.content=...)` 回应。"
+    } else {
+        "**此刻只允许：**\n\
+         • 用户讨论 → 纯文字回应（引用上方 findings，解答疑问）\n\
+         **此刻禁止：**\n\
+         • 一切工具调用\n\
+         • 重出 findings JSON、审查报告、## Done"
+    };
     let mut body = format!(
         "{SCOPE_GATE_TAG}\n\
          ⏸ **范围确认门禁**（同一会话挂起 — 非新对话）\n\n\
          findings 已入库；runtime 已阻塞工具，等待用户在面板确认。\n\n\
-         **此刻只允许：**\n\
-         • 用户讨论 → 纯文字回应（引用上方 findings，解答疑问）\n\
-         **此刻禁止：**\n\
-         • 一切工具调用\n\
-         • 重出 findings JSON、审查报告、## Done\n\n\
+         {action_rules}\n\n\
          用户 c /confirm 后系统注入 [PHASE_SWITCH] 切入实施；\
          上方审查结论与 findings **仍然有效**，实施时勿重出报告。"
     );
@@ -210,58 +227,88 @@ fn apply_event(
     current: SingleFlowPhase,
     event: &PhaseEvent,
 ) -> SingleFlowPhase {
-    match event {
-        PhaseEvent::WorkflowReset => SingleFlowPhase::Receive,
-        PhaseEvent::RoundStarted { intent } => phase_for_round_start(engine, *intent),
-        PhaseEvent::ReviewReportDelivered | PhaseEvent::FindingsStored => {
-            if has_findings(engine) && matches!(current, SingleFlowPhase::Receive | SingleFlowPhase::Review) {
+    match (current, event) {
+        (_, PhaseEvent::WorkflowReset) => {
+            crate::agent::workflow_session::clear_session_flags(engine);
+            engine.clear_impl_files_read();
+            SingleFlowPhase::Receive
+        }
+        (_, PhaseEvent::RoundStarted { intent }) => phase_for_round_start(engine, *intent),
+        (
+            SingleFlowPhase::Receive | SingleFlowPhase::Review,
+            PhaseEvent::ReviewReportDelivered | PhaseEvent::FindingsStored,
+        ) => {
+            if has_findings(engine) {
                 SingleFlowPhase::AwaitUser
             } else {
                 current
             }
         }
-        PhaseEvent::UserMessage { text } | PhaseEvent::ReopenForFix { text } => {
+        (
+            SingleFlowPhase::AwaitUser | SingleFlowPhase::Complete | SingleFlowPhase::Review,
+            PhaseEvent::ReopenForFix { text },
+        ) => {
+            // Policy B: continuation is substance-driven, not keyword-gated.
+            if can_reopen_for_fix(engine, text) {
+                SingleFlowPhase::Implement
+            } else {
+                current
+            }
+        }
+        (
+            SingleFlowPhase::AwaitUser | SingleFlowPhase::Complete | SingleFlowPhase::Review,
+            PhaseEvent::UserMessage { text },
+        ) => {
             if can_enter_implement(engine, text) {
                 SingleFlowPhase::Implement
             } else {
                 current
             }
         }
-        PhaseEvent::ScopeSelected => {
+        (SingleFlowPhase::AwaitUser, PhaseEvent::ScopeSelected) => {
             if has_findings(engine) {
                 SingleFlowPhase::Implement
             } else {
                 current
             }
         }
-        PhaseEvent::DoneGatePassed {
-            had_completion_receipt,
-        } => {
+        (
+            SingleFlowPhase::Implement,
+            PhaseEvent::DoneGatePassed {
+                had_completion_receipt,
+            },
+        ) => {
             if *had_completion_receipt {
                 SingleFlowPhase::Complete
-            } else if current == SingleFlowPhase::Implement {
-                // Implement ## Done without completion_receipt must not complete the workflow.
+            } else {
                 current
+            }
+        }
+        (
+            SingleFlowPhase::Review,
+            PhaseEvent::DoneGatePassed {
+                had_completion_receipt,
+            },
+        ) => {
+            if *had_completion_receipt {
+                SingleFlowPhase::Complete
             } else if has_findings(engine) {
                 SingleFlowPhase::AwaitUser
             } else {
                 SingleFlowPhase::Complete
             }
         }
+        (SingleFlowPhase::Receive, PhaseEvent::DoneGatePassed { .. }) => SingleFlowPhase::Complete,
+        _ => {
+            tracing::warn!("[PHASE] 非法状态转换: {:?} → {:?}，忽略", current, event);
+            current
+        }
     }
 }
 
-fn phase_for_round_start(engine: &WorkflowEngine, intent: TaskIntent) -> SingleFlowPhase {
+fn phase_for_round_start(_engine: &WorkflowEngine, intent: TaskIntent) -> SingleFlowPhase {
     match intent {
-        TaskIntent::Fix => {
-            if has_findings(engine)
-                || task_intent::looks_like_greenfield_impl(&user_request(engine))
-            {
-                SingleFlowPhase::Implement
-            } else {
-                SingleFlowPhase::Review
-            }
-        }
+        TaskIntent::Fix => SingleFlowPhase::Implement,
         TaskIntent::Review | TaskIntent::Qa => SingleFlowPhase::Review,
         TaskIntent::General => SingleFlowPhase::Receive,
     }
@@ -277,7 +324,7 @@ fn side_effects(
         PhaseEvent::UserMessage { text } | PhaseEvent::ReopenForFix { text } => {
             if after == SingleFlowPhase::Implement && before != SingleFlowPhase::Implement {
                 enter_implement(engine, text);
-                Some("进入实施阶段".into())
+                Some("进入执行阶段".into())
             } else if after == before {
                 crate::agent::workflow_guidance::append(engine, text);
                 None
@@ -316,8 +363,14 @@ fn side_effects(
 
 fn enter_implement(engine: &WorkflowEngine, user_text: &str) {
     crate::agent::workflow_session::clear_feedback_discuss(engine);
-    engine.clear_turn_memory();
-    engine.clear_turn_provenance();
+    // Review → Implement is ONE continuous investigation, not a fresh start.
+    // We deliberately do NOT clear turn memory or exploration provenance here:
+    // the tool results, decisions, and "already read" set built during review
+    // are exactly the code understanding the Implement phase needs. Clearing
+    // them made the model re-read every class it had just analyzed (huge token
+    // waste + "losing the plot"). Keep them so implementation continues seamlessly.
+    engine.snapshot_review_handoff();
+    // Only reset the per-phase EDIT bookkeeping (not the exploration memory).
     engine.clear_impl_files_read();
     engine.set_task_intent(TaskIntent::Fix);
     engine.set_variable(FIX_PIVOT_KEY, "1".to_string());
@@ -326,9 +379,18 @@ fn enter_implement(engine: &WorkflowEngine, user_text: &str) {
             let indices: Vec<u32> = store.open_findings().iter().map(|f| f.index).collect();
             if !indices.is_empty() {
                 store.set_scope(&indices);
-                findings::save(engine, &store);
             }
         }
+        for idx in &store.active_indices {
+            if let Some(finding) = store.findings.iter_mut().find(|f| f.index == *idx) {
+                if finding.status == findings::FindingStatus::Open
+                    || finding.status == findings::FindingStatus::Scoped
+                {
+                    finding.status = findings::FindingStatus::InProgress;
+                }
+            }
+        }
+        findings::save(engine, &store);
     }
     if engine.is_workflow_complete() {
         engine.reset_step_for_fix_reopen();
@@ -361,6 +423,11 @@ fn can_enter_implement(engine: &WorkflowEngine, user_text: &str) -> bool {
     if t.is_empty() {
         return false;
     }
+    // 🚨 Do NOT transition to Implement if business gate is still waiting for scope confirm.
+    // User may type "修复/处理/改" during discussion — that's feedback, not a confirmation.
+    if crate::agent::business_gate::is_pending_scope(engine) {
+        return false;
+    }
     if !task_intent::looks_like_greenfield_impl(t)
         && !crate::agent::workflow_session::looks_like_fix_continuation(t)
         && !t.starts_with("/fix")
@@ -370,6 +437,38 @@ fn can_enter_implement(engine: &WorkflowEngine, user_text: &str) -> bool {
     let greenfield = task_intent::looks_like_greenfield_impl(t);
     let verify_failed = crate::agent::post_edit_verification::verify_status_failed(engine);
     has_findings(engine) || greenfield || verify_failed
+}
+
+/// LLM-driven continuation gate (policy "B").
+///
+/// Unlike [`can_enter_implement`], this does NOT hard-require fix-keyword
+/// phrasing. After a completed/finalized round we treat the next input as a
+/// continuation (reopen Execute, keep context) whenever there is actionable
+/// substance to continue — open findings, a failed verification, or a
+/// greenfield implementation request. Fix-keywords are only a *soft* fallback
+/// for completed discussion rounds that produced no such substance.
+///
+/// Explicit `/new` `/reset`, empty input, or a pending scope-confirm still
+/// short-circuit to "not a continuation" so we never hijack a fresh task or
+/// swallow scope feedback.
+pub fn can_reopen_for_fix(engine: &WorkflowEngine, user_text: &str) -> bool {
+    let t = user_text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if crate::agent::workflow_session::looks_like_new_task(t) {
+        return false;
+    }
+    if crate::agent::business_gate::is_pending_scope(engine) {
+        return false;
+    }
+    let greenfield = task_intent::looks_like_greenfield_impl(t);
+    let verify_failed = crate::agent::post_edit_verification::verify_status_failed(engine);
+    if has_findings(engine) || verify_failed || greenfield {
+        return true;
+    }
+    // No actionable substance → only continue on an explicit fix/continue hint.
+    crate::agent::workflow_session::looks_like_fix_continuation(t)
 }
 
 // ── Legacy / convenience API ─────────────────────────────────────────
@@ -395,8 +494,7 @@ pub fn pivot_to_fix_mode(engine: &WorkflowEngine, user_text: &str) -> bool {
             text: user_text.to_string(),
         }
     };
-    transition(engine, event).changed
-        || get(engine) == SingleFlowPhase::Implement
+    transition(engine, event).changed || get(engine) == SingleFlowPhase::Implement
 }
 
 pub fn on_round_started(engine: &WorkflowEngine, intent: TaskIntent) {
@@ -451,6 +549,17 @@ pub fn on_scope_selected(engine: &WorkflowEngine) {
     transition(engine, PhaseEvent::ScopeSelected);
 }
 
+/// Option-2 single-confirm: user approved a `deliver(kind=plan)` — enter Implement
+/// directly (even without parsed findings) so writes are unlocked and auto-run.
+pub fn confirm_plan_enter_implement(engine: &WorkflowEngine) {
+    let before = get(engine);
+    if before == SingleFlowPhase::Implement {
+        return;
+    }
+    persist(engine, before, SingleFlowPhase::Implement);
+    enter_implement(engine, "plan confirmed");
+}
+
 /// User-visible banner for the output pane (on phase change).
 pub fn user_transition_banner(
     before: SingleFlowPhase,
@@ -488,7 +597,7 @@ pub fn llm_transition_directive(before: SingleFlowPhase, after: SingleFlowPhase)
         "{PHASE_SWITCH_TAG}\n\
          阶段 **{} → {}**（同一会话继续，非新对话）。上一阶段规则作废。\n\
          {}\n\
-         请立即阅读下方 [WORKSPACE]「本轮唯一动作」并严格执行。",
+         请立即阅读 [TURN_CONTEXT]「下一步」并严格执行。",
         phase_display_label(before),
         phase_display_label(after),
         transition_hint(before, after),
@@ -530,20 +639,17 @@ pub fn consume_transition_notice(engine: &WorkflowEngine) -> Option<String> {
 fn transition_hint(before: SingleFlowPhase, after: SingleFlowPhase) -> String {
     match (before, after) {
         (_, SingleFlowPhase::Review) => {
-            "• 只读审查：可 file_read / code_search，禁止 edit".to_string()
+            "• 分析阶段：可 file_read / code_search / find_symbol / edit_file".to_string()
         }
-        (_, SingleFlowPhase::AwaitUser) => {
-            "• **门禁暂停**（同一会话）— 禁止一切工具\n\
-             • 等待用户在面板选范围并按 c /confirm；或直接文字讨论 findings\n\
-             • 确认后 [PHASE_SWITCH] 切入实施，勿重出审查报告".to_string()
-        }
+        (_, SingleFlowPhase::AwaitUser) => "• **讨论暂停**（同一会话）\n\
+             • 等待用户在面板选范围并按 c /confirm；或直接文字讨论 findings 和计划\n\
+             • 确认后 [PHASE_SWITCH] 切入执行"
+            .to_string(),
         (_, SingleFlowPhase::Implement) => {
-            "• **实施阶段**（接续审查 findings）— 按 [WORKSPACE] 逐项 edit_file，禁止 code_search".to_string()
+            "• **执行阶段**（接续 findings）— 按 [TURN_CONTEXT] 逐项 file_read → edit_file"
+                .to_string()
         }
         (_, SingleFlowPhase::Complete) => "• 任务完成 — 可开始新需求".to_string(),
-        (SingleFlowPhase::Complete, SingleFlowPhase::Implement) => {
-            "• 继续修复 — 按 [WORKSPACE] 执行".to_string()
-        }
         _ => format!(
             "• 从 {} 进入 {}",
             phase_display_label(before),
@@ -570,8 +676,8 @@ fn format_required_action_short(action: &RequiredAction) -> String {
         } => format!("verify finding #{finding_index}: `{command}`"),
         RequiredAction::EmitFindingsAndDone => "产出审查报告 + findings + ## Done".into(),
         RequiredAction::EmitCompletionReceipt => "completion_receipt + ## Done".into(),
-        RequiredAction::AwaitUser => "等待用户（禁止工具）".into(),
-        RequiredAction::DiscussOnly => "讨论（禁止工具）".into(),
+        RequiredAction::AwaitUser => "等待用户确认或讨论".into(),
+        RequiredAction::DiscussOnly => "讨论模式：回应用户讨论".into(),
     }
 }
 
@@ -598,7 +704,7 @@ pub fn format_directive(engine: &WorkflowEngine) -> Option<String> {
         RequiredAction::EmitCompletionReceipt => {
             "全部 finding 已处理 — 输出 completion_receipt + ## Done".into()
         }
-        RequiredAction::AwaitUser => "门禁暂停 — 禁止工具；等待用户确认范围或讨论".into(),
+        RequiredAction::AwaitUser => "门禁暂停 — 等待用户确认范围或讨论".into(),
         RequiredAction::DiscussOnly => "讨论模式 — 直接回应，勿重出报告".into(),
     };
 
@@ -650,9 +756,9 @@ pub fn workspace_mode_label(engine: &WorkflowEngine) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::findings::{Finding, FindingsStore, FindingStatus};
+    use crate::agent::findings::{Finding, FindingStatus, FindingsStore};
     use crate::agent::session::SessionState;
-    use crate::agent::workflow::{create_default_workflow, DEFAULT_WORKFLOW_ID};
+    use crate::agent::workflow::{DEFAULT_WORKFLOW_ID, create_default_workflow};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -662,11 +768,7 @@ mod tests {
         engine.register_workflow(create_default_workflow());
         engine.activate_workflow(DEFAULT_WORKFLOW_ID).unwrap();
         engine.set_task_intent(TaskIntent::Review);
-        persist(
-            &engine,
-            SingleFlowPhase::Review,
-            SingleFlowPhase::AwaitUser,
-        );
+        persist(&engine, SingleFlowPhase::Review, SingleFlowPhase::AwaitUser);
         engine.mark_execute_report_delivered();
         let store = FindingsStore {
             summary: "2 issues".into(),
@@ -677,6 +779,7 @@ mod tests {
                 symbol: "bar".into(),
                 issue: "bug".into(),
                 recommendation: "fix".into(),
+                fix_plan: String::new(),
                 status: FindingStatus::Open,
                 user_notes: vec![],
                 dispute: None,
@@ -709,11 +812,7 @@ mod tests {
         let mut engine = WorkflowEngine::new(Arc::clone(&session));
         engine.register_workflow(create_default_workflow());
         engine.activate_workflow(DEFAULT_WORKFLOW_ID).unwrap();
-        persist(
-            &engine,
-            SingleFlowPhase::Receive,
-            SingleFlowPhase::Review,
-        );
+        persist(&engine, SingleFlowPhase::Receive, SingleFlowPhase::Review);
         let store = FindingsStore {
             summary: "x".into(),
             findings: vec![Finding {
@@ -723,6 +822,7 @@ mod tests {
                 symbol: String::new(),
                 issue: "i".into(),
                 recommendation: String::new(),
+                fix_plan: String::new(),
                 status: FindingStatus::Open,
                 user_notes: vec![],
                 dispute: None,
@@ -731,9 +831,12 @@ mod tests {
             active_indices: vec![],
         };
         findings::save(&engine, &store);
-        transition(&engine, PhaseEvent::DoneGatePassed {
-            had_completion_receipt: false,
-        });
+        transition(
+            &engine,
+            PhaseEvent::DoneGatePassed {
+                had_completion_receipt: false,
+            },
+        );
         assert_eq!(get(&engine), SingleFlowPhase::AwaitUser);
     }
 
@@ -769,14 +872,14 @@ mod tests {
     fn scope_gate_directive_active_only_during_await_user() {
         let engine = engine_with_findings();
         assert!(is_scope_gate_active(&engine));
-        let gate = format_scope_gate_directive(&engine).unwrap();
+        let gate = format_scope_gate_directive(&engine, false).unwrap();
         assert!(gate.starts_with(SCOPE_GATE_TAG));
         assert!(gate.contains("禁止"));
         assert!(gate.contains("PHASE_SWITCH"));
         pivot_to_fix_mode(&engine, "先修复 finding #1");
         assert_eq!(get(&engine), SingleFlowPhase::Implement);
         assert!(!is_scope_gate_active(&engine));
-        assert!(format_scope_gate_directive(&engine).is_none());
+        assert!(format_scope_gate_directive(&engine, false).is_none());
     }
 
     #[test]
@@ -784,7 +887,7 @@ mod tests {
         let engine = engine_with_findings();
         crate::agent::workflow_session::enter_feedback_discuss(&engine);
         assert!(!is_scope_gate_active(&engine));
-        assert!(format_scope_gate_directive(&engine).is_none());
+        assert!(format_scope_gate_directive(&engine, false).is_none());
     }
 
     #[test]
@@ -819,6 +922,7 @@ mod tests {
                     symbol: String::new(),
                     issue: "i1".into(),
                     recommendation: String::new(),
+                    fix_plan: String::new(),
                     status: FindingStatus::Open,
                     user_notes: vec![],
                     dispute: None,
@@ -831,6 +935,7 @@ mod tests {
                     symbol: String::new(),
                     issue: "i2".into(),
                     recommendation: String::new(),
+                    fix_plan: String::new(),
                     status: FindingStatus::Open,
                     user_notes: vec![],
                     dispute: None,
@@ -848,6 +953,31 @@ mod tests {
         pivot_to_fix_mode(&engine2, "修复全部");
         let store2 = findings::load_or_migrate(&engine2).unwrap();
         assert_eq!(store2.active_indices, vec![1, 2]);
+    }
+
+    #[test]
+    fn complete_phase_does_not_lock_tools() {
+        // Regression: `finish` is the LLM's explicit end and hands the turn back to
+        // the user; it must NOT strand the session in a tools-forbidden Complete state.
+        let session = Arc::new(Mutex::new(SessionState::new("t")));
+        let mut engine = WorkflowEngine::new(Arc::clone(&session));
+        engine.register_workflow(create_default_workflow());
+        engine.activate_workflow(DEFAULT_WORKFLOW_ID).unwrap();
+        persist(
+            &engine,
+            SingleFlowPhase::Implement,
+            SingleFlowPhase::Complete,
+        );
+        assert_eq!(get(&engine), SingleFlowPhase::Complete);
+
+        // Read-only / finish actions stay available (no hard "禁止调用工具" block).
+        let allowed = crate::agent::unified_action::allowed_actions_for_engine(&engine);
+        assert!(allowed.contains(&"finish"));
+        assert!(allowed.contains(&"file_read"));
+
+        // validate_tool_call no longer returns the legacy "任务已完成 — 禁止调用工具" error.
+        let args = serde_json::json!({ "path": "." });
+        assert!(engine.validate_tool_call("file_list", &args).is_ok());
     }
 
     #[test]

@@ -70,65 +70,83 @@ impl PromptInjectionDetector {
     pub fn new() -> Self {
         Self {
             pattern_sets: vec![
-                (InjectionType::InstructionOverride, Self::compile_patterns(&[
-                    // "ignore/forget/disregard all previous instructions/prompts/commands"
-                    // Use word boundaries and character-level flexibility for common variations
-                    r"(?i)(?:ignore|forget|disregard|overrule|override)\s+(?:all\s+)?(?:previous|prior|above|below|earlier)\s+(?:instructions?|prompts?|commands?|directives?)",
-                    // Direct forms: "override system prompt", "ignore system prompt" (require bigram)
-                    r"(?i)(?:ignore|forget|disregard|override|overrule)\s+(?:your\s+)?system\s+prompt",
-                    // "new system prompt:" style
-                    r"(?i)new\s+system\s+prompt\s*:",
-                    // "reset your instructions"
-                    r"(?i)reset\s+(?:your\s+)?(?:instructions?|prompt|persona)",
-                    // "you are now required to ignore"
-                    r"(?i)you\s+(?:are|must)\s+(?:now\s+)?required\s+to\s+(?:ignore|forget|disregard)",
-                ])),
-                (InjectionType::RoleSwitch, Self::compile_patterns(&[
-                    // "you are now X" / "you are no longer X"
-                    r"(?i)you\s+are\s+(?:now\s+)?(?:no\s+longer\s+)?(?:a\s+|an\s+)?(?:chatbot|gpt|ai|assistant|bot|model|system|robot|computer|program)",
-                    // "act as" / "pretend to be"
-                    r"(?i)(?:act|behave|respond)\s+as\s+(?:if\s+(?:you\s+are|you're)\s+)?(?:a\s+|an\s+)?(?:chatbot|gpt|ai|assistant|bot|model|system)",
-                    // "you are not Ox" / "you are not an AI"
-                    r"(?i)you\s+are\s+not\s+(?:ox|an?\s+(?:ai|assistant|chatbot))",
-                    // "from now on you are"
-                    r"(?i)from\s+now\s+on\s+(?:,?\s*)?you\s+(?:are|will\s+be)\s+(?:a\s+|an\s+)?(?:chatbot|gpt|ai|assistant|bot|model)",
-                ])),
-                (InjectionType::Jailbreak, Self::compile_patterns(&[
-                    // DAN and variants
-                    r"(?i)\bDAN\b",
-                    r"(?i)jail(?:ed|break|broken)\b",
-                    r"(?i)developer\s+mode",
-                    // "you are now in developer mode" (caught here too)
-                    r"(?i)do\s+(?:any|what)thing\s+now",
-                    // "unaligned" / "unconstrained" mode
-                    r"(?i)(?:unaligned|unconstrained|unrestricted)\s+mode",
-                ])),
-                (InjectionType::PromptExtraction, Self::compile_patterns(&[
-                    // "print/repeat/output your system prompt"
-                    r"(?i)(?:print|repeat|output|reveal|show|display|copy|paste|echo|dump)\s+(?:me\s+)?(?:your\s+)?(?:system\s+)?(?:prompt|instructions?|rules?|guidelines?)",
-                    // "what is your system prompt"
-                    r"(?i)what\s+(?:is|are)\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions?|rules?)",
-                    // "how are you prompted"
-                    r"(?i)how\s+(?:are\s+you|were\s+you)\s+(?:prompted|instructed|programmed)",
-                    // "tell me your system prompt"
-                    r"(?i)(?:tell|give|send)\s+me\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions?|rules?)",
-                ])),
-                (InjectionType::DataExfiltration, Self::compile_patterns(&[
-                    // "send this to [url/email]"
-                    r"(?i)(?:send|email|post|upload|forward|copy)\s+(?:this|the\s+(?:above|following))\s+to\s+(?:https?://|\S+@\S+)",
-                    // "post this to the internet"
-                    r"(?i)(?:post|publish|share)\s+(?:this|the\s+(?:above|following))\s+(?:on|to)\s+(?:the\s+)?(?:internet|web|public|github|pastebin|discord|slack)",
-                ])),
-                (InjectionType::Suspicious, Self::compile_patterns(&[
-                    // Leetspeak "ignore"
-                    r"(?i)1gn0r3\s+",
-                    // "***IGNORE***" with emphasis markers
-                    r"(?i)\*{2,}(?:ignore|forget|disregard)\*{2,}",
-                    // "stop being an AI"
-                    r"(?i)stop\s+being\s+(?:an?\s+)?(?:ai|assistant|chatbot)",
-                    // "you are a language model"
-                    r"(?i)you\s+are\s+(?:a\s+|just\s+a\s+)?(?:large\s+)?language\s+model",
-                ])),
+                (
+                    InjectionType::InstructionOverride,
+                    Self::compile_patterns(&[
+                        // "ignore/forget/disregard all previous instructions/prompts/commands"
+                        // Use word boundaries and character-level flexibility for common variations
+                        r"(?i)(?:ignore|forget|disregard|overrule|override)\s+(?:all\s+)?(?:previous|prior|above|below|earlier)\s+(?:instructions?|prompts?|commands?|directives?)",
+                        // Direct forms: "override system prompt", "ignore system prompt" (require bigram)
+                        r"(?i)(?:ignore|forget|disregard|override|overrule)\s+(?:your\s+)?system\s+prompt",
+                        // "new system prompt:" style
+                        r"(?i)new\s+system\s+prompt\s*:",
+                        // "reset your instructions"
+                        r"(?i)reset\s+(?:your\s+)?(?:instructions?|prompt|persona)",
+                        // "you are now required to ignore"
+                        r"(?i)you\s+(?:are|must)\s+(?:now\s+)?required\s+to\s+(?:ignore|forget|disregard)",
+                    ]),
+                ),
+                (
+                    InjectionType::RoleSwitch,
+                    Self::compile_patterns(&[
+                        // "you are now X" / "you are no longer X"
+                        r"(?i)you\s+are\s+(?:now\s+)?(?:no\s+longer\s+)?(?:a\s+|an\s+)?(?:chatbot|gpt|ai|assistant|bot|model|system|robot|computer|program)",
+                        // "act as" / "pretend to be"
+                        r"(?i)(?:act|behave|respond)\s+as\s+(?:if\s+(?:you\s+are|you're)\s+)?(?:a\s+|an\s+)?(?:chatbot|gpt|ai|assistant|bot|model|system)",
+                        // "you are not Ox" / "you are not an AI"
+                        r"(?i)you\s+are\s+not\s+(?:ox|an?\s+(?:ai|assistant|chatbot))",
+                        // "from now on you are"
+                        r"(?i)from\s+now\s+on\s+(?:,?\s*)?you\s+(?:are|will\s+be)\s+(?:a\s+|an\s+)?(?:chatbot|gpt|ai|assistant|bot|model)",
+                    ]),
+                ),
+                (
+                    InjectionType::Jailbreak,
+                    Self::compile_patterns(&[
+                        // DAN and variants
+                        r"(?i)\bDAN\b",
+                        r"(?i)jail(?:ed|break|broken)\b",
+                        r"(?i)developer\s+mode",
+                        // "you are now in developer mode" (caught here too)
+                        r"(?i)do\s+(?:any|what)thing\s+now",
+                        // "unaligned" / "unconstrained" mode
+                        r"(?i)(?:unaligned|unconstrained|unrestricted)\s+mode",
+                    ]),
+                ),
+                (
+                    InjectionType::PromptExtraction,
+                    Self::compile_patterns(&[
+                        // "print/repeat/output your system prompt"
+                        r"(?i)(?:print|repeat|output|reveal|show|display|copy|paste|echo|dump)\s+(?:me\s+)?(?:your\s+)?(?:system\s+)?(?:prompt|instructions?|rules?|guidelines?)",
+                        // "what is your system prompt"
+                        r"(?i)what\s+(?:is|are)\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions?|rules?)",
+                        // "how are you prompted"
+                        r"(?i)how\s+(?:are\s+you|were\s+you)\s+(?:prompted|instructed|programmed)",
+                        // "tell me your system prompt"
+                        r"(?i)(?:tell|give|send)\s+me\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions?|rules?)",
+                    ]),
+                ),
+                (
+                    InjectionType::DataExfiltration,
+                    Self::compile_patterns(&[
+                        // "send this to [url/email]"
+                        r"(?i)(?:send|email|post|upload|forward|copy)\s+(?:this|the\s+(?:above|following))\s+to\s+(?:https?://|\S+@\S+)",
+                        // "post this to the internet"
+                        r"(?i)(?:post|publish|share)\s+(?:this|the\s+(?:above|following))\s+(?:on|to)\s+(?:the\s+)?(?:internet|web|public|github|pastebin|discord|slack)",
+                    ]),
+                ),
+                (
+                    InjectionType::Suspicious,
+                    Self::compile_patterns(&[
+                        // Leetspeak "ignore"
+                        r"(?i)1gn0r3\s+",
+                        // "***IGNORE***" with emphasis markers
+                        r"(?i)\*{2,}(?:ignore|forget|disregard)\*{2,}",
+                        // "stop being an AI"
+                        r"(?i)stop\s+being\s+(?:an?\s+)?(?:ai|assistant|chatbot)",
+                        // "you are a language model"
+                        r"(?i)you\s+are\s+(?:a\s+|just\s+a\s+)?(?:large\s+)?language\s+model",
+                    ]),
+                ),
             ],
         }
     }
@@ -152,7 +170,9 @@ impl PromptInjectionDetector {
                         pattern: re.as_str().to_string(),
                         category: *category,
                         matched_text: if cap.as_str().len() > 120 {
-                            let boundary = cap.as_str().char_indices()
+                            let boundary = cap
+                                .as_str()
+                                .char_indices()
                                 .take_while(|(i, _)| *i < 120)
                                 .last()
                                 .map(|(i, c)| i + c.len_utf8())
@@ -198,7 +218,10 @@ impl PromptInjectionDetector {
         sorted.sort_by(|a, b| b.offset.cmp(&a.offset));
 
         for m in &sorted {
-            let end = m.offset + m.matched_text.len().min(text.len().saturating_sub(m.offset));
+            let end = m.offset
+                + m.matched_text
+                    .len()
+                    .min(text.len().saturating_sub(m.offset));
             if end > m.offset && end <= text.len() {
                 result_str.replace_range(
                     m.offset..end,

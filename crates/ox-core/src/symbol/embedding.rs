@@ -1,10 +1,10 @@
 use anyhow::Result;
-use candle_core::{Device, Tensor, DType};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
-use tokenizers::Tokenizer;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tokenizers::Tokenizer;
 
 use crate::config::EmbeddingConfig;
 
@@ -33,8 +33,9 @@ impl EmbeddingModel {
             .join(".ox")
             .join("models");
 
-        std::fs::create_dir_all(&cache_dir)
-            .map_err(|e| anyhow::anyhow!("Failed to create cache directory {:?}: {}", cache_dir, e))?;
+        std::fs::create_dir_all(&cache_dir).map_err(|e| {
+            anyhow::anyhow!("Failed to create cache directory {:?}: {}", cache_dir, e)
+        })?;
 
         tracing::info!("[EMBEDDING] Using cache directory: {:?}", cache_dir);
 
@@ -49,13 +50,8 @@ impl EmbeddingModel {
             .map_err(|e| anyhow::anyhow!("Failed to parse config.json: {}", e))?;
 
         // Load model weights via memory-mapped safetensors
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[&model_path],
-                DType::F32,
-                &device,
-            )?
-        };
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[&model_path], DType::F32, &device)? };
         let model = BertModel::load(vb, &config_parsed)?;
 
         // Load tokenizer
@@ -84,7 +80,10 @@ impl EmbeddingModel {
                 local_dir
             );
         }
-        tracing::info!("[EMBEDDING] Loading model from local directory: {:?}", local_dir);
+        tracing::info!(
+            "[EMBEDDING] Loading model from local directory: {:?}",
+            local_dir
+        );
         Ok((
             local_dir.join("config.json"),
             local_dir.join("model.safetensors"),
@@ -95,28 +94,45 @@ impl EmbeddingModel {
     /// Download from ModelScope via git clone (model_source = "modelscope").
     /// Clone URL: {modelscope_url}/{model_id}.git
     /// Target:    {cache_dir}/{model_id}/
-    fn load_from_modelscope(config: &EmbeddingConfig, cache_dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    fn load_from_modelscope(
+        config: &EmbeddingConfig,
+        cache_dir: &Path,
+    ) -> Result<(PathBuf, PathBuf, PathBuf)> {
         // Derive local dir name from model_id (e.g. "sentence-transformers/all-MiniLM-L6-v2" → "all-MiniLM-L6-v2")
-        let dir_name = config.model_id.rsplit('/').next().unwrap_or(&config.model_id);
+        let dir_name = config
+            .model_id
+            .rsplit('/')
+            .next()
+            .unwrap_or(&config.model_id);
         let model_dir = cache_dir.join(dir_name);
 
         if model_dir.join("model.safetensors").exists() {
-            tracing::info!("[EMBEDDING] Model already cached at {:?}, skipping download", model_dir);
+            tracing::info!(
+                "[EMBEDDING] Model already cached at {:?}, skipping download",
+                model_dir
+            );
         } else {
-            let clone_url = format!("{}/{}.git", config.modelscope_url.trim_end_matches('/'), config.model_id);
+            let clone_url = format!(
+                "{}/{}.git",
+                config.modelscope_url.trim_end_matches('/'),
+                config.model_id
+            );
             tracing::info!("[EMBEDDING] Cloning {} → {:?} ...", clone_url, model_dir);
 
             // If partial clone exists, remove it first to avoid conflicts
             if model_dir.exists() {
-                std::fs::remove_dir_all(&model_dir)
-                    .map_err(|e| anyhow::anyhow!("Failed to clean partial clone {:?}: {}", model_dir, e))?;
+                std::fs::remove_dir_all(&model_dir).map_err(|e| {
+                    anyhow::anyhow!("Failed to clean partial clone {:?}: {}", model_dir, e)
+                })?;
             }
 
             let status = Command::new("git")
                 .args(["clone", "--depth", "1", &clone_url])
                 .arg(&model_dir)
                 .status()
-                .map_err(|e| anyhow::anyhow!("Failed to run git clone: {}. Is git installed?", e))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to run git clone: {}. Is git installed?", e)
+                })?;
 
             if !status.success() {
                 anyhow::bail!(
@@ -135,7 +151,10 @@ impl EmbeddingModel {
     }
 
     /// Download from HuggingFace Hub or mirror via hf-hub API (model_source = "huggingface").
-    fn load_from_huggingface(config: &EmbeddingConfig, cache_dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    fn load_from_huggingface(
+        config: &EmbeddingConfig,
+        cache_dir: &Path,
+    ) -> Result<(PathBuf, PathBuf, PathBuf)> {
         let endpoint = Self::resolve_endpoint(&config.hf_endpoint);
         tracing::info!("[EMBEDDING] Using HF endpoint: {}", endpoint);
 
@@ -146,7 +165,11 @@ impl EmbeddingModel {
             .build()?
             .repo(hf_hub::Repo::model(config.model_id.clone()));
 
-        tracing::info!("[EMBEDDING] Downloading {} ({}-dim)...", config.model_id, config.dimension);
+        tracing::info!(
+            "[EMBEDDING] Downloading {} ({}-dim)...",
+            config.model_id,
+            config.dimension
+        );
 
         let config_path = api.get("config.json")?;
         let model_path = api.get("model.safetensors")?;
@@ -230,30 +253,26 @@ impl EmbeddingModel {
 
     /// Embed a single text into a dimensional f32 vector (no prefix — internal use).
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let tokens = self.tokenizer
+        let tokens = self
+            .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow::anyhow!("Tokenization error: {e}"))?;
 
         let input_ids = Tensor::new(tokens.get_ids(), &self.device)?.unsqueeze(0)?;
-        let attention_mask = Tensor::new(
-            tokens.get_attention_mask(),
-            &self.device,
-        )?.unsqueeze(0)?;
+        let attention_mask =
+            Tensor::new(tokens.get_attention_mask(), &self.device)?.unsqueeze(0)?;
 
-        let token_type_ids = Tensor::new(
-            tokens.get_type_ids(),
-            &self.device,
-        )?.unsqueeze(0)?;
+        let token_type_ids = Tensor::new(tokens.get_type_ids(), &self.device)?.unsqueeze(0)?;
 
-        let output = self.model.forward(
-            &input_ids,
-            &token_type_ids,
-            Some(&attention_mask),
-        )?;
+        let output = self
+            .model
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
 
         // Mean pooling: average all token embeddings (exclude padding)
         let hidden = output; // [1, seq_len, dim]
-        let mask = attention_mask.unsqueeze(2)?.to_dtype(candle_core::DType::F32)?; // [1, seq_len, 1]
+        let mask = attention_mask
+            .unsqueeze(2)?
+            .to_dtype(candle_core::DType::F32)?; // [1, seq_len, 1]
         let sum = hidden.broadcast_mul(&mask)?.sum(1)?; // [1, dim]
         let count = mask.sum(1)?.to_dtype(DType::F32)?.squeeze(1)?; // [1] → scalar-like
         // Use broadcast_div — candle ops are strict (no auto-broadcast)
@@ -285,7 +304,11 @@ impl EmbeddingModel {
             .collect::<Result<Vec<_>>>()?;
 
         // 2. Find max sequence length for padding
-        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(1);
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(1);
 
         // 3. Build padded input_ids, attention_mask, token_type_ids tensors
         let mut all_ids: Vec<i64> = Vec::with_capacity(texts.len() * max_len);
@@ -310,15 +333,15 @@ impl EmbeddingModel {
 
         let batch = texts.len();
         let input_ids = Tensor::new(all_ids.as_slice(), &self.device)?.reshape((batch, max_len))?;
-        let attention_mask = Tensor::new(all_mask.as_slice(), &self.device)?.reshape((batch, max_len))?;
-        let token_type_ids = Tensor::new(all_types.as_slice(), &self.device)?.reshape((batch, max_len))?;
+        let attention_mask =
+            Tensor::new(all_mask.as_slice(), &self.device)?.reshape((batch, max_len))?;
+        let token_type_ids =
+            Tensor::new(all_types.as_slice(), &self.device)?.reshape((batch, max_len))?;
 
         // 4. Single batch forward pass
-        let hidden = self.model.forward(
-            &input_ids,
-            &token_type_ids,
-            Some(&attention_mask),
-        )?; // [batch, seq_len, dim]
+        let hidden = self
+            .model
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask))?; // [batch, seq_len, dim]
 
         // 5. Mean pooling per sequence (exclude padding via attention mask)
         let mask_f32 = attention_mask.unsqueeze(2)?.to_dtype(DType::F32)?; // [batch, seq_len, 1]

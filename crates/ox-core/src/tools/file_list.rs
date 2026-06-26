@@ -1,12 +1,20 @@
+use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 use serde_json::{Value, json};
 use std::path::Path;
-use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
 pub struct FileListTool;
 
 const EXCLUDE_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", "dist", "build",
-    "__pycache__", ".venv", ".ox", ".idea", ".vscode",
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    ".ox",
+    ".idea",
+    ".vscode",
 ];
 
 const SINGLE_LEVEL_FOOTER: &str = "\n\
@@ -48,7 +56,10 @@ impl Tool for FileListTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
-        let path_str = args.get("path").and_then(|p| p.as_str()).map(|s| s.to_string());
+        let path_str = args
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string());
         let working_dir = ctx.working_dir.clone();
 
         let result = tokio::task::spawn_blocking(move || {
@@ -152,7 +163,10 @@ mod tests {
         let out = list_single_level(&tmp).unwrap();
         assert!(out.contains("root.txt"));
         assert!(out.contains("sub/"));
-        assert!(!out.contains("inner.txt"), "must not list files inside sub/");
+        assert!(
+            !out.contains("inner.txt"),
+            "must not list files inside sub/"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 }

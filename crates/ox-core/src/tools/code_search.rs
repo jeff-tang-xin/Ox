@@ -70,7 +70,7 @@ impl Tool for CodeSearchTool {
                 );
             }
         };
-        
+
         let base = if let Some(p) = args.get("path").and_then(|p| p.as_str()) {
             let normalized_path = p.trim().replace('\\', "/");
             let resolved = ctx.working_dir.join(&normalized_path);
@@ -82,40 +82,37 @@ impl Tool for CodeSearchTool {
         } else {
             ctx.working_dir.to_path_buf()
         };
-        
+
         let file_pattern = args
             .get("file_pattern")
             .and_then(|p| p.as_str())
             .unwrap_or("*")
             .to_string();
-            
-        let max_files = args
-            .get("max_files")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(20) as usize;
-            
+
+        let max_files = args.get("max_files").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+
         let max_matches_per_file = args
             .get("max_matches_per_file")
             .and_then(|v| v.as_u64())
             .unwrap_or(5) as usize;
-            
+
         let case_insensitive = args
             .get("case_insensitive")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-            
+
         let working_dir = ctx.working_dir.clone();
 
         // Run blocking file I/O on a dedicated thread to avoid blocking the Tokio runtime.
         let result = tokio::task::spawn_blocking(move || {
             search_with_ripgrep(
-                &pattern, 
-                &base, 
-                &file_pattern, 
-                &working_dir, 
-                max_files, 
+                &pattern,
+                &base,
+                &file_pattern,
+                &working_dir,
+                max_files,
                 max_matches_per_file,
-                case_insensitive
+                case_insensitive,
             )
         })
         .await;
@@ -142,11 +139,11 @@ fn search_with_ripgrep(
     } else {
         pattern.to_string()
     };
-    
+
     let matcher = RegexMatcher::new(&final_pattern)
         .or_else(|_| RegexMatcher::new(&regex::escape(&final_pattern)))
         .map_err(|e| format!("Invalid pattern: {e}"));
-    
+
     let matcher = match matcher {
         Ok(m) => m,
         Err(e) => return ToolOutput::error(e),
@@ -177,7 +174,7 @@ fn search_with_ripgrep(
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        
+
         // Only process files
         if !entry.file_type().map_or(false, |ft| ft.is_file()) {
             continue;
@@ -196,12 +193,12 @@ fn search_with_ripgrep(
         }
 
         files_searched += 1;
-        
+
         // Check global limits
         if files_with_results >= max_files as u32 {
             break;
         }
-        
+
         let path = entry.path().to_path_buf();
         let relative_path = path
             .strip_prefix(working_dir)
@@ -212,13 +209,13 @@ fn search_with_ripgrep(
         // Create a per-file result collector
         let file_results = Arc::new(Mutex::new(Vec::new()));
         let file_results_clone = Arc::clone(&file_results);
-        
+
         struct FileSink {
             results: Arc<Mutex<Vec<String>>>,
             file_path: String,
             max_matches: usize,
         }
-        
+
         impl Sink for FileSink {
             type Error = std::io::Error;
 
@@ -234,13 +231,13 @@ fn search_with_ripgrep(
                         mat.line_number().unwrap_or(0),
                         text.trim()
                     );
-                    
+
                     let mut results = self.results.lock().unwrap();
                     if results.len() < self.max_matches {
                         results.push(line_with_num);
                     }
                 }
-                
+
                 Ok(self.results.lock().unwrap().len() < self.max_matches)
             }
         }
@@ -252,13 +249,13 @@ fn search_with_ripgrep(
         };
 
         let _ = searcher.search_path(&matcher, &path, sink);
-        
+
         let file_match_count = file_results.lock().unwrap().len();
         if file_match_count > 0 {
             files_with_results += 1;
             let mut all_results = results.lock().unwrap();
             all_results.extend(file_results.lock().unwrap().iter().cloned());
-            
+
             if all_results.len() >= total_limit || files_with_results >= max_files as u32 {
                 break;
             }
@@ -273,13 +270,21 @@ fn search_with_ripgrep(
         ))
     } else {
         let truncated_msg = if files_with_results >= max_files as u32 {
-            format!("\n... (showing top {} results from {} files, searched {} files total)", 
-                   final_results.len(), files_with_results, files_searched)
+            format!(
+                "\n... (showing top {} results from {} files, searched {} files total)",
+                final_results.len(),
+                files_with_results,
+                files_searched
+            )
         } else {
-            format!("\n... (showing {} results from {} files, searched {} files total)", 
-                   final_results.len(), files_with_results, files_searched)
+            format!(
+                "\n... (showing {} results from {} files, searched {} files total)",
+                final_results.len(),
+                files_with_results,
+                files_searched
+            )
         };
-        
+
         ToolOutput::success(format!("{}{}", final_results.join("\n"), truncated_msg))
     }
 }

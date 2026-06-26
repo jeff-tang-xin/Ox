@@ -16,7 +16,7 @@ pub struct SessionMeta {
     pub created_at: String,
     pub updated_at: String,
     pub message_count: usize,
-    
+
     // 🚨 Workflow state persistence
     /// Current workflow mode (pipeline)
     #[serde(default)]
@@ -30,7 +30,7 @@ pub struct SessionMeta {
     /// Requirement name (for Spec Mode, e.g., "order-optimization")
     #[serde(default)]
     pub requirement_name: Option<String>,
-    
+
     // 📁 Session-scoped working directory
     /// Working directory for this session (relative to project root or absolute path)
     #[serde(default)]
@@ -160,8 +160,13 @@ impl Session {
             if age_days > 7 && messages.len() > 500 {
                 let trim = messages.len() - 500;
                 messages.drain(..trim);
-                tracing::info!("Session {} ({} days old): trimmed {} messages → {} retained",
-                    meta.id, age_days, trim, messages.len());
+                tracing::info!(
+                    "Session {} ({} days old): trimmed {} messages → {} retained",
+                    meta.id,
+                    age_days,
+                    trim,
+                    messages.len()
+                );
                 meta.message_count = messages.len();
             }
         }
@@ -374,11 +379,11 @@ impl Session {
                 let file = File::open(e.path()).ok()?;
                 let reader = BufReader::new(file);
                 let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
-                
+
                 if lines.is_empty() {
                     return None;
                 }
-                
+
                 // Parse meta from first line
                 let first_line = &lines[0];
                 let val: serde_json::Value = serde_json::from_str(first_line).ok()?;
@@ -386,12 +391,14 @@ impl Session {
                 let _id = meta.get("id")?.as_str().unwrap_or("?");
                 let _count = meta.get("message_count")?.as_u64().unwrap_or(0);
                 let created = meta.get("created_at")?.as_str().unwrap_or("?");
-                
+
                 // Extract session name from first user message
-                let session_name = lines.iter()
+                let session_name = lines
+                    .iter()
                     .skip(1) // Skip meta line
                     .find_map(|line| {
-                        serde_json::from_str::<Message>(line).ok()
+                        serde_json::from_str::<Message>(line)
+                            .ok()
                             .and_then(|msg| match msg {
                                 Message::User { content } => {
                                     let trimmed = content.trim();
@@ -400,7 +407,10 @@ impl Session {
                                     } else {
                                         let first_line = trimmed.lines().next().unwrap_or(trimmed);
                                         let display = if first_line.chars().count() > 20 {
-                                            format!("{}..", first_line.chars().take(20).collect::<String>())
+                                            format!(
+                                                "{}..",
+                                                first_line.chars().take(20).collect::<String>()
+                                            )
                                         } else {
                                             first_line.to_string()
                                         };
@@ -411,7 +421,7 @@ impl Session {
                             })
                     })
                     .unwrap_or_else(|| "new session".to_string());
-                
+
                 // Shorten the timestamp for display.
                 let short_time: String = created.chars().take(16).collect();
                 Some((name, format!("{short_time}  {session_name}")))

@@ -13,7 +13,16 @@ pub fn looks_like_read_only_audit(user_text: &str) -> bool {
     .iter()
     .any(|k| t.contains(k) || lower.contains(k));
     let wants_modify = [
-        "修改", "重构", "实现", "修复", "添加", "删除", "改写", "fix", "implement", "refactor",
+        "修改",
+        "重构",
+        "实现",
+        "修复",
+        "添加",
+        "删除",
+        "改写",
+        "fix",
+        "implement",
+        "refactor",
     ]
     .iter()
     .any(|k| t.contains(k) || lower.contains(k));

@@ -1,11 +1,11 @@
+use crate::slash_commands::{CommandMeta, CommandResult};
 /// /help command
 use crate::terminal::app::App as AppState;
-use crate::slash_commands::{CommandMeta, CommandResult};
 use crate::terminal::output_pane::OutputLine;
-use ox_core::message::Session;
-use ox_core::runtime::RuntimeEnvironment;
 use ox_core::config::OxConfig;
 use ox_core::cost::CostTracker;
+use ox_core::message::Session;
+use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
 use std::sync::Arc;
 
@@ -25,7 +25,11 @@ pub fn handle_help(
     _cost_tracker: &mut CostTracker,
     _trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
 ) -> CommandResult {
-    let topic = if args.is_empty() { None } else { Some(args.to_string()) };
+    let topic = if args.is_empty() {
+        None
+    } else {
+        Some(args.to_string())
+    };
     let text = ox_core::slash::help_text(topic.as_deref());
     for line in text.lines() {
         app.output.push_line(OutputLine::System(line.to_string()));

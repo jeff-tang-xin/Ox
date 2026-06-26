@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 // Re-export the core model type from symbol/embedding.rs
-pub use crate::symbol::embedding::EmbeddingModel;
 use crate::config::EmbeddingConfig;
+pub use crate::symbol::embedding::EmbeddingModel;
 
 /// Convenience: load the model and return it wrapped in Arc for sharing.
 pub fn load_shared(config: &EmbeddingConfig) -> anyhow::Result<Arc<EmbeddingModel>> {

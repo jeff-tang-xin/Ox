@@ -1,15 +1,14 @@
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::fs;
 /// Skill Generation Layering - Distill execution traces into reusable skills
-/// 
+///
 /// Inspired by TencentDB-Agent-Memory's approach:
 /// - L0: Raw Execution Traces (工具调用序列)
 /// - L1: Pattern Extraction (识别重复模式)
 /// - L2: Skill Templates (通用模板生成)
 /// - L3: Meta-Skills (跨项目抽象)
-
 use std::path::{Path, PathBuf};
-use std::fs;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
 use crate::message::Message;
 
@@ -95,7 +94,9 @@ impl ExecutionTrace {
                 call.tool_name,
                 if call.is_error { "❌" } else { "✅" },
                 if call.arguments.len() > 200 {
-                    let boundary = call.arguments.char_indices()
+                    let boundary = call
+                        .arguments
+                        .char_indices()
                         .take_while(|(i, _)| *i < 200)
                         .last()
                         .map(|(i, c)| i + c.len_utf8())
@@ -105,7 +106,9 @@ impl ExecutionTrace {
                     call.arguments.clone()
                 },
                 if call.result_summary.len() > 200 {
-                    let boundary = call.result_summary.char_indices()
+                    let boundary = call
+                        .result_summary
+                        .char_indices()
                         .take_while(|(i, _)| *i < 200)
                         .last()
                         .map(|(i, c)| i + c.len_utf8())
@@ -166,12 +169,16 @@ impl ExtractedPattern {
             rate = self.success_rate * 100.0,
             traces = self.source_traces.len(),
             desc = self.description,
-            sequence = self.common_tool_sequence.iter()
+            sequence = self
+                .common_tool_sequence
+                .iter()
                 .enumerate()
                 .map(|(i, t)| format!("{}. `{}`", i + 1, t))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            scenarios = self.applicable_scenarios.iter()
+            scenarios = self
+                .applicable_scenarios
+                .iter()
                 .map(|s| format!("- {}", s))
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -212,11 +219,15 @@ impl SkillTemplate {
              ## Step-by-Step Guide\n\n\
              {steps}\n\n",
             name = self.skill_name,
-            triggers = self.trigger_conditions.iter()
+            triggers = self
+                .trigger_conditions
+                .iter()
                 .map(|c| format!("- {}", c))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            steps = self.step_by_step_guide.iter()
+            steps = self
+                .step_by_step_guide
+                .iter()
                 .enumerate()
                 .map(|(i, s)| format!("{}. {}", i + 1, s))
                 .collect::<Vec<_>>()
@@ -225,10 +236,14 @@ impl SkillTemplate {
 
         if !self.pitfalls.is_empty() {
             body.push_str("## Common Pitfalls\n\n");
-            body.push_str(&self.pitfalls.iter()
-                .map(|p| format!("- ⚠️ {}", p))
-                .collect::<Vec<_>>()
-                .join("\n"));
+            body.push_str(
+                &self
+                    .pitfalls
+                    .iter()
+                    .map(|p| format!("- ⚠️ {}", p))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
             body.push_str("\n\n");
         }
 
@@ -241,7 +256,8 @@ impl SkillTemplate {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "tool": call.tool_name,
                         "arguments": call.arguments
-                    })).unwrap_or_default()
+                    }))
+                    .unwrap_or_default()
                 ));
             }
         }
@@ -341,16 +357,15 @@ impl SkillGenerator {
     }
 
     /// Extract patterns from multiple traces (L0 → L1)
-    pub fn extract_patterns(
-        &self,
-        traces: &[ExecutionTrace],
-    ) -> Vec<ExtractedPattern> {
+    pub fn extract_patterns(&self, traces: &[ExecutionTrace]) -> Vec<ExtractedPattern> {
         // Simple pattern extraction based on tool sequence similarity
         let mut patterns_by_sequence: std::collections::HashMap<Vec<String>, Vec<&ExecutionTrace>> =
             std::collections::HashMap::new();
 
         for trace in traces {
-            let sequence: Vec<String> = trace.tool_calls.iter()
+            let sequence: Vec<String> = trace
+                .tool_calls
+                .iter()
                 .map(|t| t.tool_name.clone())
                 .collect();
 
@@ -371,10 +386,7 @@ impl SkillGenerator {
                 ExtractedPattern {
                     id: format!("pattern_{i}"),
                     pattern_name: format!("Pattern {}", i + 1),
-                    description: format!(
-                        "Common tool sequence appearing {} times",
-                        group.len()
-                    ),
+                    description: format!("Common tool sequence appearing {} times", group.len()),
                     source_traces: group.iter().map(|t| t.id.clone()).collect(),
                     common_tool_sequence: sequence,
                     frequency: group.len() as u32,
@@ -387,33 +399,32 @@ impl SkillGenerator {
     }
 
     /// Generate skill templates from patterns (L1 → L2)
-    pub fn generate_skill_templates(
-        &self,
-        patterns: &[ExtractedPattern],
-    ) -> Vec<SkillTemplate> {
-        patterns.iter().map(|pattern| {
-            SkillTemplate {
-                id: format!("skill_{}", pattern.id),
-                skill_name: pattern.pattern_name.replace("Pattern", "Skill"),
-                description: pattern.description.clone(),
-                source_pattern: pattern.id.clone(),
-                trigger_conditions: pattern.applicable_scenarios.clone(),
-                step_by_step_guide: pattern.common_tool_sequence.iter()
-                    .enumerate()
-                    .map(|(_i, tool)| format!("Use `{}` tool", tool))
-                    .collect(),
-                example_tool_calls: vec![], // Would need to extract from traces
-                pitfalls: vec![],
-                timestamp: Utc::now().timestamp(),
-            }
-        }).collect()
+    pub fn generate_skill_templates(&self, patterns: &[ExtractedPattern]) -> Vec<SkillTemplate> {
+        patterns
+            .iter()
+            .map(|pattern| {
+                SkillTemplate {
+                    id: format!("skill_{}", pattern.id),
+                    skill_name: pattern.pattern_name.replace("Pattern", "Skill"),
+                    description: pattern.description.clone(),
+                    source_pattern: pattern.id.clone(),
+                    trigger_conditions: pattern.applicable_scenarios.clone(),
+                    step_by_step_guide: pattern
+                        .common_tool_sequence
+                        .iter()
+                        .enumerate()
+                        .map(|(_i, tool)| format!("Use `{}` tool", tool))
+                        .collect(),
+                    example_tool_calls: vec![], // Would need to extract from traces
+                    pitfalls: vec![],
+                    timestamp: Utc::now().timestamp(),
+                }
+            })
+            .collect()
     }
 
     /// Abstract meta-skills from multiple skill templates (L2 → L3)
-    pub fn distill_meta_skills(
-        &self,
-        _templates: &[SkillTemplate],
-    ) -> Vec<MetaSkill> {
+    pub fn distill_meta_skills(&self, _templates: &[SkillTemplate]) -> Vec<MetaSkill> {
         // Group similar skills and extract common principles
         // This is a simplified version - in production, would use LLM
         vec![]
@@ -424,7 +435,10 @@ impl SkillGenerator {
         &self,
         traces: &[ExecutionTrace],
     ) -> anyhow::Result<SkillGenerationReport> {
-        tracing::info!("Starting skill generation pipeline with {} traces", traces.len());
+        tracing::info!(
+            "Starting skill generation pipeline with {} traces",
+            traces.len()
+        );
 
         // L0 → L1
         let patterns = self.extract_patterns(traces);
@@ -492,7 +506,11 @@ fn extract_tool_calls(messages: &[Message]) -> Vec<ToolCallRecord> {
     let mut order = 0;
 
     for msg in messages {
-        if let Message::Assistant { tool_calls: tc_list, .. } = msg {
+        if let Message::Assistant {
+            tool_calls: tc_list,
+            ..
+        } = msg
+        {
             for tc in tc_list {
                 tool_calls.push(ToolCallRecord {
                     tool_name: tc.name.clone(),
@@ -511,29 +529,45 @@ fn extract_tool_calls(messages: &[Message]) -> Vec<ToolCallRecord> {
 
 /// Helper: Extract message records from messages
 fn extract_message_records(messages: &[Message]) -> Vec<MessageRecord> {
-    messages.iter().enumerate().map(|(i, msg)| {
-        let (role, content_preview, has_tool_calls) = match msg {
-            Message::User { content } => {
-                ("user".to_string(), content.chars().take(100).collect(), false)
-            }
-            Message::Assistant { content, tool_calls, .. } => {
-                ("assistant".to_string(), content.chars().take(100).collect(), !tool_calls.is_empty())
-            }
-            Message::ToolResult { content, .. } => {
-                ("tool".to_string(), content.chars().take(100).collect(), false)
-            }
-            Message::System { content } => {
-                ("system".to_string(), content.chars().take(100).collect(), false)
-            }
-        };
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            let (role, content_preview, has_tool_calls) = match msg {
+                Message::User { content } => (
+                    "user".to_string(),
+                    content.chars().take(100).collect(),
+                    false,
+                ),
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => (
+                    "assistant".to_string(),
+                    content.chars().take(100).collect(),
+                    !tool_calls.is_empty(),
+                ),
+                Message::ToolResult { content, .. } => (
+                    "tool".to_string(),
+                    content.chars().take(100).collect(),
+                    false,
+                ),
+                Message::System { content } => (
+                    "system".to_string(),
+                    content.chars().take(100).collect(),
+                    false,
+                ),
+            };
 
-        MessageRecord {
-            role,
-            content_preview,
-            has_tool_calls,
-            order: i,
-        }
-    }).collect()
+            MessageRecord {
+                role,
+                content_preview,
+                has_tool_calls,
+                order: i,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -311,17 +311,13 @@ impl OutputPane {
         if chunk.is_empty() {
             return;
         }
-        let dock = self
-            .live_thinking
-            .get_or_insert_with(LiveThinking::default);
+        let dock = self.live_thinking.get_or_insert_with(LiveThinking::default);
         dock.text.push_str(chunk);
     }
 
     /// Record tool execution in the think pane while reasoning stream is idle.
     pub fn note_tool_activity(&mut self, tool_name: &str) {
-        let dock = self
-            .live_thinking
-            .get_or_insert_with(LiveThinking::default);
+        let dock = self.live_thinking.get_or_insert_with(LiveThinking::default);
         if dock.text.trim().is_empty() {
             dock.text = format!("调用工具: {tool_name}");
         }
@@ -333,9 +329,7 @@ impl OutputPane {
         if hint.is_empty() {
             return;
         }
-        let dock = self
-            .live_thinking
-            .get_or_insert_with(LiveThinking::default);
+        let dock = self.live_thinking.get_or_insert_with(LiveThinking::default);
         dock.status_hint = Some(hint.to_string());
     }
 
@@ -392,7 +386,11 @@ impl OutputPane {
 }
 
 /// Last two visual lines for the fixed thinking dock (wrap long prose into segments first).
-pub fn thinking_dock_two_lines(text: &str, status_hint: Option<&str>, width: usize) -> (String, String) {
+pub fn thinking_dock_two_lines(
+    text: &str,
+    status_hint: Option<&str>,
+    width: usize,
+) -> (String, String) {
     let max_chars = width.saturating_sub(6).max(16);
     let segs = thinking_carousel_segments(text, status_hint);
     if segs.is_empty() {
@@ -400,7 +398,12 @@ pub fn thinking_dock_two_lines(text: &str, status_hint: Option<&str>, width: usi
     }
     let truncate = |s: &str| {
         if s.chars().count() > max_chars {
-            format!("{}…", s.chars().take(max_chars.saturating_sub(1)).collect::<String>())
+            format!(
+                "{}…",
+                s.chars()
+                    .take(max_chars.saturating_sub(1))
+                    .collect::<String>()
+            )
         } else {
             s.to_string()
         }
@@ -427,7 +430,9 @@ pub fn thinking_pane_lines(
         if s.chars().count() > max_chars {
             format!(
                 "{}…",
-                s.chars().take(max_chars.saturating_sub(1)).collect::<String>()
+                s.chars()
+                    .take(max_chars.saturating_sub(1))
+                    .collect::<String>()
             )
         } else {
             s.to_string()

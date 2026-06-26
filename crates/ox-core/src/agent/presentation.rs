@@ -23,6 +23,7 @@ pub fn from_store(store: &FindingsStore) -> ReviewPresentation {
                 target: f.symbol.clone(),
                 issue: f.issue.clone(),
                 recommendation: f.recommendation.clone(),
+                fix_plan: f.fix_plan.clone(),
             })
             .collect(),
     };
@@ -30,11 +31,19 @@ pub fn from_store(store: &FindingsStore) -> ReviewPresentation {
 }
 
 pub fn from_perception(p: &PerceptionFindings) -> ReviewPresentation {
-    let high = p.findings.iter().filter(|f| f.severity.to_lowercase().contains("high")).count();
-    let med = p.findings.iter().filter(|f| {
-        let s = f.severity.to_lowercase();
-        s.contains("medium") || s.contains("中")
-    }).count();
+    let high = p
+        .findings
+        .iter()
+        .filter(|f| f.severity.to_lowercase().contains("high"))
+        .count();
+    let med = p
+        .findings
+        .iter()
+        .filter(|f| {
+            let s = f.severity.to_lowercase();
+            s.contains("medium") || s.contains("中")
+        })
+        .count();
     let low = p.findings.len().saturating_sub(high + med);
     let executive_summary = if p.findings_summary.is_empty() {
         format!(
@@ -64,10 +73,7 @@ pub fn from_perception(p: &PerceptionFindings) -> ReviewPresentation {
         let issue: String = f.issue.chars().take(60).collect();
         table.push_str(&format!(
             "| {} | {} | {} | {} |\n",
-            f.index,
-            f.severity,
-            loc,
-            issue
+            f.index, f.severity, loc, issue
         ));
     }
     ReviewPresentation {
@@ -117,15 +123,12 @@ pub fn format_findings_card(store: &FindingsStore) -> String {
         } else {
             format!("{} · {}", f.file, f.symbol)
         };
-        lines.push(format!(
-            "**#{}** [{}] {}",
-            f.index,
-            f.severity.label(),
-            loc
-        ));
-        lines.push(format!("  {}", f.issue));
+        lines.push(format!("**#{}** [{}] {}", f.index, f.severity.label(), loc));
+        let issue_short: String = f.issue.chars().take(150).collect();
+        lines.push(format!("  {}", issue_short));
         if !f.recommendation.is_empty() {
-            lines.push(format!("  → {}", f.recommendation));
+            let rec_short: String = f.recommendation.chars().take(100).collect();
+            lines.push(format!("  → {}", rec_short));
         }
         lines.push(String::new());
     }

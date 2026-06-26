@@ -48,7 +48,6 @@ pub enum SpecWorkflowStep {
     Executing,
 }
 
-
 /// Cached workflow display information (to avoid locking in render loop)
 #[derive(Debug, Clone)]
 pub struct WorkflowDisplayInfo {
@@ -126,6 +125,18 @@ pub struct PendingSkillDraft {
     pub description: String,
 }
 
+/// Unified `complete_and_check` gate — deliver or finish awaiting user ack.
+#[derive(Debug, Clone)]
+pub enum UnifiedGatePending {
+    Deliver { tool_call_id: String, kind: String },
+    Finish { tool_call_id: String },
+}
+
+/// Sentinel for [`workflow_awaiting_confirmation`] during unified deliver gate.
+pub const UNIFIED_GATE_DELIVER_STEP: usize = 40;
+/// Sentinel for finish gate.
+pub const UNIFIED_GATE_FINISH_STEP: usize = 41;
+
 #[derive(Debug, Clone)]
 pub struct SessionEntry {
     /// Session file name (e.g., "session_001.jsonl")
@@ -142,7 +153,7 @@ impl SessionEntry {
     pub fn full_path(&self, sessions_root: &std::path::Path) -> std::path::PathBuf {
         sessions_root.join(&self.project_id).join(&self.id)
     }
-    
+
     /// Get display name with project prefix
     pub fn display_name(&self) -> String {
         format!("[{}] {}", self.project_id, self.info)
@@ -177,6 +188,8 @@ pub struct App {
     pub park_follow_up_tag: Option<ParkFollowUpTag>,
     /// Findings checklist panel (parked review → scope selection).
     pub findings_panel: Option<FindingsPanelState>,
+    /// `complete_and_check` deliver/finish gate while agent is suspended.
+    pub unified_gate: Option<UnifiedGatePending>,
     /// Skill draft awaiting user confirmation before save.
     pub pending_skill_draft: Option<PendingSkillDraft>,
     /// Skill review queued while agent is still running.
@@ -293,11 +306,12 @@ impl App {
             workflow_awaiting_confirmation: None,
             park_follow_up_tag: None,
             findings_panel: None,
+            unified_gate: None,
             pending_skill_draft: None,
             queued_skill_draft: None,
             ui_to_agent_tx: None,
             pending_model_switch: None,
-            pending_llm_task: None,  // 🆕 Unified LLM task
+            pending_llm_task: None, // 🆕 Unified LLM task
             pending_revision_feedback: false,
             trusted_all: false,
             header_info: Vec::new(),
@@ -347,6 +361,7 @@ impl App {
 
     pub fn clear_workflow_confirmation(&mut self) {
         self.workflow_awaiting_confirmation = None;
+        self.unified_gate = None;
         self.park_follow_up_tag = None;
         self.findings_panel = None;
     }
@@ -468,16 +483,20 @@ impl App {
     }
 
     /// Initialize workflow engine (called after session is created)
-    pub fn init_workflow_engine(&mut self, session_id: &str, session_meta: &ox_core::message::SessionMeta) {
+    pub fn init_workflow_engine(
+        &mut self,
+        session_id: &str,
+        session_meta: &ox_core::message::SessionMeta,
+    ) {
         // 🚨 Restore workflow state from persisted metadata
         let mut session_state = SessionState::new(session_id);
-        
+
         // Restore workflow mode and step index if available
         if !session_meta.workflow_mode.is_empty() {
             session_state.current_mode = session_meta.workflow_mode.clone();
             session_state.current_workflow = session_meta.workflow_id.clone();
             session_state.current_step_index = session_meta.workflow_step_index;
-            
+
             tracing::info!(
                 "Restored workflow state: mode={}, workflow={}, step={}",
                 session_state.current_mode,
@@ -485,29 +504,26 @@ impl App {
                 session_state.current_step_index
             );
         }
-        
+
         // Restore requirement name if available
         if let Some(ref req_name) = session_meta.requirement_name {
             session_state.set_variable("requirement_name", req_name);
             tracing::info!("Restored requirement name: {}", req_name);
         }
-        
+
         let session_state_arc = Arc::new(tokio::sync::Mutex::new(session_state));
         let mut engine = WorkflowEngine::new(session_state_arc);
 
         // Always use the 4-step pipeline (migrate legacy "free" sessions)
-        let workflow_id = if session_meta.workflow_id.is_empty()
-            || session_meta.workflow_mode == "free"
-        {
-            ox_core::agent::workflow::DEFAULT_WORKFLOW_ID
-        } else {
-            session_meta.workflow_id.as_str()
-        };
+        let workflow_id =
+            if session_meta.workflow_id.is_empty() || session_meta.workflow_mode == "free" {
+                ox_core::agent::workflow::DEFAULT_WORKFLOW_ID
+            } else {
+                session_meta.workflow_id.as_str()
+            };
         if let Err(e) = engine.activate_workflow(workflow_id) {
             tracing::warn!("Failed to activate workflow '{}': {}", workflow_id, e);
-        } else if session_meta.workflow_step_index > 0
-            && session_meta.workflow_mode != "free"
-        {
+        } else if session_meta.workflow_step_index > 0 && session_meta.workflow_mode != "free" {
             let total = engine
                 .current_workflow()
                 .map(|w| w.total_steps())
@@ -542,7 +558,7 @@ impl App {
                         if let Some((step_num, total_steps)) = engine.get_progress() {
                             // 🚨 Extract requirement name from workflow engine
                             let requirement_name = engine.get_variable("requirement_name");
-                            
+
                             self.workflow_display = Some(WorkflowDisplayInfo {
                                 workflow_name: engine
                                     .current_step_display_label()

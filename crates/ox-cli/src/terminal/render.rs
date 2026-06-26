@@ -5,13 +5,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::helpers::formatting::short_display_path;
 use super::app::{App, ParkFollowUpTag};
 use super::input_pane::InputPane;
 use super::output_pane::{
-    OutputLine, ThinkPaneMode, CHAT_THINK_HEIGHT_RATIO, SESSION_WIDTH_MAX, SESSION_WIDTH_MIN,
-    SESSION_WIDTH_PERCENT, THINK_PANE_SLIM_HEIGHT,
+    CHAT_THINK_HEIGHT_RATIO, OutputLine, SESSION_WIDTH_MAX, SESSION_WIDTH_MIN,
+    SESSION_WIDTH_PERCENT, THINK_PANE_SLIM_HEIGHT, ThinkPaneMode,
 };
+use crate::helpers::formatting::short_display_path;
 
 const BG: Color = Color::Rgb(0, 0, 0);
 const BG_INPUT: Color = Color::Rgb(30, 30, 30);
@@ -58,7 +58,9 @@ fn truncate_display(text: &str, max_chars: usize) -> String {
     } else {
         format!(
             "{}…",
-            text.chars().take(max_chars.saturating_sub(1)).collect::<String>()
+            text.chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
         )
     }
 }
@@ -73,38 +75,37 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
 
     // Adaptive layout based on terminal height
     let is_tiny = area.height < 15;
-    let indexing_bar = if app.indexing && app.index_has_progress() { 1u16 } else { 0 };
-    let has_workflow = app.workflow_display.is_some() as u16;
-    let header_height = if is_tiny { 0 } else { (2u16 + has_workflow + indexing_bar).min(5) };
-
-    let findings_panel_height = app
-        .findings_panel
-        .as_ref()
-        .map(|p| (p.rows.len() as u16 + 3).clamp(4, 14))
-        .unwrap_or(0);
-
-    let input_height = if app.pending_confirmation.is_some() || app.workflow_awaiting_confirmation.is_some() {
-        3
+    let indexing_bar = if app.indexing && app.index_has_progress() {
+        1u16
     } else {
-        2
+        0
+    };
+    let has_workflow = app.workflow_display.is_some() as u16;
+    let header_height = if is_tiny {
+        0
+    } else {
+        (2u16 + has_workflow + indexing_bar).min(5)
     };
 
+    let input_height =
+        if app.pending_confirmation.is_some() || app.workflow_awaiting_confirmation.is_some() {
+            3
+        } else {
+            2
+        };
+
     let chunks = Layout::vertical([
-        Constraint::Length(header_height), // Header (hidden on tiny screens)
-        Constraint::Min(3),                // Main output
-        Constraint::Length(findings_panel_height),
-        Constraint::Length(1),             // Status bar
-        Constraint::Length(input_height),  // Input pane
+        Constraint::Length(header_height),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(input_height),
     ])
     .split(area);
 
     render_header(frame, app, chunks[0]);
     render_main(frame, app, chunks[1]);
-    if findings_panel_height > 0 {
-        render_findings_panel(frame, app, chunks[2]);
-    }
-    render_status_bar(frame, app, chunks[3], tick_count);
-    render_input_pane(frame, app, chunks[4], tick_count);
+    render_status_bar(frame, app, chunks[2], tick_count);
+    render_input_pane(frame, app, chunks[3], tick_count);
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -118,11 +119,20 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 
     // Line 1: LLM model + embedding model
     let mut title_spans = vec![
-        Span::styled(" ◆ Ox  ".to_string(), Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
-        Span::styled(app.model_name.clone(), Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ◆ Ox  ".to_string(),
+            Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            app.model_name.clone(),
+            Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
+        ),
     ];
     if !app.embedding_model.is_empty() {
-        title_spans.push(Span::styled(" │ embed: ".to_string(), Style::default().fg(TEXT_DIM)));
+        title_spans.push(Span::styled(
+            " │ embed: ".to_string(),
+            Style::default().fg(TEXT_DIM),
+        ));
         title_spans.push(Span::styled(
             app.embedding_model.clone(),
             Style::default().fg(Color::Rgb(140, 200, 255)),
@@ -132,12 +142,16 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(title_spans));
 
     // Line 2: Workflow step status
-    if let Some(ref wf_info) = app.workflow_display && lines.len() < max_lines {
+    if let Some(ref wf_info) = app.workflow_display
+        && lines.len() < max_lines
+    {
         lines.push(Line::from(vec![
             Span::styled(" ● ".to_string(), Style::default().fg(Color::Cyan)),
             Span::styled(
                 wf_info.step_name.clone(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
     }
@@ -170,12 +184,17 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             format!("  ⏳ {phase_label} [{progress_bar}] {pct:>3}% {detail}"),
             area.width,
         );
-        lines.push(Line::from(vec![
-            Span::styled(progress_text, Style::default().fg(TEXT).bg(BG)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            progress_text,
+            Style::default().fg(TEXT).bg(BG),
+        )]));
     }
 
-    for info in app.header_info.iter().take(max_lines.saturating_sub(lines.len())) {
+    for info in app
+        .header_info
+        .iter()
+        .take(max_lines.saturating_sub(lines.len()))
+    {
         let text = info.clone();
         lines.push(Line::from(vec![
             Span::styled(" ● ".to_string(), Style::default().fg(SYS_COLOR)),
@@ -183,7 +202,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
-    let bottom_border = if lines.len() < max_lines { Borders::BOTTOM } else { Borders::NONE };
+    let bottom_border = if lines.len() < max_lines {
+        Borders::BOTTOM
+    } else {
+        Borders::NONE
+    };
     let block = Block::default()
         .borders(bottom_border)
         .border_style(Style::default().fg(BORDER))
@@ -274,7 +297,9 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::NONE)
         .title(title.as_str())
         .title_style(if app.indexing {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else if app.agent_running {
             Style::default().fg(STREAMING).add_modifier(Modifier::BOLD)
         } else if app.user_scrolled {
@@ -357,7 +382,9 @@ fn render_think_pane(frame: &mut Frame, app: &App, area: Rect, tick: u64, mode: 
             let h = if hint.chars().count() > max_chars {
                 format!(
                     "{}…",
-                    hint.chars().take(max_chars.saturating_sub(1)).collect::<String>()
+                    hint.chars()
+                        .take(max_chars.saturating_sub(1))
+                        .collect::<String>()
                 )
             } else {
                 hint.to_string()
@@ -366,12 +393,8 @@ fn render_think_pane(frame: &mut Frame, app: &App, area: Rect, tick: u64, mode: 
         }
         let body_max = max_lines.saturating_sub(lines.len());
         if body_max > 0 && !dock.text.trim().is_empty() {
-            let mut body = super::output_pane::thinking_pane_lines(
-                &dock.text,
-                None,
-                width,
-                body_max,
-            );
+            let mut body =
+                super::output_pane::thinking_pane_lines(&dock.text, None, width, body_max);
             lines.append(&mut body);
         } else if lines.len() == 1 && body_max > 0 {
             lines.push("等待模型推理输出…".to_string());
@@ -403,10 +426,7 @@ fn render_think_pane(frame: &mut Frame, app: &App, area: Rect, tick: u64, mode: 
     }
 
     while lines.len() < max_lines {
-        lines.push(Line::from(Span::styled(
-            " ".repeat(width.max(1)),
-            pad_bg,
-        )));
+        lines.push(Line::from(Span::styled(" ".repeat(width.max(1)), pad_bg)));
     }
 
     let paragraph = Paragraph::new(lines)
@@ -574,7 +594,9 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     if !app.plan_items.is_empty() {
         lines.push(Line::from(Span::styled(
             " Tasks ".to_string(),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
         for item in &app.plan_items {
             let (icon, style) = match item.status {
@@ -582,7 +604,11 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 super::app::PlanItemStatus::Pending => ("⏳", Style::default().fg(Color::Yellow)),
                 super::app::PlanItemStatus::Cancelled => ("❌", Style::default().fg(TEXT_DIM)),
             };
-            let display: String = item.file.chars().take(area.width.saturating_sub(6) as usize).collect();
+            let display: String = item
+                .file
+                .chars()
+                .take(area.width.saturating_sub(6) as usize)
+                .collect();
             lines.push(Line::from(Span::styled(
                 format!(" {icon} {display}"),
                 style,
@@ -604,7 +630,11 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(TEXT_DIM)
             };
             let icon = if entry.is_active { "▸" } else { " " };
-            let display_short: String = entry.display_name().chars().take(area.width as usize - 4).collect();
+            let display_short: String = entry
+                .display_name()
+                .chars()
+                .take(area.width as usize - 4)
+                .collect();
             lines.push(Line::from(Span::styled(
                 format!(" {icon} {display_short}"),
                 style,
@@ -667,10 +697,7 @@ fn render_findings_panel(frame: &mut Frame, app: &App, area: Rect) {
         let loc = if row.file.is_empty() {
             truncate_display(&row.symbol, 32)
         } else {
-            truncate_display(
-                &short_display_path(&row.file, 36),
-                36,
-            )
+            truncate_display(&short_display_path(&row.file, 36), 36)
         };
         let sev = truncate_display(&row.severity, 8);
         let issue = truncate_display(&row.issue, issue_budget);
@@ -700,9 +727,7 @@ fn render_findings_panel(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
         area,
     );
 }
@@ -712,7 +737,10 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
 
     // When indexing or agent running, show progress status prominently
     let (status_style, status_bg) = if app.indexing {
-        (Style::default().fg(TEXT_BRIGHT).bg(Color::Rgb(80, 60, 0)), Color::Rgb(80, 60, 0))
+        (
+            Style::default().fg(TEXT_BRIGHT).bg(Color::Rgb(80, 60, 0)),
+            Color::Rgb(80, 60, 0),
+        )
     } else {
         (Style::default().fg(TEXT_BRIGHT).bg(BLUE), BLUE)
     };
@@ -732,14 +760,23 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     if !app.status.is_empty() {
         let available = (area.width as usize).saturating_sub(80);
         let status_text = if app.status.chars().count() > available && available > 10 {
-            format!("{}…", app.status.chars().take(available.saturating_sub(1)).collect::<String>())
+            format!(
+                "{}…",
+                app.status
+                    .chars()
+                    .take(available.saturating_sub(1))
+                    .collect::<String>()
+            )
         } else {
             app.status.clone()
         };
         // Pad with spaces to ensure old text is fully overwritten on re-render
         let padded = format!(" {:<width$} ", status_text, width = available.min(80));
         left_parts.push(Span::styled(" │ ", status_style));
-        left_parts.push(Span::styled(padded, status_style.add_modifier(Modifier::BOLD)));
+        left_parts.push(Span::styled(
+            padded,
+            status_style.add_modifier(Modifier::BOLD),
+        ));
     }
 
     // Right side: phase + message count and cost (compact format)
@@ -796,7 +833,7 @@ fn park_follow_up_prompt_spans(app: &App) -> (Vec<Span<'static>>, usize) {
         .bg(BG_INPUT);
     let dim = Style::default().fg(TEXT_DIM).bg(BG_INPUT);
 
-    if app.findings_panel.is_some() && app.park_follow_up_tag.is_none() {
+    if app.workflow_awaiting_confirmation == Some(4) && app.park_follow_up_tag.is_none() {
         let base = Style::default()
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD)
@@ -849,7 +886,7 @@ fn park_follow_up_prompt_spans(app: &App) -> (Vec<Span<'static>>, usize) {
 }
 
 fn park_follow_up_block_title(app: &App) -> Line<'static> {
-    if app.findings_panel.is_some() && app.park_follow_up_tag.is_none() {
+    if app.workflow_awaiting_confirmation == Some(4) && app.park_follow_up_tag.is_none() {
         return Line::from(Span::styled(
             " 1-9 切换范围 · c 确认实施 · d 讨论 · n 新任务 ",
             Style::default()
@@ -866,28 +903,48 @@ fn park_follow_up_block_title(app: &App) -> Line<'static> {
         ));
     }
     Line::from(vec![
-        Span::styled(" 快捷键 ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " 快捷键 ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             "[1]",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" 继续  ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " 继续  ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             "[2]",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" 意见·只读  ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " 意见·只读  ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             "[3]",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" 新任务 ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " 新任务 ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 
@@ -898,29 +955,38 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     frame.render_widget(Clear, area);
 
     let indexing_prompt: String;
-    let (prompt_spans, prompt_len) = if app.pending_confirmation.as_ref().is_some_and(|p| {
-        p.tool_call_id == "__iteration_limit__" || p.tool_call_id == "__budget__"
-    }) {
-        prompt_span("❯ Y/N > ", Color::Yellow)
-    } else if app.pending_confirmation.is_some() {
-        prompt_span("❯ Y/N/T > ", Color::Yellow)
-    } else if app.workflow_awaiting_confirmation == Some(0) {
-        prompt_span("❯ 澄清 > ", Color::Magenta)
-    } else if app.workflow_awaiting_confirmation == Some(4) {
-        park_follow_up_prompt_spans(app)
-    } else if app.workflow_awaiting_confirmation == Some(2) {
-        prompt_span("❯ 确认/修改 > ", Color::Cyan)
-    } else if app.workflow_awaiting_confirmation.is_some() {
-        prompt_span("❯ 确认 > ", Color::Cyan)
-    } else if app.indexing {
-        let s = SPINNER[app.spinner_frame as usize % SPINNER.len()];
-        indexing_prompt = format!("{s} > ");
-        prompt_span(&indexing_prompt, Color::Yellow)
-    } else if app.agent_running {
-        prompt_span("▸ ox > ", STREAMING)
-    } else {
-        prompt_span("ox > ", BLUE)
-    };
+    let (prompt_spans, prompt_len) =
+        if app.pending_confirmation.as_ref().is_some_and(|p| {
+            p.tool_call_id == "__iteration_limit__" || p.tool_call_id == "__budget__"
+        }) {
+            prompt_span("❯ Y/N > ", Color::Yellow)
+        } else if app.pending_confirmation.is_some() {
+            prompt_span("❯ Y/N/T > ", Color::Yellow)
+        } else if app.workflow_awaiting_confirmation == Some(0) {
+            prompt_span("❯ 澄清 > ", Color::Magenta)
+        } else if app.workflow_awaiting_confirmation == Some(4) {
+            park_follow_up_prompt_spans(app)
+        } else if app.workflow_awaiting_confirmation
+            == Some(crate::terminal::app::UNIFIED_GATE_FINISH_STEP)
+        {
+            prompt_span("❯ f结束 / c继续 > ", Color::Yellow)
+        } else if app.workflow_awaiting_confirmation
+            == Some(crate::terminal::app::UNIFIED_GATE_DELIVER_STEP)
+        {
+            prompt_span("❯ c确认 > ", Color::Yellow)
+        } else if app.workflow_awaiting_confirmation == Some(2) {
+            prompt_span("❯ 确认/修改 > ", Color::Cyan)
+        } else if app.workflow_awaiting_confirmation.is_some() {
+            prompt_span("❯ 确认 > ", Color::Cyan)
+        } else if app.indexing {
+            let s = SPINNER[app.spinner_frame as usize % SPINNER.len()];
+            indexing_prompt = format!("{s} > ");
+            prompt_span(&indexing_prompt, Color::Yellow)
+        } else if app.agent_running {
+            prompt_span("▸ ox > ", STREAMING)
+        } else {
+            prompt_span("ox > ", BLUE)
+        };
 
     let border_color = if app.indexing {
         Color::Yellow
@@ -931,7 +997,11 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
     };
 
     // Add visual indicator for confirmation mode
-    let block = if app.pending_confirmation.as_ref().is_some_and(|p| p.tool_call_id == "__iteration_limit__") {
+    let block = if app
+        .pending_confirmation
+        .as_ref()
+        .is_some_and(|p| p.tool_call_id == "__iteration_limit__")
+    {
         Block::default()
             .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::Yellow))
@@ -971,6 +1041,32 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
             .style(Style::default().bg(BG_INPUT))
             .title(park_follow_up_block_title(app))
             .title_style(Style::default().fg(Color::Magenta))
+    } else if app.workflow_awaiting_confirmation
+        == Some(crate::terminal::app::UNIFIED_GATE_FINISH_STEP)
+    {
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(BG_INPUT))
+            .title(" Finish 门禁 — f 结束本轮 · c 继续 ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+    } else if app.workflow_awaiting_confirmation
+        == Some(crate::terminal::app::UNIFIED_GATE_DELIVER_STEP)
+    {
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(BG_INPUT))
+            .title(" 交付门禁 — c 确认 · 可输入讨论 ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
     } else if app.workflow_awaiting_confirmation == Some(2) {
         Block::default()
             .borders(Borders::TOP)
@@ -1017,7 +1113,10 @@ fn render_input_pane(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
 
     // Calculate cursor position using visual width of visible portion before cursor
     let visible_before_cursor = if scroll_offset <= app.input.cursor {
-        app.input.buffer.get(scroll_offset..app.input.cursor).unwrap_or("")
+        app.input
+            .buffer
+            .get(scroll_offset..app.input.cursor)
+            .unwrap_or("")
     } else {
         ""
     };

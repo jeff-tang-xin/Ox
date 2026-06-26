@@ -24,41 +24,40 @@
 /// # Retrieval Strategy (per design doc §5.2)
 /// "深度优先 + Token 预算": inject L0 first (always), then L1/L2 by semantic
 /// similarity, then L3 only if highly relevant, until token budget exhausted.
-
 pub mod index_progress;
 pub use index_progress::IndexProgress;
 pub mod bm25;
 pub mod bridge;
-pub mod entity;
+pub mod consolidation;
 pub mod embedding;
+pub mod entity;
 pub mod extractor;
 pub mod graph;
+pub mod keywords;
 pub mod language;
 pub mod layering;
-pub mod keywords;
-pub mod memory_node;
 pub mod live_update;
 pub mod memory_cluster;
-pub mod consolidation;
+pub mod memory_node;
 pub mod retrieval;
 pub mod vector_store;
 
-pub use memory_node::{format_memory_context, MemoryNode, MemoryNodeType};
 pub use keywords::KeywordExtraction;
+pub use memory_node::{MemoryNode, MemoryNodeType, format_memory_context};
 
+use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use anyhow::Result;
 
+use crate::config::EmbeddingConfig;
+use bm25::Bm25Index;
 use entity::{Entity, EntityKind, RelationType, injection_priority};
+use extractor::AstExtractor;
 use graph::EntityGraph;
 use layering::AutoLayering;
-use bm25::Bm25Index;
-use vector_store::{UnifiedVectorStore, SearchHit};
 use std::sync::Mutex as StdMutex;
-use extractor::AstExtractor;
-use crate::config::EmbeddingConfig;
+use vector_store::{SearchHit, UnifiedVectorStore};
 
 /// Top-level coordinator for the unified knowledge engine.
 ///
@@ -162,10 +161,7 @@ impl KnowledgeEngine {
 
     /// BM25 keyword search — returns entity ids with normalized scores.
     pub fn bm25_search(&self, query: &str, top_k: usize) -> Vec<(String, f32)> {
-        self.bm25_index
-            .lock()
-            .unwrap()
-            .search(query, top_k)
+        self.bm25_index.lock().unwrap().search(query, top_k)
     }
 
     /// Hybrid retrieval: fuse vector hits with BM25 scores.
@@ -242,7 +238,11 @@ impl KnowledgeEngine {
     }
 
     fn purge_file_indexes(&mut self, file_path: &str) {
-        let ids = self.entity_graph.lock().unwrap().entity_ids_for_file(file_path);
+        let ids = self
+            .entity_graph
+            .lock()
+            .unwrap()
+            .entity_ids_for_file(file_path);
         for id in ids {
             self.remove_bm25(&id);
             self.entity_graph.lock().unwrap().remove(&id);
@@ -333,7 +333,11 @@ impl KnowledgeEngine {
     }
 
     /// Rule-based L0→L3 promotion (no LLM). Returns number of new entities stored.
-    pub fn run_consolidation(&mut self, session_id: &str, project_id: Option<&str>) -> Result<usize> {
+    pub fn run_consolidation(
+        &mut self,
+        session_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<usize> {
         let result = {
             let graph = self.entity_graph.lock().unwrap();
             let mut layering = self.auto_layering.lock().unwrap();
@@ -396,7 +400,11 @@ impl KnowledgeEngine {
             return Ok(Vec::new());
         }
         let code = std::fs::read_to_string(file_path)?;
-        let entities = self.extractor.lock().unwrap().extract_entities(file_path, &code)?;
+        let entities = self
+            .extractor
+            .lock()
+            .unwrap()
+            .extract_entities(file_path, &code)?;
         Ok(entities)
     }
 
@@ -445,7 +453,9 @@ impl KnowledgeEngine {
 
             // Check mtime — if unchanged, skip AST parse entirely
             if let Ok(meta) = std::fs::metadata(path) {
-                let mtime = meta.modified().ok()
+                let mtime = meta
+                    .modified()
+                    .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
@@ -511,7 +521,9 @@ impl KnowledgeEngine {
             self.project_path.to_string_lossy().hash(&mut hasher);
             hasher.finish()
         };
-        home.join(".ox").join("cache").join(format!("ast_{:016x}.json", hash))
+        home.join(".ox")
+            .join("cache")
+            .join(format!("ast_{:016x}.json", hash))
     }
 
     /// Returns true if the vector store already has indexed code symbols.
@@ -574,11 +586,8 @@ impl KnowledgeEngine {
             }
             let pa = a.file_path().map(path_priority).unwrap_or(6);
             let pb = b.file_path().map(path_priority).unwrap_or(6);
-            pa.cmp(&pb).then_with(|| {
-                a.file_path()
-                    .unwrap_or("")
-                    .cmp(b.file_path().unwrap_or(""))
-            })
+            pa.cmp(&pb)
+                .then_with(|| a.file_path().unwrap_or("").cmp(b.file_path().unwrap_or("")))
         });
     }
 
@@ -601,7 +610,7 @@ impl KnowledgeEngine {
     /// Skips hidden dirs, target/, node_modules/, etc.
     pub fn collect_source_files(&self) -> Vec<PathBuf> {
         let walker = ignore::WalkBuilder::new(&self.project_path)
-            .standard_filters(true)   // .gitignore, .ignore, hidden files
+            .standard_filters(true) // .gitignore, .ignore, hidden files
             .hidden(false)
             .build();
 
@@ -616,7 +625,11 @@ impl KnowledgeEngine {
     /// Use this for incremental (live) indexing. For startup, use collect_all_symbols() + embed_and_store().
     pub fn index_file(&mut self, file_path: &Path) -> Result<usize> {
         let code = std::fs::read_to_string(file_path)?;
-        let entities = self.extractor.lock().unwrap().extract_entities(file_path, &code)?;
+        let entities = self
+            .extractor
+            .lock()
+            .unwrap()
+            .extract_entities(file_path, &code)?;
 
         if entities.is_empty() {
             return Ok(0);
@@ -635,7 +648,8 @@ impl KnowledgeEngine {
 
         tracing::info!(
             "[KNOWLEDGE_ENGINE] Indexed {} → {} symbols",
-            file_path.display(), count
+            file_path.display(),
+            count
         );
 
         Ok(count)
@@ -657,7 +671,8 @@ impl KnowledgeEngine {
                     .unwrap_or(0);
                 let cache_path = self.cache_path();
                 if let Ok(data) = std::fs::read_to_string(&cache_path) {
-                    if let Ok(cache) = serde_json::from_str::<std::collections::HashMap<String, i64>>(&data)
+                    if let Ok(cache) =
+                        serde_json::from_str::<std::collections::HashMap<String, i64>>(&data)
                     {
                         if cache.get(&path_str) == Some(&mtime) {
                             return Ok(0);
@@ -740,7 +755,8 @@ impl KnowledgeEngine {
 
         tracing::info!(
             "[KNOWLEDGE_ENGINE] Project index complete: {} symbols across {} files",
-            total_symbols, total_files
+            total_symbols,
+            total_files
         );
 
         Ok(total_symbols)
@@ -750,7 +766,11 @@ impl KnowledgeEngine {
     /// Returns the new entities so callers can update the EntityGraph.
     pub fn reindex_file(&mut self, file_path: &Path) -> Result<Vec<Entity>> {
         let code = std::fs::read_to_string(file_path)?;
-        let entities = self.extractor.lock().unwrap().extract_entities(file_path, &code)?;
+        let entities = self
+            .extractor
+            .lock()
+            .unwrap()
+            .extract_entities(file_path, &code)?;
 
         let file_path_str = file_path.to_string_lossy().to_string();
         self.purge_file_indexes(&file_path_str);
@@ -809,7 +829,12 @@ impl KnowledgeEngine {
         has_code_changes: bool,
     ) -> Result<Entity> {
         let entity = Entity::working_memory(
-            session_id, action, intent, result, tools_used, has_code_changes,
+            session_id,
+            action,
+            intent,
+            result,
+            tools_used,
+            has_code_changes,
         );
         self.store.insert_entity(&entity)?;
         self.after_entity_stored(&entity);
@@ -856,7 +881,8 @@ impl KnowledgeEngine {
         project_id: Option<&str>,
         task_description: &str,
     ) -> Result<Entity> {
-        let entity = Entity::episodic_memory(episode_name, session_id, project_id, task_description);
+        let entity =
+            Entity::episodic_memory(episode_name, session_id, project_id, task_description);
         self.store.insert_entity(&entity)?;
         self.after_entity_stored(&entity);
         self.track_entity(&entity);
@@ -885,23 +911,26 @@ impl KnowledgeEngine {
     /// Runs in a background tokio task — call once at startup.
     pub fn start_file_watcher(engine: Arc<tokio::sync::RwLock<Self>>) {
         let project_path = {
-            let eng = engine.try_read().unwrap_or_else(|_| panic!("KnowledgeEngine lock held during watcher init"));
+            let eng = engine
+                .try_read()
+                .unwrap_or_else(|_| panic!("KnowledgeEngine lock held during watcher init"));
             eng.project_path.clone()
         };
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<notify::Event>();
 
-        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res {
-                let _ = event_tx.send(event);
-            }
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!("[KNOWLEDGE_ENGINE] Failed to create file watcher: {e}");
-                return;
-            }
-        };
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let _ = event_tx.send(event);
+                }
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("[KNOWLEDGE_ENGINE] Failed to create file watcher: {e}");
+                    return;
+                }
+            };
 
         use notify::{RecursiveMode, Watcher};
         if let Err(e) = watcher.watch(&project_path, RecursiveMode::Recursive) {
@@ -918,7 +947,9 @@ impl KnowledgeEngine {
             loop {
                 match event_rx.recv().await {
                     Some(event) => {
-                        if event.kind.is_access() { continue; }
+                        if event.kind.is_access() {
+                            continue;
+                        }
                         let is_remove = event.kind.is_remove();
                         for path in event.paths {
                             if path.is_file() || is_remove {
@@ -948,11 +979,17 @@ impl KnowledgeEngine {
                         for path in paths {
                             let path_str = path.to_string_lossy().to_string();
                             // Skip non-source files and build dirs
-                            if path_str.contains("/.git/") || path_str.contains("\\/.git\\")
-                                || path_str.contains("/target/") || path_str.contains("\\target\\")
-                                || path_str.contains("/node_modules/") || path_str.contains("\\node_modules\\")
-                                || path_str.contains("/.ox/") || path_str.contains("\\.ox\\")
-                            { continue; }
+                            if path_str.contains("/.git/")
+                                || path_str.contains("\\/.git\\")
+                                || path_str.contains("/target/")
+                                || path_str.contains("\\target\\")
+                                || path_str.contains("/node_modules/")
+                                || path_str.contains("\\node_modules\\")
+                                || path_str.contains("/.ox/")
+                                || path_str.contains("\\.ox\\")
+                            {
+                                continue;
+                            }
 
                             if is_remove || !path.exists() {
                                 let mut eng = engine_clone.write().await;
@@ -970,7 +1007,10 @@ impl KnowledgeEngine {
             }
         });
 
-        tracing::info!("[KNOWLEDGE_ENGINE] File watcher started for {:?}", project_path);
+        tracing::info!(
+            "[KNOWLEDGE_ENGINE] File watcher started for {:?}",
+            project_path
+        );
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1001,19 +1041,17 @@ impl KnowledgeEngine {
             EntityKind::CodeFile,
             EntityKind::CodeModule,
         ];
-        let mut hits = self.hybrid_search_by_kinds(
-            query,
-            &all_kinds,
-            max_results * 2,
-            0.2,
-        )?;
+        let mut hits = self.hybrid_search_by_kinds(query, &all_kinds, max_results * 2, 0.2)?;
 
         // Sort by injection priority (lower = more important for context)
         hits.sort_by(|a, b| {
             let pa = injection_priority(a.entity.kind);
             let pb = injection_priority(b.entity.kind);
-            pa.cmp(&pb)
-                .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+            pa.cmp(&pb).then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
 
         // Ensure L3 is only included if highly relevant
@@ -1030,27 +1068,21 @@ impl KnowledgeEngine {
 
         tracing::debug!(
             "[KNOWLEDGE_ENGINE] Retrieval for '{}': {} hits (session={})",
-            query, hits.len(), session_id
+            query,
+            hits.len(),
+            session_id
         );
 
         Ok(hits)
     }
 
     /// Retrieve only long-term memories (L1-L3), excluding WorkingMemory and code.
-    pub fn retrieve_memories(
-        &self,
-        query: &str,
-        max_results: usize,
-    ) -> Result<Vec<SearchHit>> {
+    pub fn retrieve_memories(&self, query: &str, max_results: usize) -> Result<Vec<SearchHit>> {
         self.store.search_long_term_memory(query, max_results, 0.2)
     }
 
     /// Retrieve code symbols matching the query.
-    pub fn retrieve_code(
-        &self,
-        query: &str,
-        max_results: usize,
-    ) -> Result<Vec<SearchHit>> {
+    pub fn retrieve_code(&self, query: &str, max_results: usize) -> Result<Vec<SearchHit>> {
         self.store.search_code(query, max_results)
     }
 
@@ -1062,7 +1094,8 @@ impl KnowledgeEngine {
         max_results: usize,
         min_score: f32,
     ) -> Result<Vec<SearchHit>> {
-        self.store.search_unified(query, max_results, Some(kinds), min_score)
+        self.store
+            .search_unified(query, max_results, Some(kinds), min_score)
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1076,13 +1109,26 @@ impl KnowledgeEngine {
 
     /// Check source code for syntax errors via tree-sitter.
     pub fn check_syntax(&mut self, path: &Path, code: &str) -> Option<Vec<language::SyntaxError>> {
-        let lang_name = self.extractor.lock().unwrap().detect_language(path)?.to_string();
-        self.extractor.lock().unwrap().check_syntax(code, &lang_name).ok()
+        let lang_name = self
+            .extractor
+            .lock()
+            .unwrap()
+            .detect_language(path)?
+            .to_string();
+        self.extractor
+            .lock()
+            .unwrap()
+            .check_syntax(code, &lang_name)
+            .ok()
     }
 
     /// Detect language from file extension.
     pub fn detect_language(&self, path: &Path) -> Option<String> {
-        self.extractor.lock().unwrap().detect_language(path).map(|s| s.to_string())
+        self.extractor
+            .lock()
+            .unwrap()
+            .detect_language(path)
+            .map(|s| s.to_string())
     }
 
     /// 1-hop `Calls` neighbors of seed symbols (in-memory EntityGraph).

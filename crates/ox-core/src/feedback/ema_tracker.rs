@@ -140,11 +140,7 @@ impl Emamanager {
     }
 
     /// Persist tracker state to a JSON metrics file.
-    pub fn persist_to_file(
-        &self,
-        metric_name: &str,
-        path: &std::path::Path,
-    ) -> anyhow::Result<()> {
+    pub fn persist_to_file(&self, metric_name: &str, path: &std::path::Path) -> anyhow::Result<()> {
         let mut map: std::collections::HashMap<String, EmaPersisted> = if path.exists() {
             serde_json::from_str(&std::fs::read_to_string(path)?).unwrap_or_default()
         } else {

@@ -1,3 +1,5 @@
+use anyhow::Result;
+use serde_json::json;
 /// Unified TriviumDB-backed vector store for ALL knowledge entities.
 ///
 /// Replaces the two separate instances (`symbols.tdb` + `memories.tdb`) with a
@@ -10,16 +12,13 @@
 /// - `expand_depth=2`: graph expansion along entity relations
 /// - File-level deduplication: re-indexing a file removes old entities first
 /// - Batch insert with chunked embedding (100 entities/chunk)
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use anyhow::Result;
-use serde_json::json;
 
 use super::entity::{Entity, EntityKind, EntityMetadata, MemoryCoordinate, Relation, SymbolType};
-use crate::symbol::embedding::EmbeddingModel;
 use crate::config::EmbeddingConfig;
+use crate::symbol::embedding::EmbeddingModel;
 
 /// A unified search result carrying the entity and its similarity score.
 #[derive(Debug, Clone)]
@@ -73,7 +72,9 @@ impl UnifiedVectorStore {
 
     /// True when this file path already has stored vectors (resume / incremental skip).
     pub fn has_file_vectors(&self, file_path: &str) -> bool {
-        self.file_ids.get(file_path).is_some_and(|ids| !ids.is_empty())
+        self.file_ids
+            .get(file_path)
+            .is_some_and(|ids| !ids.is_empty())
     }
 
     fn embed_text<'a>(&self, entity: &'a Entity) -> String {
@@ -92,7 +93,9 @@ impl UnifiedVectorStore {
             .embedding_model
             .embed_passage(&embed_text, entity.kind.is_code_entity())?;
         let payload = entity_to_payload(entity);
-        let id = self.db.insert(&embedding, payload)
+        let id = self
+            .db
+            .insert(&embedding, payload)
             .map_err(|e| anyhow::anyhow!("TriviumDB insert error for entity {}: {e}", entity.id))?;
 
         self.entity_ids.insert(entity.id.clone(), id);
@@ -104,7 +107,9 @@ impl UnifiedVectorStore {
 
         tracing::debug!(
             "[UNIFIED_VECTOR] Inserted entity {} (kind={}, {} chars)",
-            entity.id, entity.kind.as_str(), entity.content.len()
+            entity.id,
+            entity.kind.as_str(),
+            entity.content.len()
         );
 
         Ok(id)
@@ -158,7 +163,8 @@ impl UnifiedVectorStore {
             let processed = ((chunk_idx + 1) * chunk_size).min(total);
             tracing::debug!(
                 "[UNIFIED_VECTOR] Embedding progress: {}/{} entities",
-                processed, total
+                processed,
+                total
             );
         }
 
@@ -167,7 +173,8 @@ impl UnifiedVectorStore {
 
         tracing::info!(
             "[UNIFIED_VECTOR] Batch-inserted {}/{} entities",
-            total_count, total
+            total_count,
+            total
         );
         Ok(total_count)
     }
@@ -187,7 +194,8 @@ impl UnifiedVectorStore {
             }
             tracing::debug!(
                 "[UNIFIED_VECTOR] Removed {} old vectors for {}",
-                n, file_path
+                n,
+                file_path
             );
         }
     }
@@ -207,8 +215,9 @@ impl UnifiedVectorStore {
     /// Delete a single entity by its entity_id (payload key).
     pub fn delete_entity_by_id(&mut self, entity_id: &str) -> Result<bool> {
         if let Some(id) = self.entity_ids.remove(entity_id) {
-            self.db.delete(id)
-                .map_err(|e| anyhow::anyhow!("TriviumDB delete error for entity {entity_id}: {e}"))?;
+            self.db.delete(id).map_err(|e| {
+                anyhow::anyhow!("TriviumDB delete error for entity {entity_id}: {e}")
+            })?;
             for ids in self.file_ids.values_mut() {
                 ids.retain(|&vid| vid != id);
             }
@@ -219,7 +228,8 @@ impl UnifiedVectorStore {
 
     /// Delete a single entity by its TriviumDB internal ID.
     pub fn delete_by_id(&mut self, id: u64) -> Result<()> {
-        self.db.delete(id)
+        self.db
+            .delete(id)
             .map_err(|e| anyhow::anyhow!("TriviumDB delete error for id {id}: {e}"))
     }
 
@@ -274,12 +284,15 @@ impl UnifiedVectorStore {
         let query_embedding = self.embedding_model.embed_query(query)?;
 
         // expand_depth=2: 2-hop graph traversal along entity relations
-        let raw_results = self.db.search(
-            &query_embedding,
-            top_k * 3, // Fetch more to account for kind filtering
-            2,         // expand_depth=2
-            min_score,
-        ).map_err(|e| anyhow::anyhow!("TriviumDB search error: {e}"))?;
+        let raw_results = self
+            .db
+            .search(
+                &query_embedding,
+                top_k * 3, // Fetch more to account for kind filtering
+                2,         // expand_depth=2
+                min_score,
+            )
+            .map_err(|e| anyhow::anyhow!("TriviumDB search error: {e}"))?;
 
         let hits: Vec<SearchHit> = raw_results
             .into_iter()
@@ -303,23 +316,29 @@ impl UnifiedVectorStore {
 
         tracing::debug!(
             "[UNIFIED_VECTOR] Search '{}' → {} hits (min_score={}, filtered from {})",
-            query, hits.len(), min_score,
-            if kind_filter.is_some() { "with filter" } else { "no filter" }
+            query,
+            hits.len(),
+            min_score,
+            if kind_filter.is_some() {
+                "with filter"
+            } else {
+                "no filter"
+            }
         );
 
         Ok(hits)
     }
 
     /// Search only code symbols (CodeSymbol, CodeFile, CodeModule).
-    pub fn search_code(
-        &self,
-        query: &str,
-        top_k: usize,
-    ) -> Result<Vec<SearchHit>> {
+    pub fn search_code(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>> {
         self.search_unified(
             query,
             top_k,
-            Some(&[EntityKind::CodeSymbol, EntityKind::CodeFile, EntityKind::CodeModule]),
+            Some(&[
+                EntityKind::CodeSymbol,
+                EntityKind::CodeFile,
+                EntityKind::CodeModule,
+            ]),
             0.0,
         )
     }
@@ -368,11 +387,7 @@ impl UnifiedVectorStore {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     /// Find CodeSymbol entities in a specific file.
-    pub fn find_symbols_in_file(
-        &self,
-        file_path: &str,
-        query_hint: &str,
-    ) -> Result<Vec<Entity>> {
+    pub fn find_symbols_in_file(&self, file_path: &str, query_hint: &str) -> Result<Vec<Entity>> {
         let normalized_target = normalize_path_key(file_path);
         let search_query = if query_hint.is_empty() {
             file_path
@@ -380,12 +395,7 @@ impl UnifiedVectorStore {
             query_hint
         };
 
-        let hits = self.search_unified(
-            search_query,
-            100,
-            Some(&[EntityKind::CodeSymbol]),
-            0.0,
-        )?;
+        let hits = self.search_unified(search_query, 100, Some(&[EntityKind::CodeSymbol]), 0.0)?;
 
         let symbols: Vec<Entity> = hits
             .into_iter()
@@ -445,7 +455,10 @@ fn entity_to_payload(entity: &Entity) -> serde_json::Value {
         } => {
             let map = payload.as_object_mut().unwrap();
             map.insert("file_path".into(), json!(file_path));
-            map.insert("symbol_name".into(), json!(fq_name.rsplit("::").next().unwrap_or(fq_name)));
+            map.insert(
+                "symbol_name".into(),
+                json!(fq_name.rsplit("::").next().unwrap_or(fq_name)),
+            );
             map.insert("symbol_type".into(), json!(symbol_type.to_string()));
             map.insert("language".into(), json!(language));
             map.insert("start_line".into(), json!(start_line));
@@ -465,24 +478,40 @@ fn entity_to_payload(entity: &Entity) -> serde_json::Value {
             map.insert("module_name".into(), json!(name));
             map.insert("file_path".into(), json!(path));
         }
-        EntityMetadata::WorkingMemory { session_id, action, has_code_changes, .. } => {
+        EntityMetadata::WorkingMemory {
+            session_id,
+            action,
+            has_code_changes,
+            ..
+        } => {
             let map = payload.as_object_mut().unwrap();
             map.insert("session_id".into(), json!(session_id));
             map.insert("action".into(), json!(action));
             map.insert("has_code_changes".into(), json!(has_code_changes));
         }
-        EntityMetadata::AtomicMemory { memory_type, project_id, .. } => {
+        EntityMetadata::AtomicMemory {
+            memory_type,
+            project_id,
+            ..
+        } => {
             let map = payload.as_object_mut().unwrap();
             map.insert("memory_type".into(), json!(memory_type));
             map.insert("project_id".into(), json!(project_id));
         }
-        EntityMetadata::EpisodicMemory { episode_name, session_id, task_description, .. } => {
+        EntityMetadata::EpisodicMemory {
+            episode_name,
+            session_id,
+            task_description,
+            ..
+        } => {
             let map = payload.as_object_mut().unwrap();
             map.insert("episode_name".into(), json!(episode_name));
             map.insert("session_id".into(), json!(session_id));
             map.insert("task_description".into(), json!(task_description));
         }
-        EntityMetadata::SemanticMemory { domain, project_id, .. } => {
+        EntityMetadata::SemanticMemory {
+            domain, project_id, ..
+        } => {
             let map = payload.as_object_mut().unwrap();
             map.insert("domain".into(), json!(domain));
             map.insert("project_id".into(), json!(project_id));
@@ -514,20 +543,17 @@ fn payload_to_entity(payload: &serde_json::Value) -> Option<Entity> {
         .get("coordinate_json")
         .and_then(|v| v.as_str())
         .and_then(|s| serde_json::from_str::<MemoryCoordinate>(s).ok())
-        .unwrap_or_else(|| MemoryCoordinate::new(
-            entity_kind.depth().unwrap_or(0),
-            entity_id.as_str(),
-            384,
-        ));
+        .unwrap_or_else(|| {
+            MemoryCoordinate::new(entity_kind.depth().unwrap_or(0), entity_id.as_str(), 384)
+        });
 
-    let is_critical = payload.get("is_critical")
+    let is_critical = payload
+        .get("is_critical")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
     // If metadata deserialization failed, reconstruct from flattened fields
-    let metadata = metadata.unwrap_or_else(|| {
-        reconstruct_metadata(entity_kind, payload)
-    });
+    let metadata = metadata.unwrap_or_else(|| reconstruct_metadata(entity_kind, payload));
 
     Some(Entity {
         id: entity_id,
@@ -542,15 +568,31 @@ fn payload_to_entity(payload: &serde_json::Value) -> Option<Entity> {
 
 /// Fallback: reconstruct EntityMetadata from flattened payload fields.
 fn reconstruct_metadata(kind: EntityKind, payload: &serde_json::Value) -> EntityMetadata {
-    let s = |key: &str| payload.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let s_opt = |key: &str| payload.get(key).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let s = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let s_opt = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
     let i = |key: &str| payload.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let f = |key: &str| payload.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
     let b = |key: &str| payload.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
     let strings = |key: &str| {
-        payload.get(key)
+        payload
+            .get(key)
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default()
     };
 
@@ -572,19 +614,28 @@ fn reconstruct_metadata(kind: EntityKind, payload: &serde_json::Value) -> Entity
             source: s("source"),
             related_files: strings("related_files"),
             quality_score: f("quality_score"),
-            judge_eval_count: payload.get("judge_eval_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            judge_eval_count: payload
+                .get("judge_eval_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
         },
         EntityKind::EpisodicMemory => EntityMetadata::EpisodicMemory {
             episode_name: s("episode_name"),
             project_id: s_opt("project_id"),
             session_id: s("session_id"),
-            start_time: payload.get("start_time").and_then(|v| v.as_i64()).unwrap_or(0),
+            start_time: payload
+                .get("start_time")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
             end_time: payload.get("end_time").and_then(|v| v.as_i64()),
             task_description: s("task_description"),
             conclusions: strings("conclusions"),
             unresolved: strings("unresolved"),
             continuation_hint: s_opt("continuation_hint"),
-            usage_count: payload.get("usage_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            usage_count: payload
+                .get("usage_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
             related_atoms: strings("related_atoms"),
         },
         EntityKind::SemanticMemory => EntityMetadata::SemanticMemory {

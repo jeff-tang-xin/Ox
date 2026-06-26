@@ -14,7 +14,9 @@
 pub mod gate;
 pub mod gates;
 
-pub use gate::{Gate, GateCtx, GateOutcome, GateReport, GateRunner, current_failures, reset_failures};
+pub use gate::{
+    Gate, GateCtx, GateOutcome, GateReport, GateRunner, current_failures, reset_failures,
+};
 
 /// Default per-turn global gate-failure budget before escalating to the user.
 pub const DEFAULT_GATE_BUDGET: u32 = 8;

@@ -197,9 +197,7 @@ mod tests {
                 .unwrap();
             assert!(!ready, "round {i} should not be ready yet");
         }
-        let (n, ready) = buf
-            .append_round(&root, "task5", "foo", c2, "d2")
-            .unwrap();
+        let (n, ready) = buf.append_round(&root, "task5", "foo", c2, "d2").unwrap();
         assert_eq!(n, 5);
         assert!(ready);
         let (id, merged, desc) = buf.build_merged_draft();

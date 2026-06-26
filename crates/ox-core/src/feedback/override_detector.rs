@@ -97,7 +97,7 @@ impl CodeOverrideDetector {
                     change_ratio,
                     time_elapsed: record.timestamp.elapsed(),
                 });
-                
+
                 // ✅ IMPORTANT: Remove from tracking after detecting override
                 // This prevents reporting the same override multiple times
                 to_remove.push(path.clone());

@@ -1,11 +1,11 @@
-mod terminal;
-pub mod slash_commands;
-pub mod middleware;
+pub mod app_runtime;
+pub mod event_loop;
+pub mod handlers;
 pub mod helpers;
 pub mod keyword_extraction;
-pub mod app_runtime;
-pub mod handlers;
-pub mod event_loop;
+pub mod middleware;
+pub mod slash_commands;
+mod terminal;
 
 use std::io;
 use std::sync::Arc;
@@ -20,10 +20,10 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-use ox_core::agent::{self, AgentToUiEvent};
 use ox_core::agent::interjection::{InterjectionBuffer, InterjectionPriority};
 use ox_core::agent::interrupt::InterruptController;
 use ox_core::agent::ui_event::UiToAgentEvent;
+use ox_core::agent::{self, AgentToUiEvent};
 use ox_core::config::{AgentConfig, OxConfig};
 use ox_core::context::{self, ContextBuilder};
 use ox_core::cost::CostTracker;
@@ -31,8 +31,8 @@ use ox_core::knowledge::KnowledgeEngine;
 use ox_core::llm::{self, LlmProvider, ProviderResolveInfo};
 use ox_core::message::{Message, Session};
 use ox_core::runtime;
-use ox_core::safety::injection;
 use ox_core::safety::TrustManager;
+use ox_core::safety::injection;
 use ox_core::tools::{ToolContext, ToolRegistry};
 use terminal::app::{App, PlanItem, PlanItemStatus, SessionAction, UserInput};
 use terminal::event::{Event, EventHandler};
@@ -67,7 +67,12 @@ async fn main() -> anyhow::Result<()> {
     terminal.clear()?;
 
     let result = run_app(
-        &mut terminal, &config, rt_env, provider, resolve_info, provider_error,
+        &mut terminal,
+        &config,
+        rt_env,
+        provider,
+        resolve_info,
+        provider_error,
     )
     .await;
 
@@ -116,9 +121,7 @@ fn init_logging() -> anyhow::Result<()> {
             .with_writer(std::sync::Mutex::new(log_file))
             .with_ansi(false)
             .with_filter(filter);
-        tracing_subscriber::registry()
-            .with(file_layer)
-            .init();
+        tracing_subscriber::registry().with(file_layer).init();
         tracing::info!("✅ Logging initialized. Writing to: {:?}", log_file_path);
     } else {
         use tracing_subscriber::filter::LevelFilter;
@@ -140,7 +143,11 @@ fn install_panic_hook() {
 
 fn create_provider(
     config: &OxConfig,
-) -> (Option<Arc<dyn LlmProvider>>, Option<ProviderResolveInfo>, Option<String>) {
+) -> (
+    Option<Arc<dyn LlmProvider>>,
+    Option<ProviderResolveInfo>,
+    Option<String>,
+) {
     match llm::create_provider_with_info(&config.models.default, &config.models) {
         Ok((p, info)) => (Some(Arc::from(p)), Some(info), None),
         Err(e) => {
@@ -188,9 +195,11 @@ async fn run_app(
     // Header
     app.header_info.push(rt_env.banner_summary());
     if provider.is_some() {
-        app.header_info.push("Type a message or /help for commands. /exit to quit.".to_string());
+        app.header_info
+            .push("Type a message or /help for commands. /exit to quit.".to_string());
     } else {
-        app.header_info.push("No API key. Set env var or config. Running in echo mode.".to_string());
+        app.header_info
+            .push("No API key. Set env var or config. Running in echo mode.".to_string());
     }
 
     if !OxConfig::config_exists() {
@@ -271,8 +280,13 @@ async fn run_app(
 
     // Initial system prompt (for interjections, not main turns)
     let system_prompt = context::build_system_prompt(
-        &rt_env, &tool_registry, ox_core::context::UserIntent::General,
-        Some(&config.behavior_rules), None, None,
+        &rt_env,
+        &tool_registry,
+        ox_core::context::UserIntent::General,
+        Some(&config.behavior_rules),
+        None,
+        None,
+        config.agent.unified_tool_mode,
     );
 
     let context_builder = ContextBuilder::from_config(&config.context);
@@ -287,39 +301,11 @@ async fn run_app(
         CostTracker::load_or_create(&std::env::temp_dir()).unwrap()
     });
 
-    // ── Knowledge Engine init ──
-    let db_path = db_dir.join("knowledge.tdb");
-    let db_path_str = db_path.to_string_lossy().to_string();
-    let config_clone = config.clone();
-    let rt_env_clone = rt_env.clone();
-
-    app.status = format!("Loading embed: {}…", app.embedding_model);
-    app.dirty = true;
-    terminal.draw(|frame| render::render(frame, &mut app, 0))?;
-
-    let knowledge_engine = tokio::task::spawn_blocking(move || {
-        let embedding_model = ox_core::knowledge::embedding::load_shared(&config_clone.embedding)
-            .unwrap_or_else(|e| {
-                panic!("Embedding model required for KnowledgeEngine: {e}");
-            });
-        KnowledgeEngine::new(
-            &db_path_str,
-            embedding_model,
-            &config_clone.embedding,
-            rt_env_clone
-                .project_root
-                .as_deref()
-                .unwrap_or(&rt_env_clone.working_dir),
-        )
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to create KnowledgeEngine: {e}");
-            std::process::exit(1);
-        })
-    })
-    .await
-    .expect("KnowledgeEngine init panicked");
-
-    let knowledge_engine = Arc::new(tokio::sync::RwLock::new(knowledge_engine));
+    // ── Knowledge Engine — disabled (embedding/vector retrieval removed) ──
+    // No vector indexing, no background embedding, no pre-turn retrieval.
+    // find_symbol uses tree-sitter directly; skills are file-based.
+    let knowledge_engine: Option<Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>> =
+        None;
 
     let ema_metrics_path = rt_env.ox_home_dir.join("ema_metrics.json");
     if let Err(e) = app
@@ -329,61 +315,43 @@ async fn run_app(
         tracing::warn!("Failed to load EMA history: {}", e);
     }
 
-    // ── Background indexing ──
-    let knowledge_for_index = Arc::clone(&knowledge_engine);
-    let embed_chunk_size = config.embedding.index_embed_chunk_size.max(1);
-    let embed_progress_step = config.embedding.index_embed_progress_step.max(1);
-    let lazy_index = config.embedding.lazy_index;
-    let background_full_index = config.embedding.background_full_index;
-    let (index_progress_tx, mut index_progress_rx) =
-        mpsc::unbounded_channel::<ox_core::knowledge::IndexProgress>();
-    let (index_phase_tx, mut index_phase_rx) = mpsc::unbounded_channel::<String>();
-    let (index_done_tx, mut index_done_rx) = mpsc::unbounded_channel::<usize>();
+    // Indexing — disabled
+    app.indexing = false;
+    app.status = String::new();
 
-    if lazy_index {
-        // Chat immediately; embed on-demand per turn + optional background full index.
-        if background_full_index {
-            tokio::spawn(async move {
-                run_full_project_index(
-                    knowledge_for_index,
-                    embed_chunk_size,
-                    embed_progress_step,
-                    index_phase_tx,
-                    index_progress_tx,
-                    index_done_tx,
-                )
-                .await;
-            });
-            app.indexing = true;
-            app.index_phase = "parsing".into();
-            app.status = "后台索引中 — 可立即聊天".to_string();
-        } else {
-            KnowledgeEngine::start_file_watcher(Arc::clone(&knowledge_for_index));
-            app.indexing = false;
-            app.status = "按需索引 — findings/查询路径优先嵌入".to_string();
+    // ── GitNexus code graph (MCP) — mandatory ──
+    // Probe the toolchain synchronously (cheap, just PATH lookups). GitNexus is a
+    // required component: when launchable we bring it up in the background and the
+    // per-turn gate blocks the first prompt until it's ready; when the toolchain
+    // is missing we surface install guidance and the gate blocks agent turns until
+    // it's fixed. The Arc is held for the whole session (dropping it kills the
+    // child) and threaded into the tool context so `code_graph` can reach it.
+    let (gitnexus, gitnexus_launchable, gitnexus_hint) = {
+        let availability = ox_core::mcp::detect(&config.gitnexus);
+        app.output.push_system(&availability.summary());
+        let hint = availability.hint();
+        if let Some(ref h) = hint {
+            app.output.push_system(&format!("ℹ️ {h}"));
         }
-    } else {
-        tokio::spawn(async move {
-            run_full_project_index(
-                knowledge_for_index,
-                embed_chunk_size,
-                embed_progress_step,
-                index_phase_tx,
-                index_progress_tx,
-                index_done_tx,
-            )
-            .await;
-        });
-        app.indexing = true;
-        app.index_phase = "parsing".into();
-        app.status = "AST parsing… (chat ready)".to_string();
-    }
+        let svc = Arc::new(ox_core::mcp::GitNexusService::new(
+            config.gitnexus.clone(),
+            rt_env.effective_project_root(),
+        ));
+        // The background index+start spawn is deferred until `agent_tx` exists
+        // (below) so it can report readiness to the UI scrollback.
+        (svc, availability.is_launchable(), hint)
+    };
 
     // ── Tool context ──
-    let mut tool_ctx = Arc::new(ToolContext::new(
-        rt_env.clone(), rt_env.working_dir.clone(),
-        Arc::new(config.clone()), Arc::clone(&knowledge_engine),
-    ));
+    let mut tool_ctx = Arc::new(
+        ToolContext::new(
+            rt_env.clone(),
+            rt_env.working_dir.clone(),
+            Arc::new(config.clone()),
+            knowledge_engine.clone(),
+        )
+        .with_gitnexus(Some(Arc::clone(&gitnexus))),
+    );
 
     let mut model_name = provider
         .as_ref()
@@ -396,6 +364,67 @@ async fn run_app(
     let mut events = EventHandler::new(Duration::from_millis(33));
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<AgentToUiEvent>();
     let agent_config = Arc::new(config.agent.clone());
+
+    // ── GitNexus background bring-up (index + MCP server) ──
+    // Deferred to here so it can report progress/readiness to the UI. On first
+    // launch (no index yet) we eagerly build it so the very first questions
+    // already benefit from the code graph (higher accuracy). Reindex still runs
+    // ONLY when missing/stale; a fresh index skips straight to starting the
+    // reader. The CLI writer and MCP reader never touch KuzuDB concurrently
+    // because `start()` runs after `analyze()` completes.
+    if gitnexus_launchable {
+        let bg = Arc::clone(&gitnexus);
+        let ui = agent_tx.clone();
+        let auto_index = config.gitnexus.auto_index;
+        tokio::spawn(async move {
+            if auto_index && bg.needs_startup_reindex().await {
+                let _ = ui.send(AgentToUiEvent::Status(
+                    "🔗 GitNexus：正在构建代码图谱（首次或有更新，请稍候）…".to_string(),
+                ));
+                match bg.cli_analyze().await {
+                    Ok(r) if r.success => tracing::info!("[GitNexus] analyze complete"),
+                    Ok(r) => tracing::warn!(
+                        "[GitNexus] analyze exited {:?}: {}",
+                        r.exit_code,
+                        r.stderr.trim()
+                    ),
+                    Err(e) => tracing::warn!("[GitNexus] analyze failed: {e}"),
+                }
+            }
+            match bg.start().await {
+                Ok(_) => {
+                    tracing::info!("[GitNexus] MCP server ready");
+                    let _ = ui.send(AgentToUiEvent::SystemNotice(
+                        "✅ GitNexus 代码图谱已就绪：find_symbol 将带出调用关系，提问会先做语义预检索。"
+                            .to_string(),
+                    ));
+                    // Clear the lingering "正在构建…" transient status line.
+                    let _ = ui.send(AgentToUiEvent::Status(String::new()));
+                }
+                Err(e) => {
+                    tracing::warn!("[GitNexus] start failed: {e}");
+                    // start() already recorded Failed(reason); the per-turn gate
+                    // will surface it and block (mandatory mode).
+                    let _ = ui.send(AgentToUiEvent::SystemNotice(format!(
+                        "⛔ GitNexus（必需）启动失败，提问将被阻止直到修复：{e}"
+                    )));
+                }
+            }
+        });
+    } else if config.gitnexus.enabled {
+        // Mandatory but the toolchain is missing (Node/npx or launcher). Record
+        // the reason so the per-turn gate blocks with guidance, and surface a
+        // prominent banner now. (If GitNexus is explicitly disabled in config we
+        // skip this and leave it as an opt-out escape hatch.)
+        let reason = gitnexus_hint.clone().unwrap_or_else(|| {
+            "GitNexus 不可用：请安装 Node.js（提供 npx），或在 ~/.ox/config.toml 的 [gitnexus] command 指定可执行文件。"
+                .to_string()
+        });
+        gitnexus.mark_unavailable(reason.clone()).await;
+        app.output.push_system(&format!(
+            "⛔ GitNexus 是必需组件，但当前不可用 — 修复前提问会被阻止：\n{reason}"
+        ));
+    }
 
     let compressed_ctx_store = Arc::new(
         ox_core::context::compressed_store::CompressedContextStore::open(
@@ -417,7 +446,7 @@ async fn run_app(
 
     // Workflow engine
     app.init_workflow_engine(&session.meta.id, &session.meta);
-    app.knowledge_engine = Some(Arc::clone(&knowledge_engine));
+    app.knowledge_engine = knowledge_engine.clone();
 
     // ── Onboarding check ──
     let mut needs_onboarding = false;
@@ -435,17 +464,14 @@ async fn run_app(
     // ========================================================================
     loop {
         // ── Onboarding trigger ──
-        if needs_onboarding && (!app.indexing || lazy_index) {
+        if needs_onboarding && !app.indexing {
             needs_onboarding = false;
-            app.output.push_system(
-                "🔍 首次进入本项目 — 将生成项目规范与业务指导 Skill…",
-            );
-            app.output.push_system(
-                "   → .ox/skills/project-conventions.md（项目规范）",
-            );
-            app.output.push_system(
-                "   → .ox/skills/project-business-guide.md（业务指导）",
-            );
+            app.output
+                .push_system("🔍 首次进入本项目 — 将生成项目规范与业务指导 Skill…");
+            app.output
+                .push_system("   → .ox/skills/project-conventions.md（项目规范）");
+            app.output
+                .push_system("   → .ox/skills/project-business-guide.md（业务指导）");
             if ox_core::agent::onboarding::is_greenfield_project(&project_root) {
                 app.output.push_system(
                     "   ℹ️ 未检测到工程标记 — 将基于当前目录创建初始 Skill（任意语言/stack）",
@@ -456,12 +482,22 @@ async fn run_app(
                 let _ = session.append_message(Message::user(&onboarding_prompt_text));
 
                 let pre_turn_result = handlers::pre_turn::prepare_turn(
-                    config, &rt_env, &tool_registry, &context_builder, context_window,
-                    &Some(Arc::clone(&knowledge_engine)), &onboarding_prompt_text,
-                    &session.messages, &compressed_cache,
-                    TurnVariant::Onboarding { prompt_text: onboarding_prompt_text.clone() },
+                    config,
+                    &rt_env,
+                    &tool_registry,
+                    &context_builder,
+                    context_window,
+                    &knowledge_engine,
+                    &onboarding_prompt_text,
+                    &session.messages,
+                    &compressed_cache,
+                    TurnVariant::Onboarding {
+                        prompt_text: onboarding_prompt_text.clone(),
+                    },
                     &None, // 不走 4 步工作流，直接探索 + 写 Skill
-                    &session.meta.id, &agent_tx,
+                    &session.meta.id,
+                    &agent_tx,
+                    None, // onboarding 不做语义预检索
                 )
                 .await;
 
@@ -483,8 +519,16 @@ async fn run_app(
                     agent::run_agent_turn(
                         p_clone,
                         agent::collaboration::RoleProviders::default(),
-                        turn_messages, reg, ctx, tx, ui_rx,
-                        cancel, tm, ac, planning, None,
+                        turn_messages,
+                        reg,
+                        ctx,
+                        tx,
+                        ui_rx,
+                        cancel,
+                        tm,
+                        ac,
+                        planning,
+                        None,
                         turn_id,
                     )
                     .await;
@@ -496,14 +540,6 @@ async fn run_app(
         let override_signals = app.override_detector.detect_overrides();
         middleware::feedback::process_implicit_feedback(&mut app, &override_signals);
         middleware::feedback::update_feedback_metrics(&mut app, &ema_metrics_path);
-
-        // ── Drain indexing progress ──
-        if app.indexing {
-            drain_indexing_progress(
-                &mut app, &mut index_phase_rx, &mut index_progress_rx,
-                &mut index_done_rx, &mut tick_count,
-            );
-        }
 
         // ── Render ──
         if app.needs_render() {
@@ -629,8 +665,8 @@ async fn run_app(
 fn suspend_workflow_on_exit(app: &mut App, session: &mut Session) {
     if let Some(ref wf) = app.workflow_engine {
         if let Ok(mut engine) = wf.try_lock() {
-            let was_active =
-                !engine.is_workflow_complete() && engine.get_variable("_current_user_request").is_some();
+            let was_active = !engine.is_workflow_complete()
+                && engine.get_variable("_current_user_request").is_some();
             engine.finalize_interrupted_on_exit();
             if was_active {
                 if let Some(task) = engine.get_variable("_current_user_request") {
@@ -646,173 +682,6 @@ fn suspend_workflow_on_exit(app: &mut App, session: &mut Session) {
                 }
             }
         }
-    }
-}
-
-/// Full-project AST walk + chunked embedding (blocking startup or background).
-async fn run_full_project_index(
-    knowledge_for_index: Arc<tokio::sync::RwLock<KnowledgeEngine>>,
-    embed_chunk_size: usize,
-    progress_step: usize,
-    index_phase_tx: mpsc::UnboundedSender<String>,
-    index_progress_tx: mpsc::UnboundedSender<ox_core::knowledge::IndexProgress>,
-    index_done_tx: mpsc::UnboundedSender<usize>,
-) {
-    let start_watcher = || KnowledgeEngine::start_file_watcher(Arc::clone(&knowledge_for_index));
-
-    let _ = index_phase_tx.send("parsing".to_string());
-    let progress_tx = index_progress_tx.clone();
-    let phase1_result = {
-        let engine = knowledge_for_index.read().await;
-        tokio::task::block_in_place(|| engine.collect_all_symbols(Some(progress_tx)))
-    };
-    let mut all_entities = match phase1_result {
-        Ok((entities, _)) => entities,
-        Err(e) => {
-            tracing::warn!("[INDEXER] Phase 1 failed: {e}");
-            let _ = index_done_tx.send(0);
-            start_watcher();
-            return;
-        }
-    };
-    if all_entities.is_empty() {
-        tracing::info!("[INDEXER] No symbols to embed — indexing complete");
-        let _ = index_done_tx.send(0);
-        start_watcher();
-        return;
-    }
-    KnowledgeEngine::sort_entities_for_startup_index(&mut all_entities);
-    let total_entities = all_entities.len();
-    let _ = index_phase_tx.send(format!("embedding:{total_entities}"));
-    let _ = index_progress_tx.send(ox_core::knowledge::IndexProgress::embedding(
-        0,
-        total_entities,
-    ));
-    tracing::info!("[INDEXER] Phase 2: embedding {total_entities} symbols…");
-    let progress_step = progress_step.min(embed_chunk_size).max(1);
-    let mut offset = 0;
-    // Smaller write-lock windows so retrieval can interleave during background embed.
-    let embed_batch = progress_step.min(embed_chunk_size).min(16).max(1);
-    while offset < total_entities {
-        let chunk = embed_batch.min(total_entities - offset);
-        let _ = index_progress_tx.send(ox_core::knowledge::IndexProgress::embedding(
-            offset,
-            total_entities,
-        ));
-        let result = {
-            let mut engine = knowledge_for_index.write().await;
-            tokio::task::block_in_place(|| {
-                engine.embed_and_store_chunk(&all_entities, offset, chunk)
-            })
-        };
-        match result {
-            Ok(n) => {
-                tracing::debug!("[INDEXER] Embedded chunk at {offset}: {n} stored");
-            }
-            Err(e) => tracing::warn!("[INDEXER] Embedding chunk failed at {offset}: {e}"),
-        }
-        offset += chunk;
-        let _ = index_progress_tx.send(ox_core::knowledge::IndexProgress::embedding(
-            offset,
-            total_entities,
-        ));
-        tokio::task::yield_now().await;
-    }
-    tracing::info!("[INDEXER] ✅ All done: {total_entities} entities embedded");
-    let _ = index_done_tx.send(total_entities);
-    start_watcher();
-}
-
-/// Clamp indexing percent to 0–100 for display.
-fn index_pct(done: usize, total: usize) -> usize {
-    if total == 0 {
-        return 0;
-    }
-    ((done.min(total)) * 100 / total).min(100)
-}
-
-/// Drain indexing progress channels and update app state.
-fn drain_indexing_progress(
-    app: &mut App,
-    phase_rx: &mut mpsc::UnboundedReceiver<String>,
-    progress_rx: &mut mpsc::UnboundedReceiver<ox_core::knowledge::IndexProgress>,
-    done_rx: &mut mpsc::UnboundedReceiver<usize>,
-    tick_count: &mut u64,
-) {
-    if let Ok(phase) = phase_rx.try_recv() {
-        if let Some(total_str) = phase.strip_prefix("embedding:") {
-            app.index_phase = "embedding".to_string();
-            app.output.invalidate_cache();
-            // Drop stale parsing progress events queued before embed phase.
-            while progress_rx.try_recv().is_ok() {}
-            if let Ok(total) = total_str.parse::<usize>() {
-                app.index_embed_total = total.max(1);
-                app.index_embed_done = 0;
-                app.status = format!("Embedding {:>5}/{:<5} entities ({:>3}%)", 0, total, 0);
-            } else {
-                app.status = "Embedding vectors…".to_string();
-            }
-        } else {
-            app.index_phase = phase.clone();
-            app.status = match phase.as_str() {
-                "parsing" => "AST parsing…".to_string(),
-                "embedding" => "Embedding vectors…".to_string(),
-                other => other.to_string(),
-            };
-        }
-        app.dirty = true;
-    }
-    while let Ok(msg) = progress_rx.try_recv() {
-        use ox_core::knowledge::IndexProgress;
-        match msg {
-            IndexProgress::Parsing {
-                files_done,
-                files_total,
-                symbols_so_far,
-            } if app.index_phase != "embedding" => {
-                app.index_phase = "parsing".to_string();
-                app.index_parse_done = files_done;
-                app.index_parse_total = files_total.max(1);
-                app.index_symbols = symbols_so_far;
-                let pct = index_pct(files_done, files_total);
-                app.status = format!(
-                    "AST {:>5}/{:<5} files, {:>6} sym ({:>3}%)",
-                    files_done, files_total, symbols_so_far, pct
-                );
-            }
-            IndexProgress::Embedding {
-                entities_done,
-                entities_total,
-            } => {
-                app.index_phase = "embedding".to_string();
-                let done = entities_done.min(entities_total);
-                app.index_embed_done = done;
-                app.index_embed_total = entities_total.max(1);
-                let pct = index_pct(entities_done, entities_total);
-                app.status = format!(
-                    "Embedding {:>5}/{:<5} entities ({:>3}%)",
-                    done, entities_total, pct
-                );
-            }
-            IndexProgress::Parsing { .. } => {
-                // Ignore parsing events after embed phase started.
-            }
-        }
-        *tick_count = tick_count.wrapping_add(1);
-        app.spinner_frame = *tick_count;
-        app.dirty = true;
-    }
-    if let Ok(total) = done_rx.try_recv() {
-        app.indexing = false;
-        app.index_phase.clear();
-        app.output.invalidate_cache();
-        app.index_symbols = total;
-        app.index_embed_done = app.index_embed_total;
-        app.status = String::new();
-        app.output.push_system(&format!(
-            "✅ Indexing complete: {total} symbols embedded. Ready to chat!"
-        ));
-        app.dirty = true;
     }
 }
 
@@ -841,13 +710,17 @@ fn process_key_event(
     _compressed_ctx_store: &Arc<ox_core::context::compressed_store::CompressedContextStore>,
     compressed_cache: &mut Option<(Vec<Message>, usize)>,
     command_registry: &slash_commands::CommandRegistry,
-    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
 ) {
     // Handle Ctrl+C/D — check both with modifiers and without (cross-platform)
     let is_ctrl_c = matches!(key.code, KeyCode::Char('c'))
-        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
     let is_ctrl_d = matches!(key.code, KeyCode::Char('d'))
-        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
 
     if is_ctrl_c || is_ctrl_d {
         helpers::handle_interrupt_key(app, &key, interrupt_ctrl);
@@ -874,6 +747,21 @@ fn process_key_event(
         }
         KeyResult::FindingsConfirm => {
             let wd = rt_env.effective_project_root();
+            // If agent is running (business gate waiting), send confirmation
+            // directly to the gate via channel — DON'T spawn a new turn.
+            if app.agent_running {
+                if let Some(ref tx) = app.ui_to_agent_tx {
+                    let _ = tx.send(ox_core::agent::ui_event::UiToAgentEvent::ScopeConfirmed);
+                    app.output.push_system("✅ 确认已发送 — 等待 agent 继续...");
+                }
+                // Confirmation accepted by the gate — dismiss the confirm panel so
+                // it doesn't linger after `c` (the agent now resumes implementing).
+                app.clear_workflow_confirmation();
+                app.scroll_to_bottom();
+                app.user_scrolled = false;
+                app.dirty = true;
+                return;
+            }
             let (handled, spawn_turn) = try_apply_workflow_command(app, "/confirm", &wd);
             if handled && spawn_turn {
                 spawn_agent_turn_for_text(
@@ -905,6 +793,17 @@ fn process_key_event(
             app.scroll_to_bottom();
             app.user_scrolled = false;
         }
+        KeyResult::UnifiedDeliverConfirm => {
+            if !agent_handler::send_unified_deliver_ack(app) {
+                app.output.push_system("无法发送交付确认（agent 未运行）");
+            }
+        }
+        KeyResult::UnifiedFinish(finished) => {
+            if !agent_handler::send_unified_finish_ack(app, finished) {
+                app.output
+                    .push_system("无法发送 finish 确认（agent 未运行）");
+            }
+        }
         KeyResult::InputSubmitted(input) => {
             match input {
                 UserInput::Exit => {
@@ -913,23 +812,49 @@ fn process_key_event(
                 }
                 UserInput::SlashCommand { cmd, args } => {
                     process_slash_command(
-                        app, &cmd, &args, session, rt_env, config,
-                        cost_tracker, trust_manager,
-                        provider, agent_tx, tool_registry, tool_ctx,
-                        context_builder, context_window,
-                        interrupt_ctrl, agent_config,
-                        model_name, command_registry,
-                        compressed_cache, knowledge_engine,
+                        app,
+                        &cmd,
+                        &args,
+                        session,
+                        rt_env,
+                        config,
+                        cost_tracker,
+                        trust_manager,
+                        provider,
+                        agent_tx,
+                        tool_registry,
+                        tool_ctx,
+                        context_builder,
+                        context_window,
+                        interrupt_ctrl,
+                        agent_config,
+                        model_name,
+                        command_registry,
+                        compressed_cache,
+                        knowledge_engine,
                     );
                 }
                 UserInput::Text(text) => {
                     process_text_input(
-                        app, &text, session, background_session,
-                        provider, agent_tx, tool_registry,
-                        tool_ctx, context_builder, context_window,
-                        config, agent_config, trust_manager,
-                        rt_env, interrupt_ctrl, interjection_buf,
-                        compressed_cache, model_name, cost_tracker,
+                        app,
+                        &text,
+                        session,
+                        background_session,
+                        provider,
+                        agent_tx,
+                        tool_registry,
+                        tool_ctx,
+                        context_builder,
+                        context_window,
+                        config,
+                        agent_config,
+                        trust_manager,
+                        rt_env,
+                        interrupt_ctrl,
+                        interjection_buf,
+                        compressed_cache,
+                        model_name,
+                        cost_tracker,
                     );
                 }
             }
@@ -961,7 +886,7 @@ fn process_slash_command(
     _model_name: &str,
     command_registry: &slash_commands::CommandRegistry,
     compressed_cache: &Option<(Vec<Message>, usize)>,
-    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
 ) {
     let workflow_line = if args.is_empty() {
         format!("/{cmd}")
@@ -997,8 +922,13 @@ fn process_slash_command(
 
     if let Some(meta) = command_registry.get_command(cmd) {
         let result = (meta.handler)(
-            app, args, session, rt_env, config,
-            cost_tracker, trust_manager,
+            app,
+            args,
+            session,
+            rt_env,
+            config,
+            cost_tracker,
+            trust_manager,
         );
         match result {
             slash_commands::CommandResult::Error(msg) => {
@@ -1006,7 +936,8 @@ fn process_slash_command(
             }
             slash_commands::CommandResult::Unknown(_) => {
                 app.output.push_system(&format!(
-                    "Unknown command: /{}. Type /help for available commands.", cmd
+                    "Unknown command: /{}. Type /help for available commands.",
+                    cmd
                 ));
             }
             slash_commands::CommandResult::LlmRequest {
@@ -1015,18 +946,32 @@ fn process_slash_command(
                 skip_workflow,
             } => {
                 spawn_agent_turn_from_slash(
-                    app, &prompt, &description, skip_workflow, session,
-                    provider, agent_tx, tool_registry, tool_ctx,
-                    context_builder, context_window,
-                    interrupt_ctrl, agent_config, trust_manager,
-                    rt_env, config, compressed_cache, knowledge_engine,
+                    app,
+                    &prompt,
+                    &description,
+                    skip_workflow,
+                    session,
+                    provider,
+                    agent_tx,
+                    tool_registry,
+                    tool_ctx,
+                    context_builder,
+                    context_window,
+                    interrupt_ctrl,
+                    agent_config,
+                    trust_manager,
+                    rt_env,
+                    config,
+                    compressed_cache,
+                    knowledge_engine,
                 );
             }
             _ => {}
         }
     } else {
         app.output.push_system(&format!(
-            "Unknown command: /{}. Type /help for available commands.", cmd
+            "Unknown command: /{}. Type /help for available commands.",
+            cmd
         ));
     }
     app.dirty = true;
@@ -1062,7 +1007,8 @@ fn spawn_agent_turn_for_text(
     begin_round: bool,
 ) {
     if provider.is_none() {
-        app.output.push_line(OutputLine::System(format!("[echo] {}", text.trim())));
+        app.output
+            .push_line(OutputLine::System(format!("[echo] {}", text.trim())));
         return;
     }
 
@@ -1144,6 +1090,14 @@ fn spawn_agent_turn_for_text(
 
     tokio::spawn(async move {
         let status_tx = tx.clone();
+        // Mandatory GitNexus gate: block until the code graph is ready (or abort
+        // with guidance if it's unavailable). Instant once ready.
+        if let Some(svc) = tool_ctx_clone.gitnexus.clone() {
+            if let Err(msg) = await_gitnexus_ready(&svc, &status_tx).await {
+                let _ = status_tx.send(AgentToUiEvent::Error(msg));
+                return;
+            }
+        }
         let result = handlers::pre_turn::prepare_turn(
             &config_clone,
             &rt_env_clone,
@@ -1158,6 +1112,7 @@ fn spawn_agent_turn_for_text(
             &workflow_engine_clone,
             &session_id,
             &status_tx,
+            tool_ctx_clone.gitnexus.clone(),
         )
         .await;
 
@@ -1205,18 +1160,26 @@ fn process_text_input(
     _cost_tracker: &mut CostTracker,
 ) {
     if app.indexing && !config.embedding.lazy_index {
-        app.output.push_system("⏳ Please wait — indexing in progress...");
+        app.output
+            .push_system("⏳ Please wait — indexing in progress...");
         app.dirty = true;
         return;
     }
 
     let trimmed = text.trim();
     if trimmed.starts_with('/') {
-        let (wf_handled, spawn_turn) = try_apply_workflow_command(
-            app,
-            trimmed,
-            &rt_env.effective_project_root(),
-        );
+        // If agent is running (gate waiting), send confirmation directly.
+        if app.agent_running && (trimmed == "/confirm" || trimmed == "/fix") {
+            if let Some(ref tx) = app.ui_to_agent_tx {
+                let _ = tx.send(ox_core::agent::ui_event::UiToAgentEvent::ScopeConfirmed);
+            }
+            app.scroll_to_bottom();
+            app.user_scrolled = false;
+            app.dirty = true;
+            return;
+        }
+        let (wf_handled, spawn_turn) =
+            try_apply_workflow_command(app, trimmed, &rt_env.effective_project_root());
         if wf_handled {
             if spawn_turn {
                 spawn_agent_turn_for_text(
@@ -1250,7 +1213,10 @@ fn process_text_input(
         let t = text.trim().to_lowercase();
         let t = t.strip_prefix('/').unwrap_or(&t);
         let save = matches!(t, "ok" | "y" | "yes" | "保存" | "确认" | "好" | "save");
-        let dismiss = matches!(t, "n" | "no" | "skip" | "取消" | "放弃" | "discard" | "忽略");
+        let dismiss = matches!(
+            t,
+            "n" | "no" | "skip" | "取消" | "放弃" | "discard" | "忽略"
+        );
 
         if save {
             let root = rt_env.effective_project_root();
@@ -1260,7 +1226,8 @@ fn process_text_input(
             ) {
                 Ok(id) => {
                     app.output.push_system(&format!("✅ Skill 已保存: {id}"));
-                    let _ = ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clear_disk(&root);
+                    let _ =
+                        ox_core::agent::skill_reflect_buffer::SkillReflectBuffer::clear_disk(&root);
                     app.status.clear();
                 }
                 Err(e) => app.output.push_error(&format!("保存 Skill 失败: {e}")),
@@ -1277,7 +1244,8 @@ fn process_text_input(
             return;
         }
         // User started a new task — drop the suggestion and continue with their message.
-        app.output.push_system("ℹ️ Skill 建议已忽略，继续处理你的输入。");
+        app.output
+            .push_system("ℹ️ Skill 建议已忽略，继续处理你的输入。");
         app.status.clear();
         app.dirty = true;
         // fall through — do not return
@@ -1316,13 +1284,16 @@ fn process_text_input(
         };
         let content = text.trim_start_matches('!').to_string();
         let delivered = if let Some(tx) = &app.ui_to_agent_tx {
-            tx.send(UiToAgentEvent::Interjection(content.clone())).is_ok()
+            tx.send(UiToAgentEvent::Interjection(content.clone()))
+                .is_ok()
         } else {
             false
         };
         if !delivered {
             interjection_buf.push(content.clone(), priority);
         }
+        // Clear stale gate confirmation state — user is discussing, not confirming.
+        app.workflow_awaiting_confirmation = None;
         let step_hint = if parked_resume {
             "park-resume".to_string()
         } else if let Some(name) = app
@@ -1353,7 +1324,8 @@ fn process_text_input(
     }
 
     if provider.is_none() {
-        app.output.push_line(OutputLine::System(format!("[echo] {}", text.trim())));
+        app.output
+            .push_line(OutputLine::System(format!("[echo] {}", text.trim())));
         return;
     }
 
@@ -1367,8 +1339,11 @@ fn process_text_input(
     // Injection scan
     let text = if injection::is_suspicious(text) {
         let result = injection::detect(text);
-        let categories: Vec<String> =
-            result.matches.iter().map(|m| format!("{:?}", m.category)).collect();
+        let categories: Vec<String> = result
+            .matches
+            .iter()
+            .map(|m| format!("{:?}", m.category))
+            .collect();
         tracing::warn!("🛡️ Prompt injection detected: categories={:?}", categories);
         app.output.push_line(OutputLine::System(format!(
             "⚠️ Prompt injection detected and sanitized: {}",
@@ -1406,7 +1381,8 @@ fn process_text_input(
                 ));
             }
             let (mode, banner) = ox_core::agent::phase::workspace_mode_event(&engine);
-            if ox_core::agent::phase::get(&engine) == ox_core::agent::phase::SingleFlowPhase::Implement
+            if ox_core::agent::phase::get(&engine)
+                == ox_core::agent::phase::SingleFlowPhase::Implement
             {
                 app.clear_workflow_confirmation();
             }
@@ -1444,13 +1420,28 @@ fn process_text_input(
 
     tokio::spawn(async move {
         let status_tx = tx.clone();
+        // Mandatory GitNexus gate (see Normal-turn handler above).
+        if let Some(svc) = tool_ctx_clone.gitnexus.clone() {
+            if let Err(msg) = await_gitnexus_ready(&svc, &status_tx).await {
+                let _ = status_tx.send(AgentToUiEvent::Error(msg));
+                return;
+            }
+        }
         let result = handlers::pre_turn::prepare_turn(
-            &config_clone, &rt_env_clone, &tool_registry_clone,
-            &context_builder_clone, context_window,
-            &knowledge_engine_clone, &text,
-            &session_messages, &compressed_cache_data,
+            &config_clone,
+            &rt_env_clone,
+            &tool_registry_clone,
+            &context_builder_clone,
+            context_window,
+            &knowledge_engine_clone,
+            &text,
+            &session_messages,
+            &compressed_cache_data,
             TurnVariant::Normal,
-            &workflow_engine_clone, &session_id, &status_tx,
+            &workflow_engine_clone,
+            &session_id,
+            &status_tx,
+            tool_ctx_clone.gitnexus.clone(),
         )
         .await;
 
@@ -1458,9 +1449,16 @@ fn process_text_input(
         agent::run_agent_turn(
             provider_clone,
             agent::collaboration::RoleProviders::default(),
-            result.turn_messages, tool_registry_clone,
-            tool_ctx_clone, tx, ui_to_agent_rx,
-            cancel_token, tm, ac, result.planning, workflow_engine_clone,
+            result.turn_messages,
+            tool_registry_clone,
+            tool_ctx_clone,
+            tx,
+            ui_to_agent_rx,
+            cancel_token,
+            tm,
+            ac,
+            result.planning,
+            workflow_engine_clone,
             turn_id,
         )
         .await;
@@ -1528,10 +1526,11 @@ fn spawn_agent_turn_from_slash(
     rt_env: &runtime::RuntimeEnvironment,
     config: &OxConfig,
     compressed_cache: &Option<(Vec<Message>, usize)>,
-    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
 ) {
     if app.indexing && !config.embedding.lazy_index {
-        app.output.push_system("⏳ Please wait — indexing in progress...");
+        app.output
+            .push_system("⏳ Please wait — indexing in progress...");
         app.dirty = true;
         return;
     }
@@ -1563,7 +1562,7 @@ fn spawn_agent_turn_from_slash(
     let rt_env = rt_env.clone();
     let session_messages = session.messages.clone();
     let session_id = session.meta.id.clone();
-    let knowledge = Arc::clone(knowledge_engine);
+    let knowledge = knowledge_engine.clone();
     let compressed_cache = compressed_cache.clone();
     let prompt = prompt.to_string();
     let description = description.to_string();
@@ -1589,7 +1588,7 @@ fn spawn_agent_turn_from_slash(
             &registry,
             &context_builder,
             context_window,
-            &Some(knowledge),
+            &knowledge,
             &prompt,
             &session_messages,
             &compressed_cache,
@@ -1597,6 +1596,7 @@ fn spawn_agent_turn_from_slash(
             &wf,
             &session_id,
             &status_tx,
+            None, // slash/onboarding 不做语义预检索
         )
         .await;
 
@@ -1627,7 +1627,7 @@ fn process_session_action(
     background_session: &mut Option<Session>,
     action: SessionAction,
     rt_env: &mut runtime::RuntimeEnvironment,
-    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
     sessions_root: &std::path::Path,
     compressed_ctx_store: &Arc<ox_core::context::compressed_store::CompressedContextStore>,
     compressed_cache: &mut Option<(Vec<Message>, usize)>,
@@ -1638,17 +1638,17 @@ fn process_session_action(
     match action {
         SessionAction::New => {
             if app.agent_running {
-                let new_s = Session::new(&session_dir, &rt_env.project_id)
-                    .unwrap_or_else(|e| {
-                        tracing::error!("Cannot create new session: {e}");
-                        std::process::exit(1);
-                    });
+                let new_s = Session::new(&session_dir, &rt_env.project_id).unwrap_or_else(|e| {
+                    tracing::error!("Cannot create new session: {e}");
+                    std::process::exit(1);
+                });
                 *background_session = Some(std::mem::replace(session, new_s));
                 app.ui_to_agent_tx = None;
                 app.init_workflow_engine(&session.meta.id, &session.meta);
                 *compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
             } else {
-                let _ = session_handler::handle_session_new(app, session, rt_env, knowledge_engine);
+                let _ =
+                    session_handler::handle_session_new(app, session, rt_env, &knowledge_engine);
                 app.init_workflow_engine(&session.meta.id, &session.meta);
                 *compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
             }
@@ -1657,22 +1657,30 @@ fn process_session_action(
             if app.agent_running {
                 // Move current session to background, load new one
                 let sessions_root = rt_env.ox_home_dir.join("sessions");
-                let target = app.sessions.iter()
+                let target = app
+                    .sessions
+                    .iter()
                     .find(|s| s.id == filename || s.display_name().contains(&filename));
                 if let Some(entry) = target {
                     let session_path = std::path::PathBuf::from(&sessions_root)
-                        .join(&entry.project_id).join(&entry.id);
+                        .join(&entry.project_id)
+                        .join(&entry.id);
                     let parent_dir = session_path.parent().unwrap_or(&session_dir);
                     if let Ok(Some(archived)) = Session::load_archived(parent_dir, &entry.id) {
                         *background_session = Some(std::mem::replace(session, archived));
                         app.ui_to_agent_tx = None;
                         app.init_workflow_engine(&session.meta.id, &session.meta);
-                        *compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+                        *compressed_cache =
+                            compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
                     }
                 }
             } else {
                 if let Err(e) = session_handler::handle_session_resume(
-                    app, session, rt_env, &filename, has_provider,
+                    app,
+                    session,
+                    rt_env,
+                    &filename,
+                    has_provider,
                 ) {
                     app.output.push_system(&format!("Failed to resume: {e}"));
                     return;
@@ -1686,32 +1694,45 @@ fn process_session_action(
             let current_idx = app.sessions.iter().position(|s| s.is_active);
             if let Some(idx) = current_idx {
                 let total = app.sessions.len();
-                let next_idx = if idx + 1 < total { idx + 1 } else { idx.saturating_sub(1) };
+                let next_idx = if idx + 1 < total {
+                    idx + 1
+                } else {
+                    idx.saturating_sub(1)
+                };
                 if next_idx != idx {
                     if let Some(entry) = app.sessions.get(next_idx) {
                         let entry_id = entry.id.clone();
                         let entry_project_id = entry.project_id.clone();
                         let sessions_root = rt_env.ox_home_dir.join("sessions");
                         let session_path = std::path::PathBuf::from(&sessions_root)
-                            .join(&entry_project_id).join(&entry_id);
+                            .join(&entry_project_id)
+                            .join(&entry_id);
                         let parent_dir = session_path.parent().unwrap_or(&session_dir);
 
                         if app.agent_running {
-                            if let Ok(Some(archived)) = Session::load_archived(parent_dir, &entry_id) {
+                            if let Ok(Some(archived)) =
+                                Session::load_archived(parent_dir, &entry_id)
+                            {
                                 *background_session = Some(std::mem::replace(session, archived));
                                 app.ui_to_agent_tx = None;
                                 app.init_workflow_engine(&session.meta.id, &session.meta);
-                                *compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+                                *compressed_cache =
+                                    compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
                             }
                         } else {
                             if let Err(e) = session_handler::handle_session_resume(
-                                app, session, rt_env, &entry_id, has_provider,
+                                app,
+                                session,
+                                rt_env,
+                                &entry_id,
+                                has_provider,
                             ) {
                                 app.output.push_system(&format!("Failed to switch: {e}"));
                                 return;
                             }
                             app.init_workflow_engine(&session.meta.id, &session.meta);
-                            *compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
+                            *compressed_cache =
+                                compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
                         }
                     }
                 }
@@ -1722,13 +1743,55 @@ fn process_session_action(
 
     // Rebuild sidebar after any session change
     session_handler::rebuild_sidebar(
-        app, sessions_root, &rt_env.project_id,
+        app,
+        sessions_root,
+        &rt_env.project_id,
         &helpers::session_display_name(session),
     );
 }
 
 /// Process an agent event from the agent task.
 #[allow(clippy::too_many_arguments)]
+/// Mandatory GitNexus gate (run at the start of a Normal turn).
+///
+/// - Returns `Ok(())` immediately once the code graph is ready.
+/// - Waits indefinitely (with a one-shot status line) while it is still coming
+///   up — including the first-run index build.
+/// - Returns `Err(guidance)` when GitNexus is unavailable or failed, so the
+///   caller aborts the turn and surfaces the message (input is re-enabled via
+///   the resulting `Error` event).
+async fn await_gitnexus_ready(
+    svc: &ox_core::mcp::GitNexusService,
+    status_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> Result<(), String> {
+    use ox_core::mcp::GitNexusStatus;
+    let mut announced = false;
+    loop {
+        if svc.is_ready().await {
+            return Ok(());
+        }
+        match svc.status().await {
+            GitNexusStatus::Failed(reason) => {
+                return Err(format!(
+                    "⛔ GitNexus（必需）不可用，已阻止本次提问：\n{reason}\n修复后请重启 Ox 再试。"
+                ));
+            }
+            // Explicit opt-out in config — let the turn proceed without the graph.
+            GitNexusStatus::Disabled => return Ok(()),
+            // NotStarted / Starting (incl. first-run index build): keep waiting.
+            _ => {
+                if !announced {
+                    let _ = status_tx.send(AgentToUiEvent::Status(
+                        "⏳ 等待 GitNexus 代码图谱就绪…（首次会构建索引，请稍候）".to_string(),
+                    ));
+                    announced = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
+    }
+}
+
 fn process_agent_event(
     app: &mut App,
     ev: AgentToUiEvent,
@@ -1749,7 +1812,7 @@ fn process_agent_event(
     config: &OxConfig,
     agent_config: &Arc<AgentConfig>,
     compressed_cache: &Option<(Vec<Message>, usize)>,
-    knowledge_engine: &Arc<tokio::sync::RwLock<KnowledgeEngine>>,
+    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
     system_prompt: &str,
 ) {
     let target_session = background_session.as_mut().unwrap_or(session);
@@ -1758,36 +1821,84 @@ fn process_agent_event(
         AgentToUiEvent::TextChunk(text) => {
             agent_handler::handle_text_chunk(app, &text);
         }
-        AgentToUiEvent::ToolStart { name, id: _, detail } => {
+        AgentToUiEvent::ToolStart {
+            name,
+            id: _,
+            detail,
+        } => {
             agent_handler::handle_tool_start(app, &name, &detail);
         }
-        AgentToUiEvent::ToolResult { name, output, is_error } => {
+        AgentToUiEvent::ToolResult {
+            name,
+            output,
+            is_error,
+        } => {
             agent_handler::handle_tool_result(app, &name, &output, is_error, target_session);
         }
-        AgentToUiEvent::ToolProgress { tool_call_id, tool_name, message, progress_percent } => {
-            agent_handler::handle_tool_progress(app, tool_call_id, tool_name, message, progress_percent);
+        AgentToUiEvent::ToolProgress {
+            tool_call_id,
+            tool_name,
+            message,
+            progress_percent,
+        } => {
+            agent_handler::handle_tool_progress(
+                app,
+                tool_call_id,
+                tool_name,
+                message,
+                progress_percent,
+            );
         }
-        AgentToUiEvent::TurnDone { turn_id, new_messages, usage } => {
+        AgentToUiEvent::TurnDone {
+            turn_id,
+            new_messages,
+            usage,
+        } => {
             let result = agent_handler::handle_turn_done(
-                app, turn_id, session, background_session,
-                &new_messages, &usage,
-                provider.is_some(), rt_env, tool_registry,
-                knowledge_engine, cost_tracker, model_name,
-                compressed_cache, agent_tx, tool_ctx,
-                config, interrupt_ctrl,
-                interjection_buf, context_builder,
-                context_window, agent_config, trust_manager,
-                provider, system_prompt,
+                app,
+                turn_id,
+                session,
+                background_session,
+                &new_messages,
+                &usage,
+                provider.is_some(),
+                rt_env,
+                tool_registry,
+                knowledge_engine,
+                cost_tracker,
+                model_name,
+                compressed_cache,
+                agent_tx,
+                tool_ctx,
+                config,
+                interrupt_ctrl,
+                interjection_buf,
+                context_builder,
+                context_window,
+                agent_config,
+                trust_manager,
+                provider,
+                system_prompt,
             );
 
             match result {
                 HandleResult::Normal => {
                     // ── Workflow step orchestration: check if next step should auto-run ──
                     spawn_next_workflow_step_if_needed(
-                        app, session, provider, agent_tx, tool_registry,
-                        tool_ctx, context_builder, context_window,
-                        interrupt_ctrl, agent_config, trust_manager,
-                        config, rt_env, system_prompt,
+                        app,
+                        session,
+                        provider,
+                        agent_tx,
+                        tool_registry,
+                        tool_ctx,
+                        context_builder,
+                        context_window,
+                        interrupt_ctrl,
+                        agent_config,
+                        trust_manager,
+                        config,
+                        rt_env,
+                        system_prompt,
                     );
                 }
                 HandleResult::BackgroundDone => {}
@@ -1818,8 +1929,16 @@ fn process_agent_event(
                         agent::run_agent_turn(
                             p,
                             agent::collaboration::RoleProviders::default(),
-                            turn_messages, registry, ctx, tx, ui_rx,
-                            cancel, tm, ac, false, wf,
+                            turn_messages,
+                            registry,
+                            ctx,
+                            tx,
+                            ui_rx,
+                            cancel,
+                            tm,
+                            ac,
+                            false,
+                            wf,
                             turn_id,
                         )
                         .await;
@@ -1837,26 +1956,55 @@ fn process_agent_event(
         AgentToUiEvent::Status(status) => {
             agent_handler::handle_status(app, status);
         }
+        AgentToUiEvent::SystemNotice(msg) => {
+            app.output.push_system(&msg);
+            if !app.user_scrolled {
+                app.scroll_to_bottom();
+            }
+            app.dirty = true;
+        }
         AgentToUiEvent::ToolConfirmationRequest {
-            tool_call_id, tool_name, args_summary, safety_level, high_risk_warning,
+            tool_call_id,
+            tool_name,
+            args_summary,
+            safety_level,
+            high_risk_warning,
         } => {
             agent_handler::handle_tool_confirmation(
-                app, tool_call_id, tool_name, args_summary, safety_level, &high_risk_warning,
+                app,
+                tool_call_id,
+                tool_name,
+                args_summary,
+                safety_level,
+                &high_risk_warning,
             );
         }
-        AgentToUiEvent::ToolOutputChunk { tool_call_id: _, chunk } => {
+        AgentToUiEvent::ToolOutputChunk {
+            tool_call_id: _,
+            chunk,
+        } => {
             agent_handler::handle_tool_output_chunk(app, &chunk);
         }
-        AgentToUiEvent::BudgetExceeded { total_tokens, estimated_cost } => {
+        AgentToUiEvent::BudgetExceeded {
+            total_tokens,
+            estimated_cost,
+        } => {
             agent_handler::handle_budget_exceeded(app, total_tokens, estimated_cost);
         }
         AgentToUiEvent::IterationLimitReached { iteration } => {
             agent_handler::handle_iteration_limit(app, iteration);
         }
         AgentToUiEvent::WorkingDirChanged(new_dir) => {
+            let carry_gitnexus = tool_ctx.gitnexus.clone();
             if let Some(new_ctx) = agent_handler::handle_working_dir_changed(
-                app, session, rt_env, new_dir, provider.is_some(),
-                config, knowledge_engine,
+                app,
+                session,
+                rt_env,
+                new_dir,
+                provider.is_some(),
+                config,
+                knowledge_engine,
+                carry_gitnexus,
             ) {
                 *tool_ctx = new_ctx;
             }
@@ -1869,27 +2017,13 @@ fn process_agent_event(
         AgentToUiEvent::ReasoningChunk(text) => {
             agent_handler::handle_reasoning_chunk(app, &text);
         }
-        AgentToUiEvent::FindingsPanel { summary, rows } => {
-            let show_panel = app
-                .workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .map(|e| {
-                    ox_core::agent::phase::get(&e)
-                        == ox_core::agent::phase::SingleFlowPhase::AwaitUser
-                })
-                .unwrap_or(true);
-            if show_panel {
-                app.findings_panel = Some(crate::terminal::app::FindingsPanelState {
-                    summary,
-                    rows,
-                });
-                app.workflow_awaiting_confirmation = Some(4);
-            }
-            app.dirty = true;
-        }
+        // FindingsPanel — no-op: findings are rendered as markdown in chat area.
+        AgentToUiEvent::FindingsPanel { .. } => {}
         AgentToUiEvent::ScopeConfirmPrompt { summary } => {
-            app.output.push_system(&summary);
+            app.output.push_line(OutputLine::Markdown(summary));
+            app.workflow_awaiting_confirmation = Some(4);
+            app.scroll_to_bottom();
+            app.user_scrolled = false;
             app.dirty = true;
         }
         AgentToUiEvent::WorkspaceModeChanged { mode, banner } => {
@@ -1902,10 +2036,20 @@ fn process_agent_event(
             }
             app.dirty = true;
         }
-        AgentToUiEvent::WorkflowCompleted { task_description, execution_summary } => {
+        AgentToUiEvent::WorkflowCompleted {
+            task_description,
+            execution_summary,
+        } => {
             agent_handler::handle_workflow_completed(
-                app, session, provider, rt_env, agent_tx, knowledge_engine,
-                task_description, execution_summary, agent_config,
+                app,
+                session,
+                provider,
+                rt_env,
+                agent_tx,
+                knowledge_engine,
+                task_description,
+                execution_summary,
+                agent_config,
             );
         }
         AgentToUiEvent::PlanReviewReady { markdown } => {
@@ -1914,13 +2058,32 @@ fn process_agent_event(
         AgentToUiEvent::WorkflowAwaitingConfirmation { step_idx, message } => {
             agent_handler::handle_workflow_awaiting_confirmation(app, step_idx, &message);
         }
-        AgentToUiEvent::SkillReflectRoundSaved { round, threshold, task_summary } => {
-            agent_handler::handle_skill_reflect_round_saved(
-                app, round, threshold, &task_summary,
-            );
+        AgentToUiEvent::SkillReflectRoundSaved {
+            round,
+            threshold,
+            task_summary,
+        } => {
+            agent_handler::handle_skill_reflect_round_saved(app, round, threshold, &task_summary);
         }
-        AgentToUiEvent::SkillDraftReady { skill_id, content, description } => {
+        AgentToUiEvent::SkillDraftReady {
+            skill_id,
+            content,
+            description,
+        } => {
             agent_handler::handle_skill_draft_ready(app, skill_id, content, description);
+        }
+        AgentToUiEvent::DeliverPreview {
+            tool_call_id,
+            kind,
+            content,
+        } => {
+            agent_handler::handle_deliver_preview(app, &tool_call_id, &kind, &content);
+        }
+        AgentToUiEvent::FinishPreview {
+            tool_call_id,
+            summary,
+        } => {
+            agent_handler::handle_finish_preview(app, &tool_call_id, &summary);
         }
     }
 }
@@ -1957,15 +2120,20 @@ fn spawn_next_workflow_step_if_needed(
         return;
     }
 
-    let (step_prompt, step_idx, should_continue, awaiting_confirmation) = if let Some(ref wf) = app.workflow_engine {
-        if let Ok(engine) = wf.try_lock() {
-            let prompt = engine.get_step_system_prompt();
-            let idx = engine.get_current_step_index();
-            let cont = engine.is_workflow_active() && !engine.is_workflow_complete();
-            let waiting = engine.is_current_step_waiting_confirmation();
-            (prompt, idx, cont, waiting)
-        } else { (None, 0, false, false) }
-    } else { (None, 0, false, false) };
+    let (step_prompt, step_idx, should_continue, awaiting_confirmation) =
+        if let Some(ref wf) = app.workflow_engine {
+            if let Ok(engine) = wf.try_lock() {
+                let prompt = engine.get_step_system_prompt();
+                let idx = engine.get_current_step_index();
+                let cont = engine.is_workflow_active() && !engine.is_workflow_complete();
+                let waiting = engine.is_current_step_waiting_confirmation();
+                (prompt, idx, cont, waiting)
+            } else {
+                (None, 0, false, false)
+            }
+        } else {
+            (None, 0, false, false)
+        };
 
     if !should_continue || provider.is_none() {
         return;
@@ -1979,21 +2147,31 @@ fn spawn_next_workflow_step_if_needed(
 
     // Build FRESH system prompt with current step's instructions
     let system_prompt = context::build_system_prompt_with_step(
-        rt_env, tool_registry,
+        rt_env,
+        tool_registry,
         ox_core::context::UserIntent::General,
-        Some(&config.behavior_rules), None,
+        Some(&config.behavior_rules),
+        None,
         &context::TurnContext {
-            git_log: None, git_diff_stat: None, dir_structure: None,
-            recent_summary: None, relevant_symbols: None,
+            git_log: None,
+            git_diff_stat: None,
+            dir_structure: None,
+            recent_summary: None,
+            relevant_symbols: None,
         },
         step_prompt.as_deref(),
         step_idx,
+        config.agent.unified_tool_mode,
     );
 
     // Minimal context: system prompt + session messages (previous step outputs)
     let mut turn_messages = crate::helpers::build_context_with_option(
-        context_builder, &system_prompt, "",
-        &session.messages, context_window, false,
+        context_builder,
+        &system_prompt,
+        "",
+        &session.messages,
+        context_window,
+        false,
     );
 
     // Inject user-round anchor + durable memory for workflow spawns (pre_turn skips these).
@@ -2028,10 +2206,19 @@ fn spawn_next_workflow_step_if_needed(
         agent::run_agent_turn(
             p,
             agent::collaboration::RoleProviders::default(),
-            turn_messages, registry, ctx, tx, ui_rx,
-            cancel, tm, ac, false, wf,
+            turn_messages,
+            registry,
+            ctx,
+            tx,
+            ui_rx,
+            cancel,
+            tm,
+            ac,
+            false,
+            wf,
             turn_id,
-        ).await;
+        )
+        .await;
     });
 
     app.scroll_to_bottom();

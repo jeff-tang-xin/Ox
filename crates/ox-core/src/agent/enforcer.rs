@@ -1,7 +1,7 @@
-use crate::message::{Message, ToolCall};
 use crate::config::rules::EnforcementRules;
-use regex::Regex;
+use crate::message::{Message, ToolCall};
 use lazy_static::lazy_static;
+use regex::Regex;
 use serde_json;
 
 /// Check if a file path is source code (needs Plan before editing).
@@ -25,7 +25,7 @@ lazy_static! {
         // 通用模式
         Regex::new(r"(Step|步骤|第一步|1\.|\*|-).*?(?:to|将|会|要)").unwrap(),
     ];
-    
+
     // 步骤列表的正则表达式模式（多语言支持）
     static ref STEP_PATTERNS: Vec<Regex> = vec![
         // 英文步骤标识
@@ -42,7 +42,7 @@ lazy_static! {
 }
 
 /// Rule Enforcer - 强制执行系统级约束
-/// 
+///
 /// 与 Skill 不同，Rules 是由代码直接校验的。如果违反，工具调用会被立即拦截，
 /// 并将错误信息返回给 LLM，要求其修正行为。
 pub struct RuleEnforcer;
@@ -60,28 +60,39 @@ impl RuleEnforcer {
 
         // 1. 校验: 编辑前必须有计划 (Plan Before Edit)
         if rules.plan_before_edit {
-            if let Err(e) = Self::check_plan_before_edit(tool_call, messages, &rules.custom_plan_patterns, rules.trivial_edit_threshold) {
+            if let Err(e) = Self::check_plan_before_edit(
+                tool_call,
+                messages,
+                &rules.custom_plan_patterns,
+                rules.trivial_edit_threshold,
+            ) {
                 return Err(e);
             }
         }
 
         // 2. 校验: Shell 执行前必须有步骤列表 (Steps Before Shell)
         if rules.steps_before_shell {
-            if let Err(e) = Self::check_steps_before_shell(tool_call, messages, &rules.custom_step_patterns) {
+            if let Err(e) =
+                Self::check_steps_before_shell(tool_call, messages, &rules.custom_step_patterns)
+            {
                 return Err(e);
             }
         }
 
         // 3. 校验: 编辑前必须先读取文件 (Read Before Edit)
         if rules.read_before_edit {
-            if let Err(e) = Self::check_read_before_edit(tool_call, messages, rules.trivial_edit_threshold) {
+            if let Err(e) =
+                Self::check_read_before_edit(tool_call, messages, rules.trivial_edit_threshold)
+            {
                 return Err(e);
             }
         }
 
         // 4. 校验: 修改定义前检查调用方 (Impact Analysis)
         if rules.impact_analysis {
-            if let Err(e) = Self::check_impact_before_edit(tool_call, messages, rules.trivial_edit_threshold) {
+            if let Err(e) =
+                Self::check_impact_before_edit(tool_call, messages, rules.trivial_edit_threshold)
+            {
                 return Err(e);
             }
         }
@@ -90,8 +101,16 @@ impl RuleEnforcer {
     }
 
     /// 检查编辑操作前是否有明确的计划陈述
-    fn check_plan_before_edit(tc: &ToolCall, messages: &[Message], custom_patterns: &[String], trivial_threshold: usize) -> Result<(), String> {
-        if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
+    fn check_plan_before_edit(
+        tc: &ToolCall,
+        messages: &[Message],
+        custom_patterns: &[String],
+        trivial_threshold: usize,
+    ) -> Result<(), String> {
+        if !matches!(
+            tc.name.as_str(),
+            "file_write" | "edit_file" | "delete_range"
+        ) {
             return Ok(());
         }
 
@@ -131,7 +150,9 @@ impl RuleEnforcer {
 
         // 🎯 只检查最近一次用户消息之后的消息（与 Steps Before Shell 逻辑一致）
         // 这样用户提一个问题 → LLM 计划一次 → 多次编辑操作都可通过
-        let last_user_idx = messages.iter().rev()
+        let last_user_idx = messages
+            .iter()
+            .rev()
             .position(|m| matches!(m, Message::User { .. }))
             .map(|pos| messages.len() - 1 - pos);
 
@@ -146,15 +167,17 @@ impl RuleEnforcer {
         let has_plan = recent_messages.iter().any(|msg| {
             if let Message::Assistant { content, .. } = msg {
                 // 使用内置正则表达式进行多语言模式匹配
-                let built_in_match = PLAN_PATTERNS.iter().any(|pattern| pattern.is_match(content));
-                
+                let built_in_match = PLAN_PATTERNS
+                    .iter()
+                    .any(|pattern| pattern.is_match(content));
+
                 // 检查自定义模式
                 let custom_match = custom_patterns.iter().any(|pattern_str| {
                     Regex::new(pattern_str)
                         .map(|pattern| pattern.is_match(content))
                         .unwrap_or(false)
                 });
-                
+
                 built_in_match || custom_match
             } else {
                 false
@@ -169,16 +192,22 @@ impl RuleEnforcer {
     }
 
     /// 检查 Shell 命令执行前是否有步骤列表
-    fn check_steps_before_shell(tc: &ToolCall, messages: &[Message], custom_patterns: &[String]) -> Result<(), String> {
+    fn check_steps_before_shell(
+        tc: &ToolCall,
+        messages: &[Message],
+        custom_patterns: &[String],
+    ) -> Result<(), String> {
         if tc.name != "shell_exec" {
             return Ok(());
         }
-        
+
         // 🎯 核心逻辑：只检查最近一次用户消息之后是否有步骤列表
-        let last_user_idx = messages.iter().rev()
+        let last_user_idx = messages
+            .iter()
+            .rev()
             .position(|m| matches!(m, Message::User { .. }))
             .map(|pos| messages.len() - 1 - pos);
-        
+
         let search_start = last_user_idx.unwrap_or(0);
         // 使用安全的切片方法
         let recent_messages = if search_start < messages.len() {
@@ -186,57 +215,60 @@ impl RuleEnforcer {
         } else {
             &[]
         };
-        
+
         // 查找最近的任务列表
         let mut task_list_found = false;
         let mut has_pending_tasks = false;
-        
+
         for msg in recent_messages.iter().rev() {
             if let Message::Assistant { content, .. } = msg {
                 // 检查是否包含任务列表格式
-                if STEP_PATTERNS.iter().any(|pattern| {
-                    content.lines().any(|line| pattern.is_match(line.trim()))
-                }) {
+                if STEP_PATTERNS
+                    .iter()
+                    .any(|pattern| content.lines().any(|line| pattern.is_match(line.trim())))
+                {
                     task_list_found = true;
-                    
+
                     // 检查是否有未完成的任务（待办事项标记）
                     // 支持多种格式：- [ ], ☐, □, TODO, 待完成
-                    let has_unfinished = content.contains("- [ ]") || 
-                                        content.contains("☐") ||
-                                        content.contains("□") ||
-                                        content.to_lowercase().contains("todo") ||
-                                        content.contains("待完成") ||
-                                        content.contains("未完成");
-                    
+                    let has_unfinished = content.contains("- [ ]")
+                        || content.contains("☐")
+                        || content.contains("□")
+                        || content.to_lowercase().contains("todo")
+                        || content.contains("待完成")
+                        || content.contains("未完成");
+
                     // 检查是否有已完成的标记
-                    let has_completed = content.contains("- [x]") ||
-                                       content.contains("- [X]") ||
-                                       content.contains("✓") ||
-                                       content.contains("✔") ||
-                                       content.contains("✅");
-                    
+                    let has_completed = content.contains("- [x]")
+                        || content.contains("- [X]")
+                        || content.contains("✓")
+                        || content.contains("✔")
+                        || content.contains("✅");
+
                     // 默认认为有 pending 任务，除非检测到明确的完成标记且无未完成标记
                     has_pending_tasks = has_unfinished || !has_completed;
-                    
+
                     break; // 找到最近的任务列表即可
                 }
             }
         }
-        
+
         // 如果内置模式没找到，尝试自定义模式
         if !task_list_found && !custom_patterns.is_empty() {
             task_list_found = recent_messages.iter().any(|m| {
                 if let Message::Assistant { content, .. } = m {
                     custom_patterns.iter().any(|pattern_str| {
                         Regex::new(pattern_str)
-                            .map(|pattern| content.lines().any(|line| pattern.is_match(line.trim())))
+                            .map(|pattern| {
+                                content.lines().any(|line| pattern.is_match(line.trim()))
+                            })
                             .unwrap_or(false)
                     })
                 } else {
                     false
                 }
             });
-            
+
             if task_list_found {
                 has_pending_tasks = true; // 自定义模式默认认为有待办任务
             }
@@ -256,14 +288,24 @@ impl RuleEnforcer {
     ///
     /// 在文件被修改前，确认 LLM 已经通过 file_read/recall 读取过它。
     /// 这防止 LLM"猜测"文件内容而不是先阅读。
-    fn check_read_before_edit(tc: &ToolCall, messages: &[Message], trivial_threshold: usize) -> Result<(), String> {
-        if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
+    fn check_read_before_edit(
+        tc: &ToolCall,
+        messages: &[Message],
+        trivial_threshold: usize,
+    ) -> Result<(), String> {
+        if !matches!(
+            tc.name.as_str(),
+            "file_write" | "edit_file" | "delete_range"
+        ) {
             return Ok(());
         }
 
         // 只对源码文件强制（同 plan_before_edit）
         let target_path = match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-            Ok(args) => args.get("path").and_then(|p| p.as_str()).map(|s| s.trim().to_string()),
+            Ok(args) => args
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(|s| s.trim().to_string()),
             Err(_) => return Ok(()),
         };
         let target_path = match target_path {
@@ -297,7 +339,9 @@ impl RuleEnforcer {
         }
 
         // 🎯 扫描最近一次用户消息之后的消息中是否有对同一路径的 file_read
-        let last_user_idx = messages.iter().rev()
+        let last_user_idx = messages
+            .iter()
+            .rev()
             .position(|m| matches!(m, Message::User { .. }))
             .map(|pos| messages.len() - 1 - pos);
 
@@ -320,7 +364,9 @@ impl RuleEnforcer {
                 Message::Assistant { tool_calls, .. } => {
                     for tc in tool_calls {
                         if tc.name == "file_read" {
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                            if let Ok(args) =
+                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                            {
                                 if let Some(read_path) = args.get("path").and_then(|p| p.as_str()) {
                                     let read_basename = std::path::Path::new(read_path)
                                         .file_name()
@@ -379,14 +425,24 @@ impl RuleEnforcer {
     ///
     /// 当编辑已存在的源码文件时，确保 LLM 调用了 code_search 来检查依赖/调用方。
     /// 防止修改函数签名/接口后忘记更新调用处。
-    fn check_impact_before_edit(tc: &ToolCall, messages: &[Message], trivial_threshold: usize) -> Result<(), String> {
-        if !matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range") {
+    fn check_impact_before_edit(
+        tc: &ToolCall,
+        messages: &[Message],
+        trivial_threshold: usize,
+    ) -> Result<(), String> {
+        if !matches!(
+            tc.name.as_str(),
+            "file_write" | "edit_file" | "delete_range"
+        ) {
             return Ok(());
         }
 
         // 只对已存在的源码文件强制
         let target_path = match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-            Ok(args) => args.get("path").and_then(|p| p.as_str()).map(|s| s.trim().to_string()),
+            Ok(args) => args
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(|s| s.trim().to_string()),
             Err(_) => return Ok(()),
         };
         let target_path = match target_path {
@@ -425,7 +481,9 @@ impl RuleEnforcer {
             .unwrap_or_default();
 
         // 🎯 检查最近一次用户消息之后，是否对同一文件执行过 code_search
-        let last_user_idx = messages.iter().rev()
+        let last_user_idx = messages
+            .iter()
+            .rev()
             .position(|m| matches!(m, Message::User { .. }))
             .map(|pos| messages.len() - 1 - pos);
 
@@ -441,7 +499,8 @@ impl RuleEnforcer {
                 tool_calls.iter().any(|tc| {
                     if tc.name == "code_search" {
                         if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                            let search_query = args.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                            let search_query =
+                                args.get("query").and_then(|q| q.as_str()).unwrap_or("");
                             // code_search was called with the file name or path as query
                             if search_query.contains(&target_basename)
                                 || search_query.contains(&target_path)
@@ -491,7 +550,8 @@ mod tests {
                 "path": path,
                 "old_string": old_string,
                 "new_string": new_string,
-            }).to_string(),
+            })
+            .to_string(),
         }
     }
 
@@ -502,7 +562,8 @@ mod tests {
             arguments: serde_json::json!({
                 "path": path,
                 "content": content,
-            }).to_string(),
+            })
+            .to_string(),
         }
     }
 
@@ -512,13 +573,18 @@ mod tests {
         let tc = make_edit_file_call("src/main.rs", "teh", "the");
         let messages = vec![]; // 没有 plan，但 trivial 编辑应放行
         let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
-        assert!(result.is_ok(), "Trivial edit should bypass plan requirement");
+        assert!(
+            result.is_ok(),
+            "Trivial edit should bypass plan requirement"
+        );
     }
 
     #[test]
     fn test_non_trivial_edit_requires_plan() {
         // 大段修改：old_string 超过阈值，没有 plan 应被拦截
-        let long_old = "fn main() {\n    println!(\"Hello, world!\");\n    let x = 1;\n    let y = 2;\n}".to_string();
+        let long_old =
+            "fn main() {\n    println!(\"Hello, world!\");\n    let x = 1;\n    let y = 2;\n}"
+                .to_string();
         let tc = make_edit_file_call("src/main.rs", &long_old, "fn main() {}");
         let messages = vec![];
         let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
@@ -531,7 +597,10 @@ mod tests {
         let tc = make_file_write_call("src/main.rs", "fn main() {}");
         let messages = vec![];
         let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
-        assert!(result.is_err(), "file_write should never be considered trivial");
+        assert!(
+            result.is_err(),
+            "file_write should never be considered trivial"
+        );
     }
 
     #[test]
@@ -540,7 +609,10 @@ mod tests {
         let tc = make_edit_file_call("src/main.rs", "teh", "the");
         let messages = vec![];
         let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 0);
-        assert!(result.is_err(), "Threshold 0 should disable trivial whitelist");
+        assert!(
+            result.is_err(),
+            "Threshold 0 should disable trivial whitelist"
+        );
     }
 
     #[test]
@@ -555,7 +627,8 @@ mod tests {
                     { "old_string": "teh", "new_string": "the" },
                     { "old_string": "recieve", "new_string": "receive" },
                 ]
-            }).to_string(),
+            })
+            .to_string(),
         };
         let messages = vec![];
         let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
@@ -565,7 +638,9 @@ mod tests {
     #[test]
     fn test_batch_edits_mixed_requires_plan() {
         // 批量编辑中有一个 old_string 很长，需要 plan
-        let long_old = "fn main() {\n    println!(\"Hello, world!\");\n    let x = 1;\n    let y = 2;\n}".to_string();
+        let long_old =
+            "fn main() {\n    println!(\"Hello, world!\");\n    let x = 1;\n    let y = 2;\n}"
+                .to_string();
         let tc = ToolCall {
             id: "test".to_string(),
             name: "edit_file".to_string(),
@@ -575,17 +650,25 @@ mod tests {
                     { "old_string": "teh", "new_string": "the" },
                     { "old_string": long_old, "new_string": "fn main() {}" },
                 ]
-            }).to_string(),
+            })
+            .to_string(),
         };
         let messages = vec![];
         let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
-        assert!(result.is_err(), "Mixed batch with non-trivial edit should require plan");
+        assert!(
+            result.is_err(),
+            "Mixed batch with non-trivial edit should require plan"
+        );
     }
 
     #[test]
     fn test_non_source_file_always_passes() {
         // 非源码文件不受 plan 规则约束
-        let tc = make_edit_file_call("README.md", "some long text that exceeds threshold", "replacement");
+        let tc = make_edit_file_call(
+            "README.md",
+            "some long text that exceeds threshold",
+            "replacement",
+        );
         let messages = vec![];
         let result = RuleEnforcer::check_plan_before_edit(&tc, &messages, &[], 50);
         assert!(result.is_ok(), "Non-source files should always pass");

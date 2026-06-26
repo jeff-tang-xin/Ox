@@ -1,14 +1,17 @@
 //! Bridge between `KnowledgeEngine` (Entity model) and `MemoryNode` display types.
 
+use super::KnowledgeEngine;
 use super::entity::{Entity, EntityKind, EntityMetadata};
 use super::memory_node::{MemoryNode, MemoryNodeType, MemorySource};
-use super::KnowledgeEngine;
 
 /// Convert a knowledge `Entity` into a `MemoryNode` for display / interjection.
 pub fn entity_to_memory_node(entity: &Entity, project_id: Option<String>) -> MemoryNode {
     let node_type = match entity.kind {
         EntityKind::AtomicMemory => {
-            if let EntityMetadata::AtomicMemory { ref memory_type, .. } = entity.metadata {
+            if let EntityMetadata::AtomicMemory {
+                ref memory_type, ..
+            } = entity.metadata
+            {
                 match memory_type.as_str() {
                     "Style" => MemoryNodeType::Style,
                     "BestPractice" => MemoryNodeType::BestPractice,
@@ -67,7 +70,11 @@ impl KnowledgeEngine {
         project_id: Option<&str>,
         limit: usize,
     ) -> Vec<MemoryNode> {
-        let q = if query.is_empty() { "recent project knowledge" } else { query };
+        let q = if query.is_empty() {
+            "recent project knowledge"
+        } else {
+            query
+        };
 
         let hits = self
             .retrieve_for_context(q, "current", limit.saturating_mul(2))
@@ -86,7 +93,8 @@ impl KnowledgeEngine {
         project_id: &str,
         language: &str,
     ) -> anyhow::Result<Entity> {
-        let entity = self.record_atomic_fact(content, "Style", Some(project_id), language, "UserExplicit")?;
+        let entity =
+            self.record_atomic_fact(content, "Style", Some(project_id), language, "UserExplicit")?;
         self.track_entity(&entity);
         Ok(entity)
     }

@@ -12,7 +12,6 @@ pub struct WorkflowEngine {
     current_workflow: Option<Workflow>,
     /// Session state tracker
     session_state: Arc<tokio::sync::Mutex<SessionState>>,
-
 }
 
 impl WorkflowEngine {
@@ -110,14 +109,14 @@ impl WorkflowEngine {
         }
     }
 
-    /// Check if tool execution is allowed in current step
+    /// Check if tool execution is allowed in current step.
+    /// When scope is pending (business gate), still allow read-only tools
+    /// so the LLM can file_read during discussion. Write tools blocked separately.
     pub fn allows_tool_execution(&self) -> bool {
         if self.is_single_step() {
-            if crate::agent::business_gate::is_pending_scope(self)
-                && !crate::agent::business_gate::scope_implementation_unlocked(self)
-            {
-                return false;
-            }
+            // During scope confirmation, allow tool execution (schema will be filtered
+            // to read-only by unified_action's allowed_actions_for_engine).
+            // Write/edit tools are blocked individually in validate_single_step_tool.
             return matches!(
                 crate::agent::phase::get(self),
                 crate::agent::phase::SingleFlowPhase::Receive
@@ -156,124 +155,44 @@ impl WorkflowEngine {
         matches!(tool_name, "file_write" | "edit_file" | "delete_range")
     }
 
-    /// Implement-phase memory_search: conventions/architecture only — not a substitute for file_read.
-    fn validate_impl_memory_search(args: &serde_json::Value) -> Result<(), String> {
-        let query = args
-            .get("query")
-            .and_then(|q| q.as_str())
-            .unwrap_or("")
-            .trim();
-        if query.is_empty() {
-            return Err("memory_search 需要非空 query。".into());
-        }
-        let max = args
-            .get("max_results")
-            .and_then(|m| m.as_u64())
-            .unwrap_or(5);
-        if max > 10 {
-            return Err("实施阶段 memory_search max_results 不得超过 10。".into());
-        }
-        let lower = query.to_lowercase();
-        let looks_like_code_locator = [".java", ".rs", ".ts", ".py", "line ", "offset", "第", "行"]
-            .iter()
-            .any(|k| lower.contains(k));
-        if looks_like_code_locator {
-            return Err(
-                "实施阶段 memory_search 用于架构/约定/偏好，不可替代 file_read。\
-                 定位代码请用 find_symbol 或 file_read。"
-                    .into(),
-            );
-        }
-        Ok(())
-    }
-
     fn validate_single_step_tool(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Result<(), String> {
-        if crate::agent::business_gate::is_pending_scope(self) {
+        // Business gate: only block write/edit/shell tools, not read-only tools.
+        // LLM must be able to file_read during scope discussion.
+        if crate::agent::business_gate::is_pending_scope(self)
+            && Self::is_code_modifying_tool(tool_name)
+        {
             return Err(
                 "⏸️ 业务流程门禁 — 等待用户确认 findings 范围（c /confirm）；讨论请直接输入文字。"
                     .to_string(),
             );
         }
-        if crate::agent::phase::get(self) == crate::agent::phase::SingleFlowPhase::Complete {
-            return Err("✅ 任务已完成 — 禁止调用工具。".to_string());
-        }
+        // NOTE: phase==Complete is intentionally NOT a hard block. `finish` is the
+        // LLM's explicit end and yields the turn back to the user; gates/tools must
+        // never forbid future actions. The next user round resets the workflow.
 
-        let intent = self.get_task_intent();
-        let mode = crate::agent::phase::workspace_mode(self);
-
-        let review_locked = matches!(
-            mode,
-            crate::agent::workspace::WorkspaceMode::ExecuteReview
-                | crate::agent::workspace::WorkspaceMode::FeedbackDiscuss
-                | crate::agent::workspace::WorkspaceMode::ScopeConfirm
-        ) || matches!(intent, crate::agent::task_intent::TaskIntent::Review | crate::agent::task_intent::TaskIntent::Qa)
-            && crate::agent::phase::get(self) != crate::agent::phase::SingleFlowPhase::Implement;
-
-        if review_locked && Self::is_code_modifying_tool(tool_name) {
-            if crate::agent::business_gate::scope_implementation_unlocked(self) {
-                return Ok(());
-            }
+        if !self.allows_code_modification() && Self::is_code_modifying_tool(tool_name) {
             return Err(format!(
-                "❌ 只读模式（intent={}）禁止 `{tool_name}`。审查产出后等待业务流程门禁确认；确认后 edit 走安全门禁。",
-                intent.as_str()
+                "🔒 只读阶段 — 动手前先 finish(finding_json=[...]) 提交计划，用户 c 确认后解锁。禁止 {tool_name}。"
             ));
         }
 
-        if crate::agent::business_gate::scope_implementation_unlocked(self)
-            && matches!(mode, crate::agent::workspace::WorkspaceMode::ExecuteImpl)
-        {
-            if tool_name == "memory_search" {
-                return Self::validate_impl_memory_search(args);
-            }
-            if matches!(tool_name, "code_search" | "file_search" | "file_list") {
+        if crate::agent::phase::get(self) == crate::agent::phase::SingleFlowPhase::Implement {
+            if matches!(tool_name, "file_search" | "file_list") {
                 return Err(format!(
-                    "❌ 实施阶段禁止广泛探索 `{tool_name}`（易陷入搜索循环）。\
-                     架构/约定用 `memory_search`；定位符号用 `find_symbol`；取历史用 `recall`；\
-                     改代码前按 [WORKSPACE] 先 `file_read` 再 `edit_file`。"
+                    "实施阶段禁止 {tool_name} — 用 find_symbol/file_read 定位。"
                 ));
             }
         }
 
-        // After review report + findings: no more explore until user pivots to fix.
-        if matches!(
-            mode,
-            crate::agent::workspace::WorkspaceMode::ExecuteReview
-                | crate::agent::workspace::WorkspaceMode::ScopeConfirm
-        ) && self.execute_report_already_delivered()
-            && crate::agent::findings::load_or_migrate(self)
-                .is_some_and(|s| !s.findings.is_empty())
-            && matches!(
-                tool_name,
-                "find_symbol" | "code_search" | "file_search" | "file_list"
-            )
-        {
-            return Err(format!(
-                "❌ 审查报告已提交，禁止继续 `{tool_name}`。\
-                 请补全 ## Done / findings，或等待用户说「修复」/ /fix 后用 edit_file。"
-            ));
-        }
-
-        if review_locked && tool_name == "shell_exec" {
-            let cmd = args
-                .get("command")
-                .or_else(|| args.get("cmd"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
-            if Self::shell_looks_like_file_read(cmd) {
-                return Err("❌ 只读模式禁止用 shell 读文件；请用 file_read。".to_string());
-            }
-        }
+        crate::agent::read_guard::check(tool_name, args, self)?;
 
         if tool_name == "file_read" {
             if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                let offset = args
-                    .get("offset")
-                    .and_then(|o| o.as_u64())
-                    .unwrap_or(0);
+                let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
                 self.validate_impl_file_read(path, offset)?;
             }
         }
@@ -372,27 +291,33 @@ impl WorkflowEngine {
             } else {
                 session.current_step_index + 1
             };
-            
+
             let jumped = new_idx > session.current_step_index + 1;
             session.current_step_index = new_idx;
             session.awaiting_user_confirmation = false;
-            
+
             if jumped {
                 tracing::info!(
                     "[WORKFLOW] Jumped to step {}/{}: {} (skipped intermediate steps)",
                     session.current_step_index + 1,
                     workflow.total_steps(),
-                    workflow.get_step(session.current_step_index).map(|s| s.name.as_str()).unwrap_or("Unknown")
+                    workflow
+                        .get_step(session.current_step_index)
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("Unknown")
                 );
             } else {
                 tracing::info!(
                     "Advanced to step {}/{}: {}",
                     session.current_step_index + 1,
                     workflow.total_steps(),
-                    workflow.get_step(session.current_step_index).map(|s| s.name.as_str()).unwrap_or("Unknown")
+                    workflow
+                        .get_step(session.current_step_index)
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("Unknown")
                 );
             }
-            
+
             // Only mark complete when PAST the last step (index >= total_steps)
             if session.current_step_index >= workflow.total_steps() {
                 Ok(false)
@@ -488,6 +413,8 @@ impl WorkflowEngine {
             crate::agent::workflow_session::clear_session_flags(self);
             crate::agent::perception::clear(self);
             crate::agent::workflow_phases::clear_phase(self);
+            // Clear impl file read counters so new turns don't inherit old limits
+            self.clear_impl_files_read();
             for key in [
                 "_step0_output",
                 "_step1_output",
@@ -593,7 +520,10 @@ impl WorkflowEngine {
 
     /// Build plan tracker from parked review report; reset per-file read ledger.
     pub fn bootstrap_implementation_plan(&self) {
-        crate::agent::workflow_phases::set_phase(self, crate::agent::workflow_phases::WorkflowPhase::Act);
+        crate::agent::workflow_phases::set_phase(
+            self,
+            crate::agent::workflow_phases::WorkflowPhase::Act,
+        );
 
         if let Some(findings) = crate::agent::perception::load(self) {
             let tracker = crate::agent::perception::to_plan_tracker(&findings);
@@ -648,16 +578,9 @@ impl WorkflowEngine {
 
     /// Re-open workflow after premature ## Done or verify failure.
     pub fn reopen_execute_for_fixes(&mut self, user_text: &str) -> bool {
-        if !crate::agent::phase::can_pivot_to_fix(self, user_text) {
-            return false;
-        }
-        let had_findings = crate::agent::findings::load_or_migrate(self)
-            .map(|s| !s.findings.is_empty())
-            .unwrap_or(false);
-        let greenfield = crate::agent::task_intent::looks_like_greenfield_impl(user_text);
-        let verify_failed =
-            crate::agent::post_edit_verification::verify_status_failed(self);
-        if !self.is_workflow_complete() && !verify_failed && !had_findings && !greenfield {
+        // Policy B: LLM-driven continuation — relies on actionable substance
+        // (findings / failed verify / greenfield) rather than fix-keyword phrasing.
+        if !crate::agent::phase::can_reopen_for_fix(self, user_text) {
             return false;
         }
         let r = crate::agent::phase::transition(
@@ -667,7 +590,8 @@ impl WorkflowEngine {
             },
         );
         self.set_variable(crate::agent::user_round::ROUND_FINALIZED_KEY, String::new());
-        r.changed || crate::agent::phase::get(self) == crate::agent::phase::SingleFlowPhase::Implement
+        r.changed
+            || crate::agent::phase::get(self) == crate::agent::phase::SingleFlowPhase::Implement
     }
 
     pub fn has_file_read_snapshot(&self, path: &str) -> bool {
@@ -680,15 +604,63 @@ impl WorkflowEngine {
 
     pub fn shell_looks_like_file_read(cmd: &str) -> bool {
         let lower = cmd.to_lowercase();
-        ["cat ", "type ", "head ", "tail ", "more ", "less ", "get-content"]
-            .iter()
-            .any(|p| lower.contains(p))
+        [
+            "cat ",
+            "type ",
+            "head ",
+            "tail ",
+            "more ",
+            "less ",
+            "get-content",
+        ]
+        .iter()
+        .any(|p| lower.contains(p))
     }
 
     const IMPL_READ_KEY: &str = "_impl_files_read";
 
     pub fn clear_impl_files_read(&self) {
         self.set_variable(Self::IMPL_READ_KEY, "[]".to_string());
+    }
+
+    const REVIEW_HANDOFF_KEY: &str = "_review_handoff_files";
+
+    /// Capture files explored during review BEFORE `enter_implement` clears the
+    /// turn memory, so the Implement phase knows they were already read and does
+    /// not re-explore them from scratch (fixes review→implement context loss).
+    pub fn snapshot_review_handoff(&self) {
+        let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for p in self.get_explored_path_set() {
+            if !p.trim().is_empty() {
+                files.insert(p);
+            }
+        }
+        // Findings files are the highest-signal set — always carry them over.
+        if let Some(store) = crate::agent::findings::load_or_migrate(self) {
+            for f in &store.findings {
+                if !f.file.trim().is_empty() {
+                    files.insert(f.file.clone());
+                }
+            }
+        }
+        let files: Vec<String> = files.into_iter().collect();
+        if files.is_empty() {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(&files) {
+            self.set_variable(Self::REVIEW_HANDOFF_KEY, json);
+        }
+    }
+
+    /// Files carried over from the review phase (already read, content in context).
+    pub fn review_handoff_files(&self) -> Vec<String> {
+        self.get_variable(Self::REVIEW_HANDOFF_KEY)
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn clear_review_handoff(&self) {
+        self.set_variable(Self::REVIEW_HANDOFF_KEY, String::new());
     }
 
     fn impl_files_read_set(&self) -> std::collections::HashSet<String> {
@@ -699,50 +671,54 @@ impl WorkflowEngine {
 
     pub fn impl_file_already_read(&self, path: &str) -> bool {
         let norm = crate::agent::plan_tracker::normalize_path(path);
-        self.impl_files_read_set().contains(&norm)
+        self.impl_file_read_count(&norm) > 0
+    }
+
+    const IMPL_EDITED_KEY: &str = "_impl_files_edited";
+
+    pub fn record_impl_file_edited(&self, path: &str) {
+        let norm = crate::agent::plan_tracker::normalize_path(path);
+        let mut list: Vec<String> = self
+            .get_variable(Self::IMPL_EDITED_KEY)
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if list
+            .iter()
+            .any(|p| crate::agent::plan_tracker::normalize_path(p) == norm)
+        {
+            return;
+        }
+        list.push(path.to_string());
+        if let Ok(json) = serde_json::to_string(&list) {
+            self.set_variable(Self::IMPL_EDITED_KEY, json);
+        }
+    }
+
+    /// Implementation phase: allow all reads. Compaction handles context bloat.
+    pub fn validate_impl_file_read(&self, _path: &str, _offset: u64) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Count how many times a file has been read this implementation round.
+    fn impl_file_read_count(&self, norm_path: &str) -> usize {
+        let key = &format!("{}:{}", Self::IMPL_READ_KEY, norm_path);
+        self.get_variable(key)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
     }
 
     pub fn record_impl_file_read(&self, path: &str, _arguments: &str) {
         let norm = crate::agent::plan_tracker::normalize_path(path);
-        let mut set = self.impl_files_read_set();
-        if set.insert(norm) {
-            if let Ok(json) = serde_json::to_string(&set) {
-                self.set_variable(Self::IMPL_READ_KEY, json);
-            }
-        }
+        let key = format!("{}:{}", Self::IMPL_READ_KEY, norm);
+        let count = self
+            .get_variable(&key)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        self.set_variable(&key, (count + 1).to_string());
     }
 
-    /// Implementation phase: one file_read per path at offset 0; offset>0 allowed for续读.
-    pub fn validate_impl_file_read(&self, path: &str, offset: u64) -> Result<(), String> {
-        if !crate::agent::workflow_session::is_implementation_phase(self) {
-            return Ok(());
-        }
-        if path.trim().is_empty() {
-            return Ok(());
-        }
-        if offset > 0 {
-            return Ok(());
-        }
-        if self.impl_file_already_read(path) {
-            return Err(format!(
-                "实施阶段 `{path}` 已读过（每文件 offset=0 最多 1 次）。\
-                 请直接 edit_file；或 file_read 带 offset>0 续读指定行段。"
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn impl_edit_nudge_after_read(&self, path: &str, _preview: &str) -> Option<String> {
-        if !crate::agent::workflow_session::is_implementation_phase(self) {
-            return None;
-        }
-        let tracker = self.get_plan_tracker()?;
-        let step = tracker.step_for_path(path)?;
-        Some(format!(
-            "⚡ `{path}` 已读取（实施阶段仅此一次）。**立即**对步骤 {} 执行 edit_file 或 file_write：{}\n\
-             禁止再次 file_read 同一文件；完成后进入下一项。",
-            step.index, step.desc
-        ))
+    pub fn impl_edit_nudge_after_read(&self, _path: &str, _preview: &str) -> Option<String> {
+        None
     }
 
     pub fn should_skip_execute_confirmation(&self, _from_step: usize, _target_step: usize) -> bool {
@@ -806,7 +782,7 @@ impl WorkflowEngine {
                 if prompt.contains("{EXECUTE_HANDOFF}") {
                     prompt = prompt.replace(
                         "{EXECUTE_HANDOFF}",
-                        "（单步模式 — 按 [WORKSPACE] 与 findings 执行）",
+                        "（单步模式 — 按 [TURN_CONTEXT] 与 findings 执行）",
                     );
                 }
                 if prompt.contains("{USER_GUIDANCE}") {
@@ -908,10 +884,7 @@ impl WorkflowEngine {
 
         if tool_name == "file_read" {
             if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                let offset = args
-                    .get("offset")
-                    .and_then(|o| o.as_u64())
-                    .unwrap_or(0);
+                let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
                 self.validate_impl_file_read(path, offset)?;
             }
         }
@@ -1023,17 +996,19 @@ impl WorkflowEngine {
     ) -> Option<crate::agent::workflow_command::CommandOutcome> {
         let cmd = crate::agent::workflow_command::parse(input)?;
         Some(crate::agent::workflow_command::apply_with_cwd(
-            self, cmd, working_dir,
+            self,
+            cmd,
+            working_dir,
         ))
     }
-    
+
     /// 🚨 Set a variable in session state
     pub fn set_variable(&self, key: &str, value: String) {
         if let Ok(mut session) = self.session_state.try_lock() {
             session.set_variable(key, &value);
         }
     }
-    
+
     /// 🚨 Get a variable from session state
     pub fn get_variable(&self, key: &str) -> Option<String> {
         if let Ok(session) = self.session_state.try_lock() {
@@ -1169,9 +1144,7 @@ impl WorkflowEngine {
         let hint = if tool_name == "edit_file"
             && (result_content.contains("Syntax error") || result_content.contains("AST Syntax"))
         {
-            Some(
-                "⚠️ 编辑可能未通过语法检查 — 请修复后重试，勿标记为完成。".to_string(),
-            )
+            Some("⚠️ 编辑可能未通过语法检查 — 请修复后重试，勿标记为完成。".to_string())
         } else {
             None
         };
@@ -1267,8 +1240,7 @@ impl WorkflowEngine {
             "缺陷",
         ];
         let hits = markers.iter().filter(|m| t.contains(*m)).count();
-        (hits >= 2 && (t.contains("完成") || t.contains("Done")))
-            || (hits >= 3)
+        (hits >= 2 && (t.contains("完成") || t.contains("Done"))) || (hits >= 3)
     }
 
     /// Execute step in read-only perceive mode — disabled in single-step model.
@@ -1323,17 +1295,18 @@ impl WorkflowEngine {
     }
 
     /// Block file_read/code_search after a review report (read-only execute phase only).
-    pub fn should_block_execute_reexplore(&self, tool_calls: &[ToolCall], assistant_text: &str) -> bool {
-        if !tool_calls.is_empty()
-            && Self::looks_like_review_report(assistant_text)
-        {
+    pub fn should_block_execute_reexplore(
+        &self,
+        tool_calls: &[ToolCall],
+        assistant_text: &str,
+    ) -> bool {
+        if !tool_calls.is_empty() && Self::looks_like_review_report(assistant_text) {
             self.mark_execute_report_delivered();
         }
         if crate::agent::workflow_session::is_implementation_phase(self) {
             return false;
         }
-        (self.execute_report_already_delivered()
-            || self.should_park_execute_output(assistant_text))
+        (self.execute_report_already_delivered() || self.should_park_execute_output(assistant_text))
             && Self::tool_calls_are_reexplore_only(tool_calls)
     }
 
@@ -1444,11 +1417,17 @@ impl WorkflowEngine {
                     continue;
                 }
                 let label = labels.get(i).copied().unwrap_or("未知");
-                let json_or_summary = if let (Some(s), Some(e)) = (output.find('{'), output.rfind('}')) {
-                    &output[s..=e]
-                } else {
-                    &output[..output.len().min(500)]
-                };
+                let json_or_summary =
+                    if let (Some(s), Some(e)) = (output.find('{'), output.rfind('}')) {
+                        &output[s..=e]
+                    } else {
+                        // Char-boundary-safe cap: `&output[..500]` panics mid-UTF-8 char.
+                        let mut end = output.len().min(500);
+                        while end > 0 && !output.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        &output[..end]
+                    };
                 summaries.push(format!("Step {}: {}\n{}", i + 1, label, json_or_summary));
             }
         }
@@ -1462,7 +1441,11 @@ impl WorkflowEngine {
     /// Normalize a directory path for exploration deduplication.
     pub fn normalize_explore_path(path: &str) -> String {
         let p = path.trim().trim_matches(|c| c == '/' || c == '\\');
-        if p.is_empty() { ".".to_string() } else { p.to_lowercase() }
+        if p.is_empty() {
+            ".".to_string()
+        } else {
+            p.to_lowercase()
+        }
     }
 
     /// Record that a directory was already listed/read during Plan exploration.
@@ -1545,8 +1528,7 @@ impl WorkflowEngine {
         self.get_exploration_entries()
             .into_iter()
             .find(|e| {
-                e.tool == tool
-                    && crate::agent::plan_tracker::normalize_path(&e.target) == norm
+                e.tool == tool && crate::agent::plan_tracker::normalize_path(&e.target) == norm
             })
             .map(|e| {
                 let mut out = format!(
@@ -1581,7 +1563,9 @@ pub fn extract_json_block(text: &str) -> Option<String> {
     // Try code-fenced JSON first
     if let (Some(start), Some(end)) = (text.find("```json"), text.rfind("```")) {
         let inner = &text[start + 7..end].trim();
-        if inner.starts_with('{') { return Some(inner.to_string()); }
+        if inner.starts_with('{') {
+            return Some(inner.to_string());
+        }
     }
     // Try raw JSON object
     if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
@@ -1599,4 +1583,3 @@ pub struct StepDisplayInfo {
     pub current_step: usize,
     pub total_steps: usize,
 }
-

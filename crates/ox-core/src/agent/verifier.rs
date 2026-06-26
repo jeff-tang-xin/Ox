@@ -19,7 +19,10 @@ pub fn after_edit_note(
             f.status = FindingStatus::AwaitingVerify;
             f.impl_log.push(findings::ImplAction {
                 tool: "edit_file".into(),
-                detail: format!("{file_path}: {}", diff_snippet.chars().take(200).collect::<String>()),
+                detail: format!(
+                    "{file_path}: {}",
+                    diff_snippet.chars().take(200).collect::<String>()
+                ),
             });
         }
         findings::save(engine, &store);

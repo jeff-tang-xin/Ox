@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::message::Message;
@@ -31,6 +31,10 @@ pub fn arm_findings_scope(engine: &WorkflowEngine) {
 }
 
 pub fn ack_findings_scope(engine: &WorkflowEngine) {
+    if engine.get_variable(SCOPE_ACK_KEY).as_deref() == Some("1") {
+        tracing::warn!("[BUSINESS_GATE] scope 已确认，重复触发忽略");
+        return;
+    }
     engine.set_variable(PENDING_SCOPE_KEY, String::new());
     engine.set_variable(SCOPE_ACK_KEY, "1".to_string());
     super::phase::on_scope_selected(engine);
@@ -65,8 +69,12 @@ pub async fn await_findings_scope_gate(
     ),
 ) -> BusinessGateResume {
     let _ = ui_tx.send(super::AgentToUiEvent::Status(
-        "⏸ 业务流程门禁：等待确认 findings 范围 — 面板选 finding 后 c /confirm；可输入讨论".to_string(),
+        "⏸ 业务流程门禁：等待确认 findings 范围 — 面板选 finding 后 c /confirm；可输入讨论"
+            .to_string(),
     ));
+
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(300));
+    tokio::pin!(timeout);
 
     loop {
         tokio::select! {
@@ -83,6 +91,21 @@ pub async fn await_findings_scope_gate(
                         return BusinessGateResume::Acknowledged;
                     }
                     Some(ui_event::UiToAgentEvent::Interjection(text)) => {
+                        let trimmed = text.trim();
+                        let lower = trimmed.to_lowercase();
+                        let is_confirm = trimmed == "c"
+                            || trimmed == "/confirm"
+                            || trimmed == "/fix"
+                            || lower == "确认"
+                            || lower == "开始实施";
+                        if is_confirm {
+                            if let Some(wf) = workflow_engine {
+                                if let Ok(engine) = wf.try_lock() {
+                                    ack_findings_scope(&engine);
+                                }
+                            }
+                            return BusinessGateResume::Acknowledged;
+                        }
                         push_interjection(workflow_engine, messages, &text, ui_tx);
                         let unlocked = workflow_engine
                             .as_ref()
@@ -93,7 +116,69 @@ pub async fn await_findings_scope_gate(
                         }
                         return BusinessGateResume::Discuss;
                     }
-                    Some(ui_event::UiToAgentEvent::ToolConfirmation { .. }) => {}
+                    Some(ui_event::UiToAgentEvent::ToolConfirmation { tool_call_id, .. }) => {
+                        tracing::warn!(
+                            "[BUSINESS_GATE] 收到意外的 ToolConfirmation (id={tool_call_id})，safety gate 可能超时"
+                        );
+                    }
+                    Some(ui_event::UiToAgentEvent::FinishAck { finished, .. }) => {
+                        if finished {
+                            return BusinessGateResume::Cancelled;
+                        }
+                    }
+                    Some(ui_event::UiToAgentEvent::BusinessAck { kind }) => {
+                        if kind != BusinessGateKind::FindingsScope {
+                            tracing::warn!(
+                                "[BUSINESS_GATE] 收到意外的 BusinessAck (kind={:?})",
+                                kind
+                            );
+                        }
+                    }
+                }
+            }
+            _ = cancel_token.cancelled() => return BusinessGateResume::Cancelled,
+            () = &mut timeout => {
+                tracing::warn!("[BUSINESS_GATE] 超时（300秒），自动取消");
+                return BusinessGateResume::Cancelled;
+            }
+        }
+    }
+}
+
+/// Suspend after generic `deliver` (non-findings) until user confirms or discusses.
+pub async fn await_deliver_gate(
+    ui_rx: &mut mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
+    cancel_token: &CancellationToken,
+    workflow_engine: &Option<Arc<Mutex<WorkflowEngine>>>,
+    messages: &mut Vec<Message>,
+    ui_tx: &mpsc::UnboundedSender<super::AgentToUiEvent>,
+    push_interjection: impl Fn(
+        &Option<Arc<Mutex<WorkflowEngine>>>,
+        &mut Vec<Message>,
+        &str,
+        &mpsc::UnboundedSender<super::AgentToUiEvent>,
+    ),
+    kind: &str,
+) -> BusinessGateResume {
+    let _ = ui_tx.send(super::AgentToUiEvent::Status(format!(
+        "⏸ 交付门禁 ({kind})：c /confirm 确认 · 输入讨论"
+    )));
+
+    loop {
+        tokio::select! {
+            ev = ui_rx.recv() => {
+                match ev {
+                    None => return BusinessGateResume::Cancelled,
+                    Some(ui_event::UiToAgentEvent::BusinessAck { kind: BusinessGateKind::Deliver })
+                    | Some(ui_event::UiToAgentEvent::BusinessAck { kind: BusinessGateKind::FindingsScope })
+                    | Some(ui_event::UiToAgentEvent::ScopeConfirmed) => {
+                        return BusinessGateResume::Acknowledged;
+                    }
+                    Some(ui_event::UiToAgentEvent::Interjection(text)) => {
+                        push_interjection(workflow_engine, messages, &text, ui_tx);
+                        return BusinessGateResume::Discuss;
+                    }
+                    _ => {}
                 }
             }
             _ = cancel_token.cancelled() => return BusinessGateResume::Cancelled,
@@ -111,7 +196,8 @@ mod tests {
         let session = Arc::new(Mutex::new(SessionState::new("t")));
         let mut engine = WorkflowEngine::new(session);
         engine.register_workflow(create_default_workflow());
-        engine.activate_workflow(crate::agent::workflow::DEFAULT_WORKFLOW_ID)
+        engine
+            .activate_workflow(crate::agent::workflow::DEFAULT_WORKFLOW_ID)
             .unwrap();
         engine
     }

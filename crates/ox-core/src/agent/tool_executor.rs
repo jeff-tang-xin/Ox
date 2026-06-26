@@ -112,10 +112,7 @@ pub fn extract_tool_detail(tool_name: &str, arguments: &str) -> Option<String> {
 }
 
 /// Build a helpful error message for an unknown tool, including suggestions.
-pub fn build_unknown_tool_error(
-    tool_name: &str,
-    available_tools: &[String],
-) -> String {
+pub fn build_unknown_tool_error(tool_name: &str, available_tools: &[String]) -> String {
     let available = available_tools.join(", ");
 
     // Find similar tool names (prefix-based matching)
@@ -151,7 +148,9 @@ pub fn build_json_parse_error(tool_name: &str, parse_err: &str) -> String {
     let example = match tool_name {
         "file_read" => "{\"path\": \"src/main.rs\", \"limit\": 100}",
         "file_write" => "{\"path\": \"output.txt\", \"content\": \"Hello World\"}",
-        "edit_file" => "{\"path\": \"src/lib.rs\", \"old_string\": \"...\", \"new_string\": \"...\"}",
+        "edit_file" => {
+            "{\"path\": \"src/lib.rs\", \"old_string\": \"...\", \"new_string\": \"...\"}"
+        }
         "shell_exec" => "{\"command\": \"ls -la\", \"timeout_ms\": 5000}",
         "file_search" => "{\"pattern\": \"*.rs\", \"path\": \"src/\"}",
         "code_search" => "{\"query\": \"fn main\", \"path\": \"src/\"}",

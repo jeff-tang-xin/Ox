@@ -6,7 +6,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::helpers;
-use crate::terminal::app::App;
+use crate::terminal::app::{App, UnifiedGatePending};
 
 /// Handle a single key event. Returns true if the key was consumed.
 ///
@@ -14,36 +14,32 @@ use crate::terminal::app::App;
 /// The heavy lifting (text submission, slash commands, LLM invocation) is handled
 /// by the event loop after this function returns the input.
 pub fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> KeyResult {
-    // Findings panel shortcuts (parked review): 1-9 toggle, c confirm, d discuss, n new task.
-    if app.findings_panel.is_some()
-        && app.workflow_awaiting_confirmation == Some(4)
-        && app.park_follow_up_tag.is_none()
-    {
+    // Unified complete_and_check gates (agent suspended, same turn).
+    if let Some(gate) = app.unified_gate.clone() {
         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-            if let KeyCode::Char(ch @ '1'..='9') = key.code {
-                let n = (ch as u8 - b'0') as u32;
-                return KeyResult::FindingsToggle(n);
+            match (&gate, key.code) {
+                (UnifiedGatePending::Deliver { .. }, KeyCode::Char('c' | 'C')) => {
+                    return KeyResult::UnifiedDeliverConfirm;
+                }
+                (UnifiedGatePending::Finish { .. }, KeyCode::Char('f' | 'F')) => {
+                    return KeyResult::UnifiedFinish(true);
+                }
+                (UnifiedGatePending::Finish { .. }, KeyCode::Char('c' | 'C')) => {
+                    return KeyResult::UnifiedFinish(false);
+                }
+                _ => {}
             }
+        }
+    }
+
+    // Scope confirmation shortcuts (no panel — findings shown in chat).
+    if app.workflow_awaiting_confirmation == Some(4) && app.park_follow_up_tag.is_none() {
+        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
             if matches!(key.code, KeyCode::Char('c' | 'C')) {
                 return KeyResult::FindingsConfirm;
             }
             if matches!(key.code, KeyCode::Char('d' | 'D')) {
                 return KeyResult::FindingsDiscuss;
-            }
-            if matches!(key.code, KeyCode::Char('n' | 'N')) {
-                return KeyResult::ParkMenuShortcut('3');
-            }
-        }
-    }
-
-    // Park menu shortcuts: 1/2/3 while awaiting step-4 confirmation (menu stage only).
-    if app.workflow_awaiting_confirmation == Some(4)
-        && app.park_follow_up_tag.is_none()
-        && app.findings_panel.is_none()
-    {
-        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-            if let KeyCode::Char(ch @ ('1' | '2' | '3')) = key.code {
-                return KeyResult::ParkMenuShortcut(ch);
             }
         }
     }
@@ -54,14 +50,6 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> KeyResult {
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
             if ch != 'y' && ch != 'Y' && ch != 'n' && ch != 'N' && ch != 't' && ch != 'T' {
-                // Don't insert 1/2/3 at park menu — those are shortcuts.
-                if app.workflow_awaiting_confirmation == Some(4)
-                    && app.park_follow_up_tag.is_none()
-                    && app.findings_panel.is_none()
-                    && matches!(ch, '1' | '2' | '3')
-                {
-                    return KeyResult::ParkMenuShortcut(ch);
-                }
                 app.input.insert_char(ch);
                 app.dirty = true;
                 return KeyResult::Handled;
@@ -71,22 +59,19 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> KeyResult {
 
     match (key.code, key.modifiers) {
         // Confirmation keys (Y/N/T when pending)
-        (KeyCode::Char('y'), KeyModifiers::NONE)
-        | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
+        (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Char('Y'), KeyModifiers::NONE) => {
             if !helpers::handle_confirmation_key(app, &key) {
                 app.input.insert_char('y');
                 app.dirty = true;
             }
         }
-        (KeyCode::Char('n'), KeyModifiers::NONE)
-        | (KeyCode::Char('N'), KeyModifiers::NONE) => {
+        (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Char('N'), KeyModifiers::NONE) => {
             if !helpers::handle_confirmation_key(app, &key) {
                 app.input.insert_char('n');
                 app.dirty = true;
             }
         }
-        (KeyCode::Char('t'), KeyModifiers::NONE)
-        | (KeyCode::Char('T'), KeyModifiers::NONE) => {
+        (KeyCode::Char('t'), KeyModifiers::NONE) | (KeyCode::Char('T'), KeyModifiers::NONE) => {
             if !helpers::handle_confirmation_key(app, &key) {
                 app.input.insert_char('t');
                 app.dirty = true;
@@ -113,7 +98,10 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> KeyResult {
             }
         }
         // Editing keys
-        (KeyCode::Backspace, _) | (KeyCode::Delete, _) | (KeyCode::Left, _) | (KeyCode::Right, _) => {
+        (KeyCode::Backspace, _)
+        | (KeyCode::Delete, _)
+        | (KeyCode::Left, _)
+        | (KeyCode::Right, _) => {
             helpers::handle_editing_key(app, &key);
         }
         // Navigation keys
@@ -151,6 +139,10 @@ pub enum KeyResult {
     FindingsConfirm,
     /// Enter read-only discuss mode (same as /discuss).
     FindingsDiscuss,
+    /// Confirm unified deliver gate (`complete_and_check` action=deliver).
+    UnifiedDeliverConfirm,
+    /// Finish gate: `finished` true = end turn, false = continue.
+    UnifiedFinish(bool),
     /// User pressed Enter with text — caller should process the input.
     InputSubmitted(crate::terminal::app::UserInput),
 }

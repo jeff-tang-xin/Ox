@@ -25,10 +25,7 @@ pub fn check_and_recover(
         let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) else {
             continue;
         };
-        let cmd = args
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
+        let cmd = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
 
         let is_build_or_test = cmd.contains("cargo build")
             || cmd.contains("cargo check")

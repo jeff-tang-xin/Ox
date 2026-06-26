@@ -9,11 +9,14 @@ pub enum UiToAgentEvent {
     /// User injected an interjection message during agent run.
     Interjection(String),
     /// User confirmed a business output (findings scope, plan, etc.).
-    BusinessAck {
-        kind: BusinessGateKind,
-    },
+    BusinessAck { kind: BusinessGateKind },
     /// Legacy alias for [`BusinessAck`] with [`BusinessGateKind::FindingsScope`].
     ScopeConfirmed,
+    /// User responded to `action=finish` gate.
+    FinishAck {
+        finished: bool,
+        note: Option<String>,
+    },
 }
 
 /// User's decision on a tool confirmation request (safety gate).
@@ -31,4 +34,5 @@ pub enum ConfirmationDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusinessGateKind {
     FindingsScope,
+    Deliver,
 }

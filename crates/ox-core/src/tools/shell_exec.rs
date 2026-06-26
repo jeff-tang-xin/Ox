@@ -218,21 +218,30 @@ impl Tool for ShellExecTool {
 
                     // stderr section
                     if !stderr_text.is_empty() {
-                        parts.push(format!("── stderr ({n} lines) ──\n{stderr_text}", n = stderr_lines.len()));
+                        parts.push(format!(
+                            "── stderr ({n} lines) ──\n{stderr_text}",
+                            n = stderr_lines.len()
+                        ));
                     }
 
                     // Extract first relevant error line for quick diagnosis
-                    let first_error = combined.lines()
+                    let first_error = combined
+                        .lines()
                         .find(|l| {
-                            l.contains("error[") || l.contains("error:") ||
-                            l.contains("Error:") || l.contains("❌") ||
-                            l.contains("fatal") || l.contains("cannot find")
+                            l.contains("error[")
+                                || l.contains("error:")
+                                || l.contains("Error:")
+                                || l.contains("❌")
+                                || l.contains("fatal")
+                                || l.contains("cannot find")
                         })
                         .map(|l| l.trim().to_string());
 
                     // Build concise analysis block
-                    let mut analysis = format!("\n── Analysis ──\n📊 {} lines | {} errors | {} warnings\n💥 Exit code: {exit_code}",
-                        line_count, error_count, warning_count);
+                    let mut analysis = format!(
+                        "\n── Analysis ──\n📊 {} lines | {} errors | {} warnings\n💥 Exit code: {exit_code}",
+                        line_count, error_count, warning_count
+                    );
 
                     if let Some(ref first) = first_error {
                         analysis.push_str(&format!("\n🔍 First error: {}", first));
@@ -240,18 +249,33 @@ impl Tool for ShellExecTool {
 
                     // Common error hints
                     if combined.contains("not found") || combined.contains("No such file") {
-                        analysis.push_str("\n💡 Hint: A file or command was not found. Check the path and name.");
+                        analysis.push_str(
+                            "\n💡 Hint: A file or command was not found. Check the path and name.",
+                        );
                     }
-                    if combined.contains("syntax error") || combined.contains("parse error") || combined.contains("unexpected") {
-                        analysis.push_str("\n💡 Hint: There may be a syntax error. Check the command syntax.");
+                    if combined.contains("syntax error")
+                        || combined.contains("parse error")
+                        || combined.contains("unexpected")
+                    {
+                        analysis.push_str(
+                            "\n💡 Hint: There may be a syntax error. Check the command syntax.",
+                        );
                     }
-                    if combined.contains("permission denied") || combined.contains("Permission denied") || combined.contains("EACCES") {
+                    if combined.contains("permission denied")
+                        || combined.contains("Permission denied")
+                        || combined.contains("EACCES")
+                    {
                         analysis.push_str("\n💡 Hint: Permission denied. Try with appropriate permissions or check file ownership.");
                     }
-                    if combined.contains("does not exist") || combined.contains("No such file or directory") {
+                    if combined.contains("does not exist")
+                        || combined.contains("No such file or directory")
+                    {
                         analysis.push_str("\n💡 Hint: Path not found. Use `ls` to verify the file/directory exists.");
                     }
-                    if combined.contains("connection refused") || combined.contains("Connection refused") || combined.contains("timed out") {
+                    if combined.contains("connection refused")
+                        || combined.contains("Connection refused")
+                        || combined.contains("timed out")
+                    {
                         analysis.push_str("\n💡 Hint: Network issue. Check if the service is running and reachable.");
                     }
 

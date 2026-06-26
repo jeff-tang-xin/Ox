@@ -24,6 +24,7 @@ pub fn inject_context(
     tool_ctx: &Arc<ToolContext>,
     workflow_engine: &Option<Arc<Mutex<WorkflowEngine>>>,
     tool_registry: &ToolRegistry,
+    unified_tool_mode: bool,
 ) {
     strip_prior_step_memory(messages);
     strip_prior_discipline(messages);
@@ -31,6 +32,7 @@ pub fn inject_context(
     strip_prior_phase_switch(messages);
     strip_prior_scope_gate(messages);
     strip_prior_tool_route(messages);
+    strip_prior_unified_route(messages);
     strip_prior_skill_route(messages);
 
     if let Some(wf) = workflow_engine {
@@ -45,28 +47,53 @@ pub fn inject_context(
         if let Ok(engine) = wf.try_lock() {
             if crate::agent::phase::should_inject_workspace(&engine) {
                 let slim = crate::agent::context_slim::is_slim_phase(&engine);
-                if !slim {
+                // Unified mode: [WORKSPACE] embeds route + lock status — keep injections minimal.
+                if unified_tool_mode {
                     if iteration == 0 {
                         messages.push(Message::system(
-                            &crate::agent::idle_narrative::discipline_for_iteration(iteration),
-                        ));
-                    } else if engine.get_task_intent() != crate::agent::task_intent::TaskIntent::Fix
-                    {
-                        messages.push(Message::system(
-                            &crate::agent::idle_narrative::discipline_for_iteration(iteration),
+                            &crate::agent::idle_narrative::discipline_for_iteration_unified(0),
                         ));
                     }
-                } else if iteration == 0 {
-                    messages.push(Message::system(
-                        crate::agent::idle_narrative::RESPONSE_DISCIPLINE,
-                    ));
+                    crate::agent::workspace::inject_workspace(messages, &engine, true);
+                    if crate::agent::business_gate::is_pending_scope(&engine) {
+                        if let Some(gate) =
+                            crate::agent::phase::format_scope_gate_directive(&engine, true)
+                        {
+                            messages.push(Message::system(&gate));
+                        }
+                    }
+                    return;
                 }
-                crate::agent::workspace::inject_workspace(messages, &engine);
-                if let Some(gate) = crate::agent::phase::format_scope_gate_directive(&engine) {
+                let discipline: Option<String> = if !slim {
+                    if iteration == 0
+                        || engine.get_task_intent() != crate::agent::task_intent::TaskIntent::Fix
+                    {
+                        Some(crate::agent::idle_narrative::discipline_for_iteration(
+                            iteration,
+                        ))
+                    } else {
+                        None
+                    }
+                } else if iteration == 0 {
+                    Some(crate::agent::idle_narrative::RESPONSE_DISCIPLINE.to_string())
+                } else {
+                    None
+                };
+                if let Some(d) = discipline {
+                    messages.push(Message::system(&d));
+                }
+                crate::agent::workspace::inject_workspace(messages, &engine, unified_tool_mode);
+                if let Some(gate) =
+                    crate::agent::phase::format_scope_gate_directive(&engine, unified_tool_mode)
+                {
                     messages.push(Message::system(&gate));
                 }
-                inject_task_step_memory(messages, iteration, &engine);
-                inject_atlas_routes(messages, &engine, tool_registry);
+                inject_task_step_memory(messages, iteration, &engine, unified_tool_mode);
+                if unified_tool_mode {
+                    inject_unified_routes(messages, &engine, tool_registry);
+                } else {
+                    inject_atlas_routes(messages, &engine, tool_registry);
+                }
                 return;
             }
         }
@@ -74,6 +101,14 @@ pub fn inject_context(
 
     // ── Generic fallback (non-workflow) ──
     if iteration == 0 {
+        if unified_tool_mode {
+            messages.push(Message::system(
+                &crate::agent::idle_narrative::discipline_for_iteration_unified(0),
+            ));
+            messages.push(Message::system(
+                &crate::agent::unified_action::build_unified_route_fallback(),
+            ));
+        }
         return;
     }
 
@@ -88,17 +123,20 @@ pub fn inject_context(
             }
         );
         if iteration % 3 == 0 {
-            if let Ok(engine) = tool_ctx.knowledge.try_read() {
-                if let Ok(hits) = engine.retrieve_for_context(task, "", 3) {
-                    if !hits.is_empty() {
-                        reminder.push_str("\n\n📚 Memory:");
-                        for hit in hits.iter().take(3) {
-                            let preview: String = hit.entity.content.chars().take(100).collect();
-                            reminder.push_str(&format!(
-                                "\n- [{}] {}",
-                                hit.entity.kind.as_str(),
-                                preview
-                            ));
+            if let Some(knowledge) = &tool_ctx.knowledge {
+                if let Ok(engine) = knowledge.try_read() {
+                    if let Ok(hits) = engine.retrieve_for_context(task, "", 3) {
+                        if !hits.is_empty() {
+                            reminder.push_str("\n\n📚 Memory:");
+                            for hit in hits.iter().take(3) {
+                                let preview: String =
+                                    hit.entity.content.chars().take(100).collect();
+                                reminder.push_str(&format!(
+                                    "\n- [{}] {}",
+                                    hit.entity.kind.as_str(),
+                                    preview
+                                ));
+                            }
                         }
                     }
                 }
@@ -113,15 +151,15 @@ fn strip_prior_discipline(messages: &mut Vec<Message>) {
         !matches!(
             m,
             Message::System { content }
-                if content.starts_with("【输出纪律】")
+                if content.starts_with("【输出纪律")
         )
     });
 }
 
 fn strip_prior_step_memory(messages: &mut Vec<Message>) {
-    messages.retain(|m| {
-        !matches!(m, Message::System { content } if content.starts_with(STEP_MEMORY_TAG))
-    });
+    messages.retain(
+        |m| !matches!(m, Message::System { content } if content.starts_with(STEP_MEMORY_TAG)),
+    );
 }
 
 fn strip_prior_phase(messages: &mut Vec<Message>) {
@@ -168,8 +206,39 @@ fn strip_prior_skill_route(messages: &mut Vec<Message>) {
     });
 }
 
-fn inject_atlas_routes(messages: &mut Vec<Message>, engine: &WorkflowEngine, tool_registry: &ToolRegistry) {
-    messages.push(Message::system(&crate::agent::tool_graph::build_tool_route(engine)));
+fn strip_prior_unified_route(messages: &mut Vec<Message>) {
+    messages.retain(|m| {
+        !matches!(
+            m,
+            Message::System { content }
+                if content.starts_with(crate::agent::unified_action::UNIFIED_ROUTE_TAG)
+        )
+    });
+}
+
+fn inject_unified_routes(
+    messages: &mut Vec<Message>,
+    engine: &WorkflowEngine,
+    tool_registry: &ToolRegistry,
+) {
+    messages.push(Message::system(
+        &crate::agent::unified_action::build_unified_route(engine),
+    ));
+    let phase = crate::agent::phase::get(engine).as_str().to_string();
+    let skills = tool_registry.get_skills_list();
+    if let Some(block) = crate::skill::policy::build_skill_route(&skills, &phase) {
+        messages.push(Message::system(&block));
+    }
+}
+
+fn inject_atlas_routes(
+    messages: &mut Vec<Message>,
+    engine: &WorkflowEngine,
+    tool_registry: &ToolRegistry,
+) {
+    messages.push(Message::system(
+        &crate::agent::tool_graph::build_tool_route(engine),
+    ));
     let phase = crate::agent::phase::get(engine).as_str().to_string();
     let skills = tool_registry.get_skills_list();
     if let Some(block) = crate::skill::policy::build_skill_route(&skills, &phase) {
@@ -178,7 +247,12 @@ fn inject_atlas_routes(messages: &mut Vec<Message>, engine: &WorkflowEngine, too
 }
 
 /// Single-step task memory: tool progress + digest paths in fix mode.
-fn inject_task_step_memory(messages: &mut Vec<Message>, _iteration: u32, engine: &WorkflowEngine) {
+fn inject_task_step_memory(
+    messages: &mut Vec<Message>,
+    _iteration: u32,
+    engine: &WorkflowEngine,
+    unified_tool_mode: bool,
+) {
     let slim = crate::agent::context_slim::is_slim_phase(engine);
     let progress = if slim {
         crate::agent::context_slim::build_recent_tool_progress(messages, true, 10)
@@ -189,33 +263,25 @@ fn inject_task_step_memory(messages: &mut Vec<Message>, _iteration: u32, engine:
     if !progress.is_empty() {
         body.push_str(&format!("【本轮工具（勿重复）】\n{progress}"));
     }
-    if engine.get_task_intent() == crate::agent::task_intent::TaskIntent::Fix
-        || crate::agent::context_slim::is_slim_phase(engine)
-    {
-        let needs_impl_read = crate::agent::workspace::WorkflowWorkspace::build(engine)
-            .is_some_and(|ws| matches!(ws.required_action, crate::agent::workspace::RequiredAction::ReadFile { .. }));
-        let digests: Vec<String> = crate::agent::tool_digest::all_digests(engine)
-            .into_iter()
-            .map(|d| format!("  digest: {}", d.path))
-            .collect();
-        if !digests.is_empty() {
-            if !body.is_empty() {
-                body.push('\n');
-            }
-            if needs_impl_read {
-                body.push_str("【审查期 digest — 实施须再 file_read 一次】\n");
-            } else {
-                body.push_str("【已读文件 — 实施阶段直接 edit_file】\n");
-            }
-            body.push_str(&digests.join("\n"));
+    let digests: Vec<String> = crate::agent::tool_digest::all_digests(engine)
+        .into_iter()
+        .map(|d| format!("  digest: {}", d.path))
+        .collect();
+    if !digests.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
         }
+        body.push_str(if unified_tool_mode {
+            "【已读文件 — 可直接 action=edit_file】\n"
+        } else {
+            "【已读文件 — 可直接 edit_file】\n"
+        });
+        body.push_str(&digests.join("\n"));
     }
     if body.is_empty() {
         return;
     }
-    messages.push(Message::system(&format!(
-        "{STEP_MEMORY_TAG}\n{body}"
-    )));
+    messages.push(Message::system(&format!("{STEP_MEMORY_TAG}\n{body}")));
 }
 
 pub fn build_tool_progress(messages: &[Message], include_writes: bool) -> String {
@@ -268,6 +334,9 @@ pub fn build_tool_progress(messages: &[Message], include_writes: bool) -> String
 }
 
 fn tool_key(name: &str, arguments: &str, include_writes: bool) -> Option<String> {
+    if name == crate::agent::unified_action::TOOL_NAME {
+        return unified_tool_key(arguments, include_writes);
+    }
     match name {
         "file_list" => {
             let path = parse_tool_path_arg(arguments).unwrap_or_else(|| ".".into());
@@ -295,7 +364,26 @@ fn tool_key(name: &str, arguments: &str, include_writes: bool) -> Option<String>
     }
 }
 
+fn unified_tool_key(arguments: &str, include_writes: bool) -> Option<String> {
+    let req = crate::agent::unified_action::parse_request(arguments).ok()?;
+    let inner = crate::agent::unified_action::action_to_tool_name(&req.action)
+        .unwrap_or(req.action.as_str());
+    if inner == "finish" {
+        let kind = if crate::agent::unified_action::finding_json(&req.params).is_some() {
+            "finish:findings"
+        } else {
+            "finish"
+        };
+        return Some(format!("complete_and_check:{kind}"));
+    }
+    tool_key(inner, &req.params.to_string(), include_writes)
+        .map(|k| format!("complete_and_check:{k}"))
+}
+
 fn format_tool_line(name: &str, key: &str, outcome: &str) -> String {
+    if name == crate::agent::unified_action::TOOL_NAME {
+        return format!("  complete_and_check({key}) → {outcome}");
+    }
     match name {
         "file_list" => format!(
             "  file_list({}) → {outcome}",
@@ -329,7 +417,11 @@ fn format_tool_line(name: &str, key: &str, outcome: &str) -> String {
 fn parse_tool_path_arg(arguments: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(arguments)
         .ok()
-        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("path")
+                .and_then(|p| p.as_str())
+                .map(|s| s.to_string())
+        })
 }
 
 fn parse_read_range(arguments: &str) -> (u64, u64) {
@@ -390,10 +482,7 @@ mod tests {
 
     #[test]
     fn test_strip_prior_step_memory() {
-        let mut msgs = vec![
-            Message::system("[STEP_MEMORY]\nold"),
-            Message::user("hi"),
-        ];
+        let mut msgs = vec![Message::system("[STEP_MEMORY]\nold"), Message::user("hi")];
         strip_prior_step_memory(&mut msgs);
         assert_eq!(msgs.len(), 1);
     }

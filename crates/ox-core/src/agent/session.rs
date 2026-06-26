@@ -1,5 +1,3 @@
-
-
 /// Session state - tracks the current state of a conversation session
 #[derive(Debug, Clone)]
 pub struct SessionState {

@@ -1,7 +1,7 @@
+use crate::symbol::language::{LanguageRegistry, SyntaxError};
+use crate::symbol::types::{Symbol, SymbolType};
 use std::path::Path;
 use tree_sitter::Node;
-use crate::symbol::types::{Symbol, SymbolType};
-use crate::symbol::language::{LanguageRegistry, SyntaxError};
 
 pub struct AstExtractor {
     registry: LanguageRegistry,
@@ -20,21 +20,16 @@ impl AstExtractor {
         code: &str,
     ) -> anyhow::Result<Vec<Symbol>> {
         let path = path.as_ref();
-        let lang_name = self.registry.detect_language(path)
+        let lang_name = self
+            .registry
+            .detect_language(path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {:?}", path))?
             .to_string();
 
         let tree = self.registry.parse(code, &lang_name)?;
         let mut symbols = Vec::new();
 
-        self.extract_from_node(
-            tree.root_node(),
-            code,
-            &lang_name,
-            path,
-            None,
-            &mut symbols,
-        );
+        self.extract_from_node(tree.root_node(), code, &lang_name, path, None, &mut symbols);
 
         Ok(symbols)
     }
@@ -45,7 +40,11 @@ impl AstExtractor {
     }
 
     /// Check code for syntax errors without full symbol extraction.
-    pub fn check_syntax(&mut self, code: &str, lang_name: &str) -> anyhow::Result<Vec<SyntaxError>> {
+    pub fn check_syntax(
+        &mut self,
+        code: &str,
+        lang_name: &str,
+    ) -> anyhow::Result<Vec<SyntaxError>> {
         self.registry.check_syntax(code, lang_name)
     }
 
@@ -62,8 +61,12 @@ impl AstExtractor {
         // This ensures we capture calls before the parent is added
         let extracted_calls = if matches!(
             node.kind(),
-            "function_item" | "function_signature_item" | "function_declaration"
-                | "function_definition" | "method_definition" | "function_declarator"
+            "function_item"
+                | "function_signature_item"
+                | "function_declaration"
+                | "function_definition"
+                | "method_definition"
+                | "function_declarator"
         ) {
             self.extract_function_calls(node, code)
         } else {
@@ -81,12 +84,24 @@ impl AstExtractor {
         // Determine parent for children
         let child_parent = if matches!(
             node.kind(),
-            "function_item" | "function_signature_item" | "function_declaration"
-                | "function_definition" | "class_declaration" | "class_definition"
-                | "class_specifier" | "struct_item" | "struct_specifier"
-                | "enum_item" | "enum_declaration" | "enum_specifier"
-                | "trait_item" | "interface_declaration" | "interface_type"
-                | "impl_item" | "namespace_definition" | "mod_item"
+            "function_item"
+                | "function_signature_item"
+                | "function_declaration"
+                | "function_definition"
+                | "class_declaration"
+                | "class_definition"
+                | "class_specifier"
+                | "struct_item"
+                | "struct_specifier"
+                | "enum_item"
+                | "enum_declaration"
+                | "enum_specifier"
+                | "trait_item"
+                | "interface_declaration"
+                | "interface_type"
+                | "impl_item"
+                | "namespace_definition"
+                | "mod_item"
         ) {
             self.get_node_name(node, code)
         } else {
@@ -121,7 +136,10 @@ impl AstExtractor {
                     let mut func_cursor = child.walk();
                     for func_child in child.children(&mut func_cursor) {
                         let fc = func_child.kind();
-                        if fc == "identifier" || fc == "scoped_identifier" || fc == "field_expression" {
+                        if fc == "identifier"
+                            || fc == "scoped_identifier"
+                            || fc == "field_expression"
+                        {
                             if let Ok(text) = func_child.utf8_text(code.as_bytes()) {
                                 let name = text.trim().to_string();
                                 if !name.is_empty() && !calls.contains(&name) {
@@ -211,7 +229,9 @@ impl AstExtractor {
             "enum_item" => Some((SymbolType::Enum, self.get_node_name(node, code)?)),
             "trait_item" => Some((SymbolType::Trait, self.get_node_name(node, code)?)),
             "impl_item" => {
-                let name = self.get_node_name(node, code).unwrap_or_else(|| "<impl>".to_string());
+                let name = self
+                    .get_node_name(node, code)
+                    .unwrap_or_else(|| "<impl>".to_string());
                 Some((SymbolType::Impl, name))
             }
             "type_item" => Some((SymbolType::TypeAlias, self.get_node_name(node, code)?)),
@@ -250,8 +270,12 @@ impl AstExtractor {
             "function_declaration" => Some((SymbolType::Function, self.get_node_name(node, code)?)),
             "class_declaration" => Some((SymbolType::Class, self.get_node_name(node, code)?)),
             "method_definition" => Some((SymbolType::Method, self.get_node_name(node, code)?)),
-            "interface_declaration" => Some((SymbolType::Interface, self.get_node_name(node, code)?)),
-            "type_alias_declaration" => Some((SymbolType::TypeAlias, self.get_node_name(node, code)?)),
+            "interface_declaration" => {
+                Some((SymbolType::Interface, self.get_node_name(node, code)?))
+            }
+            "type_alias_declaration" => {
+                Some((SymbolType::TypeAlias, self.get_node_name(node, code)?))
+            }
             "enum_declaration" => Some((SymbolType::Enum, self.get_node_name(node, code)?)),
             _ => self.extract_js_symbol(node, code),
         }
@@ -263,7 +287,9 @@ impl AstExtractor {
             "class_specifier" => Some((SymbolType::Class, self.get_node_name(node, code)?)),
             "struct_specifier" => Some((SymbolType::Struct, self.get_node_name(node, code)?)),
             "enum_specifier" => Some((SymbolType::Enum, self.get_node_name(node, code)?)),
-            "namespace_definition" => Some((SymbolType::Namespace, self.get_node_name(node, code)?)),
+            "namespace_definition" => {
+                Some((SymbolType::Namespace, self.get_node_name(node, code)?))
+            }
             _ => None,
         }
     }
@@ -282,7 +308,9 @@ impl AstExtractor {
     fn extract_java_symbol(&self, node: Node, code: &str) -> Option<(SymbolType, String)> {
         match node.kind() {
             "class_declaration" => Some((SymbolType::Class, self.get_node_name(node, code)?)),
-            "interface_declaration" => Some((SymbolType::Interface, self.get_node_name(node, code)?)),
+            "interface_declaration" => {
+                Some((SymbolType::Interface, self.get_node_name(node, code)?))
+            }
             "method_declaration" => Some((SymbolType::Method, self.get_node_name(node, code)?)),
             "enum_declaration" => Some((SymbolType::Enum, self.get_node_name(node, code)?)),
             "package_declaration" => Some((SymbolType::Package, self.get_node_name(node, code)?)),

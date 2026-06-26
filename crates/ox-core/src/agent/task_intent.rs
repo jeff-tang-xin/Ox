@@ -48,7 +48,7 @@ impl TaskIntent {
             }
             Self::Qa => "优先直接回答；需核对时单次 file_read/find_symbol，勿全面探索。",
             Self::General => {
-                "路径→file_read；符号→find_symbol；改前先读。复杂任务先 ## Plan。"
+                "路径→file_read；符号→find_symbol；可直接动手编辑。复杂任务先 ## Plan。"
             }
         }
     }
@@ -145,8 +145,17 @@ pub fn looks_like_greenfield_impl(user_text: &str) -> bool {
     }
     let lower = t.to_lowercase();
     let impl_signals = [
-        "实现", "implement", "写一个", "创建", "添加功能", "新增", "开发",
-        "build a", "create a", "add feature", "write a",
+        "实现",
+        "implement",
+        "写一个",
+        "创建",
+        "添加功能",
+        "新增",
+        "开发",
+        "build a",
+        "create a",
+        "add feature",
+        "write a",
     ];
     let has_impl = impl_signals
         .iter()
@@ -163,8 +172,17 @@ fn looks_like_fix_request(t: &str) -> bool {
 
 fn looks_like_fix(t: &str, lower: &str) -> bool {
     [
-        "修复", "fix", "改掉", "改一下", "帮我改", "implement", "实现", "执行修复",
-        "apply fix", "resolve finding", "/fix",
+        "修复",
+        "fix",
+        "改掉",
+        "改一下",
+        "帮我改",
+        "implement",
+        "实现",
+        "执行修复",
+        "apply fix",
+        "resolve finding",
+        "/fix",
     ]
     .iter()
     .any(|k| t.contains(k) || lower.contains(k))
@@ -172,8 +190,19 @@ fn looks_like_fix(t: &str, lower: &str) -> bool {
 
 fn looks_like_review(t: &str, lower: &str) -> bool {
     [
-        "审查", "检查", "review", "audit", "代码审查", "走查", "对照", "是否符合",
-        "有没有问题", "风险", "评估", "注释", "规范",
+        "审查",
+        "检查",
+        "review",
+        "audit",
+        "代码审查",
+        "走查",
+        "对照",
+        "是否符合",
+        "有没有问题",
+        "风险",
+        "评估",
+        "注释",
+        "规范",
     ]
     .iter()
     .any(|k| t.contains(k) || lower.contains(k))
@@ -182,8 +211,17 @@ fn looks_like_review(t: &str, lower: &str) -> bool {
 
 fn looks_like_qa(t: &str, lower: &str) -> bool {
     [
-        "是什么", "为什么", "怎么", "如何", "explain", "what is", "how does", "什么意思",
-        "帮我看", "介绍一下", "说明",
+        "是什么",
+        "为什么",
+        "怎么",
+        "如何",
+        "explain",
+        "what is",
+        "how does",
+        "什么意思",
+        "帮我看",
+        "介绍一下",
+        "说明",
     ]
     .iter()
     .any(|k| t.contains(k) || lower.contains(k))
@@ -219,10 +257,7 @@ mod tests {
     #[test]
     fn fix_without_findings_downgrades() {
         let engine = WorkflowEngine::new(Arc::new(Mutex::new(SessionState::new("t"))));
-        assert_eq!(
-            resolve_for_round(&engine, "修复一下"),
-            TaskIntent::General
-        );
+        assert_eq!(resolve_for_round(&engine, "修复一下"), TaskIntent::General);
     }
 
     #[test]
