@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::message::Message;
 
 use super::engine::WorkflowEngine;
+use super::findings;
 use super::ui_event::{self, BusinessGateKind};
 
 pub const PENDING_SCOPE_KEY: &str = "_business_gate_pending_scope";
@@ -41,7 +42,12 @@ pub fn ack_findings_scope(engine: &WorkflowEngine) {
 }
 
 pub fn is_pending_scope(engine: &WorkflowEngine) -> bool {
-    engine.get_variable(PENDING_SCOPE_KEY).as_deref() == Some("1")
+    // Only show scope gate if there are PENDING findings (not Done/Skipped/WontFix)
+    let has_pending = findings::load_or_migrate(engine)
+        .map(|s| s.has_pending_findings())
+        .unwrap_or(false);
+
+    has_pending && engine.get_variable(PENDING_SCOPE_KEY).as_deref() == Some("1")
 }
 
 pub fn scope_implementation_unlocked(engine: &WorkflowEngine) -> bool {

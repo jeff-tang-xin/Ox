@@ -464,7 +464,7 @@ async fn run_app(
     // ========================================================================
     loop {
         // ── Onboarding trigger ──
-        if needs_onboarding && !app.indexing {
+        if needs_onboarding {
             needs_onboarding = false;
             app.output
                 .push_system("🔍 首次进入本项目 — 将生成项目规范与业务指导 Skill…");

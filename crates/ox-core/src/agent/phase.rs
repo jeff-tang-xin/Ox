@@ -406,9 +406,10 @@ fn enter_implement(engine: &WorkflowEngine, user_text: &str) {
     }
 }
 
+/// Check for pending findings (excludes Done/Skipped/WontFix)
 fn has_findings(engine: &WorkflowEngine) -> bool {
     findings::load_or_migrate(engine)
-        .map(|s| !s.findings.is_empty())
+        .map(|s| s.has_pending_findings())
         .unwrap_or(false)
 }
 

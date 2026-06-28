@@ -105,6 +105,29 @@ pub struct FindingsStore {
 }
 
 impl FindingsStore {
+    /// Check if there are any pending (not Done/Skipped/WontFix) findings
+    pub fn has_pending_findings(&self) -> bool {
+        self.findings.iter().any(|f| {
+            !matches!(
+                f.status,
+                FindingStatus::Done | FindingStatus::Skipped | FindingStatus::WontFix
+            )
+        })
+    }
+
+    /// Get pending findings count
+    pub fn pending_count(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| {
+                !matches!(
+                    f.status,
+                    FindingStatus::Done | FindingStatus::Skipped | FindingStatus::WontFix
+                )
+            })
+            .count()
+    }
+
     pub fn from_perception(p: &PerceptionFindings) -> Self {
         let findings = p.findings.iter().map(finding_from_item).collect();
         Self {

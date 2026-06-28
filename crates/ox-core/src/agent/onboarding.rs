@@ -144,7 +144,7 @@ pub fn onboarding_system_directive(greenfield: bool) -> String {
          | project-conventions.md | 在本项目里代码怎么写、怎么构建、怎么验证？ | 业务介绍、模块职责 |\n\
          | project-business-guide.md | 项目做什么？术语/流程？改功能看哪？ | 构建命令、格式化工具 |\n\
          \n\
-         **流程**：所有动作都走 `complete_and_check({{\"action\":\"...\",\"params\":{{...}}}})`：project_detect → file_list（单层逐层）→ file_read 关键配置/入口 → **分别** file_write → finish(content=\"## Done...\")。\n\
+         **流程**：所有动作都走 `complete_and_check`：project_detect → file_list → file_read → file_write → finish。
          **技术栈**：只写 project_detect 与配置文件**实际检测到**的内容，不要默认某一语言。\n\
          **禁止**：四步工作流 JSON；通用编程常识；臆造路径/命令；两篇混写。\n\
          **篇幅**：每个 Skill ≤1500 字；大仓库用要点，避免 file_write 被模型截断。{greenfield_note}"
