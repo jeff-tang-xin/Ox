@@ -16,6 +16,7 @@ use ox_core::llm::{LlmProvider, ProviderResolveInfo};
 use ox_core::message::{Message, Session};
 use ox_core::runtime::RuntimeEnvironment;
 use ox_core::safety::TrustManager;
+use ox_core::mcp::GitNexusService;
 use ox_core::tools::{ToolContext, ToolRegistry};
 
 use crate::slash_commands::CommandRegistry;
@@ -45,6 +46,7 @@ pub struct AppRuntime {
     pub tick_count: u64,
     pub compressed_cache: Option<(Vec<Message>, usize)>,
     pub background_session: Option<Session>,
+    pub gitnexus: Arc<GitNexusService>,
 }
 
 impl AppRuntime {
@@ -66,6 +68,7 @@ impl AppRuntime {
         trust_manager: Arc<std::sync::Mutex<TrustManager>>,
         cost_tracker: CostTracker,
         agent_tx: mpsc::UnboundedSender<AgentToUiEvent>,
+        gitnexus: Arc<GitNexusService>,
     ) -> Self {
         let events = EventHandler::new(Duration::from_millis(33));
         Self {
@@ -91,6 +94,7 @@ impl AppRuntime {
             tick_count: 0,
             compressed_cache: None,
             background_session: None,
+            gitnexus,
         }
     }
 

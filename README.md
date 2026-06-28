@@ -1,8 +1,9 @@
 # Ox 🐂
 
-[![Version](https://img.shields.io/badge/version-v2.0.0.02-blue.svg)](https://github.com/nicepkg/ox)
+[![Version](https://img.shields.io/badge/version-v2.0.0-blue.svg)](https://github.com/nicepkg/ox)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/nicepkg/ox/actions/workflows/rust.yml/badge.svg)](https://github.com/nicepkg/ox/actions/workflows/rust.yml)
 
 > **Terminal AI coding assistant — read first, code second; enforce discipline, ship production-grade output**
 
@@ -36,6 +37,7 @@ Ox Workspace
 │   │       ├── cost/     # CostTracker (token + dollar accounting)
 │   │       ├── feedback/ # EMA tracker, override detector, rollback
 │   │       ├── knowledge/# BM25, vector store, entity graph, live update
+│   │       ├── mcp/      # Model Context Protocol adapter
 │   │       ├── llm/      # LlmProvider trait, OpenAI, Anthropic, SSE adapter
 │   │       ├── message/  # Message, Session, TaskPlan
 │   │       ├── runtime/  # RuntimeEnvironment, directory, project
@@ -46,11 +48,15 @@ Ox Workspace
 │   │       └── tools/    # 16 built-in tools + Tool trait + ToolRegistry
 │   └── ox-cli/           # Terminal UI binary
 │       └── src/
-│           ├── main.rs   # Entry point — #[tokio::main]
-│           ├── handlers/ # Agent, key, session, pre-turn handlers
-│           ├── middleware/# Feedback, interjection
-│           ├── slash_commands/ # /help, /model, /session, /skill …
-│           └── terminal/ # TUI app, input/output panes, markdown render
+│           ├── main.rs          # Entry point — #[tokio::main]
+│           ├── app_runtime.rs   # App runtime bootstrap
+│           ├── event_loop.rs    # Main TUI event loop
+│           ├── keyword_extraction.rs # Keyword extraction utilities
+│           ├── handlers/        # Agent, key, session, pre-turn handlers
+│           ├── helpers/         # Shared helper utilities
+│           ├── middleware/      # Feedback, interjection
+│           ├── slash_commands/  # /help, /model, /session, /skill …
+│           └── terminal/        # TUI app, input/output panes, markdown render
 ```
 
 ### Crate boundary
@@ -76,7 +82,7 @@ ox-cli  →  ox-core  →  (third-party crates only)
 ### Install
 
 ```bash
-git clone https://github.com/your-org/ox.git
+git clone https://github.com/nicepkg/ox.git
 cd ox
 cargo build --release
 # Binary at target/release/ox

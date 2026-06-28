@@ -150,36 +150,49 @@ impl Tool for ShellExecTool {
         let stderr = child.stderr.take();
 
         let timeout = tokio::time::Duration::from_millis(timeout_ms);
+
+        // Spawn tasks to read stdout and stderr in parallel
+        // Use tokio::spawn with careful error handling
+        let stdout_handle = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            if let Some(stdout) = stdout {
+                let reader = BufReader::new(stdout);
+                let mut lines_reader = reader.lines();
+                while let Ok(Some(line)) = lines_reader.next_line().await {
+                    lines.push(line);
+                }
+            }
+            tracing::debug!("[SHELL] stdout read {} lines", lines.len());
+            lines
+        });
+
+        let stderr_handle = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            if let Some(stderr) = stderr {
+                let reader = BufReader::new(stderr);
+                let mut lines_reader = reader.lines();
+                while let Ok(Some(line)) = lines_reader.next_line().await {
+                    lines.push(line);
+                }
+            }
+            tracing::debug!("[SHELL] stderr read {} lines", lines.len());
+            lines
+        });
+
         let result = tokio::time::timeout(timeout, async {
-            let stdout_lines = tokio::spawn(async move {
-                let mut lines = Vec::new();
-                if let Some(stdout) = stdout {
-                    let reader = BufReader::new(stdout);
-                    let mut lines_reader = reader.lines();
-                    while let Ok(Some(line)) = lines_reader.next_line().await {
-                        lines.push(line);
-                    }
-                }
-                lines
+            // Wait for output reading to complete
+            let stdout_lines = stdout_handle.await.unwrap_or_else(|e| {
+                tracing::error!("[SHELL] stdout task panicked: {}", e);
+                Vec::new()
+            });
+            let stderr_lines = stderr_handle.await.unwrap_or_else(|e| {
+                tracing::error!("[SHELL] stderr task panicked: {}", e);
+                Vec::new()
             });
 
-            let stderr_lines = tokio::spawn(async move {
-                let mut lines = Vec::new();
-                if let Some(stderr) = stderr {
-                    let reader = BufReader::new(stderr);
-                    let mut lines_reader = reader.lines();
-                    while let Ok(Some(line)) = lines_reader.next_line().await {
-                        lines.push(line);
-                    }
-                }
-                lines
-            });
-
-            let out = stdout_lines.await.unwrap_or_default();
-            let err = stderr_lines.await.unwrap_or_default();
-
+            // Wait for process to exit
             let status = child.wait().await;
-            (out, err, status)
+            (stdout_lines, stderr_lines, status)
         })
         .await;
 

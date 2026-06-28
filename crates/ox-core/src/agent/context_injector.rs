@@ -6,6 +6,7 @@
 //! (which says "explore" or "execute") dominates its attention.
 
 use crate::agent::engine::WorkflowEngine;
+use crate::agent::task_intent::TaskIntent;
 use crate::message::Message;
 use crate::tools::{ToolContext, ToolRegistry};
 use std::sync::Arc;
@@ -14,10 +15,35 @@ use tokio::sync::Mutex;
 /// Marker prefix — prior step-memory injections are stripped before each iteration.
 pub const STEP_MEMORY_TAG: &str = "[STEP_MEMORY]";
 
+/// 决定是否需要注入记忆 (动态注入策略)
+///
+/// 决定是否需要注入记忆 (动态注入策略)
+///
+/// 策略：
+/// - Fix 任务：每 2 轮注入（上下文容易丢失）
+/// - Review 任务：每 4 轮注入（主要是审查，可间隔更长）
+/// - QA 任务：每 5 轮注入（问答型，主要靠当前上下文）
+/// - General 任务：每 3 轮注入（默认）
+/// - 首次迭代总是注入
+pub fn should_inject_memory(iteration: u32, task_intent: TaskIntent) -> bool {
+    if iteration == 0 {
+        return true;
+    }
+
+    let interval = match task_intent {
+        TaskIntent::Fix => 2,     // fix 需要更频繁的记忆提醒
+        TaskIntent::Review => 4, // review 任务可以间隔更长
+        TaskIntent::Qa => 5,     // qa 主要是回答，不需要频繁
+        TaskIntent::General => 3,
+    };
+
+    (iteration % interval) == 0
+}
+
 /// Inject context at the start of each LLM iteration.
 ///
 /// The injected message is placed LAST so it gets the LLM's strongest attention.
-pub fn inject_context(
+pub async fn inject_context(
     messages: &mut Vec<Message>,
     user_task: &Option<String>,
     iteration: u32,
@@ -25,6 +51,7 @@ pub fn inject_context(
     workflow_engine: &Option<Arc<Mutex<WorkflowEngine>>>,
     tool_registry: &ToolRegistry,
     unified_tool_mode: bool,
+    task_intent: TaskIntent,
 ) {
     strip_prior_step_memory(messages);
     strip_prior_discipline(messages);
@@ -122,21 +149,27 @@ pub fn inject_context(
                 anchor
             }
         );
-        if iteration % 3 == 0 {
+        // 动态注入：基于任务类型决定注入频率
+        if should_inject_memory(iteration, task_intent) {
             if let Some(knowledge) = &tool_ctx.knowledge {
                 if let Ok(engine) = knowledge.try_read() {
-                    if let Ok(hits) = engine.retrieve_for_context(task, "", 3) {
-                        if !hits.is_empty() {
-                            reminder.push_str("\n\n📚 Memory:");
-                            for hit in hits.iter().take(3) {
-                                let preview: String =
-                                    hit.entity.content.chars().take(100).collect();
-                                reminder.push_str(&format!(
-                                    "\n- [{}] {}",
-                                    hit.entity.kind.as_str(),
-                                    preview
-                                ));
-                            }
+                    let nodes = engine
+                        .gitnexus_query_fallback(
+                            tool_ctx.gitnexus.as_ref(),
+                            task,
+                            None,
+                            3,
+                        )
+                        .await;
+                    if !nodes.is_empty() {
+                        reminder.push_str("\n\n📚 Memory:");
+                        for node in nodes.iter().take(3) {
+                            let preview: String = node.content.chars().take(100).collect();
+                            reminder.push_str(&format!(
+                                "\n- [{}] {}",
+                                node.node_type.as_str(),
+                                preview
+                            ));
                         }
                     }
                 }

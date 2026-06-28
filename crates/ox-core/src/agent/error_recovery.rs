@@ -4,6 +4,7 @@
 //! build or test failures, and injects structured recovery prompts.
 
 use crate::message::Message;
+use std::sync::Arc;
 
 /// Analyze tool results for build/test failures and generate recovery prompts.
 ///
@@ -12,10 +13,14 @@ use crate::message::Message;
 /// - Attempt 1: Read error → Read source → Diagnose → Fix → Verify
 /// - Attempt 2-3: Different approach, re-read source
 /// - Attempt 4+: Report to user and ask for guidance
+///
+/// When gitnexus is provided and a build error occurs, also runs impact analysis
+/// to understand what might be affected by the fix.
 pub fn check_and_recover(
     messages: &mut Vec<Message>,
     new_messages: &[Message],
     tool_calls: &[crate::message::ToolCall],
+    gitnexus: Option<&Arc<crate::mcp::GitNexusService>>,
 ) {
     for tc in tool_calls {
         if tc.name != "shell_exec" {
@@ -99,6 +104,32 @@ pub fn check_and_recover(
                         .join("\n")
                 };
 
+                // ── GitNexus impact analysis (if available) ──
+                let impact_info = if let Some(gn) = gitnexus {
+                    // Try to extract a symbol name from the error for impact analysis
+                    let symbol_from_error = extract_symbol_from_error(&error_summary);
+                    if let Some(symbol) = symbol_from_error {
+                        let params = crate::mcp::gitnexus::ImpactParams::new(&symbol, "downstream");
+                        match tokio::runtime::Handle::current().block_on(async {
+                            if gn.is_ready().await {
+                                gn.impact(&params).await.ok()
+                            } else {
+                                None
+                            }
+                        }) {
+                            Some(result) if !result.is_error => {
+                                let summary = result.text.lines().take(10).collect::<Vec<_>>().join("\n");
+                                Some(format!("\n📊 Code impact preview:\n```\n{}\n```", summary))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 let fix_attempts = messages
                     .iter()
                     .filter(|m| {
@@ -108,9 +139,10 @@ pub fn check_and_recover(
                     + 1;
 
                 let recovery_msg = if fix_attempts == 1 {
+                    let impact_hint = impact_info.as_deref().unwrap_or("");
                     format!(
                         "🔧 BUILD/TOOL FAILED (attempt 1/3)\n\n\
-                         Error summary:\n```\n{}\n```\n\n\
+                         Error summary:\n```\n{}\n```\n{}{}\n\n\
                          Recovery protocol — follow these steps IN ORDER:\n\
                          1. **Read the error** — the relevant lines are shown above\n\
                          2. **Read the affected source code** — use `file_read` on the files mentioned in the error\n\
@@ -118,7 +150,9 @@ pub fn check_and_recover(
                          4. **Fix the issue** — use `edit_file` to apply the correction\n\
                          5. **Verify** — re-run the build/test command to confirm\n\n\
                          DO NOT guess. Read the source code first, then fix.",
-                        error_summary
+                        error_summary,
+                        impact_hint,
+                        if impact_info.is_some() { "\n💡 Use code_graph(op=\"context\", name=\"<symbol>\") for full impact view" } else { "" }
                     )
                 } else {
                     format!(
@@ -144,4 +178,34 @@ pub fn check_and_recover(
             }
         }
     }
+}
+
+/// Try to extract a function/type symbol name from an error message.
+/// Looks for common error patterns like "cannot find symbol X" or "undefined: Y".
+fn extract_symbol_from_error(error: &str) -> Option<String> {
+    // Pattern: "cannot find symbol X in ..."
+    if let Some(pos) = error.find("cannot find symbol ") {
+        let rest = &error[pos + 19..];
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+        if end > 0 && end < 50 {
+            return Some(rest[..end].to_string());
+        }
+    }
+    // Pattern: "undefined: X" or "undefined method X"
+    if let Some(pos) = error.find("undefined") {
+        let rest = &error[pos + 9..];
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+        if end > 0 && end < 50 {
+            return Some(rest[..end].to_string());
+        }
+    }
+    // Pattern: "cannot find function X"
+    if let Some(pos) = error.find("cannot find function ") {
+        let rest = &error[pos + 21..];
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+        if end > 0 && end < 50 {
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
 }

@@ -27,3 +27,6 @@ reasonix.toml
 .env
 .codegraph
 .gitnexus
+.claude
+.cursor
+.oxroot

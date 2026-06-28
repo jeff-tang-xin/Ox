@@ -2056,9 +2056,19 @@ pub async fn run_agent_turn(
                         outcome
                     }
                     Err(_elapsed) => {
-                        tracing::error!("[UNIFIED_CALL] TIMEOUT after 120s — aborting");
+                        // 增强超时日志：记录更多上下文信息
+                        let action_hint = tc.arguments.chars().take(100).collect::<String>();
+                        tracing::error!(
+                            "[UNIFIED_CALL] TIMEOUT after 120s — aborting | iteration={} | tool_calls_in_turn={} | action_hint={}",
+                            iteration,
+                            tool_calls.len(),
+                            action_hint
+                        );
                         let _ = ui_tx.send(AgentToUiEvent::Status(
-                            "⏹️ 操作超时 (120s) — 强制结束".to_string(),
+                            format!(
+                                "⏱️ 操作超时 (120s) — 强制结束 | 已重试 {} 次",
+                                iteration
+                            )
                         ));
                         emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                         return;
@@ -3380,7 +3390,13 @@ pub async fn run_agent_turn(
             }
 
             // 🔄 Auto-fix: if build/test failed, inject error for self-repair
-            error_recovery::check_and_recover(&mut messages, &new_messages, &tool_calls);
+            // Also pass gitnexus for impact analysis when available
+            error_recovery::check_and_recover(
+                &mut messages,
+                &new_messages,
+                &tool_calls,
+                tool_ctx.gitnexus.as_ref(),
+            );
 
             // 🛑 Repeated-failure hand-off: if the same verify has failed N times
             // in a row, stop auto-retrying and give control back to the user
