@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::message::{Message, ToolCall};
+use crate::mcp::gitnexus::GraphResult;
 use crate::safety::TrustManager;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 
@@ -17,6 +18,254 @@ use super::safety_gate;
 use super::tool_result_envelope::{EnvelopeStatus, ToolResultEnvelope};
 use super::ui_event;
 use super::unified_action::{self, ActionGate, TOOL_NAME, UnifiedActionRequest, UnifiedRoute};
+
+/// Analyze potential impact before edit_file operations using GitNexus.
+/// Returns a summary of affected symbols/functions, or None if unavailable.
+pub async fn analyze_edit_impact(
+    tool_ctx: &Arc<ToolContext>,
+    file_path: &str,
+) -> Option<String> {
+    let svc = tool_ctx.gitnexus.as_ref()?;
+    if !svc.is_ready().await {
+        return None;
+    }
+
+    // Extract function/method name from file_path if possible
+    // For simplicity, we analyze the file itself as the target
+    let target = file_path.split('/').last()?.split('\\').last()?;
+    if target.is_empty() {
+        return None;
+    }
+
+    let mut params = crate::mcp::gitnexus::ImpactParams::new(target, "downstream");
+    params.max_depth = Some(2);  // Limit depth for performance
+
+    match svc.impact(&params).await {
+        Ok(result) if !result.is_error && !result.text.is_empty() => {
+            // Parse and summarize the impact
+            let summary = summarize_impact(&result.text, target);
+            Some(summary)
+        }
+        _ => None,
+    }
+}
+
+/// Summarize impact results into a concise message.
+fn summarize_impact(impact_text: &str, target: &str) -> String {
+    let mut summary = format!("📊 **代码影响分析** (`{}`):\n\n", target);
+
+    // Try to extract key information from the impact result
+    if impact_text.contains("risk") {
+        if impact_text.contains("LOW") {
+            summary.push_str("✅ **风险等级: LOW** - 影响范围较小\n");
+        } else if impact_text.contains("MEDIUM") {
+            summary.push_str("⚠️ **风险等级: MEDIUM** - 有一定影响范围\n");
+        } else if impact_text.contains("HIGH") || impact_text.contains("CRITICAL") {
+            summary.push_str("🔴 **风险等级: HIGH/CRITICAL** - 影响范围较大，请谨慎操作\n");
+        }
+    }
+
+    // Add snippet of affected items
+    let lines: Vec<&str> = impact_text.lines().take(10).collect();
+    if !lines.is_empty() {
+        summary.push_str("**可能影响的代码:**\n");
+        for line in lines {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && trimmed.len() < 100 {
+                summary.push_str(&format!("  • {}\n", trimmed));
+            }
+        }
+    }
+
+    summary
+}
+
+/// Analyze git changes using GitNexus detect_changes when finishing a task.
+/// Returns a summary of affected files/processes, or None if unavailable.
+pub async fn analyze_finish_changes(
+    tool_ctx: &Arc<ToolContext>,
+) -> Option<String> {
+    let svc = tool_ctx.gitnexus.as_ref()?;
+    if !svc.is_ready().await {
+        return None;
+    }
+
+    let params = crate::mcp::gitnexus::DetectChangesParams::default();
+    // scope defaults to "unstaged"
+
+    match svc.detect_changes(&params).await {
+        Ok(result) if !result.is_error && !result.text.is_empty() => {
+            Some(summarize_changes(&result.text))
+        }
+        _ => None,
+    }
+}
+
+/// Summarize detect_changes results into a concise message.
+fn summarize_changes(changes_text: &str) -> String {
+    let mut summary = "📝 **本次修改分析**:\n\n".to_string();
+
+    // Extract key information
+    let lines: Vec<&str> = changes_text.lines().take(15).collect();
+    for line in &lines {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && trimmed.len() < 120 {
+            summary.push_str(&format!("  • {}\n", trimmed));
+        }
+    }
+
+    if lines.is_empty() {
+        summary.push_str("  (无未暂存的修改)\n");
+    }
+
+    summary
+}
+
+/// Analyze API route impact using GitNexus route_map and shape_check.
+/// This helps users understand API consumers before making changes.
+/// Returns a summary of route consumers and potential mismatches, or None if unavailable.
+pub async fn analyze_api_impact(
+    tool_ctx: &Arc<ToolContext>,
+    route: Option<&str>,
+) -> Option<String> {
+    let svc = tool_ctx.gitnexus.as_ref()?;
+    if !svc.is_ready().await {
+        return None;
+    }
+
+    // First, get route_map to find consumers
+    let route_map_params = crate::mcp::gitnexus::RouteMapParams {
+        route: route.map(|s| s.to_string()),
+        repo: None,
+    };
+
+    let route_result = match svc.route_map(&route_map_params).await {
+        Ok(r) if !r.is_error && !r.text.is_empty() => r,
+        _ => return None,
+    };
+
+    // Then, get shape_check to find response mismatches
+    let shape_check_params = crate::mcp::gitnexus::ShapeCheckParams {
+        route: route.map(|s| s.to_string()),
+        repo: None,
+    };
+
+    let shape_result: Option<GraphResult> = match svc.shape_check(&shape_check_params).await {
+        Ok(r) if !r.is_error && !r.text.is_empty() => Some(r),
+        _ => None,  // shape_check is optional
+    };
+
+    Some(summarize_api_impact(&route_result.text, shape_result.as_ref().map(|r| r.text.as_str())))
+}
+
+/// Summarize API impact results into a concise message.
+fn summarize_api_impact(route_text: &str, shape_text: Option<&str>) -> String {
+    let mut summary = String::new();
+
+    // Parse route_map results
+    if !route_text.is_empty() {
+        summary.push_str("🔗 **API 路由分析**:\n\n");
+
+        // Extract route information
+        let lines: Vec<&str> = route_text.lines().take(15).collect();
+        for line in lines {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && trimmed.len() < 100 {
+                // Highlight key information
+                if trimmed.contains("Handler") || trimmed.contains("Consumer") || trimmed.contains("->") {
+                    summary.push_str(&format!("  → {}\n", trimmed));
+                } else {
+                    summary.push_str(&format!("  • {}\n", trimmed));
+                }
+            }
+        }
+    }
+
+    // Parse shape_check results if available
+    if let Some(shape) = shape_text {
+        if !shape.is_empty() {
+            summary.push_str("\n⚠️ **API 响应不匹配检查**:\n\n");
+            let lines: Vec<&str> = shape.lines().take(10).collect();
+            for line in lines {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && trimmed.len() < 100 {
+                    if trimmed.contains("MISMATCH") || trimmed.contains("error") || trimmed.contains("missing") {
+                        summary.push_str(&format!("  ⚡ {}\n", trimmed));
+                    } else {
+                        summary.push_str(&format!("  • {}\n", trimmed));
+                    }
+                }
+            }
+        }
+    }
+
+    if summary.is_empty() {
+        summary.push_str("  (未发现路由信息)\n");
+    }
+
+    summary
+}
+
+/// Analyze if a rename operation is safe using GitNexus rename in dry-run mode.
+/// Returns preview of all references that would be changed, or None if unavailable.
+pub async fn preview_rename_impact(
+    tool_ctx: &Arc<ToolContext>,
+    symbol_name: &str,
+    file_path: Option<&str>,
+) -> Option<String> {
+    let svc = tool_ctx.gitnexus.as_ref()?;
+    if !svc.is_ready().await {
+        return None;
+    }
+
+    let params = crate::mcp::gitnexus::RenameParams {
+        symbol_name: Some(symbol_name.to_string()),
+        new_name: format!("{}_NEW", symbol_name),  // Placeholder for preview
+        file_path: file_path.map(|s| s.to_string()),
+        repo: None,
+        dry_run: Some(true),  // Preview only
+        symbol_uid: None,
+    };
+
+    match svc.rename(&params).await {
+        Ok(result) if !result.is_error && !result.text.is_empty() => {
+            Some(summarize_rename_preview(&result.text, symbol_name))
+        }
+        _ => None,
+    }
+}
+
+/// Summarize rename preview results.
+fn summarize_rename_preview(rename_text: &str, original_name: &str) -> String {
+    let mut summary = format!("🔍 **重命名预览** (`{}`):\n\n", original_name);
+
+    // Count high confidence vs low confidence changes
+    let graph_matches = rename_text.matches("graph").count();
+    let text_matches = rename_text.matches("text_search").count();
+
+    if graph_matches > 0 || text_matches > 0 {
+        summary.push_str(&format!("📍 高可信度引用 (graph): {} 处\n", graph_matches));
+        if text_matches > 0 {
+            summary.push_str(&format!("⚠️  低可信度引用 (text_search): {} 处\n\n", text_matches));
+        } else {
+            summary.push_str("\n");
+        }
+    }
+
+    // Show sample matches
+    let lines: Vec<&str> = rename_text.lines().take(10).collect();
+    if !lines.is_empty() {
+        summary.push_str("**匹配位置:**\n");
+        for line in lines {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && trimmed.len() < 100 {
+                summary.push_str(&format!("  • {}\n", trimmed));
+            }
+        }
+    }
+
+    summary
+}
 
 /// Metadata for turn memory / live update after a delegated tool call.
 pub struct DelegateMeta {
@@ -90,6 +339,7 @@ pub async fn handle_complete_and_check(
             handle_finish(
                 tc,
                 &req,
+                tool_ctx,
                 workflow_engine,
                 messages,
                 ui_tx,
@@ -226,6 +476,7 @@ where
 async fn handle_finish(
     tc: &ToolCall,
     req: &UnifiedActionRequest,
+    tool_ctx: &Arc<ToolContext>,
     workflow_engine: &Option<Arc<Mutex<WorkflowEngine>>>,
     messages: &mut Vec<Message>,
     ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
@@ -241,6 +492,18 @@ async fn handle_finish(
     let content = unified_action::finish_content(&req.params);
     let review_json = unified_action::finding_json(&req.params);
 
+    // ── Onboarding shortcut: no gate, no findings — just end the turn. ──
+    if crate::agent::onboarding::is_onboarding_turn(messages) {
+        if let Some(wf) = workflow_engine {
+            if let Ok(mut engine) = wf.try_lock() {
+                let _ = engine.complete_workflow();
+            }
+        }
+        return UnifiedHandleOutcome::TurnDone {
+            summary: (!content.is_empty()).then(|| content.clone()),
+        };
+    }
+
     // Show free-text (analysis / answer / summary) in chat.
     if !content.is_empty() {
         let _ = ui_tx.send(AgentToUiEvent::DeliverPreview {
@@ -252,6 +515,18 @@ async fn handle_finish(
             }
             .to_string(),
             content: content.clone(),
+        });
+    }
+
+    // ── Analyze git changes when finishing with findings (non-blocking) ──
+    if review_json.is_some() {
+        // Get tool_ctx from messages if possible, or skip
+        let ctx_for_analysis = tool_ctx.clone();
+        tokio::spawn(async move {
+            if let Some(changes) = analyze_finish_changes(&ctx_for_analysis).await {
+                tracing::info!("[DETECT_CHANGES] finish analysis: {}", changes);
+                // Could be sent to UI for user awareness
+            }
         });
     }
 
@@ -498,6 +773,23 @@ async fn handle_delegate(
                 }
                 ui_event::ConfirmationDecision::Allow => {}
             }
+        }
+    }
+
+    // ── Impact analysis before edit operations ──
+    let mut impact_warning = String::new();
+    if inner_name == "edit_file" || inner_name == "file_write" || inner_name == "delete_range" {
+        if let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
+            // Run impact analysis asynchronously (non-blocking)
+            let ctx_clone = Arc::clone(tool_ctx);
+            let path_owned = path.to_string();
+            tokio::spawn(async move {
+                if let Some(impact) = analyze_edit_impact(&ctx_clone, &path_owned).await {
+                    tracing::info!("[IMPACT] edit impact analysis: {}", impact);
+                    // The impact analysis is logged for reference
+                    // Could be sent to UI if needed
+                }
+            });
         }
     }
 

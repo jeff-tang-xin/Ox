@@ -62,8 +62,10 @@ impl AutoReflector {
             task_description.chars().take(80).collect::<String>()
         );
 
+        let existing_skills = crate::skill::dedup::list_project_skill_ids(&self.project_root);
+
         let prompt =
-            self.build_reflection_prompt(task_description, execution_summary, conversation_history);
+            self.build_reflection_prompt(task_description, execution_summary, conversation_history, &existing_skills);
         let skill_content = self.call_llm_for_reflection(&prompt).await?;
 
         if skill_content.trim().is_empty() {
@@ -200,6 +202,7 @@ impl AutoReflector {
         task_description: &str,
         execution_summary: &str,
         conversation_history: &[Message],
+        existing_skills: &[String],
     ) -> String {
         // Extract recent conversation context (last 20 messages max)
         let start_idx = conversation_history.len().saturating_sub(20);
@@ -224,10 +227,17 @@ impl AutoReflector {
             .collect::<Vec<_>>()
             .join("\n\n");
 
+        let existing_skills_str = if existing_skills.is_empty() {
+            "(none)".to_string()
+        } else {
+            existing_skills.iter().map(|s| format!("- {}", s)).collect::<Vec<_>>().join("\n")
+        };
+
         SKILL_CREATION_PROMPT
             .replace("{task_description}", task_description)
             .replace("{execution_summary}", execution_summary)
             .replace("{conversation_context}", &conversation_context)
+            .replace("{existing_skills}", &existing_skills_str)
     }
 
     /// Call LLM to generate reflection insights
@@ -266,10 +276,8 @@ impl AutoReflector {
         Self::write_skill_file(&self.project_root, content)
     }
 
-    /// Write skill markdown to disk (shared by instance and static callers).
+    /// Write skill markdown to disk via dedup::plan_skill_write (shared by instance and static callers).
     fn write_skill_file(project_root: &Path, content: &str) -> Result<String> {
-        let default_skills_dir = project_root.join(".ox").join("skills");
-
         let (repaired_content, skill_id, scope) = match Self::extract_frontmatter_static(content) {
             Ok((metadata, body)) => {
                 let id = metadata.get("id").cloned().unwrap_or_else(|| {
@@ -321,40 +329,79 @@ impl AutoReflector {
             }
         };
 
-        let skills_dir = if scope == "global" {
-            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-            home.join(".ox").join("skills")
-        } else {
-            default_skills_dir
-        };
-        fs::create_dir_all(&skills_dir)?;
-
         let resolved_id = crate::skill::dedup::canonical_mandatory_id(&skill_id)
             .unwrap_or(skill_id.as_str())
             .to_string();
-        let skill_file = skills_dir.join(format!("{}.md", resolved_id));
-        Self::write_skill_to_path(&skill_file, &resolved_id, &repaired_content)
-    }
 
-    fn write_skill_to_path(
-        skill_file: &Path,
-        skill_id: &str,
-        repaired_content: &str,
-    ) -> Result<String> {
-        if skill_file.exists() {
-            if let Ok(existing) = fs::read_to_string(skill_file) {
-                let merged = crate::skill::dedup::merge_skill_markdown(&existing, repaired_content);
-                fs::write(skill_file, &merged)?;
-                tracing::info!(
-                    "[AUTO-REFLECT] Merged into existing skill: {:?}",
-                    skill_file
-                );
-                return Ok(format!("{skill_id} (merged)"));
+        // Global-scope skills go to ~/.ox/skills/ — no dedup policy needed.
+        if scope == "global" {
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            let skills_dir = home.join(".ox").join("skills");
+            fs::create_dir_all(&skills_dir)?;
+            let path = skills_dir.join(format!("{resolved_id}.md"));
+            fs::write(&path, &repaired_content)?;
+            tracing::info!("[AUTO-REFLECT] Saved global skill to: {:?}", path);
+            return Ok(resolved_id);
+        }
+
+        // Project-scope skills go through the full dedup decision chain.
+        let plan = crate::skill::dedup::plan_skill_write(
+            project_root,
+            &resolved_id,
+            &repaired_content,
+            true,  // allow_merge
+            false, // not onboarding
+        );
+
+        match plan {
+            crate::skill::dedup::SkillWritePlan::CreateNew => {
+                let skills_dir = project_root.join(".ox").join("skills");
+                fs::create_dir_all(&skills_dir)?;
+                let path = skills_dir.join(format!("{resolved_id}.md"));
+                fs::write(&path, &repaired_content)?;
+                tracing::info!("[AUTO-REFLECT] Saved skill to: {:?}", path);
+                Ok(resolved_id)
+            }
+            crate::skill::dedup::SkillWritePlan::OverwriteMandatory => {
+                let path = project_root.join(".ox").join("skills").join(format!("{resolved_id}.md"));
+                fs::write(&path, &repaired_content)?;
+                tracing::info!("[AUTO-REFLECT] Overwrote mandatory skill: {:?}", path);
+                Ok(format!("{resolved_id} (overwritten)"))
+            }
+            crate::skill::dedup::SkillWritePlan::RedirectToCanonical {
+                canonical_id,
+                reason,
+            } => {
+                tracing::info!("[AUTO-REFLECT] {reason}");
+                let path = project_root
+                    .join(".ox")
+                    .join("skills")
+                    .join(format!("{canonical_id}.md"));
+                if path.exists() {
+                    let existing = fs::read_to_string(&path)?;
+                    let merged =
+                        crate::skill::dedup::merge_skill_markdown(&existing, &repaired_content);
+                    fs::write(&path, &merged)?;
+                    Ok(format!("{canonical_id} (merged via redirect)"))
+                } else {
+                    fs::create_dir_all(path.parent().unwrap())?;
+                    fs::write(&path, &repaired_content)?;
+                    Ok(format!("{canonical_id} (created via redirect)"))
+                }
+            }
+            crate::skill::dedup::SkillWritePlan::MergeIntoExisting {
+                target_path,
+                merged_markdown,
+            } => {
+                fs::write(&target_path, &merged_markdown)?;
+                tracing::info!("[AUTO-REFLECT] Merged into existing skill: {:?}", target_path);
+                Ok(format!("{resolved_id} (merged)"))
+            }
+            crate::skill::dedup::SkillWritePlan::RejectDuplicate { message } => {
+                tracing::warn!("[AUTO-REFLECT] Skill rejected: {message}");
+                Ok(format!("{resolved_id} (rejected: duplicate)"))
             }
         }
-        fs::write(skill_file, repaired_content)?;
-        tracing::info!("[AUTO-REFLECT] Saved skill to: {:?}", skill_file);
-        Ok(skill_id.to_string())
     }
 
     /// Extract YAML frontmatter from markdown content

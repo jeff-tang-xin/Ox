@@ -144,7 +144,7 @@ pub fn onboarding_system_directive(greenfield: bool) -> String {
          | project-conventions.md | 在本项目里代码怎么写、怎么构建、怎么验证？ | 业务介绍、模块职责 |\n\
          | project-business-guide.md | 项目做什么？术语/流程？改功能看哪？ | 构建命令、格式化工具 |\n\
          \n\
-         **流程**：所有动作都走 `complete_and_check`：project_detect → file_list → file_read → file_write → finish。
+         **流程**：所有动作都走 `complete_and_check`：project_detect → code_graph → file_list → file_read → file_write → finish。
          **技术栈**：只写 project_detect 与配置文件**实际检测到**的内容，不要默认某一语言。\n\
          **禁止**：四步工作流 JSON；通用编程常识；臆造路径/命令；两篇混写。\n\
          **篇幅**：每个 Skill ≤1500 字；大仓库用要点，避免 file_write 被模型截断。{greenfield_note}"
@@ -224,7 +224,8 @@ scope: project
 ## 探索顺序（唯一工具出口）
 每一步都必须调用 `complete_and_check`，不要输出裸工具名或旧式函数调用。
 1. `complete_and_check({{"action":"project_detect","params":{{}}}})` — 记录检测到的语言与工具
-2. `complete_and_check({{"action":"file_list","params":{{"path":"."}}}})`，再按实际目录单层逐层 list
+2. `complete_and_check({{"action":"code_graph","params":{{"op":"create"}}}})` — 构建代码图谱，后续 Skill 可引用结构化依赖/调用关系
+3. `complete_and_check({{"action":"file_list","params":{{"path":"."}}}})`，再按实际目录单层逐层 list
 3. `complete_and_check({{"action":"file_read","params":{{"path":"README.md","offset":0,"limit":120}}}})`：README、构建配置（如 pom.xml / package.json / pyproject.toml / go.mod / Cargo.toml）、应用入口
 4. 按需 `complete_and_check({{"action":"code_search","params":{{"query":"..."}}}})` / `complete_and_check({{"action":"find_symbol","params":{{"name":"..."}}}})`
 5. 分别 `complete_and_check({{"action":"file_write","params":{{"path":".ox/skills/project-conventions.md","content":"..."}}}})` 和 `complete_and_check({{"action":"file_write","params":{{"path":".ox/skills/project-business-guide.md","content":"..."}}}})`

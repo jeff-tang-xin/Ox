@@ -158,6 +158,12 @@ Examples:
 - Lessons learned from debugging difficult issues
 - Integration patterns between multiple systems
 
+## Existing Skills in This Project
+
+{existing_skills}
+
+**IMPORTANT:** If a skill with a similar topic already exists, you MUST update/merge into it instead of creating a new file. Only create a new skill if the topic is genuinely new and not covered by any existing skill.
+
 ## Your Task
 
 {task_description}

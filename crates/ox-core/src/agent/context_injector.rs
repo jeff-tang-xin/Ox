@@ -17,27 +17,33 @@ pub const STEP_MEMORY_TAG: &str = "[STEP_MEMORY]";
 
 /// 决定是否需要注入记忆 (动态注入策略)
 ///
-/// 决定是否需要注入记忆 (动态注入策略)
-///
 /// 策略：
 /// - Fix 任务：每 2 轮注入（上下文容易丢失）
-/// - Review 任务：每 4 轮注入（主要是审查，可间隔更长）
-/// - QA 任务：每 5 轮注入（问答型，主要靠当前上下文）
-/// - General 任务：每 3 轮注入（默认）
+/// - Review 任务：每 3 轮注入（主要是审查，可间隔更长）
+/// - QA 任务：每 4 轮注入（问答型，主要靠当前上下文）
+/// - General 任务：每 2 轮注入（默认，保持更好的上下文）
 /// - 首次迭代总是注入
-pub fn should_inject_memory(iteration: u32, task_intent: TaskIntent) -> bool {
+/// - 在工作流模式下总是注入（因为有其他上下文来源）
+pub fn should_inject_memory(iteration: u32, task_intent: TaskIntent, is_workflow: bool) -> bool {
+    // Always inject on first iteration
     if iteration == 0 {
         return true;
     }
 
+    // In workflow mode, inject more frequently since we have other context sources
+    if is_workflow {
+        return iteration % 2 == 0;
+    }
+
+    // In non-workflow mode, inject more conservatively
     let interval = match task_intent {
         TaskIntent::Fix => 2,     // fix 需要更频繁的记忆提醒
-        TaskIntent::Review => 4, // review 任务可以间隔更长
-        TaskIntent::Qa => 5,     // qa 主要是回答，不需要频繁
-        TaskIntent::General => 3,
+        TaskIntent::Review => 3, // review 任务可以间隔稍长
+        TaskIntent::Qa => 4,     // qa 主要是回答，不需要太频繁
+        TaskIntent::General => 2, // general 任务保持较短间隔
     };
 
-    (iteration % interval) == 0
+    iteration % interval == 0
 }
 
 /// Inject context at the start of each LLM iteration.
@@ -62,71 +68,82 @@ pub async fn inject_context(
     strip_prior_unified_route(messages);
     strip_prior_skill_route(messages);
 
-    if let Some(wf) = workflow_engine {
-        if let Ok(engine) = wf.try_lock() {
-            if let Some(notice) = crate::agent::phase::consume_transition_notice(&engine) {
-                messages.push(Message::system(&notice));
+    // FIX: Combine both workflow_engine lock operations into a single lock acquisition
+    // to avoid race condition where the second try_lock fails due to state changes.
+    let engine_guard = match workflow_engine {
+        Some(wf) => match wf.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                tracing::warn!("[inject_context] Failed to acquire workflow_engine lock, using fallback injection");
+                None
             }
+        },
+        None => None,
+    };
+
+    // Process transition notice if lock was acquired
+    if let Some(ref engine) = engine_guard {
+        if let Some(notice) = crate::agent::phase::consume_transition_notice(engine) {
+            messages.push(Message::system(&notice));
         }
     }
 
-    if let Some(wf) = workflow_engine {
-        if let Ok(engine) = wf.try_lock() {
-            if crate::agent::phase::should_inject_workspace(&engine) {
-                let slim = crate::agent::context_slim::is_slim_phase(&engine);
-                // Unified mode: [WORKSPACE] embeds route + lock status — keep injections minimal.
-                if unified_tool_mode {
-                    if iteration == 0 {
-                        messages.push(Message::system(
-                            &crate::agent::idle_narrative::discipline_for_iteration_unified(0),
-                        ));
-                    }
-                    crate::agent::workspace::inject_workspace(messages, &engine, true);
-                    if crate::agent::business_gate::is_pending_scope(&engine) {
-                        if let Some(gate) =
-                            crate::agent::phase::format_scope_gate_directive(&engine, true)
-                        {
-                            messages.push(Message::system(&gate));
-                        }
-                    }
-                    return;
+    // Check workspace injection with the same lock (or skip if lock failed)
+    if let Some(ref engine) = engine_guard {
+        if crate::agent::phase::should_inject_workspace(engine) {
+            let slim = crate::agent::context_slim::is_slim_phase(engine);
+            // Unified mode: [WORKSPACE] embeds route + lock status — keep injections minimal.
+            if unified_tool_mode {
+                if iteration == 0 {
+                    messages.push(Message::system(
+                        &crate::agent::idle_narrative::discipline_for_iteration_unified(0),
+                    ));
                 }
-                let discipline: Option<String> = if !slim {
-                    if iteration == 0
-                        || engine.get_task_intent() != crate::agent::task_intent::TaskIntent::Fix
+                crate::agent::workspace::inject_workspace(messages, engine, true);
+                if crate::agent::business_gate::is_pending_scope(engine) {
+                    if let Some(gate) =
+                        crate::agent::phase::format_scope_gate_directive(engine, true)
                     {
-                        Some(crate::agent::idle_narrative::discipline_for_iteration(
-                            iteration,
-                        ))
-                    } else {
-                        None
+                        messages.push(Message::system(&gate));
                     }
-                } else if iteration == 0 {
-                    Some(crate::agent::idle_narrative::RESPONSE_DISCIPLINE.to_string())
-                } else {
-                    None
-                };
-                if let Some(d) = discipline {
-                    messages.push(Message::system(&d));
-                }
-                crate::agent::workspace::inject_workspace(messages, &engine, unified_tool_mode);
-                if let Some(gate) =
-                    crate::agent::phase::format_scope_gate_directive(&engine, unified_tool_mode)
-                {
-                    messages.push(Message::system(&gate));
-                }
-                inject_task_step_memory(messages, iteration, &engine, unified_tool_mode);
-                if unified_tool_mode {
-                    inject_unified_routes(messages, &engine, tool_registry);
-                } else {
-                    inject_atlas_routes(messages, &engine, tool_registry);
                 }
                 return;
             }
+            let discipline: Option<String> = if !slim {
+                if iteration == 0
+                    || engine.get_task_intent() != crate::agent::task_intent::TaskIntent::Fix
+                {
+                    Some(crate::agent::idle_narrative::discipline_for_iteration(
+                        iteration,
+                    ))
+                } else {
+                    None
+                }
+            } else if iteration == 0 {
+                Some(crate::agent::idle_narrative::RESPONSE_DISCIPLINE.to_string())
+            } else {
+                None
+            };
+            if let Some(d) = discipline {
+                messages.push(Message::system(&d));
+            }
+            crate::agent::workspace::inject_workspace(messages, engine, unified_tool_mode);
+            if let Some(gate) =
+                crate::agent::phase::format_scope_gate_directive(engine, unified_tool_mode)
+            {
+                messages.push(Message::system(&gate));
+            }
+            inject_task_step_memory(messages, iteration, engine, unified_tool_mode);
+            if unified_tool_mode {
+                inject_unified_routes(messages, engine, tool_registry);
+            } else {
+                inject_atlas_routes(messages, engine, tool_registry);
+            }
+            return;
         }
     }
 
-    // ── Generic fallback (non-workflow) ──
+    // ── Generic fallback (non-workflow or lock failed) ──
     if iteration == 0 {
         if unified_tool_mode {
             messages.push(Message::system(
@@ -149,8 +166,8 @@ pub async fn inject_context(
                 anchor
             }
         );
-        // 动态注入：基于任务类型决定注入频率
-        if should_inject_memory(iteration, task_intent) {
+        // 动态注入：基于任务类型决定注入频率（非工作流模式）
+        if should_inject_memory(iteration, task_intent, false) {
             if let Some(knowledge) = &tool_ctx.knowledge {
                 if let Ok(engine) = knowledge.try_read() {
                     let nodes = engine

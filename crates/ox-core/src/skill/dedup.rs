@@ -234,6 +234,124 @@ pub fn skill_dedup_directive(project_root: &Path) -> Option<String> {
     ))
 }
 
+/// 检查是否需要提示用户合并相似 skill
+/// 返回 Some((similar_skill_id, reason)) 如果有相似的，否则返回 None
+pub fn check_similar_skills(
+    project_root: &Path,
+    new_skill_id: &str,
+    new_description: &str,
+) -> Option<(String, String)> {
+    let skills_dir = project_root.join(".ox").join("skills");
+    if !skills_dir.exists() {
+        return None;
+    }
+
+    // 读取所有现有 skills 的信息
+    let mut existing_skills: Vec<(String, String)> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    // 解析 description
+                    let desc = extract_description(&content);
+                    let id = path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !id.is_empty() {
+                        existing_skills.push((id, desc));
+                    }
+                }
+            }
+        }
+    }
+
+    // 检测相似性
+    let new_words: std::collections::HashSet<String> = new_description
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| s.len() > 2)
+        .map(|s| s.to_string())
+        .collect();
+
+    for (existing_id, existing_desc) in &existing_skills {
+        // 跳过同名
+        if existing_id == new_skill_id {
+            continue;
+        }
+
+        let existing_words: std::collections::HashSet<String> = existing_desc
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| s.len() > 2)
+            .map(|s| s.to_string())
+            .collect();
+
+        let intersection: std::collections::HashSet<_> =
+            new_words.intersection(&existing_words).collect();
+
+        // 关键词重叠 >= 2
+        if intersection.len() >= 2 {
+            let overlap_list: Vec<String> = intersection.iter().take(5).map(|s| (*s).to_string()).collect();
+            return Some((
+                existing_id.clone(),
+                format!(
+                    "描述关键词与 '{}' 重叠: {}",
+                    existing_id,
+                    overlap_list.join(", ")
+                ),
+            ));
+        }
+
+        // 检查 ID 是否相似
+        let new_id_parts: std::collections::HashSet<_> = new_skill_id
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| s.len() > 1)
+            .collect();
+        let existing_id_parts: std::collections::HashSet<_> = existing_id
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| s.len() > 1)
+            .collect();
+
+        let id_overlap: std::collections::HashSet<_> =
+            new_id_parts.intersection(&existing_id_parts).collect();
+
+        if !id_overlap.is_empty() {
+            let overlap_list: Vec<String> = id_overlap.iter().take(3).map(|s| (*s).to_string()).collect();
+            return Some((
+                existing_id.clone(),
+                format!(
+                    "ID 与 '{}' 相似，都包含 '{}'",
+                    existing_id,
+                    overlap_list.join("', '")
+                ),
+            ));
+        }
+    }
+
+    None
+}
+
+/// 从 skill markdown 中提取 description
+fn extract_description(content: &str) -> String {
+    // 尝试从 frontmatter 提取
+    if let Some(start) = content.find("---") {
+        if let Some(end) = content[start + 3..].find("---") {
+            let yaml = &content[start + 3..start + 3 + end];
+            for line in yaml.lines() {
+                let line = line.trim();
+                if line.starts_with("description:") {
+                    let desc = line.trim_start_matches("description:").trim();
+                    return desc.trim_matches('"').trim_matches('\'').to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -188,6 +188,25 @@ impl Tool for FileWriteTool {
                 .project_root
                 .clone()
                 .unwrap_or_else(|| ctx.working_dir.clone());
+
+            // 主动检测相似 skill 并警告
+            let new_desc = args.get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some((similar_id, reason)) = crate::skill::dedup::check_similar_skills(
+                &project_root,
+                &skill_id,
+                new_desc,
+            ) {
+                skill_write_notice = format!(
+                    "\n⚠️ **相似 Skill 警告**: {}\
+                     \n  建议: 用 edit_file 更新 '~/.ox/skills/{}.md' 而不是创建新文件\
+                     \n  ���用 merge: true 追加到现有 skill",
+                    reason,
+                    similar_id
+                );
+            }
+
             let allow_merge = args.get("merge").and_then(|v| v.as_bool()).unwrap_or(false);
             match crate::skill::dedup::plan_skill_write(
                 &project_root,

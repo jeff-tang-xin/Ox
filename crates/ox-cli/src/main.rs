@@ -319,6 +319,16 @@ async fn run_app(
     app.indexing = false;
     app.status = String::new();
 
+    // ── Git check: warn if not a git project ──
+    let project_root = rt_env.effective_project_root();
+    let is_git_project = project_root.join(".git").exists();
+    if !is_git_project {
+        app.output.push_system(
+            "⚠️ 当前目录不是 Git 项目。GitNexus 需要 Git 才能索引代码图谱。\n\
+             💡 请运行 `git init` 初始化项目，然后重启 Ox。",
+        );
+    }
+
     // ── GitNexus code graph (MCP) — mandatory ──
     // Probe the toolchain synchronously (cheap, just PATH lookups). GitNexus is a
     // required component: when launchable we bring it up in the background and the
@@ -333,14 +343,23 @@ async fn run_app(
         if let Some(ref h) = hint {
             app.output.push_system(&format!("ℹ️ {h}"));
         }
+        // Additional check: if git is missing, warn about GitNexus dependency
+        if !is_git_project {
+            app.output.push_system(
+                "⚠️ GitNexus 需要 Git 项目才能工作。请先初始化 Git 仓库。",
+            );
+        }
         let svc = Arc::new(ox_core::mcp::GitNexusService::new(
             config.gitnexus.clone(),
-            rt_env.effective_project_root(),
+            project_root,
         ));
         // The background index+start spawn is deferred until `agent_tx` exists
         // (below) so it can report readiness to the UI scrollback.
-        (svc, availability.is_launchable(), hint)
+        (svc, availability.is_launchable() && is_git_project, hint)
     };
+
+    // Wire GitNexus service into App for slash commands
+    app.gitnexus = Some(Arc::clone(&gitnexus));
 
     // ── Tool context ──
     let mut tool_ctx = Arc::new(
@@ -377,34 +396,102 @@ async fn run_app(
         let ui = agent_tx.clone();
         let auto_index = config.gitnexus.auto_index;
         tokio::spawn(async move {
-            if auto_index && bg.needs_startup_reindex().await {
-                let _ = ui.send(AgentToUiEvent::Status(
-                    "🔗 GitNexus：正在构建代码图谱（首次或有更新，请稍候）…".to_string(),
+            // FIX: Check if index exists and is valid first
+            let index_valid = bg.index_is_valid().await;
+
+            // FIX: If index doesn't exist or is invalid, need to run init first
+            if auto_index && !index_valid {
+                let _ = ui.send(AgentToUiEvent::SystemNotice(
+                    "🔨 GitNexus：初始化代码图谱索引...".to_string(),
                 ));
-                match bg.cli_analyze().await {
-                    Ok(r) if r.success => tracing::info!("[GitNexus] analyze complete"),
-                    Ok(r) => tracing::warn!(
-                        "[GitNexus] analyze exited {:?}: {}",
-                        r.exit_code,
-                        r.stderr.trim()
-                    ),
-                    Err(e) => tracing::warn!("[GitNexus] analyze failed: {e}"),
+
+                // Run init first to create .gitnexus directory
+                match bg.cli_init().await {
+                    Ok(r) if r.success => {
+                        tracing::info!("[GitNexus] init succeeded");
+                    }
+                    Ok(r) => {
+                        tracing::warn!("[GitNexus] init exited {:?}: {}", r.exit_code, r.stderr.trim());
+                        // Continue anyway - analyze might still work
+                    }
+                    Err(e) => {
+                        tracing::warn!("[GitNexus] init failed: {e}");
+                        // Continue anyway - analyze might still work
+                    }
+                }
+
+                let _ = ui.send(AgentToUiEvent::SystemNotice(
+                    "🔨 GitNexus：开始构建代码图谱，首次索引可能需要1-3分钟…".to_string(),
+                ));
+                // Spawn a progress ticker so the user sees the index is still running.
+                let tick_ui = ui.clone();
+                let ticker = tokio::spawn(async move {
+                    let mut secs: u64 = 0;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                        secs += 15;
+                        let msg = format!("🔗 GitNexus：仍在构建代码图谱…（已用时 {}s）", secs);
+                        let _ = tick_ui.send(AgentToUiEvent::Status(msg));
+                    }
+                });
+
+                let analyze_result = bg.cli_analyze().await;
+                ticker.abort(); // stop the progress ticker
+
+                match &analyze_result {
+                    Ok(r) if r.success => {
+                        // Try to extract a summary from the last non-empty stdout line.
+                        let summary = r.stdout.lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .last()
+                            .map(|l| l.to_string())
+                            .unwrap_or_else(|| "索引完成".to_string());
+                        tracing::info!("[GitNexus] analyze complete: {summary}");
+                        let _ = ui.send(AgentToUiEvent::SystemNotice(
+                            format!("✅ GitNexus 索引构建完成：{summary}"),
+                        ));
+                    }
+                    Ok(r) => {
+                        tracing::warn!(
+                            "[GitNexus] analyze exited {:?}: {}",
+                            r.exit_code,
+                            r.stderr.trim()
+                        );
+                        let _ = ui.send(AgentToUiEvent::SystemNotice(format!(
+                            "⚠️ GitNexus 索引构建异常（exit {:?}）：{}",
+                            r.exit_code,
+                            r.stderr.lines().filter(|l| !l.trim().is_empty()).last()
+                                .unwrap_or("(unknown error)")
+                        )));
+                    }
+                    Err(e) => {
+                        tracing::warn!("[GitNexus] analyze failed: {e}");
+                        let _ = ui.send(AgentToUiEvent::SystemNotice(format!(
+                            "❌ GitNexus 索引构建失败：{e}"
+                        )));
+                    }
                 }
             }
+            // Clear any lingering status line before MCP start.
+            let _ = ui.send(AgentToUiEvent::Status(String::new()));
+
             match bg.start().await {
                 Ok(_) => {
                     tracing::info!("[GitNexus] MCP server ready");
-                    let _ = ui.send(AgentToUiEvent::SystemNotice(
-                        "✅ GitNexus 代码图谱已就绪：find_symbol 将带出调用关系，提问会先做语义预检索。"
-                            .to_string(),
-                    ));
-                    // Clear the lingering "正在构建…" transient status line.
-                    let _ = ui.send(AgentToUiEvent::Status(String::new()));
+                    if bg.index_is_valid().await {
+                        let _ = ui.send(AgentToUiEvent::SystemNotice(
+                            "✅ GitNexus 代码图谱已就绪：find_symbol 将带出调用关系，提问会先做语义预检索。"
+                                .to_string(),
+                        ));
+                    } else {
+                        let _ = ui.send(AgentToUiEvent::SystemNotice(
+                            "⚠️ GitNexus MCP server 已启动，但代码图谱索引为空或无效。请执行 /index build 构建索引。"
+                                .to_string(),
+                        ));
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("[GitNexus] start failed: {e}");
-                    // start() already recorded Failed(reason); the per-turn gate
-                    // will surface it and block (mandatory mode).
                     let _ = ui.send(AgentToUiEvent::SystemNotice(format!(
                         "⛔ GitNexus（必需）启动失败，提问将被阻止直到修复：{e}"
                     )));
@@ -1755,23 +1842,45 @@ fn process_session_action(
 /// Mandatory GitNexus gate (run at the start of a Normal turn).
 ///
 /// - Returns `Ok(())` immediately once the code graph is ready.
-/// - Waits indefinitely (with a one-shot status line) while it is still coming
+/// - Waits with a 60s timeout (with periodic status updates) while it is still coming
 ///   up — including the first-run index build.
-/// - Returns `Err(guidance)` when GitNexus is unavailable or failed, so the
-///   caller aborts the turn and surfaces the message (input is re-enabled via
+/// - Returns `Err(guidance)` when GitNexus is unavailable or failed after timeout,
+///   so the caller aborts the turn and surfaces the message (input is re-enabled via
 ///   the resulting `Error` event).
+/// - Automatically attempts restart if the service appears hung.
 async fn await_gitnexus_ready(
     svc: &ox_core::mcp::GitNexusService,
     status_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
 ) -> Result<(), String> {
     use ox_core::mcp::GitNexusStatus;
+
+    const MAX_WAIT_SECS: u64 = 60;  // Max wait time before giving up
+    const CHECK_INTERVAL_MS: u64 = 500;
+    const RESTART_THRESHOLD_SECS: u64 = 30;  // Attempt restart after 30s
+
+    let start_time = std::time::Instant::now();
     let mut announced = false;
+    let mut restart_attempted = false;
+    let mut consecutive_failures = 0;
+
     loop {
+        // Check timeout
+        let elapsed = start_time.elapsed().as_secs();
+        if elapsed >= MAX_WAIT_SECS {
+            return Err(format!(
+                "⛔ GitNexus 等待超时（{}秒），请检查 GitNexus 状态后重试。\n\
+                 提示：可运行 `gitnexus status` 查看状态，或 `gitnexus analyze` 重新构建索引。",
+                MAX_WAIT_SECS
+            ));
+        }
+
         if svc.is_ready().await {
             return Ok(());
         }
+
         match svc.status().await {
             GitNexusStatus::Failed(reason) => {
+                // Don't wait on permanent failure
                 return Err(format!(
                     "⛔ GitNexus（必需）不可用，已阻止本次提问：\n{reason}\n修复后请重启 Ox 再试。"
                 ));
@@ -1779,14 +1888,35 @@ async fn await_gitnexus_ready(
             // Explicit opt-out in config — let the turn proceed without the graph.
             GitNexusStatus::Disabled => return Ok(()),
             // NotStarted / Starting (incl. first-run index build): keep waiting.
+            // Try auto-restart if we've been waiting too long
             _ => {
-                if !announced {
+                // Attempt restart if stuck for too long
+                if elapsed >= RESTART_THRESHOLD_SECS && !restart_attempted {
+                    restart_attempted = true;
                     let _ = status_tx.send(AgentToUiEvent::Status(
-                        "⏳ 等待 GitNexus 代码图谱就绪…（首次会构建索引，请稍候）".to_string(),
+                        "⚠️ GitNexus 响应缓慢，尝试自动重启...".to_string(),
                     ));
+                    // Try to restart the service
+                    if let Err(e) = svc.start().await {
+                        tracing::warn!("[GitNexus] Auto-restart failed: {}", e);
+                    } else {
+                        let _ = status_tx.send(AgentToUiEvent::Status(
+                            "🔄 GitNexus 已重启，等待重新连接...".to_string(),
+                        ));
+                    }
+                }
+
+                if !announced || elapsed % 10 == 0 {
+                    let _ = status_tx.send(AgentToUiEvent::Status(format!(
+                        "⏳ 等待 GitNexus 代码图谱就绪…（{}秒）",
+                        elapsed
+                    )));
                     announced = true;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+                // Track consecutive failures for potential recovery
+                consecutive_failures += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(CHECK_INTERVAL_MS)).await;
             }
         }
     }

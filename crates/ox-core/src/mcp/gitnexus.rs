@@ -352,6 +352,11 @@ impl GitNexusService {
         self.config.enabled
     }
 
+    /// The project root this service was created for.
+    pub fn project_root(&self) -> &std::path::Path {
+        &self.project_root
+    }
+
     pub async fn status(&self) -> GitNexusStatus {
         self.status.lock().await.clone()
     }
@@ -549,13 +554,25 @@ impl GitNexusService {
         self.run_cli("analyze").await
     }
 
+    /// Run `gitnexus init` to initialize the index directory.
+    pub async fn cli_init(&self) -> anyhow::Result<CliResult> {
+        self.run_cli("init").await
+    }
+
     /// Run `gitnexus status` (index freshness / staleness report).
     pub async fn cli_status(&self) -> anyhow::Result<CliResult> {
         self.run_cli("status").await
     }
 
     async fn run_cli(&self, sub: &str) -> anyhow::Result<CliResult> {
-        let args = self.config.cli_args(sub);
+        // Add --worker-timeout for analyze/init commands
+        let mut args = self.config.cli_args(sub);
+        if sub == "analyze" || sub == "init" {
+            if self.config.worker_timeout_sec > 0 {
+                args.push("--worker-timeout".to_string());
+                args.push(self.config.worker_timeout_sec.to_string());
+            }
+        }
         let output = super::client::build_command(&self.config.command, &args)
             .current_dir(&self.project_root)
             .output()
@@ -580,6 +597,15 @@ impl GitNexusService {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::SeqCst)
+    }
+
+    /// Check whether a valid index actually exists for this project.
+    /// Returns `true` only when `index_built_at` finds a real timestamp.
+    pub async fn index_is_valid(&self) -> bool {
+        let root = self.project_root.clone();
+        tokio::task::spawn_blocking(move || index_built_at(&root).is_some())
+            .await
+            .unwrap_or(false)
     }
 
     /// (B) Decide whether a startup reindex is needed: true when the repo was

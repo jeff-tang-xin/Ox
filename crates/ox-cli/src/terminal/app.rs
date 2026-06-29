@@ -261,6 +261,9 @@ pub struct App {
     /// BERT embed: entities done / total (separate from file counts)
     pub index_embed_done: usize,
     pub index_embed_total: usize,
+
+    /// GitNexus code-graph service (cloned from AppRuntime).
+    pub gitnexus: Option<Arc<ox_core::mcp::gitnexus::GitNexusService>>,
 }
 
 impl App {
@@ -356,6 +359,9 @@ impl App {
             index_symbols: 0,
             index_embed_done: 0,
             index_embed_total: 0,
+
+            // GitNexus service
+            gitnexus: None,
         }
     }
 

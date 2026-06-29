@@ -85,6 +85,10 @@ pub fn handle_skill_command(
             }
             crate::slash_commands::CommandResult::Success
         }
+        "audit" => {
+            handle_skill_audit(app, rt_env);
+            crate::slash_commands::CommandResult::Success
+        }
         _ => {
             show_skill_help(app);
             crate::slash_commands::CommandResult::Success
@@ -101,13 +105,189 @@ fn show_skill_help(app: &mut AppState) {
          /skill create <id> [desc]            - Create skill template\n\
          /skill create-llm <desc>             - Use LLM to generate skill\n\
          /skill reflect                       - Reflect on recent task and create skill\n\
-         /skill delete <id>                   - Delete a skill\n\n\
+         /skill delete <id>                   - Delete a skill\n\
+         /skill audit                         - Audit skills for potential merges\n\n\
          Examples:\n\
          /skill create rust-error-handling \"Best practices for error handling\"\n\
          /skill create-llm Rust async patterns\n\
          /skill reflect\n\
+         /skill audit\n\
          /skill show think-before-coding",
     );
+}
+
+/// 审计 Skills，检测可能需要合并的相似项
+fn handle_skill_audit(app: &mut AppState, rt_env: &RuntimeEnvironment) {
+    use ox_core::skill::SkillLoader;
+
+    let loader = SkillLoader::new(
+        rt_env.ox_home_dir.join("skills"),
+        rt_env.working_dir.join(".ox").join("skills"),
+    );
+
+    match loader.load_enabled_skills() {
+        Ok(skills) => {
+            if skills.is_empty() {
+                app.output.push_system("No skills to audit.");
+                return;
+            }
+
+            // 按 scope 分组
+            let mut global_skills = Vec::new();
+            let mut project_skills = Vec::new();
+            let mut mandatory_skills = Vec::new();
+
+            for skill in &skills {
+                let scope_str = match skill.scope {
+                    ox_core::skill::SkillScope::System => "system",
+                    ox_core::skill::SkillScope::Global => "global",
+                    ox_core::skill::SkillScope::Project => "project",
+                };
+                match scope_str {
+                    "global" => global_skills.push(skill),
+                    "project" => project_skills.push(skill),
+                    "mandatory" => mandatory_skills.push(skill),
+                    _ => project_skills.push(skill),
+                }
+            }
+
+            let mut output = String::new();
+            output.push_str("🔍 **Skill Audit Report**\n\n");
+
+            // 统计信息
+            output.push_str(&format!(
+                "📊 Total: {} skills ({} global, {} project, {} mandatory)\n\n",
+                skills.len(),
+                global_skills.len(),
+                project_skills.len(),
+                mandatory_skills.len()
+            ));
+
+            // 检测可能的重复/相似
+            let similar = find_similar_skills(&skills);
+            if !similar.is_empty() {
+                output.push_str("⚠️ **可能需要合并的相似 Skills:**\n\n");
+                for (s1, s2, reason) in &similar {
+                    output.push_str(&format!("  • `{}` ↔ `{}`\n    原因: {}\n\n", s1, s2, reason));
+                }
+            } else {
+                output.push_str("✅ 未发现明显相似的 skills\n\n");
+            }
+
+            // 检测超过上限的项目技能
+            const MAX_PROJECT_SKILLS: usize = 3;
+            if project_skills.len() > MAX_PROJECT_SKILLS {
+                output.push_str(&format!(
+                    "⚠️ 项目技能超限: {} 个 (上限 {})\n",
+                    project_skills.len(),
+                    MAX_PROJECT_SKILLS
+                ));
+                output.push_str("  建议合并到 project-conventions 或 project-business-guide\n\n");
+            }
+
+            // 列出所有 skills
+            if !global_skills.is_empty() {
+                output.push_str("**Global Skills:**\n");
+                for s in &global_skills {
+                    output.push_str(&format!("  • {} — {}\n", s.id, s.description));
+                }
+                output.push_str("\n");
+            }
+
+            if !project_skills.is_empty() {
+                output.push_str("**Project Skills:**\n");
+                for s in &project_skills {
+                    output.push_str(&format!("  • {} — {}\n", s.id, s.description));
+                }
+                output.push_str("\n");
+            }
+
+            app.output.push_system(&output);
+        }
+        Err(e) => {
+            app.output
+                .push_system(&format!("❌ Failed to load skills: {}", e));
+        }
+    }
+}
+
+/// 基于描述相似性检测可能需要合并的 skills
+fn find_similar_skills(
+    skills: &[ox_core::skill::Skill],
+) -> Vec<(String, String, String)> {
+    let mut similar = Vec::new();
+
+    // 简单的关键词重叠检测
+    for i in 0..skills.len() {
+        for j in (i + 1)..skills.len() {
+            let s1 = &skills[i];
+            let s2 = &skills[j];
+
+            // 提取关键词（简单按空格分词）
+            let words1: std::collections::HashSet<String> = s1
+                .description
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| s.len() > 2)
+                .map(|s| s.to_string())
+                .collect();
+
+            let words2: std::collections::HashSet<String> = s2
+                .description
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| s.len() > 2)
+                .map(|s| s.to_string())
+                .collect();
+
+            // 计算交集
+            let intersection: std::collections::HashSet<_> =
+                words1.intersection(&words2).collect();
+
+            // 如果有 2+ 个共同关键词，认为可能相似
+            if intersection.len() >= 2 {
+                let overlap_list: Vec<String> = intersection.iter().take(5).map(|s| (*s).to_string()).collect();
+                let reason = format!(
+                    "描述关键词重叠: {}",
+                    overlap_list.join(", ")
+                );
+                similar.push((s1.id.clone(), s2.id.clone(), reason));
+            }
+
+            // 检查 id 是否相似（包含共同单词）
+            let id_parts1: std::collections::HashSet<_> = s1
+                .id
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| s.len() > 1)
+                .collect();
+            let id_parts2: std::collections::HashSet<_> = s2
+                .id
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| s.len() > 1)
+                .collect();
+
+            let id_overlap: std::collections::HashSet<_> =
+                id_parts1.intersection(&id_parts2).collect();
+
+            if !id_overlap.is_empty() && id_overlap.len() >= 1 {
+                // 已经通过关键词检测了，这里再加一个 id 相似检测
+                let overlap_list: Vec<String> = id_overlap.iter().take(3).map(|s| (*s).to_string()).collect();
+                let reason = format!(
+                    "ID 相似: 都包含 '{}'",
+                    overlap_list.join("', '")
+                );
+                // 检查是否已经添加过
+                let already_added = similar.iter().any(|(a, b, _)| {
+                    (a == &s1.id && b == &s2.id) || (a == &s2.id && b == &s1.id)
+                });
+                if !already_added {
+                    similar.push((s1.id.clone(), s2.id.clone(), reason));
+                }
+            }
+        }
+    }
+
+    similar
 }
 
 /// 列出所有 Skills

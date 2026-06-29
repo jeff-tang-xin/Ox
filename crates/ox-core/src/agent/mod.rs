@@ -890,6 +890,7 @@ pub async fn run_agent_turn(
 
     let mut turn_memory = turn_memory::TurnMemory::new(user_task.as_deref().unwrap_or(""));
     if let Some(wf) = &workflow_engine {
+        // FIX: Add warning when lock acquisition fails
         if let Ok(engine) = wf.try_lock() {
             crate::agent::gatekeeper::reset_failures(&engine);
             post_edit_verification::reset_verify_failures(&engine);
@@ -905,6 +906,8 @@ pub async fn run_agent_turn(
             if !block.is_empty() {
                 memory_bridge::inject_durable_memory(&mut messages, &block);
             }
+        } else {
+            tracing::warn!("[run_agent_turn] Failed to acquire workflow_engine lock for memory injection");
         }
     }
 

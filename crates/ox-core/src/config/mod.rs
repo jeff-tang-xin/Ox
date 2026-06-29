@@ -896,6 +896,8 @@ pub struct GitNexusConfig {
     pub startup_timeout_ms: u64,
     /// Per tool-call request timeout (milliseconds).
     pub request_timeout_ms: u64,
+    /// Worker timeout for index operations (seconds). Larger codebases may need longer.
+    pub worker_timeout_sec: u64,
 }
 
 impl Default for GitNexusConfig {
@@ -910,6 +912,7 @@ impl Default for GitNexusConfig {
             augment_find_symbol: true,
             startup_timeout_ms: 30_000,
             request_timeout_ms: 30_000,
+            worker_timeout_sec: 300,  // 5 minutes for large codebases
         }
     }
 }

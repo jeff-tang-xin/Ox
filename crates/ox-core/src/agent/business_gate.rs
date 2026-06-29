@@ -79,10 +79,20 @@ pub async fn await_findings_scope_gate(
             .to_string(),
     ));
 
-    let timeout = tokio::time::sleep(std::time::Duration::from_secs(300));
-    tokio::pin!(timeout);
+    // FIX: Increased timeout and added auto-retry on timeout instead of hard cancel
+    const INITIAL_TIMEOUT_SECS: u64 = 300;
+    const RETRY_TIMEOUT_SECS: u64 = 600;  // 10 minutes on retry
+    let mut is_retry = false;
 
     loop {
+        let timeout_duration = if is_retry {
+            std::time::Duration::from_secs(RETRY_TIMEOUT_SECS)
+        } else {
+            std::time::Duration::from_secs(INITIAL_TIMEOUT_SECS)
+        };
+        let timeout = tokio::time::sleep(timeout_duration);
+        tokio::pin!(timeout);
+
         tokio::select! {
             ev = ui_rx.recv() => {
                 match ev {
@@ -144,8 +154,23 @@ pub async fn await_findings_scope_gate(
             }
             _ = cancel_token.cancelled() => return BusinessGateResume::Cancelled,
             () = &mut timeout => {
-                tracing::warn!("[BUSINESS_GATE] 超时（300秒），自动取消");
-                return BusinessGateResume::Cancelled;
+                // FIX: Instead of hard cancel, notify user and allow retry or cancel
+                if is_retry {
+                    // Already retried once, now really cancel
+                    tracing::warn!("[BUSINESS_GATE] 超时（{}秒），自动取消", INITIAL_TIMEOUT_SECS + RETRY_TIMEOUT_SECS);
+                    let _ = ui_tx.send(super::AgentToUiEvent::Status(
+                        "⏸ 等待确认超时（10分钟），自动取消。\n��重新发起任务或输入新需求。".to_string(),
+                    ));
+                    return BusinessGateResume::Cancelled;
+                } else {
+                    // First timeout: notify user and allow retry
+                    is_retry = true;
+                    let _ = ui_tx.send(super::AgentToUiEvent::Status(
+                        "⏸ 等待确认超时（5分钟），继续等待还是取消？\n输入 c 确认，或输入任意内容讨论。".to_string(),
+                    ));
+                    // Continue loop for retry period
+                    tracing::warn!("[BUSINESS_GATE] 首次超时（300秒），进入重试等待");
+                }
             }
         }
     }
