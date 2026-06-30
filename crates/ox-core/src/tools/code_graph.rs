@@ -107,6 +107,9 @@ impl Tool for CodeGraphTool {
         let mut forwarded = args.clone();
         if let Some(obj) = forwarded.as_object_mut() {
             obj.remove("op");
+            // For single-repo projects, strip `repo` to avoid LLM guessing
+            // the wrong name. GitNexus uses the default repo when omitted.
+            obj.remove("repo");
         }
 
         match svc.call(&op, forwarded).await {
@@ -115,13 +118,14 @@ impl Tool for CodeGraphTool {
                 if text.trim().is_empty() {
                     text = "(空结果)".to_string();
                 }
-                // If GitNexus can't find the target (e.g. file not in git yet),
-                // append a helpful hint so the LLM knows to proceed anyway.
+                // If GitNexus can't find the target (e.g. file not in git yet,
+                // or wrong repo parameter), append a helpful hint.
                 if text.contains("Target") && (text.contains("not found") || text.contains("NotFound")) {
                     text.push_str(
                         "\n\n⚠️ 目标不在代码图谱中，可能原因：\
                          \n1. 该文件是新增的，尚未 git add → 直接编辑，无需 impact 分析\
-                         \n2. GitNexus 索引未覆盖此模块 → 可继续编辑，跳过 impact"
+                         \n2. GitNexus 索引未覆盖此模块 → 可继续编辑，跳过 impact\
+                         \n3. repo 参数不正确 → 尝试去掉 repo 参数重试"
                     );
                 }
                 if text.len() > MAX_OUTPUT_CHARS {
