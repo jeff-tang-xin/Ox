@@ -16,10 +16,13 @@ impl Tool for FindSymbolTool {
     }
 
     fn description(&self) -> &str {
-        "Search for symbols (functions, classes, structs) by name. \
-         Tree-sitter exact/substring match first (up to ~20 hits), then semantic vector fallback. \
-         When the code graph is ready, results also include caller/callee/reference \
-         relationships for the top match. \
+        "定位符号位置(functions, classes, structs) by name. \
+         Tree-sitter exact/substring match first, then semantic vector fallback (up to ~20 hits). \
+         When code graph is ready, results include caller/callee for the top match. \
+         \n\
+         **用途**: 快速定位单个符号的定义位置。\
+         **不适合**: 分析执行流程、调用链、主流程 → 用 code_graph op=query。\
+         \n\
          Not a full-text search — use code_search for text in file contents."
     }
 

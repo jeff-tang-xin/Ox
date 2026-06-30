@@ -472,34 +472,51 @@ fn inject_slim_context(
     // ── 1. Strip all prior injection blocks in ONE pass ──
     strip_all_injection_blocks(messages);
 
-    // ── 2. Build compact block ──
+    // ── 2. Build compact block from helpers ──
     let mut block = String::with_capacity(1200);
 
     // Implement phase gets wider memory windows (long edit tasks need more trace).
     let slim_phase = workflow_engine
         .as_ref()
         .and_then(|wf| wf.try_lock().ok())
-        .map(|engine| crate::agent::context_slim::is_slim_phase(&engine))
+        .map(|e| crate::agent::context_slim::is_slim_phase(&e))
         .unwrap_or(false);
 
-    // Task anchor — ALWAYS visible, strongest attention
-    let task: String = user_task.chars().take(300).collect();
-    let ellipsis = if task.len() < user_task.len() {
-        "…"
-    } else {
-        ""
-    };
-    block.push_str(&format!("[TURN_CONTEXT]\n🎯 任务: {task}{ellipsis}\n"));
+    block.push_str(&build_task_anchor_block(user_task, iteration, turn_memory, workflow_engine));
+    block.push_str(&build_tool_trace_block(turn_memory, slim_phase));
 
-    // Constraint blackboard — pinned at the top, every phase, every turn. These
-    // are durable user rules that must never drift out of view, even after
-    // compaction or a phase switch.
+    if let Some(wf) = workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            block.push_str(&build_workspace_block(&engine, unified_tool_mode));
+        }
+    }
+
+    messages.push(Message::system(&block));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  inject_slim_context helpers — each builds one section of [TURN_CONTEXT]
+// ═══════════════════════════════════════════════════════════════════
+
+/// Section 1: task anchor + blackboard + phase/progress ripple.
+fn build_task_anchor_block(
+    user_task: &str,
+    iteration: u32,
+    turn_memory: &turn_memory::TurnMemory,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+) -> String {
+    let mut b = String::new();
+    let task: String = user_task.chars().take(300).collect();
+    let ellipsis = if task.len() < user_task.len() { "…" } else { "" };
+    b.push_str(&format!("[TURN_CONTEXT]\n🎯 任务: {task}{ellipsis}\n"));
+
+    // Constraint blackboard — always visible
     if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
             let bb = crate::agent::blackboard::block(&engine);
             if !bb.is_empty() {
-                block.push_str(&bb);
-                block.push('\n');
+                b.push_str(&bb);
+                b.push('\n');
             }
         }
     }
@@ -509,11 +526,8 @@ fn inject_slim_context(
     let mut plan_recap = String::new();
     let phase_line = if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
-            let phase = crate::agent::phase::get(&engine);
-            // Recite the todo list every iteration so the global goal stays in view
-            // even after early messages scroll out — prevents "losing the plot".
             plan_recap = engine.plan_progress_summary();
-            format_phase_ripple(&phase, &engine)
+            format_phase_ripple(&crate::agent::phase::get(&engine), &engine)
         } else {
             String::new()
         }
@@ -521,35 +535,30 @@ fn inject_slim_context(
         String::new()
     };
     if phase_line.is_empty() {
-        block.push_str(&format!(
-            "📍 iteration {} · 工具 {} 次\n",
-            iteration + 1,
-            tool_count
-        ));
+        b.push_str(&format!("📍 iteration {} · 工具 {} 次\n", iteration + 1, tool_count));
     } else {
-        block.push_str(&format!(
-            "📍 iteration {} · 工具 {} 次 · {phase_line}\n",
-            iteration + 1,
-            tool_count
-        ));
+        b.push_str(&format!("📍 iteration {} · 工具 {} 次 · {phase_line}\n", iteration + 1, tool_count));
     }
 
-    // Todo-list recap — the global plan, recited every turn so the model never
-    // loses track of where it is across a long edit task.
+    // Todo-list recap
     if !plan_recap.is_empty() {
-        block.push('\n');
-        block.push_str(&plan_recap);
-        block.push('\n');
+        b.push('\n');
+        b.push_str(&plan_recap);
+        b.push('\n');
     }
+    b
+}
 
-    // ── Edit-class memory: ALWAYS shown in full ──
-    // Edits/writes/deletes are the core "what have I already done" signal and are
-    // few in number. Truncating them is what makes the agent re-edit files it has
-    // already changed, so they are never windowed.
+/// Section 2: tool trace — edited files + recent tool log + decisions.
+fn build_tool_trace_block(
+    turn_memory: &turn_memory::TurnMemory,
+    slim_phase: bool,
+) -> String {
+    let mut b = String::new();
     const EDIT_TOOLS: [&str; 3] = ["file_write", "edit_file", "delete_range"];
     let is_edit = |tool: &str| EDIT_TOOLS.contains(&tool);
 
-    // Distinct edited files with edit counts — one-glance "blast radius so far".
+    // Edited files with counts
     if turn_memory.entries.iter().any(|e| is_edit(&e.tool)) {
         let mut order: Vec<String> = Vec::new();
         let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -559,20 +568,19 @@ fn inject_slim_context(
                 order.push(target);
             }
         }
-        block.push_str("\n✏️ 你本轮已修改的文件 (勿重复编辑):\n");
+        b.push_str("\n✏️ 你本轮已修改的文件 (勿重复编辑):\n");
         for target in &order {
             let n = counts.get(target).copied().unwrap_or(1);
             if n > 1 {
-                block.push_str(&format!("  · {target} (已编辑 {n} 次)\n"));
+                b.push_str(&format!("  · {target} (已编辑 {n} 次)\n"));
             } else {
-                block.push_str(&format!("  · {target}\n"));
+                b.push_str(&format!("  · {target}\n"));
             }
         }
     }
 
-    // Recent tool log — edit-class fully, read-class windowed.
+    // Recent tool log
     if !turn_memory.entries.is_empty() {
-        // Larger window during Implement so long edit tasks keep enough trace.
         let read_window = if slim_phase { 12 } else { 8 };
         let edits: Vec<&turn_memory::TurnMemoryEntry> =
             turn_memory.entries.iter().filter(|e| is_edit(&e.tool)).collect();
@@ -580,129 +588,98 @@ fn inject_slim_context(
             turn_memory.entries.iter().filter(|e| !is_edit(&e.tool)).collect();
         let read_start = all_reads.len().saturating_sub(read_window);
         let recent_reads = &all_reads[read_start..];
-        // Show edits first (full), then the tail of read/explore tools.
         let combined: Vec<&turn_memory::TurnMemoryEntry> =
             edits.into_iter().chain(recent_reads.iter().copied()).collect();
         if !combined.is_empty() {
-            block.push_str("\n你刚才已经执行过:\n");
+            b.push_str("\n你刚才已经执行过:\n");
             for e in combined {
-                let icon = if e.outcome == "ok" || e.outcome.starts_with("ok") {
-                    "✅"
-                } else {
-                    "⚠️"
-                };
-                let target_short: String = e.target.chars().take(80).collect();
-                let outcome_short: String = e.outcome.chars().take(160).collect();
-                let tool_name = &e.tool;
-                block.push_str("  ");
-                block.push_str(icon);
-                block.push(' ');
-                block.push_str(tool_name);
-                block.push('(');
-                block.push_str(&target_short);
-                block.push_str(") \u{2192} ");
-                block.push_str(&outcome_short);
-                block.push('\n');
+                let icon = if e.outcome == "ok" || e.outcome.starts_with("ok") { "✅" } else { "⚠️" };
+                b.push_str(&format!("  {icon} {}({}) → {}\n", e.tool,
+                    e.target.chars().take(80).collect::<String>(),
+                    e.outcome.chars().take(160).collect::<String>()));
             }
         }
     }
 
+    // Decisions
     if !turn_memory.decisions.is_empty() {
-        let decision_window = if slim_phase { 8 } else { 4 };
-        block.push_str("\n你刚才形成的判断（非原始 think 摘要）:\n");
-        for d in turn_memory.decisions.iter().rev().take(decision_window).rev() {
-            let d_short: String = d.chars().take(220).collect();
-            block.push_str(&format!("  - {d_short}\n"));
+        let window = if slim_phase { 8 } else { 4 };
+        b.push_str("\n你刚才形成的判断（非原始 think 摘要）:\n");
+        for d in turn_memory.decisions.iter().rev().take(window).rev() {
+            b.push_str(&format!("  - {}\n", d.chars().take(220).collect::<String>()));
+        }
+    }
+    b
+}
+
+/// Section 3: workspace-derived guidance — required_action, scope gate, review handoff, durable memory.
+fn build_workspace_block(
+    engine: &crate::agent::engine::WorkflowEngine,
+    unified_tool_mode: bool,
+) -> String {
+    let mut b = String::new();
+
+    // Required action from workspace
+    if crate::agent::phase::should_inject_workspace(engine) {
+        if let Some(ws) = crate::agent::workspace::WorkflowWorkspace::build(engine) {
+            let action_text = if unified_tool_mode {
+                format_required_action_one_liner_unified(&ws.required_action)
+            } else {
+                format_required_action_one_liner(&ws.required_action)
+            };
+            b.push_str(&format!("\n下一步: {action_text}\n"));
         }
     }
 
-    // ── 3. Required action (one line from workspace) ──
-    if let Some(wf) = workflow_engine {
-        if let Ok(engine) = wf.try_lock() {
-            if crate::agent::phase::should_inject_workspace(&engine) {
-                if let Some(ws) = crate::agent::workspace::WorkflowWorkspace::build(&engine) {
-                    let action_text = if unified_tool_mode {
-                        format_required_action_one_liner_unified(&ws.required_action)
-                    } else {
-                        format_required_action_one_liner(&ws.required_action)
-                    };
-                    block.push_str(&format!("\n下一步: {action_text}\n"));
-                }
-            }
-            // Scope gate — compact one-liner + findings summary so LLM
-            // always knows what's being discussed, even if original deliver scrolled out.
-            if crate::agent::business_gate::is_pending_scope(&engine) {
-                block.push_str("\n⏸️ 门禁: 等待用户 c /confirm 确认范围\n");
-                if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
-                    if !store.findings.is_empty() {
-                        block.push_str("\n📋 当前 findings (用户按编号讨论):\n");
-                        for f in &store.findings {
-                            let icon = if store.active_indices.is_empty()
-                                || store.active_indices.contains(&f.index)
-                            {
-                                "☐"
-                            } else {
-                                "⊘"
-                            };
-                            let sev = f.severity.label();
-                            let issue: String = f.issue.chars().take(80).collect();
-                            let file_short = f.file.rsplit('/').next().unwrap_or(&f.file);
-                            block.push_str(&format!(
-                                "  {icon} #{i} [{sev}] {file_short} — {issue}\n",
-                                i = f.index
-                            ));
-                        }
-                    }
-                }
-            }
-            // ── Implement phase: files already read during review (prevent re-exploration) ──
-            if crate::agent::phase::get(&engine) == crate::agent::phase::SingleFlowPhase::Implement
-            {
-                // Prefer the review→implement handoff snapshot (explored paths +
-                // findings files captured before enter_implement cleared memory).
-                // Fall back to findings files alone if no snapshot exists.
-                let mut files: Vec<String> = engine.review_handoff_files();
-                if files.is_empty() {
-                    if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
-                        files = store
-                            .findings
-                            .iter()
-                            .filter(|f| !f.file.is_empty())
-                            .map(|f| f.file.clone())
-                            .collect();
-                    }
-                }
-                if !files.is_empty() {
-                    block.push_str(
-                        "\n📂 审查阶段已读文件（内容在上文，直接编辑，勿重新探索）:\n",
-                    );
-                    let mut seen = std::collections::HashSet::new();
-                    for f in &files {
-                        if seen.insert(f.clone()) {
-                            block.push_str(&format!("  · {f}\n"));
-                        }
-                    }
-                }
-            }
-            // When workspace is NOT active, inject durable memory + user round inline
-            if !crate::agent::phase::should_inject_workspace(&engine) {
-                let dm = engine.durable_memory_block();
-                if !dm.is_empty() {
-                    let dm_short: String = dm.chars().take(400).collect();
-                    block.push_str(&format!("\n记忆: {dm_short}\n"));
-                }
-                let ur = engine.user_round_memory_block();
-                if !ur.is_empty() {
-                    let ur_short: String = ur.chars().take(200).collect();
-                    if !ur_short.is_empty() {
-                        block.push_str(&format!("\n上下文: {ur_short}\n"));
-                    }
+    // Scope gate
+    if crate::agent::business_gate::is_pending_scope(engine) {
+        b.push_str("\n⏸️ 门禁: 等待用户 c /confirm 确认范围\n");
+        if let Some(store) = crate::agent::findings::load_or_migrate(engine) {
+            if !store.findings.is_empty() {
+                b.push_str("\n📋 当前 findings (用户按编号讨论):\n");
+                for f in &store.findings {
+                    let icon = if store.active_indices.is_empty() || store.active_indices.contains(&f.index) { "☐" } else { "⊘" };
+                    b.push_str(&format!("  {icon} #{} [{}] {} — {}\n", f.index,
+                        f.severity.label(),
+                        f.file.rsplit('/').next().unwrap_or(&f.file),
+                        f.issue.chars().take(80).collect::<String>()));
                 }
             }
         }
     }
 
-    messages.push(Message::system(&block));
+    // Implement phase: review handoff files
+    if crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::Implement {
+        let mut files: Vec<String> = engine.review_handoff_files();
+        if files.is_empty() {
+            if let Some(store) = crate::agent::findings::load_or_migrate(engine) {
+                files = store.findings.iter().filter(|f| !f.file.is_empty()).map(|f| f.file.clone()).collect();
+            }
+        }
+        if !files.is_empty() {
+            b.push_str("\n📂 审查阶段已读文件（内容在上文，直接编辑，勿重新探索）:\n");
+            let mut seen = std::collections::HashSet::new();
+            for f in &files {
+                if seen.insert(f.clone()) {
+                    b.push_str(&format!("  · {f}\n"));
+                }
+            }
+        }
+    }
+
+    // Durable memory fallback (when workspace is NOT active)
+    if !crate::agent::phase::should_inject_workspace(engine) {
+        let dm = engine.durable_memory_block();
+        if !dm.is_empty() {
+            b.push_str(&format!("\n记忆: {}\n", dm.chars().take(400).collect::<String>()));
+        }
+        let ur = engine.user_round_memory_block();
+        if !ur.is_empty() {
+            b.push_str(&format!("\n上下文: {}\n", ur.chars().take(200).collect::<String>()));
+        }
+    }
+
+    b
 }
 
 /// Compact phase-location hint for `[TURN_CONTEXT]` — tells the LLM where it is
@@ -1483,7 +1460,7 @@ pub async fn run_agent_turn(
                     new_messages.push(msg.clone());
                     messages.push(msg);
 
-                    const CONTENT_ONLY_HARD_CAP: u32 = 4;
+                    const CONTENT_ONLY_HARD_CAP: u32 = 8;
                     if content_only_streak >= CONTENT_ONLY_HARD_CAP {
                         let _ = ui_tx.send(AgentToUiEvent::Status(
                             "⏹️ 多次未发出 complete_and_check — 结束本轮，等用户输入".to_string(),
@@ -1528,7 +1505,7 @@ pub async fn run_agent_turn(
                     new_messages.push(msg.clone());
                     messages.push(msg);
 
-                    const CONTENT_ONLY_HARD_CAP: u32 = 4;
+                    const CONTENT_ONLY_HARD_CAP: u32 = 8;
                     if content_only_streak >= CONTENT_ONLY_HARD_CAP {
                         let _ = ui_tx.send(AgentToUiEvent::Status(
                             "⏹️ 多次只思考未发出动作 — 结束本轮，等用户输入".to_string(),
@@ -1549,7 +1526,7 @@ pub async fn run_agent_turn(
                 }
                 // Truly empty response (no visible, no reasoning) — nudge to act.
                 content_only_streak += 1;
-                const EMPTY_HARD_CAP: u32 = 4;
+                const EMPTY_HARD_CAP: u32 = 8;
                 if content_only_streak >= EMPTY_HARD_CAP {
                     let _ = ui_tx.send(AgentToUiEvent::Status(
                         "⏹️ 多次空响应 — 结束本轮，等用户输入".to_string(),
@@ -2038,7 +2015,7 @@ pub async fn run_agent_turn(
 
                 tracing::info!("[UNIFIED_CALL] Entering handle_complete_and_check...");
                 let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
+                    std::time::Duration::from_secs(300),
                     crate::agent::unified_handler::handle_complete_and_check(
                         tc,
                         &tool_registry,
@@ -2062,14 +2039,14 @@ pub async fn run_agent_turn(
                         // 增强超时日志：记录更多上下文信息
                         let action_hint = tc.arguments.chars().take(100).collect::<String>();
                         tracing::error!(
-                            "[UNIFIED_CALL] TIMEOUT after 120s — aborting | iteration={} | tool_calls_in_turn={} | action_hint={}",
+                            "[UNIFIED_CALL] TIMEOUT after 300s — aborting | iteration={} | tool_calls_in_turn={} | action_hint={}",
                             iteration,
                             tool_calls.len(),
                             action_hint
                         );
                         let _ = ui_tx.send(AgentToUiEvent::Status(
                             format!(
-                                "⏱️ 操作超时 (120s) — 强制结束 | 已重试 {} 次",
+                                "⏱️ 操作超时 (300s) — 强制结束 | 已重试 {} 次",
                                 iteration
                             )
                         ));

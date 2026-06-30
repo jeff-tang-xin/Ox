@@ -33,10 +33,10 @@ const READONLY_TOOLS: &[&str] = &[
 const PROGRESS_TOOLS: &[&str] = &["file_write", "edit_file", "delete_range"];
 
 /// Consecutive read-only turns before a reflection prompt is injected.
-pub const REFLECT_AT: u32 = 8;
+pub const REFLECT_AT: u32 = 12;
 
 /// Further read-only turns after reflection before handing back to the user.
-pub const STOP_AFTER_REFLECT: u32 = 5;
+pub const STOP_AFTER_REFLECT: u32 = 8;
 
 /// What the loop should do after classifying one turn's tool batch.
 #[derive(Debug, Clone, PartialEq, Eq)]

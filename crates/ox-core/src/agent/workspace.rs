@@ -545,6 +545,13 @@ fn compute_required_action(
             if crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::AwaitUser {
                 return RequiredAction::AwaitUser;
             }
+            // 还没 findings → 先用 code_graph 了解结构，再深入文件
+            if store.as_ref().is_none_or(|s| s.findings.is_empty()) {
+                return RequiredAction::Explore {
+                    hint: "先用 code_graph 了解项目/模块结构（code_graph query + find_symbol），\
+                           再 file_read 深入具体文件".to_string(),
+                };
+            }
             RequiredAction::EmitFindingsAndDone
         }
         WorkspaceMode::ScopeConfirm => RequiredAction::AwaitUser,
@@ -597,6 +604,17 @@ fn compute_required_action(
                             finding_index: idx,
                         };
                     }
+                }
+                // Before reading/editing: suggest code_graph impact analysis
+                // so the LLM understands the blast radius of its changes.
+                if !f.file.is_empty() && !engine.impl_impact_done(idx) {
+                    let hint = format!(
+                        "code_graph impact — 分析 {file} 的调用链影响范围：\
+                         complete_and_check(action=\"code_graph\", \
+                         params={{\"op\":\"impact\",\"target\":\"{file}\",\"direction\":\"downstream\"}})",
+                        file = f.file
+                    );
+                    return RequiredAction::Explore { hint };
                 }
                 if !f.file.is_empty() && !has_edit && !has_impl_read {
                     let (offset, limit) = read_offset_for_finding(engine, f);
@@ -774,6 +792,8 @@ mod tests {
         };
         findings::save(&engine, &store);
         crate::agent::tool_digest::record_read(&engine, "src/Foo.java", "class Foo {}", 0, Some(1));
+        // Mark impact as done so the gate doesn't block ReadFile
+        engine.record_impl_impact(1);
         let ws = WorkflowWorkspace::build(&engine).unwrap();
         assert!(matches!(
             ws.required_action,
@@ -813,6 +833,8 @@ mod tests {
         };
         findings::save(&engine, &store);
         engine.record_impl_file_read("src/Foo.java", "{}");
+        // Mark impact as done so the gate allows EditFile
+        engine.record_impl_impact(1);
 
         let ws = WorkflowWorkspace::build(&engine).unwrap();
         assert!(matches!(

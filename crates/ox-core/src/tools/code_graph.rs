@@ -115,6 +115,15 @@ impl Tool for CodeGraphTool {
                 if text.trim().is_empty() {
                     text = "(空结果)".to_string();
                 }
+                // If GitNexus can't find the target (e.g. file not in git yet),
+                // append a helpful hint so the LLM knows to proceed anyway.
+                if text.contains("Target") && (text.contains("not found") || text.contains("NotFound")) {
+                    text.push_str(
+                        "\n\n⚠️ 目标不在代码图谱中，可能原因：\
+                         \n1. 该文件是新增的，尚未 git add → 直接编辑，无需 impact 分析\
+                         \n2. GitNexus 索引未覆盖此模块 → 可继续编辑，跳过 impact"
+                    );
+                }
                 if text.len() > MAX_OUTPUT_CHARS {
                     let mut cut = MAX_OUTPUT_CHARS;
                     while !text.is_char_boundary(cut) {

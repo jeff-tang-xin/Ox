@@ -445,13 +445,16 @@ where
                 .is_some_and(|e| crate::agent::workflow_session::is_feedback_discuss(&e));
             let _ = ui_tx.send(AgentToUiEvent::Status("💬 讨论中...".into()));
             // In explicit discussion mode (`/discuss`) the user is having a
-            // conversation — answer directly, don't loop back into findings edits.
-            // Outside discuss mode a plain interjection means "refine the scope".
+            // conversation — answer directly, and optionally update findings
+            // if the discussion changed the understanding.
             let deferred = if in_discuss {
-                "💬 用户在讨论模式提问/反馈：基于已掌握的上下文直接 finish(params.content=回答) 回应；\
-                 不要带 finding_json、不要重新探索。回应后会回到范围确认，用户可继续讨论或 c 确认。"
+                "💬 用户在讨论模式提问/反馈：直接 finish(params.content=回答) 回应。\
+                 如果讨论中用户指出了 findings 需要修改（增删改），重新 finish(\
+                 params.content=回应, finding_json=[更新后的 findings]) 提交更新。\
+                 不做无根据的改动，但用户指出的问题必须修正。"
             } else {
-                "📋 根据用户反馈更新 finding_json，再次 finish 提交。"
+                "📋 根据用户反馈更新 finding_json（增、删、改），再次 finish 提交。\
+                 如果是纯讨论无需改 findings，直接 finish(params.content=回应) 即可。"
             };
             UnifiedHandleOutcome::Result {
                 content: ToolResultEnvelope::gate_status(
@@ -900,6 +903,21 @@ fn apply_delegate_success_effects(
         }
     } else if matches!(inner_name, "find_symbol" | "code_search") {
         crate::agent::read_guard::record_symbol_query(engine, inner_name, &req.params);
+    } else if inner_name == "code_graph" {
+        // Record impact analysis so workspace.rs knows not to re-suggest it.
+        // req.params is the flat params object from complete_and_check, e.g.
+        // {"op":"impact","target":"src/Foo.java","direction":"downstream"}
+        if req.params.get("op").and_then(|o| o.as_str()) == Some("impact") {
+            if let Some(target) = req.params.get("target") {
+                // Try to match target to a finding; even if GitNexus returned
+                // "Target not found" (file not in git / not indexed), still
+                // record impact so the gate stops blocking.
+                if let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
+                {
+                    engine.record_impl_impact(idx);
+                }
+            }
+        }
     }
 
     let step = engine.get_current_step_index();

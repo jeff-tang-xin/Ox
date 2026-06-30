@@ -71,10 +71,12 @@ fn review_round_starts_in_review_phase() {
     assert_eq!(engine.get_task_intent(), TaskIntent::Review);
     let ws = WorkflowWorkspace::build(&engine).unwrap();
     assert_eq!(ws.mode, WorkspaceMode::ExecuteReview);
+    // No findings yet → should suggest exploration via code_graph first
     assert!(matches!(
         ws.required_action,
-        RequiredAction::EmitFindingsAndDone
+        RequiredAction::Explore { .. }
     ));
+    assert!(format!("{:?}", ws.required_action).contains("code_graph"));
 }
 
 #[test]
@@ -117,6 +119,9 @@ fn user_fix_pivots_to_implement_with_edit_action() {
     );
     assert!(phase::pivot_to_fix_mode(&engine, "先修复"));
     assert_eq!(phase::get(&engine), SingleFlowPhase::Implement);
+    // Mark impact analysis as done so the gate allows ReadFile/EditFile
+    engine.record_impl_impact(1);
+    engine.record_impl_impact(2);
     let ws = WorkflowWorkspace::build(&engine).unwrap();
     assert_eq!(ws.mode, WorkspaceMode::ExecuteImpl);
     assert_eq!(engine.get_task_intent(), TaskIntent::Fix);

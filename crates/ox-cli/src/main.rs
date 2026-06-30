@@ -435,7 +435,12 @@ async fn run_app(
                     }
                 });
 
-                let analyze_result = bg.cli_analyze().await;
+                let analyze_result = {
+                    bg.set_building(true);
+                    let r = bg.cli_analyze().await;
+                    bg.set_building(false);
+                    r
+                };
                 ticker.abort(); // stop the progress ticker
 
                 match &analyze_result {

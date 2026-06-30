@@ -310,10 +310,14 @@ impl ContextBuilder {
             result.push(Message::system(&combined_system));
         }
 
-        // 2. Fill history from newest to oldest within budget.
+        // 2. Compact oldest completed rounds first (far→near, token-budget driven).
+        let mut history = history.to_vec();
         let history_budget = budgets.history as usize;
-        // Skip the first message if it's a system message (already merged above)
-        let start_idx = if has_leading_system { 1 } else { 0 };
+        compact_completed_rounds(&mut history, history_budget);
+        // After compaction, start from index 0 — the system prompt is already in result[0].
+        let start_idx: usize = 0;
+
+        // 3. Fill history from newest to oldest within budget.
         let history_count = history.len().saturating_sub(start_idx);
         if history_count <= 8 {
             for i in start_idx..history.len() {
@@ -1072,5 +1076,82 @@ pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
             filtered.len()
         );
         *messages = filtered;
+    }
+}
+
+/// Compact oldest completed rounds first, until remaining history fits within
+/// `history_budget` tokens. Process from earliest (index 0) → newest, replacing
+/// each completed round (everything before a `[ROUND_COMPLETE]` boundary) with
+/// a compact `[ROUND_HISTORY]` summary. The current incomplete round is never
+/// touched.
+///
+/// This is the "far to near" strategy: old finished work gets condensed first,
+/// respecting the token budget rather than a fixed round count.
+pub fn compact_completed_rounds(messages: &mut Vec<Message>, history_budget: usize) {
+    if messages.len() < 4 {
+        return;
+    }
+    let total_tokens: usize = messages.iter().map(estimate_message_tokens).sum();
+    if total_tokens <= history_budget {
+        return;
+    }
+
+    let mut compressed_count = 0;
+    let mut tokens_saved = 0;
+
+    loop {
+        // Re-collect boundaries each iteration (indices shift after compression)
+        let boundaries: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                matches!(m, Message::System { content } if content.starts_with(
+                    crate::agent::user_round::COMPLETE_BOUNDARY_TAG
+                ))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
+
+        // Need at least 2 boundaries to safely compress the oldest one
+        // (keep the newest completed round + current round intact)
+        if boundaries.len() < 2 {
+            break;
+        }
+
+        // Compress the OLDEST completed round: from boundaries[0] to boundaries[1]
+        let start = boundaries[0];
+        let end = boundaries[1];
+
+        let section_tokens: usize = messages[start..end]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum();
+
+        let summary = Message::system(
+            "[ROUND_HISTORY]\n✅ 已完成轮次（压缩摘要）".to_string(),
+        );
+        let summary_tokens = estimate_message_tokens(&summary);
+        let saved = section_tokens.saturating_sub(summary_tokens);
+
+        messages.splice(start..end, vec![summary]);
+        compressed_count += 1;
+        tokens_saved += saved;
+
+        // Check budget
+        let remaining: usize = messages.iter().map(estimate_message_tokens).sum();
+        if remaining <= history_budget {
+            break;
+        }
+    }
+
+    if compressed_count > 0 {
+        tracing::info!(
+            "[CONTEXT_COMPACT] Compressed {} old round(s), saved ~{} tokens, {} msgs",
+            compressed_count,
+            tokens_saved,
+            messages.len()
+        );
     }
 }

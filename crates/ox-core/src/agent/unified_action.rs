@@ -158,9 +158,15 @@ pub fn finding_json(params: &Value) -> Option<String> {
         }
     }
     // Fallback: a findings JSON block embedded in free-text content.
+    // MUST verify the content actually contains a parseable JSON findings
+    // block — a simple `"findings"` string match is too aggressive and
+    // causes discussion replies mentioning findings to enter the scope gate,
+    // leading to a 300s timeout that kills the agent turn.
     let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    if content.contains("\"findings\"") {
-        return Some(content.to_string());
+    if let Some(extracted) = crate::agent::perception::extract_json_block(content) {
+        if serde_json::from_str::<serde_json::Value>(&extracted).is_ok() {
+            return Some(content.to_string());
+        }
     }
     None
 }

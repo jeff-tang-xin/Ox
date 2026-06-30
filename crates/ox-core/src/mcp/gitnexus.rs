@@ -322,6 +322,8 @@ pub struct GitNexusService {
     start_lock: Mutex<()>,
     /// Set when Ox edits/writes/deletes a file (E): the index is behind the tree.
     dirty: AtomicBool,
+    /// Set when a CLI `analyze` process is running (prevents concurrent reindex).
+    is_building: AtomicBool,
     /// Serializes on-change reindex so concurrent queries don't double-analyze.
     refresh_lock: Mutex<()>,
 }
@@ -344,6 +346,7 @@ impl GitNexusService {
             status: Mutex::new(initial),
             start_lock: Mutex::new(()),
             dirty: AtomicBool::new(false),
+            is_building: AtomicBool::new(false),
             refresh_lock: Mutex::new(()),
         }
     }
@@ -599,6 +602,16 @@ impl GitNexusService {
         self.dirty.load(Ordering::SeqCst)
     }
 
+    /// Mark that a CLI `analyze` / `init` is in progress.
+    /// Prevents `ensure_fresh_for_query` from running a concurrent reindex.
+    pub fn set_building(&self, v: bool) {
+        self.is_building.store(v, Ordering::SeqCst);
+    }
+
+    pub fn is_building(&self) -> bool {
+        self.is_building.load(Ordering::SeqCst)
+    }
+
     /// Check whether a valid index actually exists for this project.
     /// Returns `true` only when `index_built_at` finds a real timestamp.
     pub async fn index_is_valid(&self) -> bool {
@@ -636,6 +649,14 @@ impl GitNexusService {
             return false;
         }
         tracing::info!("[GitNexus] edits since last index — reindexing before query");
+        // If a background build is in progress, don't start a concurrent one.
+        if self.is_building() {
+            tracing::warn!("[GitNexus] index build already in progress — skipping on-query reindex");
+            // Still need to restart the server so the fresh index (being built
+            // in background) can be queried once ready.
+            self.set_status(GitNexusStatus::NotStarted).await;
+            return true;
+        }
         // Stop the reader so the CLI writer never shares KuzuDB with it.
         self.shutdown().await;
         match self.cli_analyze().await {

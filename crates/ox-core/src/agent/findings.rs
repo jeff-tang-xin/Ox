@@ -455,6 +455,26 @@ fn finding_from_plan_step(s: &PlanStep) -> Finding {
     }
 }
 
+/// Given a target (file path or symbol), find which finding index it belongs to.
+/// Used by unified_handler to record impact-analysis completion per finding.
+pub fn finding_index_for_target(engine: &WorkflowEngine, target: &serde_json::Value) -> Option<u32> {
+    let target_str = target.as_str()?;
+    let store = load(engine)?;
+    // Try exact file match first
+    for f in &store.findings {
+        if f.file == target_str || f.symbol == target_str {
+            return Some(f.index);
+        }
+    }
+    // Try path suffix match (e.g. "src/Foo.java" matches "/project/src/Foo.java")
+    for f in &store.findings {
+        if f.file.ends_with(target_str) || target_str.ends_with(&f.file) {
+            return Some(f.index);
+        }
+    }
+    None
+}
+
 pub fn parse_scope_indices(text: &str) -> Vec<u32> {
     let mut indices = Vec::new();
     let mut i = 0;

@@ -186,6 +186,25 @@ impl WorkflowEngine {
                     "实施阶段禁止 {tool_name} — 用 find_symbol/file_read 定位。"
                 ));
             }
+            // Impact gate: require code_graph impact analysis before reading/editing
+            // finding-related files, so the LLM understands the blast radius.
+            if matches!(tool_name, "file_read" | "edit_file") {
+                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                    if !path.trim().is_empty() {
+                        let target_val = serde_json::Value::String(path.to_string());
+                        if let Some(idx) = crate::agent::findings::finding_index_for_target(self, &target_val) {
+                            if !self.impl_impact_done(idx) {
+                                return Err(format!(
+                                    "📊 影响范围门禁 — 编辑 `{path}` 前请先评估改动影响。\n\
+                                     先调用 complete_and_check(action=\"code_graph\", \
+                                     params={{\"op\":\"impact\",\"target\":\"{path}\",\"direction\":\"downstream\"}}) \
+                                     查看调用链影响范围。"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         crate::agent::read_guard::check(tool_name, args, self)?;
@@ -417,6 +436,8 @@ impl WorkflowEngine {
             crate::agent::findings::clear(self);
             // Clear impl file read counters so new turns don't inherit old limits
             self.clear_impl_files_read();
+            // Clear impact analysis tracking for fresh start
+            self.clear_impl_impact();
             for key in [
                 "_step0_output",
                 "_step1_output",
@@ -694,6 +715,36 @@ impl WorkflowEngine {
         if let Ok(json) = serde_json::to_string(&list) {
             self.set_variable(Self::IMPL_EDITED_KEY, json);
         }
+    }
+
+    const IMPL_IMPACT_KEY: &str = "_impl_impact_done";
+
+    /// True when code_graph impact analysis has been recorded for this finding.
+    pub fn impl_impact_done(&self, finding_index: u32) -> bool {
+        let list: Vec<u32> = self
+            .get_variable(Self::IMPL_IMPACT_KEY)
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        list.contains(&finding_index)
+    }
+
+    /// Mark a finding as having had code_graph impact analysis.
+    pub fn record_impl_impact(&self, finding_index: u32) {
+        let mut list: Vec<u32> = self
+            .get_variable(Self::IMPL_IMPACT_KEY)
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if !list.contains(&finding_index) {
+            list.push(finding_index);
+            if let Ok(json) = serde_json::to_string(&list) {
+                self.set_variable(Self::IMPL_IMPACT_KEY, json);
+            }
+        }
+    }
+
+    /// Clear all impact-analysis tracking (called on workflow reset / new round).
+    pub fn clear_impl_impact(&self) {
+        self.set_variable(Self::IMPL_IMPACT_KEY, "[]".to_string());
     }
 
     /// Implementation phase: allow all reads. Compaction handles context bloat.

@@ -195,7 +195,8 @@ fn find_incomplete_findings_suffix_start(text: &str) -> Option<usize> {
     None
 }
 
-fn extract_json_block(text: &str) -> Option<String> {
+/// Find the first valid JSON block containing `"findings"` field in text.
+pub fn extract_json_block(text: &str) -> Option<String> {
     let (start, end) = find_findings_json_range(text)?;
     let slice = &text[start..end];
     if slice.starts_with("```json") {
