@@ -413,6 +413,8 @@ impl WorkflowEngine {
             crate::agent::workflow_session::clear_session_flags(self);
             crate::agent::perception::clear(self);
             crate::agent::workflow_phases::clear_phase(self);
+            // FIX: Clear findings store to prevent context pollution across rounds
+            crate::agent::findings::clear(self);
             // Clear impl file read counters so new turns don't inherit old limits
             self.clear_impl_files_read();
             for key in [

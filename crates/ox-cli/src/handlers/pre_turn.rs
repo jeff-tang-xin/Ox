@@ -314,19 +314,26 @@ async fn build_codegraph_hint(
     let svc = gitnexus.as_ref()?;
     let q = user_text.trim();
     // Skip trivial inputs (confirmations like "ok"/"继续") — no useful semantics.
-    if q.chars().count() < 6 {
+    if q.chars().count() < 4 {  // 降低到 4，让更多查询触发
         return None;
     }
     if !svc.is_ready().await {
         return None; // not ready → no latency, no hint
     }
+
+    // FIX: dirty 时给降级提示，而非完全跳过
     if svc.is_dirty() {
-        return None; // pending reindex → keep turn start fast
+        return Some(
+            "[CODE_GRAPH_HINT]\n\
+             🔗 代码图谱可用但有未索引改动（可能不完全准确）。\n\
+             💡 手动用 code_graph 查询会自动触发增量更新。".to_string()
+        );
     }
 
     let mut params = ox_core::mcp::gitnexus::QueryParams::new(q);
     params.limit = Some(5);
-    let res = tokio::time::timeout(std::time::Duration::from_secs(6), svc.query(&params))
+    // FIX: 增加超时到 10 秒
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), svc.query(&params))
         .await
         .ok()?
         .ok()?;

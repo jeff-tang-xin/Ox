@@ -416,9 +416,19 @@ pub fn build_unified_route(engine: &WorkflowEngine) -> String {
     }
     if spec.allowed.contains(&"code_graph") {
         out.push_str(
-            "🕸 code_graph(GitNexus 代码图谱)：改动/重构前先建关系模型与影响面——\
-             op=query(概念→执行流) / context(单符号谁调谁、读写) / impact(改 X 的爆炸半径) / \
-             detect_changes(未提交改动影响) / api_impact(改路由前)。比 grep 更懂调用关系；拿不准影响面别盲改。\n",
+            "🕸 **code_graph (GitNexus 代码图谱) — 优先使用**：\n\
+             \n\
+             **理解代码时必用**：\n\
+             • op=query → 根据概念找执行流程（如 主流程/auth流程）\n\
+             • op=context → 查单个符号的 360° 视图（谁调谁、读写关系）\n\
+             \n\
+             **改动前必用**：\n\
+             • op=impact → 改动爆炸半径分析（改 X 会影响哪些地方）\n\
+             • op=detect_changes → 未提交改动的影响面\n\
+             • op=api_impact → API 路由改动分析\n\
+             \n\
+             **比 grep/file_read 更强**：理解调用关系、执行流程、模块边界。\n\
+             **默认策略**：先 code_graph query，再 file_read 深入。\n",
         );
     }
     out.push_str(
