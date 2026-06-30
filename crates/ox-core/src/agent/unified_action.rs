@@ -434,7 +434,8 @@ pub fn build_unified_route(engine: &WorkflowEngine) -> String {
     out.push_str(
         "结束本轮 = 你主动调 `finish`（深思后的收尾，结束本轮、交还用户；不锁后续）：\n\
          • 有需用户审核的内容(plan/bug/将改动) → finish(params.finding_json=[...]) → 门禁仅校验，等 c 确认后继续\n\
-         • 已完成/纯分析/回答 → finish(params.content=\"…\") 收尾\n\
+         • 已完成/纯分析/回答 → finish(params.content=…) 收尾\n\
+         • **用户明确拒绝修复（说 不修复/不改/算了）→ 直接 finish(params.content=…) 结束，勿再生成 finding_json**\n\
          • 即使 finding_json 确认并改完代码，也由你**自己** finish 收尾；门禁/工具永不替你结束\n\
          • 中间想说明但还要继续 → 文字随下一个工具动作一起输出，勿用 finish 投递中间内容\n\
          finding_json 形态: {\"findings_summary\":\"…\",\"findings\":[{\"index\":1,\"severity\":\"high\",\"file\":\"…\",\"issue\":\"…\",\"recommendation\":\"…\",\"fix_plan\":\"第几行+怎么改+代码草图\"}]}\n\
