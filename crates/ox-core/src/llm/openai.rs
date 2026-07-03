@@ -230,8 +230,11 @@ impl LlmProvider for OpenAiProvider {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
 
-        // Low-temperature defaults reduce divergent/repetitive ReAct exploration.
-        body["temperature"] = serde_json::json!(self.temperature.unwrap_or(0.1));
+        // Temperature is optional. When unset, the API uses its own default
+        // (typically 0.7 for OpenAI). Only explicitly set when user configured.
+        if let Some(t) = self.temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
         body["top_p"] = serde_json::json!(self.top_p.unwrap_or(0.8));
 
         if !tools.is_empty() && !self.disable_tools {

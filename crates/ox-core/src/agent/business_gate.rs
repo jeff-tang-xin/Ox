@@ -16,6 +16,9 @@ use super::ui_event::{self, BusinessGateKind};
 
 pub const PENDING_SCOPE_KEY: &str = "_business_gate_pending_scope";
 pub const SCOPE_ACK_KEY: &str = "_business_gate_scope_ack";
+/// Pre-confirmation flag set by the interjection handler before the scope gate
+/// opens. Unlike SCOPE_ACK_KEY, this is NOT cleared by arm_findings_scope.
+pub const PRE_ACK_KEY: &str = "_gate_pre_acked";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusinessGateResume {
@@ -42,7 +45,11 @@ pub fn ack_findings_scope(engine: &WorkflowEngine) {
 }
 
 pub fn is_pending_scope(engine: &WorkflowEngine) -> bool {
-    // Only show scope gate if there are PENDING findings (not Done/Skipped/WontFix)
+    // If user pre-confirmed (typed "c" before gate opened), skip the gate.
+    if engine.get_variable(PRE_ACK_KEY).as_deref() == Some("1") {
+        return false;
+    }
+    // Only show scope gate if there are PENDING findings
     let has_pending = findings::load_or_migrate(engine)
         .map(|s| s.has_pending_findings())
         .unwrap_or(false);
@@ -58,6 +65,7 @@ pub fn scope_implementation_unlocked(engine: &WorkflowEngine) -> bool {
 pub fn clear(engine: &WorkflowEngine) {
     engine.set_variable(PENDING_SCOPE_KEY, String::new());
     engine.set_variable(SCOPE_ACK_KEY, String::new());
+    engine.set_variable(PRE_ACK_KEY, String::new());
 }
 
 /// Suspend after findings until user confirms scope or discusses.
@@ -74,11 +82,24 @@ pub async fn await_findings_scope_gate(
         &mpsc::UnboundedSender<super::AgentToUiEvent>,
     ),
 ) -> BusinessGateResume {
+    // If user already pre-confirmed (typed "c" before gate opened), skip wait.
+    if let Some(wf) = workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            if engine.get_variable(PRE_ACK_KEY).as_deref() == Some("1") {
+                engine.set_variable(PRE_ACK_KEY, String::new());
+                tracing::info!("[BUSINESS_GATE] Pre-ack detected, acknowledging");
+                ack_findings_scope(&engine);
+                return BusinessGateResume::Acknowledged;
+            }
+        }
+    }
+
     let _ = ui_tx.send(super::AgentToUiEvent::Status(
         "⏸ 业务流程门禁：等待确认 findings 范围 — 面板选 finding 后 c /confirm；可输入讨论"
             .to_string(),
     ));
 
+    // Scan messages for a confirmation that was injected by the main loop's
     // FIX: Increased timeout and added auto-retry on timeout instead of hard cancel
     const INITIAL_TIMEOUT_SECS: u64 = 300;
     const RETRY_TIMEOUT_SECS: u64 = 600;  // 10 minutes on retry
@@ -107,13 +128,12 @@ pub async fn await_findings_scope_gate(
                         return BusinessGateResume::Acknowledged;
                     }
                     Some(ui_event::UiToAgentEvent::Interjection(text)) => {
-                        let trimmed = text.trim();
-                        let lower = trimmed.to_lowercase();
-                        let is_confirm = trimmed == "c"
-                            || trimmed == "/confirm"
-                            || trimmed == "/fix"
-                            || lower == "确认"
-                            || lower == "开始实施";
+                        let t = text.trim();
+                        let is_confirm = t == "c"
+                            || t.starts_with("/confirm")
+                            || t.starts_with("/fix")
+                            || t.contains("确认")
+                            || t.contains("开始实施");
                         if is_confirm {
                             if let Some(wf) = workflow_engine {
                                 if let Ok(engine) = wf.try_lock() {
@@ -206,6 +226,12 @@ pub async fn await_deliver_gate(
                         return BusinessGateResume::Acknowledged;
                     }
                     Some(ui_event::UiToAgentEvent::Interjection(text)) => {
+                        let t = text.trim();
+                        if t == "c" || t.starts_with("/confirm") || t.starts_with("/fix")
+                            || t.contains("确认") || t.contains("开始实施")
+                        {
+                            return BusinessGateResume::Acknowledged;
+                        }
                         push_interjection(workflow_engine, messages, &text, ui_tx);
                         return BusinessGateResume::Discuss;
                     }

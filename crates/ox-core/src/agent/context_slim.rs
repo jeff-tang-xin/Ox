@@ -19,8 +19,11 @@ pub fn is_slim_phase(engine: &WorkflowEngine) -> bool {
 }
 
 /// Compact keep-tail for in-turn message compression during Implement.
+/// Fixed message count (not token-based) to guarantee critical state messages
+/// like business confirmation aren't dropped. 60 messages is enough for
+/// 50+ iteration tasks; the outer `context_builder.build()` handles budget.
 pub fn compact_keep_tail() -> usize {
-    28
+    60
 }
 
 /// Fold review-era bulk before each LLM call in Implement phase.

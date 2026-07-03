@@ -409,7 +409,7 @@ where
         ui_rx,
         cancel_token,
         workflow_engine,
-        messages,
+        messages,    // Pass messages so the gate can scan for pendings
         ui_tx,
         push_interjection,
     )
@@ -564,6 +564,21 @@ async fn handle_finish(
         }
         if let Some(wf) = workflow_engine {
             if let Ok(mut engine) = wf.try_lock() {
+                // After scope confirmation, the LLM is in implement phase.
+                // A plain finish (no finding_json) after confirmation means
+                // the LLM is acknowledging — don't complete the workflow.
+                if business_gate::scope_implementation_unlocked(&engine)
+                    && crate::agent::phase::get(&engine)
+                        == crate::agent::phase::SingleFlowPhase::Implement
+                {
+                    drop(engine);
+                    return UnifiedHandleOutcome::Result {
+                        content: content.clone(),
+                        is_error: false,
+                        deferred_system: vec!["继续实施：逐项 file_read → edit_file → 验证。全部完成后 finish（无 finding_json）收尾。".into()],
+                        delegate_meta: None,
+                    };
+                }
                 let task = engine
                     .get_variable("_current_user_request")
                     .unwrap_or_default();
@@ -592,6 +607,18 @@ async fn handle_finish(
             return result_err("workflow engine busy".into());
         };
         crate::agent::findings::ensure_from_review_output(&engine, &review_json);
+
+        // If the scope gate was already confirmed, don't re-arm it —
+        // just update findings and return. Prevents double confirmation.
+        if business_gate::scope_implementation_unlocked(&engine) {
+            return UnifiedHandleOutcome::Result {
+                content: "✅ 范围已确认。不要再提交 finding_json，直接 file_read → edit_file 实施。完成后 finish(content) 收尾。".into(),
+                is_error: false,
+                deferred_system: vec![],
+                delegate_meta: None,
+            };
+        }
+
         crate::agent::phase::transition(&engine, crate::agent::phase::PhaseEvent::FindingsStored);
         business_gate::arm_findings_scope(&engine);
     }
@@ -905,13 +932,25 @@ fn apply_delegate_success_effects(
         crate::agent::read_guard::record_symbol_query(engine, inner_name, &req.params);
     } else if inner_name == "code_graph" {
         // Record impact analysis so workspace.rs knows not to re-suggest it.
-        // req.params is the flat params object from complete_and_check, e.g.
-        // {"op":"impact","target":"src/Foo.java","direction":"downstream"}
         if req.params.get("op").and_then(|o| o.as_str()) == Some("impact") {
             if let Some(target) = req.params.get("target") {
-                // Try to match target to a finding; even if GitNexus returned
-                // "Target not found" (file not in git / not indexed), still
-                // record impact so the gate stops blocking.
+                if let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
+                {
+                    engine.record_impl_impact(idx);
+                }
+            }
+        }
+        // Record any code_graph query/impact/context so the impact gate and
+        // find_symbol gate unblock. Match the target/pattern/name to findings.
+        if let Some(op) = req.params.get("op").and_then(|o| o.as_str()) {
+            // Extract search target from the params (differs by op)
+            let search_target = match op {
+                "impact" => req.params.get("target"),
+                "query" => req.params.get("pattern").or_else(|| req.params.get("query")),
+                "context" => req.params.get("name").or_else(|| req.params.get("uid")),
+                _ => None,
+            };
+            if let Some(target) = search_target {
                 if let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
                 {
                     engine.record_impl_impact(idx);

@@ -45,6 +45,7 @@ impl Tool for CodeGraphTool {
 
     fn description(&self) -> &str {
         "查询代码知识图谱(GitNexus)。改代码前用它建立关系模型与影响面。\
+         先用 list_repos 看有哪些仓库，再选正确仓库查关系。\
          params.op 选择能力，其余字段按该 op 透传：\n\
          • query{query} 概念→执行流(调用链)  • context{name|uid} 单符号360°(谁调谁/读写)\n\
          • impact{target,direction:upstream|downstream} 改动爆炸半径  • detect_changes{} 未提交改动影响\n\
@@ -96,20 +97,25 @@ impl Tool for CodeGraphTool {
             return ToolOutput::error(e);
         }
 
-        // (E) If Ox edited files since the last index, refresh before answering
-        // so the graph reflects the current code. Cost is paid only here, lazily.
-        if ctx.config.gitnexus.reindex_on_change && svc.is_dirty() {
-            ctx.report_progress("更新代码图谱索引（检测到改动）…".to_string(), None);
-            svc.ensure_fresh_for_query().await;
-        }
+        // (E) Reindex is deferred to the pre-turn pipeline so it runs between
+        // turns, not during a code_graph call. See gitnexus_service::reindex_if_dirty.
 
         // Forward everything except `op` as the GitNexus tool arguments.
         let mut forwarded = args.clone();
         if let Some(obj) = forwarded.as_object_mut() {
             obj.remove("op");
-            // For single-repo projects, strip `repo` to avoid LLM guessing
-            // the wrong name. GitNexus uses the default repo when omitted.
-            obj.remove("repo");
+            // NOTE: repo is NOT stripped here — the project may have multiple
+            // GitNexus repos, and removing `repo` would cause "Multiple
+            // repositories indexed" errors. The LLM should include repo when
+            // it knows it, and GitNexus uses the default when omitted.
+            // GitNexus MCP server's `query` tool expects `pattern` as the
+            // search-text parameter key, but the LLM sends `query` (from Ox's
+            // precheck error message). Normalize it here.
+            if op == "query" || op == "cypher" {
+                if let Some(q) = obj.remove("query") {
+                    obj.insert("pattern".to_string(), q);
+                }
+            }
         }
 
         match svc.call(&op, forwarded).await {
@@ -118,6 +124,18 @@ impl Tool for CodeGraphTool {
                 if text.trim().is_empty() {
                     text = "(空结果)".to_string();
                 }
+                // If GitNexus says multiple repos, auto-list them so the LLM
+                // knows which repo name to use.
+                if text.contains("Multiple repositories indexed") {
+                    if let Ok(repos) = svc.list_repos().await {
+                        if !repos.is_error {
+                            let list = repos.text.trim();
+                            text.push_str(&format!(
+                                "\n\n📋 可用仓库:\n{list}\n请在下次调用时加上 repo 参数。"
+                            ));
+                        }
+                    }
+                }
                 // If GitNexus can't find the target (e.g. file not in git yet,
                 // or wrong repo parameter), append a helpful hint.
                 if text.contains("Target") && (text.contains("not found") || text.contains("NotFound")) {
@@ -125,7 +143,7 @@ impl Tool for CodeGraphTool {
                         "\n\n⚠️ 目标不在代码图谱中，可能原因：\
                          \n1. 该文件是新增的，尚未 git add → 直接编辑，无需 impact 分析\
                          \n2. GitNexus 索引未覆盖此模块 → 可继续编辑，跳过 impact\
-                         \n3. repo 参数不正确 → 尝试去掉 repo 参数重试"
+                         \n3. repo 参数不正确 → 用上面的可用仓库列表重试"
                     );
                 }
                 if text.len() > MAX_OUTPUT_CHARS {

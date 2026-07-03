@@ -179,16 +179,20 @@ pub fn inject_turn_input(messages: &mut Vec<crate::message::Message>, block: &st
         return;
     }
     strip_turn_input(messages);
-    messages.push(crate::message::Message::system(block));
+    // Inject as USER message (not System) so it has equal authority to old
+    // user messages. A system message saying "ignore old tasks" is easily
+    // overridden by visible old user messages like "fix X" or "change Y".
+    messages.push(crate::message::Message::user(block));
 }
 
 pub fn strip_turn_input(messages: &mut Vec<crate::message::Message>) {
     messages.retain(|m| {
-        !matches!(
-            m,
-            crate::message::Message::System { content }
-                if content.starts_with(TURN_INPUT_TAG)
-        )
+        let content = match m {
+            crate::message::Message::System { content } => content,
+            crate::message::Message::User { content } => content,
+            _ => return true,
+        };
+        !content.starts_with(TURN_INPUT_TAG)
     });
 }
 

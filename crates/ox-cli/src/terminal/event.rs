@@ -9,6 +9,8 @@ use tokio::sync::mpsc;
 pub enum Event {
     /// A key press (only Press kind, not Release/Repeat).
     Key(KeyEvent),
+    /// Bracketed paste content (multi-line text).
+    Paste(String),
     /// Terminal resized.
     #[allow(dead_code)]
     Resize(u16, u16),
@@ -35,6 +37,11 @@ impl EventHandler {
                                 && tx.send(Event::Key(key)).is_err() =>
                         {
                             break;
+                        }
+                        Ok(CrosstermEvent::Paste(data)) => {
+                            if tx.send(Event::Paste(data)).is_err() {
+                                break;
+                            }
                         }
                         Ok(CrosstermEvent::Resize(w, h))
                             if tx.send(Event::Resize(w, h)).is_err() =>

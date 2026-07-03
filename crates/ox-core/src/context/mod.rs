@@ -310,8 +310,10 @@ impl ContextBuilder {
             result.push(Message::system(&combined_system));
         }
 
-        // 2. Compact oldest completed rounds first (far→near, token-budget driven).
+        // 2. Demote old user messages (prepend HISTORICAL marker) so the LLM
+        //    treats them as completed requests, then compact if over budget.
         let mut history = history.to_vec();
+        demote_old_user_messages(&mut history);
         let history_budget = budgets.history as usize;
         compact_completed_rounds(&mut history, history_budget);
         // After compaction, start from index 0 — the system prompt is already in result[0].
@@ -1079,7 +1081,30 @@ pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
     }
 }
 
-/// Compact oldest completed rounds first, until remaining history fits within
+/// Demote old user messages that are before a `[ROUND_COMPLETE]` boundary by
+/// prepending a historical prefix, so the LLM sees them as completed history
+/// rather than active requests. This runs on the mutable copy of history, so
+/// the session store is never modified.
+pub fn demote_old_user_messages(messages: &mut [Message]) {
+    // Find the LAST [ROUND_COMPLETE] boundary
+    let last_boundary = messages.iter().rposition(|m| {
+        matches!(m, Message::System { content } if content.starts_with(
+            crate::agent::user_round::COMPLETE_BOUNDARY_TAG
+        ))
+    });
+    let Some(boundary) = last_boundary else {
+        return; // No completed rounds
+    };
+    // Any user message BEFORE the boundary is historical
+    for msg in &mut messages[..boundary] {
+        if let Message::User { content } = msg {
+            if !content.starts_with("(HISTORICAL") {
+                let demoted = format!("(HISTORICAL - 已完成) {}", content);
+                *content = demoted.chars().take(2000).collect();
+            }
+        }
+    }
+}
 /// `history_budget` tokens. Process from earliest (index 0) → newest, replacing
 /// each completed round (everything before a `[ROUND_COMPLETE]` boundary) with
 /// a compact `[ROUND_HISTORY]` summary. The current incomplete round is never

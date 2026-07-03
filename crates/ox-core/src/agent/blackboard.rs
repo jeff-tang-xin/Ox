@@ -6,15 +6,20 @@
 //! turn's context, in EVERY phase — unlike `[DURABLE_MEMORY]`, which goes silent
 //! during the Implement phase exactly when constraints matter most.
 //!
+//! Also stores **session facts** — key discoveries the LLM made about the codebase
+//! that should be remembered across turns within the same session.
+//!
 //! Sources:
-//! - User mid-task input that reads as a constraint ("不要动 X", "必须保持兼容",
-//!   "用 Y 不要用 Z", "别改测试") — detected heuristically and pinned here.
-//! - Explicit facts the model surfaces (future: parsed from a reflection tag).
+//! - User mid-task input that reads as a constraint ("不要动 X", "必须保持兼容") 
+//! - LLM discoveries automatically extracted from finish summaries
+//! - Explicit facts from [TURN_CONTEXT].decisions
 
 use crate::agent::engine::WorkflowEngine;
 
 const CONSTRAINTS_KEY: &str = "_blackboard_constraints";
+const FACTS_KEY: &str = "_session_facts";
 const MAX_CONSTRAINTS: usize = 12;
+const MAX_FACTS: usize = 20;
 const MAX_LEN: usize = 200;
 
 /// Pin a constraint. De-duplicates and caps the list (oldest dropped).
@@ -47,18 +52,30 @@ pub fn constraints(engine: &WorkflowEngine) -> Vec<String> {
 
 pub fn clear(engine: &WorkflowEngine) {
     engine.set_variable(CONSTRAINTS_KEY, String::new());
+    engine.set_variable(FACTS_KEY, String::new());
 }
 
 /// Block for injection at the top of the turn context. Empty when no constraints.
 pub fn block(engine: &WorkflowEngine) -> String {
+    let mut out = String::new();
     let list = constraints(engine);
-    if list.is_empty() {
-        return String::new();
+    if !list.is_empty() {
+        out.push_str("📌 用户约束（跨轮恒定，必须始终遵守）:");
+        for c in &list {
+            out.push_str("\n  • ");
+            out.push_str(c);
+        }
     }
-    let mut out = String::from("📌 用户约束（跨轮恒定，必须始终遵守）:");
-    for c in &list {
-        out.push_str("\n  • ");
-        out.push_str(c);
+    let facts = session_facts(engine);
+    if !facts.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("📚 本轮已发现的业务知识:");
+        for f in &facts {
+            out.push_str("\n  • ");
+            out.push_str(f);
+        }
     }
     out
 }
@@ -100,6 +117,37 @@ pub fn looks_like_constraint(text: &str) -> bool {
     ];
     let lower = t.to_lowercase();
     SIGNALS.iter().any(|s| lower.contains(s))
+}
+
+/// Record a discovered fact about the codebase (cross-turn memory).
+/// Facts are deduplicated and capped to prevent bloat.
+pub fn add_fact(engine: &WorkflowEngine, fact: &str) {
+    let fact = fact.trim();
+    if fact.is_empty() || fact.chars().count() > MAX_LEN {
+        return;
+    }
+    let mut list: Vec<String> = engine
+        .get_variable(FACTS_KEY)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if list.iter().any(|f| f == fact) {
+        return;
+    }
+    if list.len() >= MAX_FACTS {
+        list.remove(0);
+    }
+    list.push(fact.to_string());
+    if let Ok(json) = serde_json::to_string(&list) {
+        engine.set_variable(FACTS_KEY, json);
+    }
+}
+
+/// All recorded session facts.
+pub fn session_facts(engine: &WorkflowEngine) -> Vec<String> {
+    engine
+        .get_variable(FACTS_KEY)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

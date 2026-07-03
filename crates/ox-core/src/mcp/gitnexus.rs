@@ -464,6 +464,11 @@ impl GitNexusService {
                 return Ok(c.clone());
             }
         }
+        // If a background index build is in progress, don't start a new server
+        // on the half-built index — wait for the build to complete.
+        if self.is_building() {
+            anyhow::bail!("GitNexus index is being built in background; retry shortly");
+        }
         tracing::warn!("[GitNexus] server not alive — restarting");
         self.start().await
     }
@@ -619,6 +624,19 @@ impl GitNexusService {
         tokio::task::spawn_blocking(move || index_built_at(&root).is_some())
             .await
             .unwrap_or(false)
+    }
+
+    /// Run `gitnexus analyze` if the index is dirty (edits happened since last
+    /// query). Called from the pre-turn pipeline so reindex runs between turns,
+    /// not during a code_graph call.
+    pub async fn reindex_if_dirty(&self) {
+        if !self.config.reindex_on_change {
+            return;
+        }
+        if self.is_dirty() {
+            tracing::info!("[GitNexus] pre-turn: dirty index, running analyze");
+            let _ = self.ensure_fresh_for_query().await;
+        }
     }
 
     /// (B) Decide whether a startup reindex is needed: true when the repo was

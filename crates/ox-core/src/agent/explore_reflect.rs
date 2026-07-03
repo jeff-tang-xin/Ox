@@ -33,10 +33,10 @@ const READONLY_TOOLS: &[&str] = &[
 const PROGRESS_TOOLS: &[&str] = &["file_write", "edit_file", "delete_range"];
 
 /// Consecutive read-only turns before a reflection prompt is injected.
-pub const REFLECT_AT: u32 = 12;
+pub const REFLECT_AT: u32 = 15;
 
 /// Further read-only turns after reflection before handing back to the user.
-pub const STOP_AFTER_REFLECT: u32 = 8;
+pub const STOP_AFTER_REFLECT: u32 = 15;
 
 /// What the loop should do after classifying one turn's tool batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,16 +109,17 @@ pub fn evaluate(
 fn reflect_message(streak: u32, user_task: &str) -> String {
     let task: String = user_task.chars().take(300).collect();
     format!(
-        "🪞 反思检查点：你已连续 {streak} 次只做探索（读文件/查符号）还没有动手或收尾。\n\
-         在继续之前，先用 2-4 行回答自己（写在下一步的思考里）：\n\
-         1. 原始任务到底是什么？→ {task}\n\
-         2. 我已经查清了哪些关键信息？\n\
-         3. 还差哪一个**具体**信息才能动手？（说不出来，就说明信息已经够了）\n\
-         ⚠️ 不必读全所有相关类：定位到目标方法 + 它直接用到的数据结构，就足以写出 fix_plan。\n\
-         泛读 Repository/Dao/基类等间接依赖通常是过度探索。\n\
-         然后二选一，立即执行：\n\
-         • 信息够了 → finish 提交 finding_json（含具体 fix_plan），或直接 edit_file 开始改；\n\
-         • 真还差一个具体信息 → 只补那一个，禁止再泛读其它文件。"
+        "🪞 **反思检查点**：你已连续 {streak} 轮只做探索还没有动手或收尾。\n\
+         \n\
+         请**立即**做以下三件事之一：\n\
+         \n\
+         1. **信息够了 → 动手** — 直接 `finish(finding_json=[...])` 提交计划，或 `edit_file` 改代码。\n\
+         \n\
+         2. **不确定 → 问用户** — 业务逻辑、命名意图、方案选择不明确时，直接 `finish(content=你的问题)` 问用户。不要自己猜。\n\
+         \n\
+         3. **真就差一个具体信息 → 只补那一个文件** — 说出缺什么，读完立即回头动手。禁止再泛读。\n\
+         \n\
+         原始任务：{task}"
     )
 }
 

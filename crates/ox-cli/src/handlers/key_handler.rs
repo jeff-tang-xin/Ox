@@ -91,7 +91,12 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> KeyResult {
             // We signal the caller to handle it.
             return KeyResult::Interrupt;
         }
-        // Enter — submit input
+        // Enter — submit input (plain Enter submits; Alt+Enter / Ctrl+Enter inserts newline)
+        (KeyCode::Enter, KeyModifiers::ALT) | (KeyCode::Enter, KeyModifiers::CONTROL) => {
+            app.input.insert_newline();
+            app.dirty = true;
+            return KeyResult::Handled;
+        }
         (KeyCode::Enter, _) => {
             if let Some(input) = app.submit_input() {
                 return KeyResult::InputSubmitted(input);

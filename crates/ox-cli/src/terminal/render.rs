@@ -75,24 +75,22 @@ pub fn render(frame: &mut Frame, app: &mut App, tick_count: u64) {
 
     // Adaptive layout based on terminal height
     let is_tiny = area.height < 15;
-    let indexing_bar = if app.indexing && app.index_has_progress() {
-        1u16
-    } else {
-        0
-    };
-    let has_workflow = app.workflow_display.is_some() as u16;
     let header_height = if is_tiny {
         0
     } else {
-        (2u16 + has_workflow + indexing_bar).min(5)
+        1u16 // compact: model + workflow step in one line
     };
 
-    let input_height =
-        if app.pending_confirmation.is_some() || app.workflow_awaiting_confirmation.is_some() {
+    let input_height = {
+        let base = if app.pending_confirmation.is_some() || app.workflow_awaiting_confirmation.is_some() {
             3
         } else {
             2
         };
+        // Expand for multiline input (up to 8 lines)
+        let lines = app.input.buffer.lines().count();
+        (base + lines.saturating_sub(1)).min(8) as u16
+    };
 
     let chunks = Layout::vertical([
         Constraint::Length(header_height),
@@ -467,20 +465,27 @@ fn render_single_line(
             }
         }
         OutputLine::Tool { name, detail } => {
-            // Tool calls with subtle background indicator
+            // Tool calls with action-specific icons
+            let icon = match name.as_str() {
+                "file_read" => " 📖 ",
+                "file_write" | "edit_file" | "delete_range" => " ✏️ ",
+                "find_symbol" | "code_search" | "file_search" => " 🔎 ",
+                "shell_exec" => " 💻 ",
+                "code_graph" => " 🕸 ",
+                "finish" | "complete_and_check" => " ✅ ",
+                _ => " ⚙ ",
+            };
             let mut spans = vec![
-                Span::styled(
-                    " ⚙ ".to_string(),
-                    Style::default().fg(TOOL_COLOR).bg(Color::Rgb(40, 40, 30)),
-                ),
+                Span::styled(icon, Style::default().fg(TOOL_COLOR)),
                 Span::styled(
                     name.clone(),
                     Style::default().fg(TOOL_COLOR).add_modifier(Modifier::BOLD),
                 ),
             ];
             if let Some(cmd) = detail {
+                let short = cmd.chars().take(80).collect::<String>();
                 spans.push(Span::styled(
-                    format!(" → {}", cmd),
+                    format!(" {}", short),
                     Style::default().fg(TEXT_DIM),
                 ));
             }
@@ -492,21 +497,15 @@ fn render_single_line(
             summary,
             is_error,
         } => {
-            // Tool results with clear success/error indicators
-            let (icon, color, bg) = if *is_error {
-                (" ✗ ", TOOL_ERR, Color::Rgb(50, 20, 20))
+            let (icon, color) = if *is_error {
+                (" ✗", TOOL_ERR)
             } else {
-                (" ✓ ", TOOL_OK, Color::Rgb(20, 40, 20))
+                (" ✓", TOOL_OK)
             };
+            let short: String = summary.chars().take(120).collect();
             vec![Line::from(vec![
-                Span::styled(
-                    icon,
-                    Style::default()
-                        .fg(color)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(bg),
-                ),
-                Span::styled(summary.clone(), Style::default().fg(color)),
+                Span::styled(icon, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(short, Style::default().fg(color)),
             ])]
         }
         OutputLine::System(s) => {
@@ -563,7 +562,25 @@ fn render_single_line(
             if s.is_empty() {
                 return vec![Line::from("")];
             }
-            md_renderer.render_lines(s, width)
+            // Apply color to tool-prefixed output lines (──, ✓, ✗)
+            let first = s.lines().next().unwrap_or("").trim();
+            if first.starts_with('✓') || first.starts_with("── DATA") {
+                let rendered = md_renderer.render_lines(s, width);
+                if rendered.is_empty() {
+                    vec![Line::from(Span::styled(s.clone(), Style::default().fg(TOOL_OK)))]
+                } else {
+                    rendered
+                }
+            } else if first.starts_with('✗') || s.contains("Error:") || s.contains("错误") {
+                let rendered = md_renderer.render_lines(s, width);
+                if rendered.is_empty() {
+                    vec![Line::from(Span::styled(s.clone(), Style::default().fg(TOOL_ERR)))]
+                } else {
+                    rendered
+                }
+            } else {
+                md_renderer.render_lines(s, width)
+            }
         }
         OutputLine::ToolLog {
             tool_call_id: _,

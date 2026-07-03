@@ -472,6 +472,22 @@ pub fn finding_index_for_target(engine: &WorkflowEngine, target: &serde_json::Va
             return Some(f.index);
         }
     }
+    // Try class-name match: extract file name without extension from both sides.
+    // E.g. target="OmsxTradingConfigurationDao" matches file ".../OmsxTradingConfigurationDao.java"
+    let target_name = target_str.rsplit('/').next()
+        .or_else(|| target_str.rsplit('\\').next())
+        .unwrap_or(target_str);
+    // Strip file extension (.java, .kt, etc.) from target
+    let target_class = target_name.split('.').next().unwrap_or(target_name);
+    for f in &store.findings {
+        let fname = f.file.rsplit('/').next()
+            .or_else(|| f.file.rsplit('\\').next())
+            .unwrap_or(&f.file);
+        let fclass = fname.split('.').next().unwrap_or(fname);
+        if fclass == target_class {
+            return Some(f.index);
+        }
+    }
     None
 }
 

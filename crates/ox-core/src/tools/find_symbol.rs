@@ -62,6 +62,30 @@ impl Tool for FindSymbolTool {
         let name_owned = name.to_string();
         let working_dir = ctx.working_dir.clone();
 
+        // Before tree-sitter search, try code_graph query to get execution flow
+        // context. The LLM doesn't need to call code_graph separately —
+        // find_symbol folds in both symbol location AND relationship model.
+        // Timeout at 2s so it never slows down the symbol search.
+        let mut graph_prefix = String::new();
+        if let Some(ref svc) = ctx.gitnexus {
+            if svc.is_ready().await {
+                let qp = crate::mcp::gitnexus::QueryParams::new(name);
+                if let Ok(graph) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    svc.query(&qp),
+                ).await {
+                    if let Ok(g) = graph {
+                        if !g.is_error {
+                            let t = g.text.trim();
+                            if !t.is_empty() && t != "(空结果)" {
+                                graph_prefix = format!("── code_graph/query ──\n{t}\n\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let result = tokio::task::spawn(async move {
             // ── Step 1: tree-sitter direct search (always available, no index needed) ──
             let mut extractor = crate::knowledge::extractor::AstExtractor::new();
@@ -107,7 +131,13 @@ impl Tool for FindSymbolTool {
 
         match result {
             Ok(Ok(outcome)) => {
-                let mut output = outcome.output;
+                let mut output = String::new();
+                // Prepend code_graph query result (execution flow context)
+                if !graph_prefix.is_empty() {
+                    output.push_str(&graph_prefix);
+                }
+                // Main symbol search result
+                output.push_str(&outcome.output);
                 // Seamlessly fold in GitNexus relationship context (callers/callees/
                 // refs) when the graph is ready — no separate code_graph call needed.
                 if let Some(extra) =

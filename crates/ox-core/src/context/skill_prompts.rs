@@ -60,7 +60,7 @@ Examples:
 - Effective Git commit message format
 - Debugging memory leaks in any language
 
-**Decision Rule:** When in doubt, prefer **project** scope. Global Skills should be truly universal.
+**Decision Rule:** Evaluate both project and global scope. If the knowledge could benefit other projects, use **global**. If it references specific files, packages, or business logic unique to this project, use **project**.
 
 ## Rules
 

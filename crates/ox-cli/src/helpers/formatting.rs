@@ -56,57 +56,67 @@ pub fn short_display_path(path: &str, max_chars: usize) -> String {
     }
 }
 
-/// Summarize tool result for display.
+/// Summarize tool result for display — outputs compact Markdown-like text.
 pub fn summarize_tool_result(name: &str, output: &str) -> String {
     match name {
         "file_write" | "edit_file" | "delete_range" => {
             let first_line = output.lines().next().unwrap_or(output);
+            let path = first_line
+                .trim_start_matches("✅ Successfully written")
+                .trim_start_matches("✅ Successfully applied patch to")
+                .trim_start_matches("✅ Successfully applied edit to")
+                .trim_start_matches("✅ Successfully deleted")
+                .trim()
+                .trim_start_matches(" bytes to ")
+                .trim();
             let ast_note = if output.contains("⚠️ AST Syntax Check") {
-                " ⚠️ AST errors"
+                " `⚠️ AST errors`"
             } else {
                 ""
             };
-            let truncated: String = first_line.chars().take(100).collect();
-            if first_line.len() > 100 {
-                format!("{truncated}...{ast_note}")
-            } else {
-                format!("{truncated}{ast_note}")
-            }
+            let short_path = short_display_path(path, 60);
+            let truncated: String = short_path.chars().take(100).collect();
+            format!("`{truncated}`{ast_note}")
         }
         "file_read" => {
             let line_count = output.lines().count();
-            let first_path = output
+            let path = output
                 .lines()
                 .next()
-                .and_then(|l| l.split_whitespace().next())
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .find(|w| w.contains(".java") || w.contains(".kt") || w.contains(".ts") || w.contains(".rs") || w.contains(".py") || w.contains('.')
+                            && l.trim_start().chars().all(|c| c.is_ascii_digit() || c.is_whitespace() || c == '.' || c == '/' || c == '\\'))
+                })
                 .unwrap_or("");
-            if first_path.is_empty() {
-                format!("{line_count} lines")
+            if path.is_empty() {
+                format!("`{line_count} lines`")
             } else {
-                format!("{first_path} ({line_count} lines)")
+                let short = short_display_path(path, 50);
+                format!("`{short}` · {line_count} lines")
             }
         }
         "code_search" => {
             let match_count = output.lines().take(101).count();
             if output.contains("truncated") {
-                format!("100+ matches")
+                "`100+ matches`".into()
             } else if match_count == 0 {
-                "no matches".into()
+                "`no matches`".into()
             } else {
-                format!("{match_count} matches")
+                format!("`{match_count} matches`")
             }
         }
         "shell_exec" => {
             if let Some(line) = output.lines().find(|l| l.starts_with("[exit code:")) {
-                format!("{line}")
+                format!("`{line}`")
             } else {
                 let count = output.lines().count();
-                format!("{count} lines")
+                format!("`{count} lines`")
             }
         }
         "file_list" | "file_search" => {
             let count = output.lines().count();
-            format!("{count} entries")
+            format!("`{count} entries`")
         }
         "project_detect" => {
             let first_line = output.lines().next().unwrap_or(output);
@@ -115,18 +125,16 @@ pub fn summarize_tool_result(name: &str, output: &str) -> String {
         }
         "git_status" | "git_diff" | "git_commit" => {
             let count = output.lines().count();
-            format!("{count} lines")
+            format!("`{count} lines`")
         }
         "web_fetch" => {
             let len = output.len();
-            format!("{len} chars")
+            format!("`{len} chars`")
         }
         "complete_and_check" => {
-            // Compact format: "✓ action\noutput" or "✗ error" or "✓ confirmed (gate:kind)"
             let first = output.lines().next().unwrap_or("?");
-            if first.starts_with("✓ file_read")
-                || first.starts_with("✓ find_symbol")
-                || first.starts_with("✓ code_search")
+            if first.starts_with("✓")
+                || first.starts_with("✗")
             {
                 let rest: String = output.lines().skip(1).take(2).collect::<Vec<_>>().join(" ");
                 let rest: String = rest.chars().take(80).collect();
@@ -138,7 +146,7 @@ pub fn summarize_tool_result(name: &str, output: &str) -> String {
         _ => {
             let truncated: String = output.chars().take(120).collect();
             if output.len() > 120 {
-                format!("{truncated}...")
+                format!("{truncated}…")
             } else {
                 truncated
             }

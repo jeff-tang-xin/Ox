@@ -341,6 +341,13 @@ fn emit_turn_done(
     new_messages: Vec<Message>,
     usage: TokenUsage,
 ) {
+    tracing::info!(
+        "[TURN_DONE] turn_id={}, new_messages={}, prompt_tokens={}, completion_tokens={}",
+        turn_id,
+        new_messages.len(),
+        usage.prompt_tokens,
+        usage.completion_tokens,
+    );
     let _ = ui_tx.send(AgentToUiEvent::TurnDone {
         turn_id,
         new_messages,
@@ -388,19 +395,22 @@ fn try_capture_review_findings(
         }
     }
     if result.phase == crate::agent::phase::SingleFlowPhase::AwaitUser {
-        crate::agent::business_gate::arm_findings_scope(&engine);
-        if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
-            let summary = store.scope_confirm_summary();
-            let _ = ui_tx.send(AgentToUiEvent::ScopeConfirmPrompt {
-                summary: summary.clone(),
-            });
-            let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                "✅ 审查 findings 已记录 — {summary}\n请在面板选择范围后按 c 或 /confirm"
-            )));
-        } else {
-            let _ = ui_tx.send(AgentToUiEvent::Status(
-                "✅ 审查 findings 已记录 — 请在面板选择范围后按 c 或 /confirm".to_string(),
-            ));
+        // Don't re-arm if already confirmed
+        if !crate::agent::business_gate::scope_implementation_unlocked(&engine) {
+            crate::agent::business_gate::arm_findings_scope(&engine);
+            if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
+                let summary = store.scope_confirm_summary();
+                let _ = ui_tx.send(AgentToUiEvent::ScopeConfirmPrompt {
+                    summary: summary.clone(),
+                });
+                let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                    "✅ 审查 findings 已记录 — {summary}\n请在面板选择范围后按 c 或 /confirm"
+                )));
+            } else {
+                let _ = ui_tx.send(AgentToUiEvent::Status(
+                    "✅ 审查 findings 已记录 — 请在面板选择范围后按 c 或 /confirm".to_string(),
+                ));
+            }
         }
         return true;
     }
@@ -833,8 +843,8 @@ pub async fn run_agent_turn(
     let mut total_usage = TokenUsage::default();
 
     const MAX_SAME_TOOL_CALLS: u32 = 5; // Maximum times the same tool can be called in one turn
-    const COMPACT_MESSAGES_AFTER_ITER: u32 = 8; // preserve longer ReAct context before compacting
-    const COMPACT_KEEP_TAIL: usize = 32; // keep enough real tool results for recovery
+    const COMPACT_MESSAGES_AFTER_ITER: u32 = 999; // effectively disable; outer context_builder handles budget
+    const COMPACT_KEEP_TAIL: usize = 60; // keep enough messages for long tasks
 
     // Fresh symbol-search dedup each agent spawn (workflow vars may survive across sessions).
     if let Some(wf) = &workflow_engine {
@@ -931,8 +941,42 @@ pub async fn run_agent_turn(
 
         // Check for queued interjections before LLM call.
         while let Ok(ev) = ui_rx.try_recv() {
-            if let ui_event::UiToAgentEvent::Interjection(text) = ev {
-                push_interjection_message(&workflow_engine, &mut messages, &text, &ui_tx);
+            match ev {
+                ui_event::UiToAgentEvent::Interjection(text) => {
+                    let trimmed = text.trim();
+                    let is_confirm = trimmed == "c"
+                        || trimmed.starts_with("/confirm")
+                        || trimmed.starts_with("/fix")
+                        || trimmed.contains("确认")
+                        || trimmed.contains("开始实施");
+                    if is_confirm {
+                        // Set pre-ack so scope gate skips waiting
+                        if let Some(wf) = &workflow_engine {
+                            if let Ok(engine) = wf.try_lock() {
+                                engine.set_variable(
+                                    crate::agent::business_gate::PRE_ACK_KEY,
+                                    "1".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    push_interjection_message(&workflow_engine, &mut messages, &text, &ui_tx);
+                }
+                // ScopeConfirmed / BusinessAck sent by the UI when user presses "c".
+                // These would be consumed by try_recv() and dropped — set pre-ack
+                // so the scope gate can find it via engine variable instead.
+                ui_event::UiToAgentEvent::ScopeConfirmed
+                | ui_event::UiToAgentEvent::BusinessAck { .. } => {
+                    if let Some(wf) = &workflow_engine {
+                        if let Ok(engine) = wf.try_lock() {
+                            engine.set_variable(
+                                crate::agent::business_gate::PRE_ACK_KEY,
+                                "1".to_string(),
+                            );
+                        }
+                    }
+                }
+                _ => {} // Other events ignored
             }
         }
 
@@ -1073,89 +1117,22 @@ pub async fn run_agent_turn(
             tool_schemas.clone()
         };
 
-        // 📝 LOG REQUEST CONTEXT: Log the complete context sent to LLM for debugging
-        tracing::info!("\n{}", "=".repeat(80));
-        tracing::info!("🤖 LLM REQUEST CONTEXT (Iteration {})", iteration + 1);
-        tracing::info!("{}", "=".repeat(80));
-        tracing::info!("Total messages: {}", msgs.len());
+        // 📝 LOG REQUEST CONTEXT (debug level — expensive, iterates all messages)
+        tracing::debug!("\n{}", "=".repeat(80));
+        tracing::debug!("🤖 LLM REQUEST CONTEXT (Iteration {})", iteration + 1);
+        tracing::debug!("{}", "=".repeat(80));
+        tracing::debug!("Total messages: {}", msgs.len());
 
-        // Show system prompt preview
+        // Show system prompt preview (debug level)
         if let Some(first_msg) = msgs.first() {
             if let Message::System { content } = first_msg {
-                let sys_prompt_len = content.chars().count();
-                tracing::info!("📋 SYSTEM PROMPT LENGTH: {} characters", sys_prompt_len);
-                let preview = if sys_prompt_len > 1000 {
-                    format!(
-                        "{}...[truncated]",
-                        content.chars().take(1000).collect::<String>()
-                    )
-                } else {
-                    content.clone()
-                };
-                tracing::info!(
-                    "📋 SYSTEM PROMPT PREVIEW:\n{}",
-                    preview.replace('\n', "\\n")
-                );
+                tracing::debug!("📋 SYSTEM PROMPT LENGTH: {} characters", content.chars().count());
             }
         }
-
-        // Log each message with role and preview
-        for (i, msg) in msgs.iter().enumerate() {
-            let (role, content_preview) = match msg {
-                Message::System { .. } => continue,
-                Message::User { content } => (
-                    "USER",
-                    if content.chars().count() > 150 {
-                        format!("{}...", content.chars().take(150).collect::<String>())
-                    } else {
-                        content.clone()
-                    },
-                ),
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                    ..
-                } => {
-                    let tc_info = if !tool_calls.is_empty() {
-                        format!(" [tool_calls: {}]", tool_calls.len())
-                    } else {
-                        String::new()
-                    };
-                    let preview = if content.chars().count() > 150 {
-                        format!("{}...", content.chars().take(150).collect::<String>())
-                    } else {
-                        content.clone()
-                    };
-                    ("ASSISTANT", format!("{}{}", preview, tc_info))
-                }
-                Message::ToolResult {
-                    tool_call_id,
-                    content,
-                } => {
-                    let preview = if content.chars().count() > 100 {
-                        format!("{}...", content.chars().take(100).collect::<String>())
-                    } else {
-                        content.clone()
-                    };
-                    ("TOOL_RESULT", format!("[{}] {}", tool_call_id, preview))
-                }
-            };
-            tracing::info!(
-                "  [{}] {}: {}",
-                i,
-                role,
-                content_preview.replace('\n', "\\n")
-            );
-        }
-        tracing::info!(
-            "Enabled tools: {}",
-            schemas
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+        tracing::debug!("Enabled tools: {}",
+            schemas.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
         );
-        tracing::info!("{}", "=".repeat(80));
+        tracing::debug!("{}", "=".repeat(80));
 
         let mut llm_opts = crate::llm::StreamOptions::default();
         if unified_tool_mode && !schemas.is_empty() {
@@ -1170,7 +1147,7 @@ pub async fn run_agent_turn(
             llm_opts.tool_choice = Some(crate::llm::ToolChoice::Function(
                 crate::agent::unified_action::TOOL_NAME.to_string(),
             ));
-            llm_opts.parallel_tool_calls = Some(false);
+            llm_opts.parallel_tool_calls = Some(true);
         }
         let cancel_clone = cancel_token.clone();
         let llm_tx_err = llm_tx.clone();
@@ -1199,12 +1176,36 @@ pub async fn run_agent_turn(
         let mut think_stream = crate::agent::think_stream::ThinkTagStreamFilter::new();
         let mut last_stream_completion_tokens = 0u32;
 
+        // Timeout for the entire LLM response (stream first token → stream done).
+        // Separate from the per-tool 300s timeout; prevents the agent hanging
+        // for 15+ minutes when the API silently drops the connection.
+        const LLM_RESPONSE_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(180);
+
         while let Some(event) = tokio::select! {
             ev = llm_rx.recv() => ev,
             _ = cancel_token.cancelled() => {
-                // Cancellation requested — stop receiving LLM events.
                 tracing::warn!("[AGENT] ⚠️ Cancellation token triggered, stopping LLM stream");
                 None
+            }
+            _ = tokio::time::sleep(LLM_RESPONSE_TIMEOUT) => {
+                tracing::error!(
+                    "[AGENT] ⏱️ LLM response timed out after {:?}",
+                    LLM_RESPONSE_TIMEOUT
+                );
+                // Abort the stream task so it stops waiting on the API
+                stream_handle.abort();
+                let _ = ui_tx.send(AgentToUiEvent::Status(
+                    "⏱️ LLM 响应超时 (180s) — 请重试或简化请求".to_string(),
+                ));
+                // Add interrupt boundary so the next round knows what happened
+                let boundary = crate::agent::user_round::format_interrupt_boundary_message(
+                    &user_task.clone().unwrap_or_default(),
+                );
+                new_messages.push(crate::message::Message::system(&boundary));
+                messages.push(crate::message::Message::system(&boundary));
+                emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
+                return;
             }
         } {
             match event {
@@ -1262,21 +1263,20 @@ pub async fn run_agent_turn(
                     total_usage.completion_tokens += usage.completion_tokens;
                     total_usage.total_tokens += usage.total_tokens;
 
-                    // 📝 LOG RESPONSE SUMMARY
-                    tracing::info!("\n{}", "-".repeat(80));
-                    tracing::info!("📤 LLM RESPONSE SUMMARY");
-                    tracing::info!("{}", "-".repeat(80));
+                    // 📝 LOG RESPONSE SUMMARY (debug level)
+                    tracing::debug!("\n{}", "-".repeat(80));
+                    tracing::debug!("📤 LLM RESPONSE SUMMARY");
+                    tracing::debug!("{}", "-".repeat(80));
                     if !full_text.is_empty() {
-                        // 🚨 FIX: Use char-based truncation
                         let preview = if full_text.chars().count() > 300 {
                             format!("{}...", full_text.chars().take(300).collect::<String>())
                         } else {
                             full_text.clone()
                         };
-                        tracing::info!("Text response: {}", preview.replace('\n', "\\n"));
+                        tracing::debug!("Text response: {}", preview.replace('\n', "\\n"));
                     }
                     if !tool_calls.is_empty() {
-                        tracing::info!(
+                        tracing::debug!(
                             "Tool calls: {}",
                             tool_calls
                                 .iter()
@@ -1284,16 +1284,13 @@ pub async fn run_agent_turn(
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
-
-                        // Log each tool call's arguments (truncated)
                         for tc in &tool_calls {
-                            // 🚨 FIX: Use char-based truncation
                             let args_preview = if tc.arguments.chars().count() > 200 {
                                 format!("{}...", tc.arguments.chars().take(200).collect::<String>())
                             } else {
                                 tc.arguments.clone()
                             };
-                            tracing::info!(
+                            tracing::debug!(
                                 "  - {} [{}]: {}",
                                 tc.name,
                                 tc.id,
@@ -1301,9 +1298,9 @@ pub async fn run_agent_turn(
                             );
                         }
                     } else {
-                        tracing::info!("No tool calls");
+                        tracing::debug!("No tool calls");
                     }
-                    tracing::info!("{}", "-".repeat(80));
+                    tracing::debug!("{}", "-".repeat(80));
 
                     break;
                 }
@@ -2112,7 +2109,7 @@ pub async fn run_agent_turn(
                             content.clone()
                         };
                         let args_preview: String = tc.arguments.chars().take(500).collect();
-                        tracing::info!(
+                        tracing::debug!(
                             "[UNIFIED_IO] complete_and_check | args={} | error={} | result={}",
                             args_preview,
                             is_error,
@@ -2733,8 +2730,22 @@ pub async fn run_agent_turn(
 
             // Check for queued interjections before tool execution.
             while let Ok(ev) = ui_rx.try_recv() {
-                if let ui_event::UiToAgentEvent::Interjection(text) = ev {
-                    push_interjection_message(&workflow_engine, &mut messages, &text, &ui_tx);
+                match ev {
+                    ui_event::UiToAgentEvent::Interjection(text) => {
+                        push_interjection_message(&workflow_engine, &mut messages, &text, &ui_tx);
+                    }
+                    ui_event::UiToAgentEvent::ScopeConfirmed
+                    | ui_event::UiToAgentEvent::BusinessAck { .. } => {
+                        if let Some(wf) = &workflow_engine {
+                            if let Ok(engine) = wf.try_lock() {
+                                engine.set_variable(
+                                    crate::agent::business_gate::PRE_ACK_KEY,
+                                    "1".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -2914,9 +2925,13 @@ pub async fn run_agent_turn(
 
             // Send notification about offloading
             if offloaded.is_offloaded {
+                let path_display = offloaded
+                    .ref_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "?".to_string());
                 let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                    "📄 Result offloaded to: {}",
-                    offloaded.ref_path.as_ref().unwrap().display()
+                    "📄 Result offloaded to: {path_display}",
                 )));
             }
 
@@ -3477,12 +3492,20 @@ pub async fn run_agent_turn(
             ) {
                 explore_reflect::ReflectAction::Continue => {}
                 explore_reflect::ReflectAction::Reflect(prompt) => {
+                    tracing::info!(
+                        "[EXPLORE_REFLECT] Reflect at streak={} — injecting self-assessment",
+                        explore_streak
+                    );
                     let _ = ui_tx.send(AgentToUiEvent::Status(
                         "🪞 探索反思检查点 — 提示模型盘点已知信息后动手。".to_string(),
                     ));
                     messages.push(Message::system(&prompt));
                 }
                 explore_reflect::ReflectAction::Stop(handoff) => {
+                    tracing::warn!(
+                        "[EXPLORE_REFLECT] Stop at streak={} — ending turn (only read-only tools)",
+                        explore_streak
+                    );
                     let _ = ui_tx.send(AgentToUiEvent::Status(format!(
                         "🛑 连续 {explore_streak} 次只探索不动手 — 暂停本轮，等待你的指示。"
                     )));

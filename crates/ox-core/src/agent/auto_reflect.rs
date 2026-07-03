@@ -278,7 +278,7 @@ impl AutoReflector {
 
     /// Write skill markdown to disk via dedup::plan_skill_write (shared by instance and static callers).
     fn write_skill_file(project_root: &Path, content: &str) -> Result<String> {
-        let (repaired_content, skill_id, scope) = match Self::extract_frontmatter_static(content) {
+        let (repaired_content, skill_id, scope, _description) = match Self::extract_frontmatter_static(content) {
             Ok((metadata, body)) => {
                 let id = metadata.get("id").cloned().unwrap_or_else(|| {
                     body.lines()
@@ -311,7 +311,7 @@ impl AutoReflector {
                     scope,
                     body.trim()
                 );
-                (fixed, id, scope)
+                (fixed, id, scope, description)
             }
             Err(_) => {
                 let body = content.trim();
@@ -325,7 +325,7 @@ impl AutoReflector {
                     "---\nname: \"{}\"\ndescription: \"AI generated skill\"\nscope: \"project\"\n---\n\n{}",
                     title, body
                 );
-                (fixed, id, "project".to_string())
+                (fixed, id, "project".to_string(), "AI generated skill".to_string())
             }
         };
 

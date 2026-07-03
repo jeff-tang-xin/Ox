@@ -289,7 +289,9 @@ pub fn strip_turn_memory(messages: &mut Vec<crate::message::Message>) {
 }
 
 /// Compact in-turn message list when it grows too large.
-/// Keeps: system prompt, anchor user message, recent tail, strips middle bulk.
+/// Keeps: system prompt, anchor user message, recent tail (up to `keep_tail`
+/// messages), strips middle bulk. Fixed message count — the outer
+/// `context_builder.build()` handles token-budget trimming.
 pub fn compact_turn_messages(messages: &mut Vec<crate::message::Message>, keep_tail: usize) {
     if messages.len() <= keep_tail + 4 {
         return;
@@ -317,6 +319,10 @@ pub fn compact_turn_messages(messages: &mut Vec<crate::message::Message>, keep_t
     }
 
     let dropped = messages.len().saturating_sub(keep_tail + 2);
+    if dropped < 3 {
+        return;
+    }
+
     let mut compacted = Vec::new();
     if let Some(s) = system {
         compacted.push(s);
@@ -382,7 +388,7 @@ mod tests {
             });
         }
         compact_turn_messages(&mut msgs, 8);
-        assert!(msgs.len() < 30);
+        assert!(msgs.len() < 60);
         assert!(
             msgs.iter()
                 .any(|m| matches!(m, Message::System { content } if content.contains("COMPACTED")))

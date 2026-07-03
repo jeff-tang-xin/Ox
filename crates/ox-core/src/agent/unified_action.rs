@@ -363,7 +363,7 @@ fn unified_route_spec(engine: &WorkflowEngine) -> UnifiedRouteSpec {
                         "finish",
                     ],
                     vec!["edit_file", "file_write", "delete_range", "shell_exec"],
-                    "探索(只读)：code_graph(op=query/context/impact) 建关系模型+影响面，配合 file_read 核证 → finish 提交 finding_json 确认一次 → 实施 → finish 结束。禁止未确认前改代码。",
+                    "探索(只读)：先用 code_graph op=list_repos 看有哪些仓库，再用 code_graph op=query/context/impact 建关系模型+影响面，配合 file_read 核证 → finish 提交 finding_json 确认一次 → 实施 → finish 结束。禁止未确认前改代码。",
                 )
             }
         }

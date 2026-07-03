@@ -59,9 +59,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("Provider init failed (will retry on /model): {}", err);
     }
 
+    use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
+    stdout.execute(EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -76,8 +79,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
+    let mut stdout = io::stdout();
+    let _ = stdout.execute(DisableBracketedPaste);
     disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
+    stdout.execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -135,6 +140,12 @@ fn init_logging() -> anyhow::Result<()> {
 fn install_panic_hook() {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Log to tracing so panics appear in the same log output as agent logs
+        let msg = info.to_string();
+        tracing::error!("[PANIC] {msg}");
+        if let Some(location) = info.location() {
+            tracing::error!("[PANIC] at {}:{}", location.file(), location.line());
+        }
         let _ = disable_raw_mode();
         let _ = io::stdout().execute(LeaveAlternateScreen);
         default_panic(info);
@@ -645,8 +656,12 @@ async fn run_app(
             biased;
             ev = events.recv() => {
                 match ev {
+                    Some(Event::Paste(data)) => {
+                        app.input.insert_str(&data);
+                        app.dirty = true;
+                    }
                     Some(Event::Key(first_key)) => {
-                        // Paste detection: batch rapid keystrokes
+                        // Legacy paste fallback: batch rapid keystrokes
                         let mut keys = vec![first_key];
                         while let Some(ev) = events.try_recv() {
                             if let Event::Key(k) = ev { keys.push(k); }
@@ -897,6 +912,8 @@ fn process_key_event(
             }
         }
         KeyResult::InputSubmitted(input) => {
+            // Clear any stale gate (delivery/scope) when user submits new input
+            app.clear_workflow_confirmation();
             match input {
                 UserInput::Exit => {
                     app.output.push_system("Goodbye.");
@@ -1189,6 +1206,9 @@ fn spawn_agent_turn_for_text(
                 let _ = status_tx.send(AgentToUiEvent::Error(msg));
                 return;
             }
+            // Reindex between turns (not during code_graph calls) so the
+            // index is fresh without slowing down mid-turn queries.
+            svc.reindex_if_dirty().await;
         }
         let result = handlers::pre_turn::prepare_turn(
             &config_clone,

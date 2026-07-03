@@ -197,8 +197,17 @@ impl WorkflowEngine {
                                 return Err(format!(
                                     "📊 影响范围门禁 — 编辑 `{path}` 前请先评估改动影响。\n\
                                      先调用 complete_and_check(action=\"code_graph\", \
-                                     params={{\"op\":\"impact\",\"target\":\"{path}\",\"direction\":\"downstream\"}}) \
-                                     查看调用链影响范围。"
+                                     params={{\"op\":\"impact\",\"target\":\"{symbol}\",\"direction\":\"downstream\"}}) \
+                                     查看调用链影响范围。",
+                                    symbol = path.rsplit('/')
+                                        .last()
+                                        .unwrap_or(path)
+                                        .rsplit('\\')
+                                        .last()
+                                        .unwrap_or(path)
+                                        .rsplit('.')
+                                        .next()
+                                        .unwrap_or(path)
                                 ));
                             }
                         }
@@ -438,6 +447,8 @@ impl WorkflowEngine {
             self.clear_impl_files_read();
             // Clear impact analysis tracking for fresh start
             self.clear_impl_impact();
+            // Clear code_graph queried flag so new round re-enables the gate
+            self.clear_code_graph_queried();
             for key in [
                 "_step0_output",
                 "_step1_output",
@@ -745,6 +756,24 @@ impl WorkflowEngine {
     /// Clear all impact-analysis tracking (called on workflow reset / new round).
     pub fn clear_impl_impact(&self) {
         self.set_variable(Self::IMPL_IMPACT_KEY, "[]".to_string());
+    }
+
+    const CODE_GRAPH_QUERIED_KEY: &str = "_code_graph_queried";
+
+    /// True when code_graph has been queried in this round (unblocks find_symbol).
+    pub fn impl_code_graph_queried(&self) -> bool {
+        self.get_variable(Self::CODE_GRAPH_QUERIED_KEY)
+            .as_deref()
+            == Some("1")
+    }
+
+    /// Mark that code_graph was queried.
+    pub fn record_code_graph_queried(&self) {
+        self.set_variable(Self::CODE_GRAPH_QUERIED_KEY, "1".to_string());
+    }
+
+    pub fn clear_code_graph_queried(&self) {
+        self.set_variable(Self::CODE_GRAPH_QUERIED_KEY, String::new());
     }
 
     /// Implementation phase: allow all reads. Compaction handles context bloat.
