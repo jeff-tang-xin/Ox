@@ -49,6 +49,7 @@ fn pad_to_width(text: String, width: u16) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn truncate_display(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -338,7 +339,7 @@ fn render_chat(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Dedicated think pane — expands only while reasoning / agent activity.
-fn render_think_pane(frame: &mut Frame, app: &App, area: Rect, tick: u64, mode: ThinkPaneMode) {
+fn render_think_pane(frame: &mut Frame, app: &App, area: Rect, tick: u64, _mode: ThinkPaneMode) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -437,7 +438,7 @@ fn render_single_line(
     ol: &OutputLine,
     width: usize,
     md_renderer: &super::markdown::MarkdownRenderer,
-    tick: u64,
+    _tick: u64,
 ) -> Vec<Line<'static>> {
     match ol {
         OutputLine::User(s) => {
@@ -674,6 +675,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+#[allow(dead_code)]
 fn render_findings_panel(frame: &mut Frame, app: &App, area: Rect) {
     let Some(panel) = &app.findings_panel else {
         return;

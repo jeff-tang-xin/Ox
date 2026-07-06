@@ -1896,7 +1896,6 @@ async fn await_gitnexus_ready(
     let start_time = std::time::Instant::now();
     let mut announced = false;
     let mut restart_attempted = false;
-    let mut consecutive_failures = 0;
 
     loop {
         // Check timeout
@@ -1950,7 +1949,6 @@ async fn await_gitnexus_ready(
                 }
 
                 // Track consecutive failures for potential recovery
-                consecutive_failures += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(CHECK_INTERVAL_MS)).await;
             }
         }

@@ -91,6 +91,7 @@ pub struct LiveThinking {
 /// Collapsed think strip (status only, no reasoning body).
 pub const THINK_PANE_SLIM_HEIGHT: u16 = 3;
 /// Compact terminals fall back to this many think lines inside chat.
+#[allow(dead_code)]
 pub const THINKING_DOCK_LINES: usize = 2;
 /// Main column height split — chat largest, think medium.
 pub const CHAT_THINK_HEIGHT_RATIO: (u32, u32) = (7, 3);
@@ -386,6 +387,7 @@ impl OutputPane {
 }
 
 /// Last two visual lines for the fixed thinking dock (wrap long prose into segments first).
+#[allow(dead_code)]
 pub fn thinking_dock_two_lines(
     text: &str,
     status_hint: Option<&str>,

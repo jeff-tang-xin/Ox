@@ -693,6 +693,7 @@ impl WorkflowEngine {
         self.set_variable(Self::REVIEW_HANDOFF_KEY, String::new());
     }
 
+    #[allow(dead_code)]
     fn impl_files_read_set(&self) -> std::collections::HashSet<String> {
         self.get_variable(Self::IMPL_READ_KEY)
             .and_then(|s| serde_json::from_str(&s).ok())

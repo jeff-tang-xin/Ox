@@ -10,7 +10,7 @@ use ox_core::agent::AgentToUiEvent;
 use ox_core::config::OxConfig;
 use ox_core::context::ContextBuilder;
 use ox_core::cost::CostTracker;
-use ox_core::knowledge::{KnowledgeEngine, format_memory_context};
+use ox_core::knowledge::KnowledgeEngine;
 use ox_core::llm::LlmProvider;
 use ox_core::message::{Message, Session};
 use ox_core::runtime::RuntimeEnvironment;

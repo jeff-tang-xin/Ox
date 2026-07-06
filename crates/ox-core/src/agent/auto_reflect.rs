@@ -272,6 +272,7 @@ impl AutoReflector {
     }
 
     /// Parse the LLM-generated markdown and save as a skill.
+    #[allow(dead_code)]
     fn parse_and_save_skill(&self, content: &str) -> Result<String> {
         Self::write_skill_file(&self.project_root, content)
     }

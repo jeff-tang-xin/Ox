@@ -238,13 +238,33 @@ fn push_interjection_message(
                         "💬 User (Act 修复介入): {}",
                         text.trim().chars().take(120).collect::<String>()
                     )));
-                    // Inject a strong directive: don't re-analyze, use previous findings
-                    messages.push(Message::system(
+                    // Inject the last assistant message as reference so the LLM
+                    // doesn't need to re-read the history
+                    let last_assistant: String = messages.iter().rev()
+                        .filter_map(|m| {
+                            if let Message::Assistant { content, .. } = m {
+                                if !content.is_empty() { Some(content.clone()) } else { None }
+                            } else { None }
+                        })
+                        .next()
+                        .unwrap_or_default();
+                    let last_analysis = if last_assistant.chars().count() > 800 {
+                        format!("{}…", last_assistant.chars().take(800).collect::<String>())
+                    } else {
+                        last_assistant
+                    };
+                    let directive = if !last_analysis.is_empty() {
+                        format!(
+                            "【直接实施】用户要求你按上一轮的分析结果直接实施。\
+                             你上一轮的分析原文:\n{} \
+                             \n直接按此方案 edit_file 改代码，不要重新读文件、不要重新探索。",
+                            last_analysis
+                        )
+                    } else {
                         "【直接实施】用户要求你按上一轮的分析结果直接实施。\
-                         你刚才已经分析了代码并给出了方案。直接 edit_file 改代码，\
-                         不要重新读文件、不要重新探索、不要重复分析。\
-                         如果对方案细节不确定，直接按你刚才说的做。"
-                    ));
+                         直接 edit_file 改代码，不要重新读文件。".to_string()
+                    };
+                    messages.push(Message::system(&directive));
                     return;
                 }
                 tracing::info!("[WORKFLOW] Blocked mid-flight interjection in Act phase");

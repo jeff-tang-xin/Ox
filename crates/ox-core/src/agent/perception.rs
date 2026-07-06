@@ -305,6 +305,7 @@ pub fn format_for_user_display(text: &str) -> String {
 }
 
 /// Whether prose already describes findings (skip duplicate appendix).
+#[allow(dead_code)]
 fn prose_covers_findings(prose: &str, f: &PerceptionFindings) -> bool {
     if prose.contains("## 问题汇总") {
         return true;
