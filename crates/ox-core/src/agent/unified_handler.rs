@@ -510,16 +510,17 @@ async fn handle_finish(
 
     // Persist session summary to SQLite memory store + engine variables.
     if let Some(ref ss) = session_summary {
-        // Write to SQLite (cross-session persistence)
+        // Write to SQLite (cross-session persistence).
+        // Single lock acquisition to avoid two try_locks producing an inconsistent snapshot
+        // (one field succeeds, the other fails / sees mid-mutation state).
         if let Some(ref store) = tool_ctx.memory_store {
-            let session_id = workflow_engine.as_ref()
+            let (session_id, task) = workflow_engine.as_ref()
                 .and_then(|wf| wf.try_lock().ok())
-                .map(|e| e.session_id())
-                .unwrap_or_else(|| "default".to_string());
-            let task = workflow_engine.as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .and_then(|e| e.get_variable("_current_user_request"))
-                .unwrap_or_default();
+                .map(|e| (
+                    e.session_id(),
+                    e.get_variable("_current_user_request").unwrap_or_default(),
+                ))
+                .unwrap_or_else(|| ("default".to_string(), String::new()));
             if let Err(e) = store.save_session(&session_id, &task, ss) {
                 tracing::warn!("[MEMORY] Failed to save session: {e}");
             }

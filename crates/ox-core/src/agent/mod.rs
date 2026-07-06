@@ -1079,36 +1079,63 @@ pub async fn run_agent_turn(
         }
 
         // ── Query SQLite memory store for relevant file history ──
+        // Prefer the **current turn's user input** as the topic anchor (fixes cross-session
+        // memory drift where _last_session_summary was empty or belonged to an unrelated turn).
         if let Some(ms) = &tool_ctx.memory_store {
             if let Some(wf) = &workflow_engine {
                 if let Ok(engine) = wf.try_lock() {
-                    if let Some(json) = engine.get_variable("_last_session_summary") {
-                        if let Ok(ss) = serde_json::from_str::<crate::agent::unified_action::SessionSummary>(&json) {
-                            let mut history = String::from("📋 相关历史:\n");
-                            let mut has_any = false;
-                            // Query history for each modified file
-                            for m in &ss.files_modified {
-                                if let Ok(h) = ms.query_file_history(&m.path, 3) {
-                                    if !h.is_empty() {
-                                        let short = m.path.rsplit('/').next().unwrap_or(&m.path);
-                                        history.push_str(&format!("  [{short}]\n{}", h));
-                                        has_any = true;
+                    // Topic key: first user message this turn → truncate 200 chars; fallback to summary.
+                    let topic_from_user: Option<String> = messages.iter().find_map(|m| {
+                        if let Message::User { content } = m {
+                            Some(content.chars().take(200).collect::<String>())
+                        } else {
+                            None
+                        }
+                    });
+                    let summary_json = engine.get_variable("_last_session_summary");
+                    // Only run history lookup if we have *something* to key on.
+                    if topic_from_user.is_some() || summary_json.is_some() {
+                        let mut history = String::from("📋 相关历史:\n");
+                        let mut has_any = false;
+                        if let Some(json) = summary_json {
+                            if let Ok(ss) = serde_json::from_str::<crate::agent::unified_action::SessionSummary>(&json) {
+                                for m in &ss.files_modified {
+                                    if let Ok(h) = ms.query_file_history(&m.path, 3) {
+                                        if !h.is_empty() {
+                                            let short = m.path.rsplit('/').next().unwrap_or(&m.path);
+                                            history.push_str(&format!("  [{short}]\n{}", h));
+                                            has_any = true;
+                                        }
+                                    }
+                                }
+                                for r in &ss.files_read {
+                                    if let Ok(h) = ms.query_file_history(&r.path, 2) {
+                                        if !h.is_empty() {
+                                            let short = r.path.rsplit('/').next().unwrap_or(&r.path);
+                                            history.push_str(&format!("  [{short}]\n{}", h));
+                                            has_any = true;
+                                        }
                                     }
                                 }
                             }
-                            // Also query for each read file
-                            for r in &ss.files_read {
-                                if let Ok(h) = ms.query_file_history(&r.path, 2) {
-                                    if !h.is_empty() {
-                                        let short = r.path.rsplit('/').next().unwrap_or(&r.path);
-                                        history.push_str(&format!("  [{short}]\n{}", h));
-                                        has_any = true;
+                        }
+                        // Even without a prior summary, surface files that the user's current
+                        // topic explicitly names (path-like tokens).
+                        if let Some(topic) = topic_from_user.as_ref() {
+                            for tok in topic.split(|c: char| c.is_whitespace() || "()[]{}\"'`,;".contains(c)) {
+                                if tok.len() >= 4 && (tok.contains('/') || tok.contains('\\') || tok.ends_with(".rs")) {
+                                    if let Ok(h) = ms.query_file_history(tok, 2) {
+                                        if !h.is_empty() {
+                                            let short = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+                                            history.push_str(&format!("  [{short}]\n{}", h));
+                                            has_any = true;
+                                        }
                                     }
                                 }
                             }
-                            if has_any {
-                                engine.set_variable("_memory_history", history);
-                            }
+                        }
+                        if has_any {
+                            engine.set_variable("_memory_history", history);
                         }
                     }
                 }
