@@ -75,11 +75,10 @@ impl Tool for ProjectDetectTool {
 
         for (file, lang, build) in markers {
             if file.contains('*') {
-                if let Ok(pattern) = glob::glob(&base.join(file).to_string_lossy()) {
-                    if pattern.into_iter().any(|e| e.is_ok()) {
+                if let Ok(pattern) = glob::glob(&base.join(file).to_string_lossy())
+                    && pattern.into_iter().any(|e| e.is_ok()) {
                         info.push(format!("Language: {lang} (build: {build})"));
                     }
-                }
             } else if base.join(file).exists() {
                 info.push(format!("Language: {lang} (build: {build})"));
             }

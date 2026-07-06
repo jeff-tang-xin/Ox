@@ -59,14 +59,13 @@ fn extract_json_block(text: &str) -> Option<String> {
             }
         }
     }
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
-        if end >= start {
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
+        && end >= start {
             let slice = &text[start..=end];
             if slice.contains("completion_receipt") || slice.contains("\"complete\"") {
                 return Some(slice.to_string());
             }
         }
-    }
     None
 }
 
@@ -93,13 +92,11 @@ pub fn validate(engine: &WorkflowEngine, receipt: &CompletionReceipt) -> Result<
     }
     if let Some(status) =
         engine.get_variable(crate::agent::post_edit_verification::VERIFY_STATUS_KEY)
-    {
-        if status == "failed" {
+        && status == "failed" {
             return Err(
                 "最近一次 shell 验证失败 — 须修复错误并重新运行验证后再 ## Done".to_string(),
             );
         }
-    }
     if crate::agent::post_edit_verification::verify_status_blocks_done(engine) {
         return Err(
             "项目验证尚未通过（verify 状态未为 passed）— 须 shell_exec 验证成功后再 ## Done"

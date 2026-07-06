@@ -937,6 +937,7 @@ impl GitNexusConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct CollaborationConfig {
     /// When true, route LLM calls by task role (review / implement / qa).
     pub enabled: bool,
@@ -948,16 +949,6 @@ pub struct CollaborationConfig {
     pub qa_model: String,
 }
 
-impl Default for CollaborationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            review_model: String::new(),
-            implement_model: String::new(),
-            qa_model: String::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

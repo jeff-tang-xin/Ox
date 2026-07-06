@@ -223,7 +223,7 @@ mod tests {
     use super::*;
     use crate::knowledge::entity::{Relation, SymbolType};
 
-    fn sym(id: &str, fq: &str) -> Entity {
+    fn sym(_id: &str, fq: &str) -> Entity {
         Entity::code_symbol(
             "f",
             fq,

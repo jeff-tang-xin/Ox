@@ -206,7 +206,7 @@ pub fn handle_empty_response(
             2 => "⚠️ 审阅空转 — 已暂停，请重试".into(),
             3 if ctx
                 .engine
-                .is_some_and(|e| crate::agent::workflow_session::is_feedback_discuss(e)) =>
+                .is_some_and(crate::agent::workflow_session::is_feedback_discuss) =>
             {
                 "⚠️ 讨论空转 — 已暂停，请重新说明你的意见".into()
             }
@@ -261,17 +261,14 @@ pub fn upsert_idle_assistant(messages: &mut Vec<Message>, new_msg: &Message) {
         .iter()
         .rev()
         .find(|m| matches!(m, Message::Assistant { .. }))
-    {
-        if prev_tc.is_empty() && is_idle_narrative(prev) {
-            if let Some(idx) = messages
+        && prev_tc.is_empty() && is_idle_narrative(prev)
+            && let Some(idx) = messages
                 .iter()
                 .rposition(|m| matches!(m, Message::Assistant { .. }))
             {
                 messages[idx] = new_msg.clone();
                 return;
             }
-        }
-    }
     messages.push(new_msg.clone());
 }
 

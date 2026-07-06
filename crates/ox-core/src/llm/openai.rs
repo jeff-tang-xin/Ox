@@ -164,8 +164,8 @@ impl LlmProvider for OpenAiProvider {
             // Fix ordering: ensure tool_calls are immediately followed by ToolResults
             let mut i = 0;
             while i < messages.len() {
-                if let Message::Assistant { tool_calls, .. } = &messages[i] {
-                    if !tool_calls.is_empty() {
+                if let Message::Assistant { tool_calls, .. } = &messages[i]
+                    && !tool_calls.is_empty() {
                         let expected = tool_calls.len();
                         let expected_ids: Vec<_> =
                             tool_calls.iter().map(|tc| tc.id.clone()).collect();
@@ -210,7 +210,6 @@ impl LlmProvider for OpenAiProvider {
                             }
                         }
                     }
-                }
                 i += 1;
             }
         }
@@ -373,10 +372,7 @@ impl LlmProvider for OpenAiProvider {
 
                     let events = parser.parse_chunk(&chunk_str);
                     for event in events {
-                        match &event {
-                            LlmStreamEvent::Done { .. } => done_sent = true,
-                            _ => {}
-                        }
+                        if let LlmStreamEvent::Done { .. } = &event { done_sent = true }
                         let _ = tx.send(event);
                     }
                 }
@@ -491,11 +487,10 @@ fn message_to_openai(msg: &Message) -> serde_json::Value {
                 "content": content,
             });
             // DeepSeek thinking mode: reasoning_content MUST be passed back to the API
-            if let Some(reasoning) = reasoning_content {
-                if !reasoning.is_empty() {
+            if let Some(reasoning) = reasoning_content
+                && !reasoning.is_empty() {
                     obj["reasoning_content"] = serde_json::Value::String(reasoning.clone());
                 }
-            }
             if !tool_calls.is_empty() {
                 let tcs: Vec<serde_json::Value> = tool_calls
                     .iter()

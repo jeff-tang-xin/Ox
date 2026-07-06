@@ -32,7 +32,7 @@ pub async fn analyze_edit_impact(
 
     // Extract function/method name from file_path if possible
     // For simplicity, we analyze the file itself as the target
-    let target = file_path.split('/').last()?.split('\\').last()?;
+    let target = file_path.split('/').next_back()?.split('\\').next_back()?;
     if target.is_empty() {
         return None;
     }
@@ -182,8 +182,8 @@ fn summarize_api_impact(route_text: &str, shape_text: Option<&str>) -> String {
     }
 
     // Parse shape_check results if available
-    if let Some(shape) = shape_text {
-        if !shape.is_empty() {
+    if let Some(shape) = shape_text
+        && !shape.is_empty() {
             summary.push_str("\n⚠️ **API 响应不匹配检查**:\n\n");
             let lines: Vec<&str> = shape.lines().take(10).collect();
             for line in lines {
@@ -197,7 +197,6 @@ fn summarize_api_impact(route_text: &str, shape_text: Option<&str>) -> String {
                 }
             }
         }
-    }
 
     if summary.is_empty() {
         summary.push_str("  (未发现路由信息)\n");
@@ -248,7 +247,7 @@ fn summarize_rename_preview(rename_text: &str, original_name: &str) -> String {
         if text_matches > 0 {
             summary.push_str(&format!("⚠️  低可信度引用 (text_search): {} 处\n\n", text_matches));
         } else {
-            summary.push_str("\n");
+            summary.push('\n');
         }
     }
 
@@ -394,16 +393,14 @@ where
         &mpsc::UnboundedSender<AgentToUiEvent>,
     ),
 {
-    if let Some(wf) = workflow_engine {
-        if let Ok(engine) = wf.try_lock() {
-            if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
+    if let Some(wf) = workflow_engine
+        && let Ok(engine) = wf.try_lock()
+            && let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
                 let md = crate::agent::presentation::format_findings_card(&store);
                 let _ = ui_tx.send(AgentToUiEvent::ScopeConfirmPrompt {
                     summary: format!("{md}\n\nc 确认实施  ·  输入讨论  ·  /discuss"),
                 });
             }
-        }
-    }
 
     match business_gate::await_findings_scope_gate(
         ui_rx,
@@ -417,8 +414,8 @@ where
     {
         business_gate::BusinessGateResume::Cancelled => UnifiedHandleOutcome::Aborted,
         business_gate::BusinessGateResume::Acknowledged => {
-            if let Some(wf) = workflow_engine {
-                if let Ok(engine) = wf.try_lock() {
+            if let Some(wf) = workflow_engine
+                && let Ok(engine) = wf.try_lock() {
                     crate::agent::workflow_session::clear_feedback_discuss(&engine);
                     crate::agent::phase::confirm_plan_enter_implement(&engine);
                     // Record review findings as session facts so the LLM
@@ -435,7 +432,6 @@ where
                         }
                     }
                 }
-            }
             UnifiedHandleOutcome::Result {
                 content: ToolResultEnvelope::gate_status(
                     EnvelopeStatus::Confirmed,
@@ -527,25 +523,22 @@ async fn handle_finish(
         }
 
         // Also persist to engine variables (in-turn access via blackboard)
-        if let Some(wf) = workflow_engine {
-            if let Ok(engine) = wf.try_lock() {
-                if let Ok(json) = serde_json::to_string(ss) {
+        if let Some(wf) = workflow_engine
+            && let Ok(engine) = wf.try_lock()
+                && let Ok(json) = serde_json::to_string(ss) {
                     engine.set_variable("_last_session_summary", json);
                     for f in &ss.key_facts {
                         crate::agent::blackboard::add_fact(&engine, &f.fact);
                     }
                 }
-            }
-        }
     }
 
     // ── Onboarding shortcut: no gate, no findings — just end the turn. ──
     if crate::agent::onboarding::is_onboarding_turn(messages) {
-        if let Some(wf) = workflow_engine {
-            if let Ok(mut engine) = wf.try_lock() {
+        if let Some(wf) = workflow_engine
+            && let Ok(mut engine) = wf.try_lock() {
                 let _ = engine.complete_workflow();
             }
-        }
         return UnifiedHandleOutcome::TurnDone {
             summary: (!content.is_empty()).then(|| content.clone()),
         };
@@ -606,8 +599,8 @@ async fn handle_finish(
             )
             .await;
         }
-        if let Some(wf) = workflow_engine {
-            if let Ok(mut engine) = wf.try_lock() {
+        if let Some(wf) = workflow_engine
+            && let Ok(mut engine) = wf.try_lock() {
                 // After scope confirmation, the LLM is in implement phase.
                 // A plain finish (no finding_json) after confirmation means
                 // the LLM is acknowledging — redirect to implementation.
@@ -649,7 +642,6 @@ async fn handle_finish(
                     execution_summary: content.clone(),
                 });
             }
-        }
         return UnifiedHandleOutcome::TurnDone {
             summary: (!content.is_empty()).then(|| content.clone()),
         };
@@ -734,15 +726,15 @@ async fn handle_delegate(
     let params_str = req.params.to_string();
 
     // Pre-execution validation + read guard (parity with legacy tool path).
-    if let Some(wf) = workflow_engine {
-        if let Ok(engine) = wf.try_lock() {
+    if let Some(wf) = workflow_engine
+        && let Ok(engine) = wf.try_lock() {
             if let Err(e) = engine.validate_tool_call(inner_name, &req.params) {
                 return result_err(e);
             }
             if let Err(e) = crate::agent::read_guard::check(inner_name, &req.params, &engine) {
-                if inner_name == "file_read" {
-                    if let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
-                        if let Some(cached) =
+                if inner_name == "file_read"
+                    && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
+                        && let Some(cached) =
                             crate::agent::read_guard::cached_file_read_response(&engine, path)
                         {
                             return result_ok_envelope(
@@ -762,12 +754,9 @@ async fn handle_delegate(
                                 }),
                             );
                         }
-                    }
-                }
                 return result_err(e);
             }
         }
-    }
 
     let tool = match tool_registry.get(inner_name) {
         Some(t) => t,
@@ -791,11 +780,10 @@ async fn handle_delegate(
             .unwrap_or(false);
 
         let mut blacklist_warning = None;
-        if inner_name == "shell_exec" {
-            if let Some(cmd) = req.params.get("command").and_then(|v| v.as_str()) {
+        if inner_name == "shell_exec"
+            && let Some(cmd) = req.params.get("command").and_then(|v| v.as_str()) {
                 blacklist_warning = safety_gate::shell_blacklist_warning(trust_manager, cmd);
             }
-        }
 
         // Option-2 flow: once the user confirmed the plan/findings scope (or we're in
         // Implement phase), the whole plan is pre-approved — writes/edits/shell auto-run
@@ -868,9 +856,9 @@ async fn handle_delegate(
     }
 
     // ── Impact analysis before edit operations ──
-    let mut impact_warning = String::new();
-    if inner_name == "edit_file" || inner_name == "file_write" || inner_name == "delete_range" {
-        if let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
+    let _impact_warning = String::new();
+    if (inner_name == "edit_file" || inner_name == "file_write" || inner_name == "delete_range")
+        && let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
             // Run impact analysis asynchronously (non-blocking)
             let ctx_clone = Arc::clone(tool_ctx);
             let path_owned = path.to_string();
@@ -882,7 +870,6 @@ async fn handle_delegate(
                 }
             });
         }
-    }
 
     tracing::info!("[DELEGATE] Executing inner tool: {}", inner_name);
     let result = tool.execute(req.params.clone(), tool_ctx).await;
@@ -895,11 +882,11 @@ async fn handle_delegate(
 
     if result.is_error {
         let mut err_text = result.content.clone();
-        if inner_name == "edit_file" {
-            if let Some(wf) = workflow_engine {
-                if let Ok(engine) = wf.try_lock() {
-                    if crate::agent::workflow_session::is_implementation_phase(&engine) {
-                        if let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
+        if inner_name == "edit_file"
+            && let Some(wf) = workflow_engine
+                && let Ok(engine) = wf.try_lock()
+                    && crate::agent::workflow_session::is_implementation_phase(&engine)
+                        && let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
                             let hint = if engine.impl_file_already_read(path) {
                                 "\n\n💡 **edit 恢复：** old_string 须与上条 file_read 内容**逐字一致**（含空格/缩进）。\
                                  缩小到 3–8 行唯一片段重试；先 file_read 该文件再编辑。"
@@ -912,10 +899,6 @@ async fn handle_delegate(
                             };
                             err_text.push_str(&hint);
                         }
-                    }
-                }
-            }
-        }
         return UnifiedHandleOutcome::Result {
             content: ToolResultEnvelope::err(err_text).to_compact(),
             is_error: true,
@@ -966,17 +949,16 @@ fn apply_delegate_success_effects(
     result: &ToolOutput,
 ) -> (Vec<String>, String) {
     let mut deferred = Vec::new();
-    let mut output = result.content.clone();
+    let output = result.content.clone();
     let params_str = req.params.to_string();
     let result_content = format!("── DATA ({inner_name}) ──\n{output}\n── END DATA ──");
 
     // (E) A successful code mutation puts the GitNexus index behind the tree.
     // Mark dirty so the next `code_graph` query refreshes before answering.
-    if matches!(inner_name, "edit_file" | "file_write" | "delete_range") {
-        if let Some(gn) = &tool_ctx.gitnexus {
+    if matches!(inner_name, "edit_file" | "file_write" | "delete_range")
+        && let Some(gn) = &tool_ctx.gitnexus {
             gn.mark_dirty();
         }
-    }
 
     if inner_name == "file_read" {
         if let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
@@ -993,14 +975,12 @@ fn apply_delegate_success_effects(
         crate::agent::read_guard::record_symbol_query(engine, inner_name, &req.params);
     } else if inner_name == "code_graph" {
         // Record impact analysis so workspace.rs knows not to re-suggest it.
-        if req.params.get("op").and_then(|o| o.as_str()) == Some("impact") {
-            if let Some(target) = req.params.get("target") {
-                if let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
+        if req.params.get("op").and_then(|o| o.as_str()) == Some("impact")
+            && let Some(target) = req.params.get("target")
+                && let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
                 {
                     engine.record_impl_impact(idx);
                 }
-            }
-        }
         // Record any code_graph query/impact/context so the impact gate and
         // find_symbol gate unblock. Match the target/pattern/name to findings.
         if let Some(op) = req.params.get("op").and_then(|o| o.as_str()) {
@@ -1011,12 +991,11 @@ fn apply_delegate_success_effects(
                 "context" => req.params.get("name").or_else(|| req.params.get("uid")),
                 _ => None,
             };
-            if let Some(target) = search_target {
-                if let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
+            if let Some(target) = search_target
+                && let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
                 {
                     engine.record_impl_impact(idx);
                 }
-            }
         }
     }
 
@@ -1062,29 +1041,25 @@ fn apply_delegate_success_effects(
     }
 
     if inner_name == "file_read" && crate::agent::workflow_session::is_implementation_phase(engine)
-    {
-        if let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
+        && let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
             engine.record_impl_file_read(path, &params_str);
             if let Some(nudge) = engine.impl_edit_nudge_after_read(path, &result_content) {
                 deferred.push(nudge);
             }
         }
-    }
     if engine.is_task_step() {
         let (plan_changed, plan_hint) =
             engine.record_execute_tool_success(inner_name, &params_str, &result_content);
         if let Some(hint) = plan_hint {
             deferred.push(hint);
         }
-        if plan_changed {
-            if let Some(msg) = engine.plan_progress_message_after_tool(inner_name) {
+        if plan_changed
+            && let Some(msg) = engine.plan_progress_message_after_tool(inner_name) {
                 deferred.push(msg);
             }
-        }
         if inner_name == "shell_exec"
             && crate::agent::workflow_session::is_implementation_phase(engine)
-        {
-            if let Some(cmd) = req.params.get("command").and_then(|c| c.as_str()) {
+            && let Some(cmd) = req.params.get("command").and_then(|c| c.as_str()) {
                 let succeeded = !result.is_error;
                 crate::agent::post_edit_verification::note_shell_verify_result(
                     engine, cmd, succeeded,
@@ -1108,11 +1083,9 @@ fn apply_delegate_success_effects(
                     }
                 }
             }
-        }
         if matches!(inner_name, "edit_file" | "file_write" | "delete_range")
             && crate::agent::workflow_session::is_implementation_phase(engine)
-        {
-            if let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
+            && let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
                 engine.record_impl_file_edited(path);
                 let idx = engine
                     .get_plan_tracker()
@@ -1129,7 +1102,6 @@ fn apply_delegate_success_effects(
                         ));
                 }
             }
-        }
     }
 
     (deferred, output)

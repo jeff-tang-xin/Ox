@@ -231,8 +231,8 @@ pub fn resolve_file_read_cache(
     }
 
     if let Some(e) = entry {
-        if let Some(ref rel) = e.ref_path {
-            if let Some(full) = load_persisted_full(working_dir, rel) {
+        if let Some(ref rel) = e.ref_path
+            && let Some(full) = load_persisted_full(working_dir, rel) {
                 let lines: Vec<&str> = full.lines().collect();
                 let total = lines.len();
                 let start = offset.min(total);
@@ -254,7 +254,6 @@ pub fn resolve_file_read_cache(
                 }
                 return body;
             }
-        }
         if e.full_chars <= e.content.chars().count().saturating_add(80) {
             return format!("✅ 【缓存】`{path}` 已探索过\n\n{}", e.content);
         }
@@ -301,11 +300,10 @@ fn persist_full_content(
     content: &str,
 ) -> Option<String> {
     let path = exploration_ref_path(working_dir, tool, target);
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).is_err() {
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err() {
             return None;
         }
-    }
     let doc = format!(
         "# Exploration snapshot\n\n**Tool**: {tool}\n**Target**: {target}\n**Size**: {} chars\n\n---\n\n{content}",
         content.chars().count()

@@ -2,7 +2,6 @@ use encoding_rs::Encoding;
 use serde_json::{Value, json};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
-use std::sync::Arc;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
@@ -197,14 +196,13 @@ impl Tool for FileReadTool {
                 if let Some(ref knowledge) = ctx.knowledge {
                     let knowledge = knowledge.clone();
                     tokio::spawn(async move {
-                        if let Ok(mut engine) = knowledge.try_write() {
-                            if let Err(e) = engine.index_file(&abs_path) {
+                        if let Ok(mut engine) = knowledge.try_write()
+                            && let Err(e) = engine.index_file(&abs_path) {
                                 tracing::debug!(
                                     "[FILE_READ] Auto-index failed for {}: {e}",
                                     abs_path.display()
                                 );
                             }
-                        }
                     });
                 }
 

@@ -140,11 +140,10 @@ impl KnowledgeEngine {
 
     fn persist_bm25(&self) {
         let path = Self::bm25_cache_path(&self.project_path);
-        if let Ok(index) = self.bm25_index.try_lock() {
-            if let Err(e) = index.save(&path) {
+        if let Ok(index) = self.bm25_index.try_lock()
+            && let Err(e) = index.save(&path) {
                 tracing::warn!("[KNOWLEDGE_ENGINE] Failed to persist BM25 index: {e}");
             }
-        }
     }
 
     fn index_bm25(&self, entity: &Entity) {
@@ -437,7 +436,7 @@ impl KnowledgeEngine {
 
         let all_files: Vec<PathBuf> = walker
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |ft| ft.is_file()))
+            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
             .map(|e| e.path().to_path_buf())
             .collect();
 
@@ -462,12 +461,11 @@ impl KnowledgeEngine {
 
                 new_cache.insert(path_str.clone(), mtime);
 
-                if let Some(&cached_mtime) = file_cache.get(&path_str) {
-                    if cached_mtime == mtime && self.store.has_file_vectors(&path_str) {
+                if let Some(&cached_mtime) = file_cache.get(&path_str)
+                    && cached_mtime == mtime && self.store.has_file_vectors(&path_str) {
                         skipped_from_cache += 1;
                         continue; // Unchanged and already embedded
                     }
-                }
             }
 
             if self.detect_language(path).is_none() {
@@ -486,11 +484,10 @@ impl KnowledgeEngine {
                 }
             }
 
-            if let Some(ref tx) = progress_tx {
-                if (i + 1) % 20 == 0 || i + 1 == total_files {
+            if let Some(ref tx) = progress_tx
+                && ((i + 1) % 20 == 0 || i + 1 == total_files) {
                     let _ = tx.send(IndexProgress::parsing(i + 1, total_files, total_symbols));
                 }
-            }
         }
 
         // Save updated cache
@@ -616,7 +613,7 @@ impl KnowledgeEngine {
 
         walker
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |ft| ft.is_file()))
+            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
             .map(|e| e.path().to_path_buf())
             .collect()
     }
@@ -661,8 +658,8 @@ impl KnowledgeEngine {
             return Ok(0);
         }
         let path_str = file_path.to_string_lossy().to_string();
-        if self.store.has_file_vectors(&path_str) {
-            if let Ok(meta) = std::fs::metadata(file_path) {
+        if self.store.has_file_vectors(&path_str)
+            && let Ok(meta) = std::fs::metadata(file_path) {
                 let mtime = meta
                     .modified()
                     .ok()
@@ -670,17 +667,13 @@ impl KnowledgeEngine {
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
                 let cache_path = self.cache_path();
-                if let Ok(data) = std::fs::read_to_string(&cache_path) {
-                    if let Ok(cache) =
+                if let Ok(data) = std::fs::read_to_string(&cache_path)
+                    && let Ok(cache) =
                         serde_json::from_str::<std::collections::HashMap<String, i64>>(&data)
-                    {
-                        if cache.get(&path_str) == Some(&mtime) {
+                        && cache.get(&path_str) == Some(&mtime) {
                             return Ok(0);
                         }
-                    }
-                }
             }
-        }
         self.index_file(file_path)
     }
 
@@ -732,7 +725,7 @@ impl KnowledgeEngine {
         // Collect files first so we can report total
         let all_files: Vec<PathBuf> = walker
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |ft| ft.is_file()))
+            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
             .map(|e| e.path().to_path_buf())
             .collect();
 

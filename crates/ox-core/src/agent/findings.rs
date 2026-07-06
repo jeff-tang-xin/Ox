@@ -366,11 +366,10 @@ pub fn sync_from_perception(engine: &WorkflowEngine, p: &PerceptionFindings) {
 
 /// Load store or build from legacy perception key.
 pub fn load_or_migrate(engine: &WorkflowEngine) -> Option<FindingsStore> {
-    if let Some(store) = load(engine) {
-        if !store.findings.is_empty() {
+    if let Some(store) = load(engine)
+        && !store.findings.is_empty() {
             return Some(store);
         }
-    }
     if let Some(p) = perception::load(engine) {
         let store = FindingsStore::from_perception(&p);
         save(engine, &store);
@@ -379,9 +378,8 @@ pub fn load_or_migrate(engine: &WorkflowEngine) -> Option<FindingsStore> {
     engine
         .get_execute_review_report()
         .and_then(|r| synthesize_from_review_prose(&r))
-        .map(|store| {
-            save(engine, &store);
-            store
+        .inspect(|store| {
+            save(engine, store);
         })
 }
 
@@ -394,7 +392,7 @@ pub fn synthesize_from_review_prose(report: &str) -> Option<FindingsStore> {
     let findings: Vec<Finding> = tracker
         .steps
         .iter()
-        .map(|s| finding_from_plan_step(s))
+        .map(finding_from_plan_step)
         .collect();
     let summary = perception::extract_from_text(report)
         .map(|p| p.findings_summary)
@@ -501,11 +499,10 @@ pub fn parse_scope_indices(text: &str) -> Vec<u32> {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            if let Ok(n) = text[start..i].parse::<u32>() {
-                if n > 0 && !indices.contains(&n) {
+            if let Ok(n) = text[start..i].parse::<u32>()
+                && n > 0 && !indices.contains(&n) {
                     indices.push(n);
                 }
-            }
             continue;
         }
         i += 1;

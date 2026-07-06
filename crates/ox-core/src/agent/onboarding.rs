@@ -302,7 +302,7 @@ mod tests {
     fn is_onboarding_turn_detects_directive() {
         let msgs = vec![
             Message::system("hello"),
-            Message::system(&onboarding_system_directive(false)),
+            Message::system(onboarding_system_directive(false)),
         ];
         assert!(is_onboarding_turn(&msgs));
         assert!(!is_onboarding_turn(&[Message::user("hi")]));

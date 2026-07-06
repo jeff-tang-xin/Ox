@@ -83,16 +83,14 @@ pub async fn await_findings_scope_gate(
     ),
 ) -> BusinessGateResume {
     // If user already pre-confirmed (typed "c" before gate opened), skip wait.
-    if let Some(wf) = workflow_engine {
-        if let Ok(engine) = wf.try_lock() {
-            if engine.get_variable(PRE_ACK_KEY).as_deref() == Some("1") {
+    if let Some(wf) = workflow_engine
+        && let Ok(engine) = wf.try_lock()
+            && engine.get_variable(PRE_ACK_KEY).as_deref() == Some("1") {
                 engine.set_variable(PRE_ACK_KEY, String::new());
                 tracing::info!("[BUSINESS_GATE] Pre-ack detected, acknowledging");
                 ack_findings_scope(&engine);
                 return BusinessGateResume::Acknowledged;
             }
-        }
-    }
 
     let _ = ui_tx.send(super::AgentToUiEvent::Status(
         "⏸ 业务流程门禁：等待确认 findings 范围 — 面板选 finding 后 c /confirm；可输入讨论"
@@ -120,11 +118,10 @@ pub async fn await_findings_scope_gate(
                     None => return BusinessGateResume::Cancelled,
                     Some(ui_event::UiToAgentEvent::BusinessAck { kind: BusinessGateKind::FindingsScope })
                     | Some(ui_event::UiToAgentEvent::ScopeConfirmed) => {
-                        if let Some(wf) = workflow_engine {
-                            if let Ok(engine) = wf.try_lock() {
+                        if let Some(wf) = workflow_engine
+                            && let Ok(engine) = wf.try_lock() {
                                 ack_findings_scope(&engine);
                             }
-                        }
                         return BusinessGateResume::Acknowledged;
                     }
                     Some(ui_event::UiToAgentEvent::Interjection(text)) => {
@@ -135,11 +132,10 @@ pub async fn await_findings_scope_gate(
                             || t.contains("确认")
                             || t.contains("开始实施");
                         if is_confirm {
-                            if let Some(wf) = workflow_engine {
-                                if let Ok(engine) = wf.try_lock() {
+                            if let Some(wf) = workflow_engine
+                                && let Ok(engine) = wf.try_lock() {
                                     ack_findings_scope(&engine);
                                 }
-                            }
                             return BusinessGateResume::Acknowledged;
                         }
                         push_interjection(workflow_engine, messages, &text, ui_tx);

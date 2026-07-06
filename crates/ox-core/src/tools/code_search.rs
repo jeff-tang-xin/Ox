@@ -176,21 +176,19 @@ fn search_with_ripgrep(
         };
 
         // Only process files
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
         // Apply file pattern filter
-        if file_pattern != "*" {
-            if let Some(file_name) = entry.file_name().to_str() {
-                if !glob::Pattern::new(file_pattern)
+        if file_pattern != "*"
+            && let Some(file_name) = entry.file_name().to_str()
+                && !glob::Pattern::new(file_pattern)
                     .map(|pat| pat.matches(file_name))
                     .unwrap_or(true)
                 {
                     continue;
                 }
-            }
-        }
 
         files_searched += 1;
 

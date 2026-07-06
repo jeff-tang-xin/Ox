@@ -6,18 +6,15 @@ use crate::agent::exploration_snapshot::ExplorationEntry;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum StepStatus {
+    #[default]
     Pending,
     InProgress,
     Done,
     Skipped,
 }
 
-impl Default for StepStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanStep {
@@ -91,11 +88,10 @@ fn extract_json_block(text: &str) -> Option<String> {
             return Some(inner.to_string());
         }
     }
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
-        if start < end {
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
+        && start < end {
             return Some(text[start..=end].to_string());
         }
-    }
     None
 }
 
@@ -258,11 +254,10 @@ impl PlanTracker {
         if enforce_quality && needs_verify.is_some() {
             self.steps[pos].status = StepStatus::InProgress;
             self.steps[pos].awaiting_verify = true;
-            if self.steps[pos].verify.is_empty() {
-                if let Some(ref cmd) = needs_verify {
+            if self.steps[pos].verify.is_empty()
+                && let Some(ref cmd) = needs_verify {
                     self.steps[pos].verify = cmd.clone();
                 }
-            }
             return WriteCompletionOutcome::AwaitingVerify(needs_verify.unwrap_or_default());
         }
 
@@ -457,9 +452,9 @@ fn extract_review_items(report: &str) -> Vec<PlanStep> {
                 .map(str::trim)
                 .filter(|c| !c.is_empty() && *c != "---")
                 .collect();
-            if cols.len() >= 3 {
-                if let Ok(n) = cols[0].parse::<u32>() {
-                    if seen.insert(n) {
+            if cols.len() >= 3
+                && let Ok(n) = cols[0].parse::<u32>()
+                    && seen.insert(n) {
                         let file = cols
                             .iter()
                             .find_map(|c| {
@@ -479,8 +474,6 @@ fn extract_review_items(report: &str) -> Vec<PlanStep> {
                             steps.push(make_impl_step(n, file, target, desc));
                         }
                     }
-                }
-            }
             continue;
         }
 
@@ -493,13 +486,12 @@ fn extract_review_items(report: &str) -> Vec<PlanStep> {
             continue;
         }
 
-        if let Some((n, rest)) = parse_bug_review_line(line) {
-            if seen.insert(n) {
+        if let Some((n, rest)) = parse_bug_review_line(line)
+            && seen.insert(n) {
                 let file = extract_path_from_text(rest);
                 let target = extract_symbol_target(rest);
                 steps.push(make_impl_step(n, file, target, rest.to_string()));
             }
-        }
     }
 
     steps
@@ -508,8 +500,8 @@ fn extract_review_items(report: &str) -> Vec<PlanStep> {
 /// `BUG-1（严重）`, `F1 —`, `**BUG-2**` style headings.
 fn parse_bug_review_line(line: &str) -> Option<(u32, &str)> {
     let mut t = line.trim();
-    while t.starts_with(|c: char| c == '-' || c == '*' || c == ' ') {
-        t = t.trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ');
+    while t.starts_with(['-', '*', ' ']) {
+        t = t.trim_start_matches(['-', '*', ' ']);
     }
     let upper = t.to_ascii_uppercase();
     let rest = if upper.strip_prefix("BUG-").is_some() {

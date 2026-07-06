@@ -198,7 +198,7 @@ mod tests {
         let close = concat!("<", "/think", ">");
         let content = format!("hi {open}secret{close}x");
         let mut msgs = vec![Message::Assistant {
-            content: content.into(),
+            content: content,
             tool_calls: vec![],
             reasoning_content: Some("long reasoning".into()),
         }];

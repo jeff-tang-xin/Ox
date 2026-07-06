@@ -397,11 +397,10 @@ impl GitNexusService {
         let _guard = self.start_lock.lock().await;
 
         // Fast path: someone already started a live client.
-        if let Some(c) = self.client.lock().await.as_ref() {
-            if c.is_alive().await {
+        if let Some(c) = self.client.lock().await.as_ref()
+            && c.is_alive().await {
                 return Ok(c.clone());
             }
-        }
 
         self.set_status(GitNexusStatus::Starting).await;
         // Handshake may include a first-run package download, so honor the
@@ -459,11 +458,10 @@ impl GitNexusService {
 
     /// Return a live client, transparently restarting a dead server.
     async fn live_client(&self) -> anyhow::Result<Arc<McpClient>> {
-        if let Some(c) = self.client.lock().await.as_ref() {
-            if c.is_alive().await {
+        if let Some(c) = self.client.lock().await.as_ref()
+            && c.is_alive().await {
                 return Ok(c.clone());
             }
-        }
         // If a background index build is in progress, don't start a new server
         // on the half-built index — wait for the build to complete.
         if self.is_building() {
@@ -575,12 +573,11 @@ impl GitNexusService {
     async fn run_cli(&self, sub: &str) -> anyhow::Result<CliResult> {
         // Add --worker-timeout for analyze/init commands
         let mut args = self.config.cli_args(sub);
-        if sub == "analyze" || sub == "init" {
-            if self.config.worker_timeout_sec > 0 {
+        if (sub == "analyze" || sub == "init")
+            && self.config.worker_timeout_sec > 0 {
                 args.push("--worker-timeout".to_string());
                 args.push(self.config.worker_timeout_sec.to_string());
             }
-        }
         let output = super::client::build_command(&self.config.command, &args)
             .current_dir(&self.project_root)
             .output()
@@ -751,16 +748,14 @@ fn newest_mtime_under(dir: &Path) -> Option<SystemTime> {
     }
     let mut newest: Option<SystemTime> = None;
     for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
-        if entry.file_type().is_file() {
-            if let Ok(md) = entry.metadata() {
-                if let Ok(m) = md.modified() {
+        if entry.file_type().is_file()
+            && let Ok(md) = entry.metadata()
+                && let Ok(m) = md.modified() {
                     newest = Some(match newest {
                         Some(n) if n >= m => n,
                         _ => m,
                     });
                 }
-            }
-        }
     }
     newest
 }
@@ -791,13 +786,11 @@ fn source_tree_newer_than(root: &Path, built_at: SystemTime) -> bool {
             if seen > MAX_FILES {
                 break;
             }
-            if let Ok(md) = entry.metadata() {
-                if let Ok(m) = md.modified() {
-                    if m > built_at {
+            if let Ok(md) = entry.metadata()
+                && let Ok(m) = md.modified()
+                    && m > built_at {
                         return true;
                     }
-                }
-            }
         }
     }
     false

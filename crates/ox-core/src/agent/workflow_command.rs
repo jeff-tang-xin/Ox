@@ -378,7 +378,7 @@ mod tests {
         let mut engine = WorkflowEngine::new(Arc::clone(&session));
         engine.register_workflow(create_default_workflow());
         engine.activate_workflow(DEFAULT_WORKFLOW_ID).unwrap();
-        let mut store = findings::FindingsStore {
+        let store = findings::FindingsStore {
             summary: "s".into(),
             findings: vec![findings::Finding {
                 index: 1,

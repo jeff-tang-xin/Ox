@@ -298,7 +298,7 @@ impl Tool for ShellExecTool {
                     if !stderr_text.is_empty() {
                         parts.push(format!("── stderr ──\n{stderr_text}"));
                     }
-                    parts.push(format!("\n✅ Exit code: 0"));
+                    parts.push("\n✅ Exit code: 0".to_string());
                 }
 
                 let output = parts.join("\n\n");

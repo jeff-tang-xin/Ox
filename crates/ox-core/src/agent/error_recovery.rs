@@ -67,9 +67,7 @@ pub fn check_and_recover(
                 }
 
                 let exit_code = content
-                    .lines()
-                    .filter(|l| l.contains("exit code:"))
-                    .last()
+                    .lines().rfind(|l| l.contains("exit code:"))
                     .unwrap_or("");
 
                 if exit_code.contains("exit code: 0") {

@@ -34,11 +34,10 @@ pub fn finalize_completed_round(engine: &mut WorkflowEngine) {
     if engine.get_variable(ROUND_FINALIZED_KEY).as_deref() == Some("1") {
         return;
     }
-    if let Some(prev) = engine.get_variable("_current_user_request") {
-        if !prev.trim().is_empty() {
+    if let Some(prev) = engine.get_variable("_current_user_request")
+        && !prev.trim().is_empty() {
             archive_completed_round(engine, &prev);
         }
-    }
     engine.clear_ephemeral_workflow_state();
     engine.set_variable(ROUND_FINALIZED_KEY, "1".to_string());
 }
@@ -68,11 +67,10 @@ pub fn finalize_interrupted_on_exit(engine: &mut WorkflowEngine) {
         return;
     }
     let interrupted = engine.get_variable(ROUND_INTERRUPTED_KEY).as_deref() == Some("1");
-    if let Some(prev) = engine.get_variable("_current_user_request") {
-        if !prev.trim().is_empty() && (interrupted || round_had_activity(engine)) {
+    if let Some(prev) = engine.get_variable("_current_user_request")
+        && !prev.trim().is_empty() && (interrupted || round_had_activity(engine)) {
             archive_interrupted_round(engine, &prev);
         }
-    }
     engine.set_variable(ROUND_INTERRUPTED_KEY, String::new());
 }
 
@@ -234,19 +232,18 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
             engine.set_variable("_current_user_request", user_message.to_string());
             return false;
         }
-        if let Some(prev) = engine.get_variable("_current_user_request") {
-            if !prev.trim().is_empty()
+        if let Some(prev) = engine.get_variable("_current_user_request")
+            && !prev.trim().is_empty()
                 && prev.trim() != user_message.trim()
                 && engine.get_variable(ROUND_FINALIZED_KEY).as_deref() != Some("1")
             {
                 archive_round(engine, &prev);
             }
-        }
         engine.reset_workflow();
         engine.clear_turn_provenance();
-        let intent = crate::agent::task_intent::resolve_for_round(&engine, user_message);
+        let intent = crate::agent::task_intent::resolve_for_round(engine, user_message);
         engine.set_variable("_current_user_request", user_message.to_string());
-        crate::agent::phase::on_round_started(&engine, intent);
+        crate::agent::phase::on_round_started(engine, intent);
         return true;
     }
 
@@ -267,16 +264,15 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
         return false;
     }
 
-    if let Some(prev) = engine.get_variable("_current_user_request") {
-        if !prev.trim().is_empty() && prev.trim() != user_message.trim() {
+    if let Some(prev) = engine.get_variable("_current_user_request")
+        && !prev.trim().is_empty() && prev.trim() != user_message.trim() {
             archive_round(engine, &prev);
         }
-    }
     engine.reset_workflow();
     engine.clear_turn_provenance();
-    let intent = crate::agent::task_intent::resolve_for_round(&engine, user_message);
+    let intent = crate::agent::task_intent::resolve_for_round(engine, user_message);
     engine.set_variable("_current_user_request", user_message.to_string());
-    crate::agent::phase::on_round_started(&engine, intent);
+    crate::agent::phase::on_round_started(engine, intent);
     true
 }
 
@@ -372,12 +368,11 @@ fn round_had_activity(engine: &WorkflowEngine) -> bool {
 pub fn build_round_outcome_summary(engine: &WorkflowEngine) -> String {
     let mut parts = Vec::new();
 
-    if let Some(reply) = engine.get_variable("_chat_reply") {
-        if !reply.trim().is_empty() {
+    if let Some(reply) = engine.get_variable("_chat_reply")
+        && !reply.trim().is_empty() {
             let snippet: String = reply.chars().take(1200).collect();
             parts.push(format!("【回复】\n{snippet}"));
         }
-    }
 
     for (i, label, cap) in [
         ("_step3_output", "执行结果", 2200usize),
@@ -394,15 +389,14 @@ pub fn build_round_outcome_summary(engine: &WorkflowEngine) -> String {
         }
     }
 
-    if let Some(tm) = engine.load_turn_memory() {
-        if !tm.entries.is_empty() {
+    if let Some(tm) = engine.load_turn_memory()
+        && !tm.entries.is_empty() {
             let mut lines = vec!["【工具调用/改动】".to_string()];
             for e in tm.entries.iter().take(30) {
                 lines.push(format!("  - {}({}) → {}", e.tool, e.target, e.outcome));
             }
             parts.push(lines.join("\n"));
         }
-    }
 
     parts.join("\n\n")
 }

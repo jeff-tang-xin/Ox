@@ -382,13 +382,12 @@ fn enter_implement(engine: &WorkflowEngine, user_text: &str) {
             }
         }
         for idx in &store.active_indices {
-            if let Some(finding) = store.findings.iter_mut().find(|f| f.index == *idx) {
-                if finding.status == findings::FindingStatus::Open
-                    || finding.status == findings::FindingStatus::Scoped
+            if let Some(finding) = store.findings.iter_mut().find(|f| f.index == *idx)
+                && (finding.status == findings::FindingStatus::Open
+                    || finding.status == findings::FindingStatus::Scoped)
                 {
                     finding.status = findings::FindingStatus::InProgress;
                 }
-            }
         }
         findings::save(engine, &store);
     }
@@ -913,7 +912,7 @@ mod tests {
         let mut engine2 = WorkflowEngine::new(Arc::clone(&session));
         engine2.register_workflow(create_default_workflow());
         engine2.activate_workflow(DEFAULT_WORKFLOW_ID).unwrap();
-        let mut store2 = FindingsStore {
+        let store2 = FindingsStore {
             summary: "s".into(),
             findings: vec![
                 Finding {

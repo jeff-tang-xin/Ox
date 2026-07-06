@@ -122,11 +122,10 @@ impl SkillLoader {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Ok(skill) = self.parse_skill_file(&path, scope.clone()) {
+            if path.extension().and_then(|e| e.to_str()) == Some("md")
+                && let Ok(skill) = self.parse_skill_file(&path, scope.clone()) {
                     skills.push(skill);
                 }
-            }
         }
 
         Ok(skills)
@@ -174,11 +173,10 @@ fn skill_timestamp(
     metadata: &std::collections::HashMap<String, String>,
 ) -> chrono::DateTime<chrono::Utc> {
     for key in ["updated_at", "created_at"] {
-        if let Some(raw) = metadata.get(key) {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw.trim_matches('"')) {
+        if let Some(raw) = metadata.get(key)
+            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw.trim_matches('"')) {
                 return dt.with_timezone(&chrono::Utc);
             }
-        }
     }
     path.metadata()
         .ok()
@@ -198,15 +196,12 @@ pub fn get_system_skills() -> Vec<Skill> {
 
     let mut skills = Vec::new();
 
-    for entry in std::fs::read_dir(&builtin_dir).ok().into_iter().flatten() {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Ok(skill) = parse_skill_file_static(&path, SkillScope::System) {
-                    skills.push(skill);
-                }
+    for entry in std::fs::read_dir(&builtin_dir).ok().into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("md")
+            && let Ok(skill) = parse_skill_file_static(&path, SkillScope::System) {
+                skills.push(skill);
             }
-        }
     }
 
     skills

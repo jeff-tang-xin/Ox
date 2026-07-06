@@ -64,16 +64,14 @@ impl StreamAdapter for OpenAiAdapter {
                 let index = choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
 
                 // Check finish_reason
-                if let Some(finish_reason) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                    if finish_reason == "tool_calls" || finish_reason == "stop" {
-                        if self.active_tool_calls.contains(&index) {
+                if let Some(finish_reason) = choice.get("finish_reason").and_then(|f| f.as_str())
+                    && (finish_reason == "tool_calls" || finish_reason == "stop")
+                        && self.active_tool_calls.contains(&index) {
                             if let Some(id) = self.tool_call_ids.get(&index) {
                                 events.push(LlmStreamEvent::ToolCallEnd { id: id.clone() });
                             }
                             self.active_tool_calls.remove(&index);
                         }
-                    }
-                }
 
                 // Process delta
                 if let Some(delta) = choice.get("delta") {
@@ -188,7 +186,7 @@ impl OpenAiAdapter {
                     let buffer = self
                         .argument_buffers
                         .entry(tc_index)
-                        .or_insert_with(String::new);
+                        .or_default();
                     buffer.push_str(&args);
                     let tc_id = self
                         .tool_call_ids
@@ -281,23 +279,20 @@ impl StreamAdapter for AnthropicAdapter {
                     let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     match delta_type {
                         "text_delta" => {
-                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                if !text.is_empty() {
+                            if let Some(text) = delta.get("text").and_then(|t| t.as_str())
+                                && !text.is_empty() {
                                     events.push(LlmStreamEvent::TextDelta(text.to_string()));
                                 }
-                            }
                         }
                         "input_json_delta" => {
                             if let Some(partial) =
                                 delta.get("partial_json").and_then(|p| p.as_str())
-                            {
-                                if let Some(id) = self.block_index_to_id.get(&index).cloned() {
+                                && let Some(id) = self.block_index_to_id.get(&index).cloned() {
                                     events.push(LlmStreamEvent::ToolCallArgumentsDelta {
                                         id,
                                         delta: partial.to_string(),
                                     });
                                 }
-                            }
                         }
                         _ => {}
                     }

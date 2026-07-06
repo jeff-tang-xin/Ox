@@ -111,11 +111,10 @@ impl Tool for CodeGraphTool {
             // GitNexus MCP server's `query` tool expects `pattern` as the
             // search-text parameter key, but the LLM sends `query` (from Ox's
             // precheck error message). Normalize it here.
-            if op == "query" || op == "cypher" {
-                if let Some(q) = obj.remove("query") {
+            if (op == "query" || op == "cypher")
+                && let Some(q) = obj.remove("query") {
                     obj.insert("pattern".to_string(), q);
                 }
-            }
         }
 
         match svc.call(&op, forwarded).await {
@@ -126,16 +125,14 @@ impl Tool for CodeGraphTool {
                 }
                 // If GitNexus says multiple repos, auto-list them so the LLM
                 // knows which repo name to use.
-                if text.contains("Multiple repositories indexed") {
-                    if let Ok(repos) = svc.list_repos().await {
-                        if !repos.is_error {
+                if text.contains("Multiple repositories indexed")
+                    && let Ok(repos) = svc.list_repos().await
+                        && !repos.is_error {
                             let list = repos.text.trim();
                             text.push_str(&format!(
                                 "\n\n📋 可用仓库:\n{list}\n请在下次调用时加上 repo 参数。"
                             ));
                         }
-                    }
-                }
                 // If GitNexus can't find the target (e.g. file not in git yet,
                 // or wrong repo parameter), append a helpful hint.
                 if text.contains("Target") && (text.contains("not found") || text.contains("NotFound")) {
@@ -170,16 +167,14 @@ impl Tool for CodeGraphTool {
 fn precheck(op: &str, args: &Value) -> Result<(), String> {
     let has = |k: &str| args.get(k).map(|v| !v.is_null()).unwrap_or(false);
     match op {
-        "query" | "cypher" => {
-            if !has("query") {
+        "query" | "cypher"
+            if !has("query") => {
                 return Err(format!("op={op} 需要 params.query"));
             }
-        }
-        "context" => {
-            if !has("name") && !has("uid") {
+        "context"
+            if !has("name") && !has("uid") => {
                 return Err("op=context 需要 params.name 或 params.uid".into());
             }
-        }
         "impact" => {
             if !has("target") && !has("target_uid") {
                 return Err("op=impact 需要 params.target（或 target_uid）".into());
@@ -188,11 +183,10 @@ fn precheck(op: &str, args: &Value) -> Result<(), String> {
                 return Err("op=impact 需要 params.direction（upstream 或 downstream）".into());
             }
         }
-        "api_impact" => {
-            if !has("route") && !has("file") {
+        "api_impact"
+            if !has("route") && !has("file") => {
                 return Err("op=api_impact 需要 params.route 或 params.file".into());
             }
-        }
         "rename" => {
             if !has("new_name") {
                 return Err("op=rename 需要 params.new_name".into());
@@ -201,11 +195,10 @@ fn precheck(op: &str, args: &Value) -> Result<(), String> {
                 return Err("op=rename 需要 params.symbol_name（或 symbol_uid）".into());
             }
         }
-        "group_sync" => {
-            if !has("name") {
+        "group_sync"
+            if !has("name") => {
                 return Err("op=group_sync 需要 params.name".into());
             }
-        }
         _ => {}
     }
     Ok(())

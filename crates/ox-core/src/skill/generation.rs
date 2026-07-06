@@ -371,7 +371,7 @@ impl SkillGenerator {
 
             patterns_by_sequence
                 .entry(sequence)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(trace);
         }
 
@@ -412,8 +412,8 @@ impl SkillGenerator {
                     step_by_step_guide: pattern
                         .common_tool_sequence
                         .iter()
-                        .enumerate()
-                        .map(|(_i, tool)| format!("Use `{}` tool", tool))
+                        
+                        .map(|tool| format!("Use `{}` tool", tool))
                         .collect(),
                     example_tool_calls: vec![], // Would need to extract from traces
                     pitfalls: vec![],

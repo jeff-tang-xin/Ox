@@ -166,11 +166,10 @@ impl EntityGraph {
                         if visited.contains(&edge.to_id) {
                             continue;
                         }
-                        if let Some(allowed) = relation_types {
-                            if !allowed.contains(&edge.relation_type) {
+                        if let Some(allowed) = relation_types
+                            && !allowed.contains(&edge.relation_type) {
                                 continue;
                             }
-                        }
                         visited.insert(edge.to_id.clone());
                         let new_weight = path_weight * edge.weight;
                         if let Some(entity) = self.entities.get(&edge.to_id) {
@@ -207,7 +206,7 @@ impl EntityGraph {
             .map(|edges| {
                 edges
                     .iter()
-                    .filter(|e| relation_type.map_or(true, |rt| e.relation_type == rt))
+                    .filter(|e| relation_type.is_none_or(|rt| e.relation_type == rt))
                     .filter_map(|e| self.entities.get(&e.from_id))
                     .collect()
             })
@@ -225,7 +224,7 @@ impl EntityGraph {
             .map(|edges| {
                 edges
                     .iter()
-                    .filter(|e| relation_type.map_or(true, |rt| e.relation_type == rt))
+                    .filter(|e| relation_type.is_none_or(|rt| e.relation_type == rt))
                     .filter_map(|e| self.entities.get(&e.to_id))
                     .collect()
             })
@@ -301,11 +300,10 @@ impl EntityGraph {
                     .iter()
                     .filter(|e| my_targets.contains(e.to_id.as_str()))
                     .count();
-                if overlap > 0 {
-                    if let Some(other) = self.entities.get(other_id) {
+                if overlap > 0
+                    && let Some(other) = self.entities.get(other_id) {
                         scored.push((other, overlap));
                     }
-                }
             }
         }
 

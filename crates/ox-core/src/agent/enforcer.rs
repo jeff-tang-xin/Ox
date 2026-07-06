@@ -60,41 +60,27 @@ impl RuleEnforcer {
 
         // 1. 校验: 编辑前必须有计划 (Plan Before Edit)
         if rules.plan_before_edit {
-            if let Err(e) = Self::check_plan_before_edit(
+            Self::check_plan_before_edit(
                 tool_call,
                 messages,
                 &rules.custom_plan_patterns,
                 rules.trivial_edit_threshold,
-            ) {
-                return Err(e);
-            }
+            )?
         }
 
         // 2. 校验: Shell 执行前必须有步骤列表 (Steps Before Shell)
         if rules.steps_before_shell {
-            if let Err(e) =
-                Self::check_steps_before_shell(tool_call, messages, &rules.custom_step_patterns)
-            {
-                return Err(e);
-            }
+            Self::check_steps_before_shell(tool_call, messages, &rules.custom_step_patterns)?
         }
 
         // 3. 校验: 编辑前必须先读取文件 (Read Before Edit)
         if rules.read_before_edit {
-            if let Err(e) =
-                Self::check_read_before_edit(tool_call, messages, rules.trivial_edit_threshold)
-            {
-                return Err(e);
-            }
+            Self::check_read_before_edit(tool_call, messages, rules.trivial_edit_threshold)?
         }
 
         // 4. 校验: 修改定义前检查调用方 (Impact Analysis)
         if rules.impact_analysis {
-            if let Err(e) =
-                Self::check_impact_before_edit(tool_call, messages, rules.trivial_edit_threshold)
-            {
-                return Err(e);
-            }
+            Self::check_impact_before_edit(tool_call, messages, rules.trivial_edit_threshold)?
         }
 
         Ok(())
@@ -115,24 +101,21 @@ impl RuleEnforcer {
         }
 
         // Exception: Plan only needed for source code, not docs/config/system files
-        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-            if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
-                if !is_source_file(path) {
+        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            && let Some(path) = args.get("path").and_then(|p| p.as_str())
+                && !is_source_file(path) {
                     return Ok(());
                 }
-            }
-        }
 
         // 🎯 Trivial 编辑白名单：edit_file 的 old_string 很短时（如拼写修复），不需要 Plan
         // 只对 edit_file 生效（file_write 是全量写入，不适用）
-        if tc.name == "edit_file" && trivial_threshold > 0 {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+        if tc.name == "edit_file" && trivial_threshold > 0
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                 // 检查单次编辑的 old_string 长度
-                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str()) {
-                    if old_str.len() <= trivial_threshold {
+                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
+                    && old_str.len() <= trivial_threshold {
                         return Ok(());
                     }
-                }
                 // 检查批量编辑中是否所有 old_string 都很短
                 if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
                     let all_trivial = edits.iter().all(|e| {
@@ -146,7 +129,6 @@ impl RuleEnforcer {
                     }
                 }
             }
-        }
 
         // 🎯 只检查最近一次用户消息之后的消息（与 Steps Before Shell 逻辑一致）
         // 这样用户提一个问题 → LLM 计划一次 → 多次编辑操作都可通过
@@ -317,13 +299,12 @@ impl RuleEnforcer {
         }
 
         // 🎯 Trivial 编辑白名单：短修改不需要先读取（与 plan_before_edit 一致）
-        if tc.name == "edit_file" && trivial_threshold > 0 {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str()) {
-                    if old_str.len() <= trivial_threshold {
+        if tc.name == "edit_file" && trivial_threshold > 0
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
+                    && old_str.len() <= trivial_threshold {
                         return Ok(());
                     }
-                }
                 if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
                     let all_trivial = edits.iter().all(|e| {
                         e.get("old_string")
@@ -336,7 +317,6 @@ impl RuleEnforcer {
                     }
                 }
             }
-        }
 
         // 🎯 扫描最近一次用户消息之后的消息中是否有对同一路径的 file_read
         let last_user_idx = messages
@@ -363,11 +343,10 @@ impl RuleEnforcer {
             match msg {
                 Message::Assistant { tool_calls, .. } => {
                     for tc in tool_calls {
-                        if tc.name == "file_read" {
-                            if let Ok(args) =
+                        if tc.name == "file_read"
+                            && let Ok(args) =
                                 serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                            {
-                                if let Some(read_path) = args.get("path").and_then(|p| p.as_str()) {
+                                && let Some(read_path) = args.get("path").and_then(|p| p.as_str()) {
                                     let read_basename = std::path::Path::new(read_path)
                                         .file_name()
                                         .map(|n| n.to_string_lossy().to_string())
@@ -382,20 +361,17 @@ impl RuleEnforcer {
                                         break;
                                     }
                                 }
-                            }
-                        }
                     }
                     if has_read {
                         break;
                     }
                 }
-                Message::ToolResult { content, .. } => {
+                Message::ToolResult { content, .. }
                     // recall 的结果也视为"看过"——它恢复了 offloaded 的文件内容
-                    if content.contains(&target_basename) || content.contains(&target_path) {
+                    if (content.contains(&target_basename) || content.contains(&target_path)) => {
                         // 不能单纯因为文本中出现文件名就认为已读取
                         // 需要是 recall 工具的结果
                     }
-                }
                 _ => {}
             }
             if has_read {
@@ -454,13 +430,12 @@ impl RuleEnforcer {
         }
 
         // 🎯 Trivial 编辑白名单：短修改不需要 impact analysis
-        if tc.name == "edit_file" && trivial_threshold > 0 {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str()) {
-                    if old_str.len() <= trivial_threshold {
+        if tc.name == "edit_file" && trivial_threshold > 0
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
+                    && old_str.len() <= trivial_threshold {
                         return Ok(());
                     }
-                }
                 if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
                     let all_trivial = edits.iter().all(|e| {
                         e.get("old_string")
@@ -473,7 +448,6 @@ impl RuleEnforcer {
                     }
                 }
             }
-        }
 
         let target_basename = std::path::Path::new(&target_path)
             .file_name()
@@ -497,8 +471,8 @@ impl RuleEnforcer {
         let has_impact_check = recent_messages.iter().any(|msg| {
             if let Message::Assistant { tool_calls, .. } = msg {
                 tool_calls.iter().any(|tc| {
-                    if tc.name == "code_search" {
-                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    if tc.name == "code_search"
+                        && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                             let search_query =
                                 args.get("query").and_then(|q| q.as_str()).unwrap_or("");
                             // code_search was called with the file name or path as query
@@ -509,7 +483,6 @@ impl RuleEnforcer {
                                 return true;
                             }
                         }
-                    }
                     false
                 })
             } else {

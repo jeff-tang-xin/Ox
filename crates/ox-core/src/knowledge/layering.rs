@@ -454,7 +454,7 @@ impl AutoLayering {
                         ..
                     } => {
                         let mut entity =
-                            Entity::episodic_memory(&topic, session_id, None, &content);
+                            Entity::episodic_memory(topic, session_id, None, &content);
                         for fid in source_facts {
                             entity.relations.push(Relation {
                                 target_id: fid.clone(),
@@ -694,7 +694,8 @@ fn classify_domain(content: &str) -> String {
 
 /// Export an EpisodicMemory entity to a human-readable Markdown file.
 pub fn export_episode_to_markdown(entity: &Entity, related_atoms: &[&Entity]) -> String {
-    let em = match &entity.metadata {
+    
+    match &entity.metadata {
         EntityMetadata::EpisodicMemory {
             episode_name,
             start_time,
@@ -745,14 +746,14 @@ pub fn export_episode_to_markdown(entity: &Entity, related_atoms: &[&Entity]) ->
                     .join("\n"),
             )
         }
-        _ => return String::new(),
-    };
-    em
+        _ => String::new(),
+    }
 }
 
 /// Export a SemanticMemory entity to a human-readable Markdown file.
 pub fn export_semantic_to_markdown(entity: &Entity, related_episodes: &[&Entity]) -> String {
-    let sm = match &entity.metadata {
+    
+    match &entity.metadata {
         EntityMetadata::SemanticMemory {
             domain,
             version,
@@ -779,9 +780,8 @@ pub fn export_semantic_to_markdown(entity: &Entity, related_episodes: &[&Entity]
                     .join("\n"),
             )
         }
-        _ => return String::new(),
-    };
-    sm
+        _ => String::new(),
+    }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

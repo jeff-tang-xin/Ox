@@ -85,6 +85,12 @@ pub struct StateRegistry {
     current_session_id: Option<String>,
 }
 
+impl Default for StateRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StateRegistry {
     pub fn new() -> Self {
         let mut registry = Self {

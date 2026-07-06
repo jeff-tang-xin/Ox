@@ -5,7 +5,6 @@ use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 /// 2. If no results: knowledge engine vector search for semantic fallback
 use serde_json::{Value, json};
 use std::path::Path;
-use std::sync::Arc;
 
 pub struct FindSymbolTool;
 
@@ -67,24 +66,21 @@ impl Tool for FindSymbolTool {
         // find_symbol folds in both symbol location AND relationship model.
         // Timeout at 2s so it never slows down the symbol search.
         let mut graph_prefix = String::new();
-        if let Some(ref svc) = ctx.gitnexus {
-            if svc.is_ready().await {
+        if let Some(ref svc) = ctx.gitnexus
+            && svc.is_ready().await {
                 let qp = crate::mcp::gitnexus::QueryParams::new(name);
                 if let Ok(graph) = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     svc.query(&qp),
-                ).await {
-                    if let Ok(g) = graph {
-                        if !g.is_error {
+                ).await
+                    && let Ok(g) = graph
+                        && !g.is_error {
                             let t = g.text.trim();
                             if !t.is_empty() && t != "(空结果)" {
                                 graph_prefix = format!("── code_graph/query ──\n{t}\n\n");
                             }
                         }
-                    }
-                }
             }
-        }
 
         let result = tokio::task::spawn(async move {
             // ── Step 1: tree-sitter direct search (always available, no index needed) ──
@@ -309,7 +305,7 @@ fn search_with_treesitter(
                                         symbol_type: symbol_type.to_string(),
                                         name: fq_name.clone(),
                                         file_path: file_path.clone(),
-                                        line: start_line as usize,
+                                        line: start_line,
                                         signature: signature.clone(),
                                         parent: parent.clone(),
                                         calls: calls.clone(),

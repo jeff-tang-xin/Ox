@@ -86,20 +86,17 @@ impl IntentInfo {
 /// 记忆检索范围
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MemoryScope {
     /// 仅当前项目
     Project,
     /// 全局知识
     Global,
     /// 两者都搜索
+    #[default]
     Both,
 }
 
-impl Default for MemoryScope {
-    fn default() -> Self {
-        Self::Both
-    }
-}
 
 /// 基于规则的意图分类器
 pub struct RuleBasedClassifier {
@@ -427,8 +424,8 @@ impl RuleBasedClassifier {
 
         // 规则 3: 复杂任务可能需要参考最佳实践
         match intent {
-            QuestionType::CodeWriting | QuestionType::Refactoring => {
-                if keywords.len() >= 3 {
+            QuestionType::CodeWriting | QuestionType::Refactoring
+                if keywords.len() >= 3 => {
                     // 任务较复杂
                     return (
                         true,
@@ -436,7 +433,6 @@ impl RuleBasedClassifier {
                         MemoryScope::Both, // 可能用到全局知识
                     );
                 }
-            }
             QuestionType::Debugging => {
                 // Debug 时查找类似问题的解决方案
                 return (
@@ -549,8 +545,8 @@ impl Default for RuleBasedClassifier {
 /// 从 LLM 响应中提取意图
 pub fn extract_intent_from_llm_response(response: &str) -> Option<IntentInfo> {
     // 查找最后一个 JSON 代码块
-    if let Some(json_start) = response.rfind("```json") {
-        if let Some(json_end) = response[json_start..].find("```") {
+    if let Some(json_start) = response.rfind("```json")
+        && let Some(json_end) = response[json_start..].find("```") {
             // 使用字符边界安全的切片方法
             let start_byte = json_start + 7; // "```json" 的长度是7
             let end_byte = json_start + json_end;
@@ -577,7 +573,6 @@ pub fn extract_intent_from_llm_response(response: &str) -> Option<IntentInfo> {
                 }
             }
         }
-    }
 
     None
 }

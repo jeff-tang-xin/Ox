@@ -3,7 +3,6 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 pub struct FileWriteTool;
 
@@ -86,8 +85,8 @@ impl Tool for FileWriteTool {
 
         // Check if file is being written directly to .ox/ without subdirectory
         // Pattern: ".ox/something.md" (wrong) vs ".ox/name/something.md" (correct)
-        if rel_str.starts_with(".ox/") {
-            let after_ox = &rel_str[4..]; // Remove ".ox/"
+        if let Some(after_ox) = rel_str.strip_prefix(".ox/") {
+            // Remove ".ox/"
             if !after_ox.contains('/') && !after_ox.contains('\\') {
                 // File is directly in .ox/ (e.g., .ox/spec.md) - NO subdirectory
                 tracing::warn!(
@@ -121,9 +120,9 @@ impl Tool for FileWriteTool {
                             resolved_path.display()
                         ));
                     }
-                    ':' => {
+                    ':'
                         // ':' is only valid at position 1 (drive letter separator)
-                        if i != 1 {
+                        if i != 1 => {
                             return ToolOutput::error(format!(
                                 "❌ Invalid Path Character: ':' is not allowed in Windows filenames (except for drive letter)\n\n\
                                  💡 Problem: {} contains ':' at position {}\n\
@@ -132,7 +131,6 @@ impl Tool for FileWriteTool {
                                 i
                             ));
                         }
-                    }
                     _ => {}
                 }
             }
@@ -260,7 +258,7 @@ impl Tool for FileWriteTool {
         };
 
         // Auto-detect large files and use chunked writing (>1 MB)
-        const AUTO_CHUNK_THRESHOLD: usize = 1 * 1024 * 1024; // 1 MB
+        const AUTO_CHUNK_THRESHOLD: usize = 1024 * 1024; // 1 MB
         const CHUNK_SIZE: usize = 512 * 1024; // 512 KB per chunk
 
         let is_large_file = content_bytes.len() > AUTO_CHUNK_THRESHOLD;
@@ -341,7 +339,7 @@ impl Tool for FileWriteTool {
                 let size_info = if is_large_file {
                     format!(
                         "\n📦 Strategy: Chunked write ({} chunks of {} KB)",
-                        (content_bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE,
+                        content_bytes.len().div_ceil(CHUNK_SIZE),
                         CHUNK_SIZE / 1024
                     )
                 } else {

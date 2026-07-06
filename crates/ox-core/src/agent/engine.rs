@@ -188,42 +188,38 @@ impl WorkflowEngine {
             }
             // Impact gate: require code_graph impact analysis before reading/editing
             // finding-related files, so the LLM understands the blast radius.
-            if matches!(tool_name, "file_read" | "edit_file") {
-                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                    if !path.trim().is_empty() {
+            if matches!(tool_name, "file_read" | "edit_file")
+                && let Some(path) = args.get("path").and_then(|v| v.as_str())
+                    && !path.trim().is_empty() {
                         let target_val = serde_json::Value::String(path.to_string());
-                        if let Some(idx) = crate::agent::findings::finding_index_for_target(self, &target_val) {
-                            if !self.impl_impact_done(idx) {
+                        if let Some(idx) = crate::agent::findings::finding_index_for_target(self, &target_val)
+                            && !self.impl_impact_done(idx) {
                                 return Err(format!(
                                     "📊 影响范围门禁 — 编辑 `{path}` 前请先评估改动影响。\n\
                                      先调用 complete_and_check(action=\"code_graph\", \
                                      params={{\"op\":\"impact\",\"target\":\"{symbol}\",\"direction\":\"downstream\"}}) \
                                      查看调用链影响范围。",
                                     symbol = path.rsplit('/')
-                                        .last()
+                                        .next_back()
                                         .unwrap_or(path)
                                         .rsplit('\\')
-                                        .last()
+                                        .next_back()
                                         .unwrap_or(path)
                                         .rsplit('.')
                                         .next()
                                         .unwrap_or(path)
                                 ));
                             }
-                        }
                     }
-                }
-            }
         }
 
         crate::agent::read_guard::check(tool_name, args, self)?;
 
-        if tool_name == "file_read" {
-            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        if tool_name == "file_read"
+            && let Some(path) = args.get("path").and_then(|v| v.as_str()) {
                 let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
                 self.validate_impl_file_read(path, offset)?;
             }
-        }
 
         Ok(())
     }
@@ -902,13 +898,13 @@ impl WorkflowEngine {
                 if prompt.contains("{WORKFLOW_PHASE}") {
                     prompt = prompt.replace(
                         "{WORKFLOW_PHASE}",
-                        &crate::agent::workflow_phases::phase_prompt_addon(self),
+                        crate::agent::workflow_phases::phase_prompt_addon(self),
                     );
                 } else {
                     let phase_addon = crate::agent::workflow_phases::phase_prompt_addon(self);
                     if !phase_addon.is_empty() {
                         prompt.push_str("\n\n");
-                        prompt.push_str(&phase_addon);
+                        prompt.push_str(phase_addon);
                     }
                 }
                 if prompt.contains("{FINDINGS_SCHEMA}") {
@@ -953,8 +949,8 @@ impl WorkflowEngine {
         }
 
         // Check tool whitelist (if specified)
-        if !step.allowed_tools.is_empty() {
-            if !step.allowed_tools.contains(&tool_name.to_string()) {
+        if !step.allowed_tools.is_empty()
+            && !step.allowed_tools.contains(&tool_name.to_string()) {
                 return Err(format!(
                     "Tool '{}' is not allowed in current step '{}'. Allowed tools: {}",
                     tool_name,
@@ -962,14 +958,12 @@ impl WorkflowEngine {
                     step.allowed_tools.join(", ")
                 ));
             }
-        }
 
-        if tool_name == "file_read" {
-            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        if tool_name == "file_read"
+            && let Some(path) = args.get("path").and_then(|v| v.as_str()) {
                 let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
                 self.validate_impl_file_read(path, offset)?;
             }
-        }
 
         crate::agent::workflow_phases::validate_act_tool(self, tool_name)?;
         crate::agent::workflow_session::validate_feedback_discuss_tool(self, tool_name)?;
@@ -1027,17 +1021,15 @@ impl WorkflowEngine {
 
     /// Get current step information for display
     pub fn get_current_step_info(&self) -> Option<StepDisplayInfo> {
-        if let Some(workflow) = &self.current_workflow {
-            if let Ok(session) = self.session_state.try_lock() {
-                if let Some(step) = workflow.get_step(session.current_step_index) {
+        if let Some(workflow) = &self.current_workflow
+            && let Ok(session) = self.session_state.try_lock()
+                && let Some(step) = workflow.get_step(session.current_step_index) {
                     return Some(StepDisplayInfo {
                         name: step.name.clone(),
                         current_step: session.current_step_index + 1,
                         total_steps: workflow.total_steps(),
                     });
                 }
-            }
-        }
         None
     }
 
@@ -1285,16 +1277,15 @@ impl WorkflowEngine {
             return true;
         }
         // Trailing completion line (common in Chinese reviews)
-        if let Some(last) = text.lines().map(str::trim).filter(|l| !l.is_empty()).last() {
-            if last == "完成"
+        if let Some(last) = text.lines().map(str::trim).rfind(|l| !l.is_empty())
+            && (last == "完成"
                 || last == "**完成**"
                 || last.ends_with("完成。")
                 || last.contains("审查完成")
-                || last.contains("检查完成")
+                || last.contains("检查完成"))
             {
                 return true;
             }
-        }
         false
     }
 
@@ -1404,9 +1395,9 @@ impl WorkflowEngine {
         arguments: &str,
     ) -> Option<String> {
         let target = crate::agent::exploration_snapshot::target_from_tool_args(tool, arguments);
-        if tool == "file_read" {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) {
-                if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+        if tool == "file_read"
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments)
+                && let Some(path) = v.get("path").and_then(|p| p.as_str()) {
                     let entries = self.get_exploration_entries();
                     if crate::agent::exploration_snapshot::find_file_read_entry(&entries, path)
                         .is_some()
@@ -1420,16 +1411,13 @@ impl WorkflowEngine {
                         ));
                     }
                 }
-            }
-        }
         if let Some(hit) = self.lookup_exploration_cache(working_dir, tool, &target) {
             return Some(hit);
         }
-        if matches!(tool, "code_search" | "find_symbol" | "file_search") {
-            if self.is_path_explored(tool, &target) {
+        if matches!(tool, "code_search" | "find_symbol" | "file_search")
+            && self.is_path_explored(tool, &target) {
                 return self.lookup_exploration_cache(working_dir, tool, &target);
             }
-        }
         None
     }
 
@@ -1534,11 +1522,10 @@ impl WorkflowEngine {
     pub fn record_explored_path(&self, tool: &str, path: &str) {
         let key = format!("{}:{}", tool, Self::normalize_explore_path(path));
         let mut paths = self.get_explored_path_set();
-        if paths.insert(key) {
-            if let Ok(json) = serde_json::to_string(&paths) {
+        if paths.insert(key)
+            && let Ok(json) = serde_json::to_string(&paths) {
                 self.set_variable("_explored_paths", json);
             }
-        }
     }
 
     /// Check whether this tool+path was already explored in the current workflow.
@@ -1650,11 +1637,10 @@ pub fn extract_json_block(text: &str) -> Option<String> {
         }
     }
     // Try raw JSON object
-    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
-        if start < end {
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
+        && start < end {
             return Some(text[start..=end].to_string());
         }
-    }
     None
 }
 

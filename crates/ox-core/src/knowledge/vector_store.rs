@@ -77,7 +77,7 @@ impl UnifiedVectorStore {
             .is_some_and(|ids| !ids.is_empty())
     }
 
-    fn embed_text<'a>(&self, entity: &'a Entity) -> String {
+    fn embed_text(&self, entity: &Entity) -> String {
         entity.text_for_embedding(self.embed_max_chars)
     }
 
@@ -204,11 +204,10 @@ impl UnifiedVectorStore {
     fn remove_by_files_from_entities(&mut self, entities: &[Entity]) {
         let mut seen: HashMap<String, ()> = HashMap::new();
         for e in entities {
-            if let Some(fp) = e.file_path() {
-                if seen.insert(fp.to_string(), ()).is_none() {
+            if let Some(fp) = e.file_path()
+                && seen.insert(fp.to_string(), ()).is_none() {
                     self.remove_by_file(fp);
                 }
-            }
         }
     }
 
@@ -238,8 +237,8 @@ impl UnifiedVectorStore {
         if !path.exists() {
             return;
         }
-        if let Ok(data) = std::fs::read_to_string(path) {
-            if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<u64>>>(&data) {
+        if let Ok(data) = std::fs::read_to_string(path)
+            && let Ok(map) = serde_json::from_str::<HashMap<String, Vec<u64>>>(&data) {
                 tracing::info!(
                     "[UNIFIED_VECTOR] Loaded file_ids map ({} files) from {}",
                     map.len(),
@@ -247,7 +246,6 @@ impl UnifiedVectorStore {
                 );
                 self.file_ids = map;
             }
-        }
     }
 
     /// Persist file→vector-id map to disk.
@@ -300,11 +298,10 @@ impl UnifiedVectorStore {
                 let entity = payload_to_entity(&r.payload)?;
 
                 // Apply kind filter
-                if let Some(filter) = kind_filter {
-                    if !filter.contains(&entity.kind) {
+                if let Some(filter) = kind_filter
+                    && !filter.contains(&entity.kind) {
                         return None;
                     }
-                }
 
                 Some(SearchHit {
                     entity,

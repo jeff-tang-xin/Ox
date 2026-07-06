@@ -149,7 +149,7 @@ pub fn filter_tool_schemas(
         return Vec::new();
     }
     all.iter()
-        .filter(|s| allowed.iter().any(|a| *a == s.name.as_str()))
+        .filter(|s| allowed.contains(&s.name.as_str()))
         .cloned()
         .collect()
 }
@@ -231,7 +231,7 @@ mod tests {
         let allowed = allowed_tool_names(&engine);
         assert!(allowed.contains(&"file_read"));
         assert!(allowed.contains(&"edit_file"));
-        assert!(!allowed.iter().any(|t| *t == "code_search"));
+        assert!(!allowed.contains(&"code_search"));
     }
 
     #[test]

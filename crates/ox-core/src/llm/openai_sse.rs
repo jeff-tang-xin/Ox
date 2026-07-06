@@ -76,16 +76,14 @@ impl OpenAiSseParser {
                 let index = choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                 self.seen_indices.insert(index);
 
-                if let Some(finish_reason) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                    if finish_reason == "tool_calls" || finish_reason == "stop" {
-                        if self.active_tool_calls.contains(&index) {
+                if let Some(finish_reason) = choice.get("finish_reason").and_then(|f| f.as_str())
+                    && (finish_reason == "tool_calls" || finish_reason == "stop")
+                        && self.active_tool_calls.contains(&index) {
                             if let Some(id) = self.tool_call_ids.get(&index) {
                                 events.push(LlmStreamEvent::ToolCallEnd { id: id.clone() });
                             }
                             self.active_tool_calls.remove(&index);
                         }
-                    }
-                }
 
                 if let Some(delta) = choice.get("delta") {
                     events.extend(self.process_delta(delta, index));
@@ -195,7 +193,7 @@ impl OpenAiSseParser {
                     let buffer = self
                         .argument_buffers
                         .entry(tc_index)
-                        .or_insert_with(String::new);
+                        .or_default();
                     buffer.push_str(&args);
                     let tc_id = self
                         .tool_call_ids

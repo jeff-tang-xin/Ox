@@ -95,6 +95,12 @@ pub struct InterventionManager {
     active_intervention: Option<InterventionRequest>,
 }
 
+impl Default for InterventionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InterventionManager {
     pub fn new() -> Self {
         Self {

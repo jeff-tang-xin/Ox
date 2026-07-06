@@ -217,11 +217,10 @@ pub fn finding_json(params: &Value) -> Option<String> {
     // causes discussion replies mentioning findings to enter the scope gate,
     // leading to a 300s timeout that kills the agent turn.
     let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    if let Some(extracted) = crate::agent::perception::extract_json_block(content) {
-        if serde_json::from_str::<serde_json::Value>(&extracted).is_ok() {
+    if let Some(extracted) = crate::agent::perception::extract_json_block(content)
+        && serde_json::from_str::<serde_json::Value>(&extracted).is_ok() {
             return Some(content.to_string());
         }
-    }
     None
 }
 
@@ -250,7 +249,7 @@ pub fn tool_schema_with_actions(actions: &[&str]) -> ToolSchema {
 }
 
 pub fn tool_schema() -> ToolSchema {
-    tool_schema_with_actions(&ALL_ACTIONS)
+    tool_schema_with_actions(ALL_ACTIONS)
 }
 
 const ALL_ACTIONS: &[&str] = &[
@@ -584,6 +583,48 @@ pub fn allowed_actions_for_phase(phase: &str) -> &'static [&'static str] {
     }
 }
 
+/// Loop-detection key for unified `complete_and_check` calls.
+pub fn tool_loop_key(arguments: &str) -> String {
+    let Ok(req) = parse_request(arguments) else {
+        return format!("{TOOL_NAME}:invalid");
+    };
+    match req.action.as_str() {
+        "finish" | "deliver" | "report" | "done" | "complete" => format!("{TOOL_NAME}:finish"),
+        a if action_to_tool_name(a).is_some() => {
+            let inner = action_to_tool_name(a).unwrap();
+            delegate_tool_loop_key(inner, &req.params)
+        }
+        _ => format!("{TOOL_NAME}:unknown"),
+    }
+}
+
+fn delegate_tool_loop_key(inner: &str, params: &Value) -> String {
+    match inner {
+        "file_list" => {
+            let path = params.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+            format!("file_list:{}", WorkflowEngine::normalize_explore_path(path))
+        }
+        "file_read" => {
+            let path = params.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+            let offset = params.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
+            let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(200);
+            format!(
+                "file_read:{}@{}+{}",
+                WorkflowEngine::normalize_explore_path(path),
+                offset,
+                limit
+            )
+        }
+        other => {
+            if let Some(path) = params.get("path").and_then(|p| p.as_str()) {
+                format!("{other}:{}", WorkflowEngine::normalize_explore_path(path))
+            } else {
+                other.to_string()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,47 +672,5 @@ mod tests {
     #[test]
     fn tool_loop_key_invalid() {
         assert_eq!(tool_loop_key(""), format!("{TOOL_NAME}:invalid"));
-    }
-}
-
-/// Loop-detection key for unified `complete_and_check` calls.
-pub fn tool_loop_key(arguments: &str) -> String {
-    let Ok(req) = parse_request(arguments) else {
-        return format!("{TOOL_NAME}:invalid");
-    };
-    match req.action.as_str() {
-        "finish" | "deliver" | "report" | "done" | "complete" => format!("{TOOL_NAME}:finish"),
-        a if action_to_tool_name(a).is_some() => {
-            let inner = action_to_tool_name(a).unwrap();
-            delegate_tool_loop_key(inner, &req.params)
-        }
-        _ => format!("{TOOL_NAME}:unknown"),
-    }
-}
-
-fn delegate_tool_loop_key(inner: &str, params: &Value) -> String {
-    match inner {
-        "file_list" => {
-            let path = params.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-            format!("file_list:{}", WorkflowEngine::normalize_explore_path(path))
-        }
-        "file_read" => {
-            let path = params.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-            let offset = params.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
-            let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(200);
-            format!(
-                "file_read:{}@{}+{}",
-                WorkflowEngine::normalize_explore_path(path),
-                offset,
-                limit
-            )
-        }
-        other => {
-            if let Some(path) = params.get("path").and_then(|p| p.as_str()) {
-                format!("{other}:{}", WorkflowEngine::normalize_explore_path(path))
-            } else {
-                other.to_string()
-            }
-        }
     }
 }

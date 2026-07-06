@@ -290,7 +290,7 @@ impl ContextOffloader {
                 .metadata()
                 .ok()
                 .and_then(|m| m.modified().ok())
-                .unwrap_or_else(|| std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
         });
 
         let total_count = entries.len();

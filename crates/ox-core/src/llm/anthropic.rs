@@ -151,8 +151,8 @@ impl LlmProvider for AnthropicProvider {
                     let data = sse_buffer.take_data();
                     let event_type = sse_buffer.event_type();
 
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                        if process_anthropic_event(
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
+                        && process_anthropic_event(
                             event_type,
                             &json,
                             &tx,
@@ -161,7 +161,6 @@ impl LlmProvider for AnthropicProvider {
                         ) {
                             done_sent = true;
                         }
-                    }
 
                     sse_buffer.reset();
                 }

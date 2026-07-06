@@ -136,17 +136,15 @@ impl AstExtractor {
                     let mut func_cursor = child.walk();
                     for func_child in child.children(&mut func_cursor) {
                         let fc = func_child.kind();
-                        if fc == "identifier"
+                        if (fc == "identifier"
                             || fc == "scoped_identifier"
-                            || fc == "field_expression"
-                        {
-                            if let Ok(text) = func_child.utf8_text(code.as_bytes()) {
+                            || fc == "field_expression")
+                            && let Ok(text) = func_child.utf8_text(code.as_bytes()) {
                                 let name = text.trim().to_string();
                                 if !name.is_empty() && !calls.contains(&name) {
                                     calls.push(name);
                                 }
                             }
-                        }
                     }
                 }
                 // Continue searching in child nodes

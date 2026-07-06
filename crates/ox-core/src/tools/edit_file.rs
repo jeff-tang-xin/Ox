@@ -13,7 +13,6 @@
 /// In multi mode, edits are applied sequentially — each edit sees the result
 /// of the previous one — and the file is only written if ALL edits succeed.
 use serde_json::{Value, json};
-use std::sync::Arc;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput, content_validation};
 

@@ -16,25 +16,25 @@ pub fn extract_tool_detail(tool_name: &str, arguments: &str) -> Option<String> {
             .and_then(|v| v.get("command"))
             .and_then(|c| c.as_str())
             .map(|s| s.to_string()),
-        "file_read" => args.as_ref().and_then(|v| {
+        "file_read" => args.as_ref().map(|v| {
             let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
             let limit = v
                 .get("limit")
                 .and_then(|l| l.as_u64())
                 .map(|l| format!(" (limit:{})", l))
                 .unwrap_or_default();
-            Some(format!("{} {}", path, limit))
+            format!("{} {}", path, limit)
         }),
-        "file_write" => args.as_ref().and_then(|v| {
+        "file_write" => args.as_ref().map(|v| {
             let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
             let size = v
                 .get("content")
                 .and_then(|c| c.as_str())
                 .map(|c| c.len())
                 .unwrap_or(0);
-            Some(format!("{} ({} bytes)", path, size))
+            format!("{} ({} bytes)", path, size)
         }),
-        "edit_file" => args.as_ref().and_then(|v| {
+        "edit_file" => args.as_ref().map(|v| {
             let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
             let old = v
                 .get("old_string")
@@ -54,27 +54,27 @@ pub fn extract_tool_detail(tool_name: &str, arguments: &str) -> Option<String> {
                     }
                 })
                 .unwrap_or("");
-            Some(format!("{} | {}", path, old))
+            format!("{} | {}", path, old)
         }),
-        "delete_range" => args.as_ref().and_then(|v| {
+        "delete_range" => args.as_ref().map(|v| {
             let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
             let start = v.get("start_line").and_then(|l| l.as_u64()).unwrap_or(0);
             let end = v.get("end_line").and_then(|l| l.as_u64()).unwrap_or(0);
-            Some(format!("{} L{}-L{}", path, start, end))
+            format!("{} L{}-L{}", path, start, end)
         }),
         "code_search" => args
             .as_ref()
             .and_then(|v| v.get("pattern"))
             .and_then(|p| p.as_str())
             .map(|s| s.to_string()),
-        "find_symbol" => args.as_ref().and_then(|v| {
+        "find_symbol" => args.as_ref().map(|v| {
             let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("?");
             let kind = v
                 .get("kind")
                 .and_then(|k| k.as_str())
                 .map(|k| format!(" ({})", k))
                 .unwrap_or_default();
-            Some(format!("{}{}", query, kind))
+            format!("{}{}", query, kind)
         }),
         "file_search" => args
             .as_ref()
@@ -88,9 +88,9 @@ pub fn extract_tool_detail(tool_name: &str, arguments: &str) -> Option<String> {
             .map(|s| s.to_string())
             .or_else(|| Some("(root)".to_string())),
         "git_status" => Some(String::new()),
-        "git_diff" => args.as_ref().and_then(|v| {
+        "git_diff" => args.as_ref().map(|v| {
             let staged = v.get("staged").and_then(|s| s.as_bool()).unwrap_or(false);
-            Some(if staged { "--staged" } else { "" }.to_string())
+            if staged { "--staged" } else { "" }.to_string()
         }),
         "memory_search" => args
             .as_ref()
@@ -187,11 +187,10 @@ pub fn tool_progress_message(tool_name: &str) -> &'static str {
 
 /// Check if a tool call references a path outside the working directory.
 pub fn is_path_outside_workdir(args_json: &str, working_dir: &std::path::Path) -> bool {
-    if let Ok(args_val) = serde_json::from_str::<Value>(args_json) {
-        if let Some(path_str) = args_val.get("path").and_then(|v| v.as_str()) {
+    if let Ok(args_val) = serde_json::from_str::<Value>(args_json)
+        && let Some(path_str) = args_val.get("path").and_then(|v| v.as_str()) {
             let resolved = working_dir.join(path_str);
             return !crate::safety::is_path_within_workdir(&resolved, working_dir);
         }
-    }
     false
 }

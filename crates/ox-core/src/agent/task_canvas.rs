@@ -193,10 +193,10 @@ impl TaskCanvas {
 
         // Subgraph for current step highlighting
         if let Some(ref current) = self.current_step {
-            output.push_str(&format!("    subgraph current [\"🎯 Current Step\"]\n"));
-            output.push_str(&format!("        direction TB\n"));
+            output.push_str("    subgraph current [\"🎯 Current Step\"]\n");
+            output.push_str("        direction TB\n");
             output.push_str(&format!("        {}\n", current));
-            output.push_str(&format!("    end\n\n"));
+            output.push_str("    end\n\n");
         }
 
         // Nodes

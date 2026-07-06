@@ -12,6 +12,12 @@ pub struct AstExtractor {
     registry: LanguageRegistry,
 }
 
+impl Default for AstExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AstExtractor {
     pub fn new() -> Self {
         Self {

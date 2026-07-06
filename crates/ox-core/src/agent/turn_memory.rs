@@ -77,8 +77,8 @@ impl TurnMemory {
         if !ok {
             return "error".to_string();
         }
-        if let Some(raw) = result_content {
-            if matches!(
+        if let Some(raw) = result_content
+            && matches!(
                 tool,
                 "file_read"
                     | "find_symbol"
@@ -95,7 +95,6 @@ impl TurnMemory {
                     return format!("ok — {excerpt}");
                 }
             }
-        }
         "ok".to_string()
     }
 
@@ -257,11 +256,10 @@ fn parse_progress_line(line: &str) -> Option<(String, String, bool)> {
         "shell_exec",
     ] {
         let prefix = format!("{tool}(");
-        if let Some(rest) = line.strip_prefix(&prefix) {
-            if let Some((target, outcome)) = rest.split_once(") → ") {
+        if let Some(rest) = line.strip_prefix(&prefix)
+            && let Some((target, outcome)) = rest.split_once(") → ") {
                 return Some((tool.to_string(), target.to_string(), outcome == "成功"));
             }
-        }
     }
     if let Some((left, outcome)) = line.rsplit_once(" → ") {
         let ok = outcome == "成功";
@@ -327,7 +325,7 @@ pub fn compact_turn_messages(messages: &mut Vec<crate::message::Message>, keep_t
     if let Some(s) = system {
         compacted.push(s);
     }
-    compacted.push(crate::message::Message::system(&format!(
+    compacted.push(crate::message::Message::system(format!(
         "[CONTEXT_COMPACTED]\n为控制上下文长度，已压缩本轮较早的 {dropped} 条消息。\n\
          完整工具记录见 [TURN_MEMORY] / [STEP_MEMORY]。请基于最近消息和记忆块继续，勿从头探索。"
     )));

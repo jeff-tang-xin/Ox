@@ -87,11 +87,10 @@ pub fn list_project_skill_ids(project_root: &Path) -> Vec<String> {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if path.extension().and_then(|e| e.to_str()) == Some("md")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     ids.push(stem.to_string());
                 }
-            }
         }
     }
     ids.sort();
@@ -120,8 +119,8 @@ pub fn plan_skill_write(
     let skills_dir = project_root.join(".ox").join("skills");
 
     // Alias → canonical mandatory file
-    if let Some(canonical) = canonical_mandatory_id(skill_id) {
-        if skill_id != canonical {
+    if let Some(canonical) = canonical_mandatory_id(skill_id)
+        && skill_id != canonical {
             let canonical_path = skills_dir.join(format!("{canonical}.md"));
             if canonical_path.exists() || onboarding_turn {
                 return SkillWritePlan::RedirectToCanonical {
@@ -137,7 +136,6 @@ pub fn plan_skill_write(
                 reason: format!("请使用标准名称 `{canonical}.md`，不要创建 `{skill_id}.md`"),
             };
         }
-    }
 
     let target = skills_dir.join(format!("{skill_id}.md"));
 
@@ -164,15 +162,14 @@ pub fn plan_skill_write(
     }
 
     // File exists
-    if allow_merge {
-        if let Ok(existing) = std::fs::read_to_string(&target) {
+    if allow_merge
+        && let Ok(existing) = std::fs::read_to_string(&target) {
             let merged = merge_skill_markdown(&existing, new_content);
             return SkillWritePlan::MergeIntoExisting {
                 target_path: target,
                 merged_markdown: merged,
             };
         }
-    }
 
     if is_mandatory_skill_file(skill_id) {
         return SkillWritePlan::OverwriteMandatory;
@@ -194,7 +191,7 @@ pub fn merge_skill_markdown(existing: &str, incoming: &str) -> String {
     let (_, incoming_body) = split_frontmatter(incoming);
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let header = meta.unwrap_or_else(|| {
-        format!("---\nname: merged-skill\ndescription: merged\nscope: project\n---")
+        "---\nname: merged-skill\ndescription: merged\nscope: project\n---".to_string()
     });
     format!(
         "{header}\n\n{}\n\n---\n## 更新 ({date})\n\n{}\n",
@@ -252,8 +249,8 @@ pub fn check_similar_skills(
     if let Ok(entries) = std::fs::read_dir(&skills_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
+            if path.extension().and_then(|s| s.to_str()) == Some("md")
+                && let Ok(content) = std::fs::read_to_string(&path) {
                     // 解析 description
                     let desc = extract_description(&content);
                     let id = path.file_stem()
@@ -264,7 +261,6 @@ pub fn check_similar_skills(
                         existing_skills.push((id, desc));
                     }
                 }
-            }
         }
     }
 
@@ -337,8 +333,8 @@ pub fn check_similar_skills(
 /// 从 skill markdown 中提取 description
 fn extract_description(content: &str) -> String {
     // 尝试从 frontmatter 提取
-    if let Some(start) = content.find("---") {
-        if let Some(end) = content[start + 3..].find("---") {
+    if let Some(start) = content.find("---")
+        && let Some(end) = content[start + 3..].find("---") {
             let yaml = &content[start + 3..start + 3 + end];
             for line in yaml.lines() {
                 let line = line.trim();
@@ -348,7 +344,6 @@ fn extract_description(content: &str) -> String {
                 }
             }
         }
-    }
     String::new()
 }
 

@@ -638,8 +638,8 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     // OpenAI API requires strict ordering: Assistant with tool_calls must be immediately followed by ToolResults
     let mut i = 0;
     while i < messages.len() {
-        if let Message::Assistant { tool_calls, .. } = &messages[i] {
-            if !tool_calls.is_empty() {
+        if let Message::Assistant { tool_calls, .. } = &messages[i]
+            && !tool_calls.is_empty() {
                 let expected_count = tool_calls.len();
                 let expected_ids: Vec<_> = tool_calls.iter().map(|tc| tc.id.clone()).collect();
 
@@ -705,7 +705,6 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
                     continue;
                 }
             }
-        }
         i += 1;
     }
 }
@@ -732,6 +731,294 @@ fn estimate_message_tokens(msg: &Message) -> usize {
         }
     };
     content_len as usize + 4 // message framing overhead
+}
+
+/// Deduplicate repeated file_read results — keep only the most recent read per file.
+/// Older reads of the same file are replaced with a compact summary.
+fn deduplicate_file_reads(messages: &mut Vec<Message>) {
+    use std::collections::HashMap;
+
+    // Find all file_read tool_call IDs and their paths
+    let mut file_reads: Vec<(usize, String)> = Vec::new(); // (index, path)
+    for (i, msg) in messages.iter().enumerate() {
+        if let Message::Assistant { tool_calls, .. } = msg {
+            for tc in tool_calls {
+                if tc.name == "file_read"
+                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        && let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                            file_reads.push((i, path.to_string()));
+                        }
+            }
+        }
+    }
+
+    if file_reads.len() < 2 {
+        return;
+    }
+
+    // Find repeated files — keep last occurrence, summarize earlier ones
+    let mut last_occurrence: HashMap<String, usize> = HashMap::new();
+    for (idx, path) in &file_reads {
+        last_occurrence.insert(path.clone(), *idx);
+    }
+
+    let mut replaced = 0;
+    for &(idx, ref path) in &file_reads {
+        let Some(last_idx) = last_occurrence.get(path).copied() else {
+            continue;
+        };
+        if idx != last_idx {
+            // Find the corresponding ToolResult for this older file_read. The
+            // latest read must stay intact; otherwise the model reasons from
+            // stale file contents after edits or re-reads.
+            let msg = &messages[idx];
+            let tool_call_id = if let Message::Assistant { tool_calls, .. } = msg {
+                tool_calls
+                    .iter()
+                    .find(|tc| {
+                        tc.name == "file_read"
+                            && serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                .ok()
+                                .and_then(|args| {
+                                    args.get("path").and_then(|p| p.as_str()).map(str::to_owned)
+                                })
+                                .as_deref()
+                                == Some(path.as_str())
+                    })
+                    .map(|tc| tc.id.clone())
+            } else {
+                None
+            };
+
+            if let Some(tc_id) = tool_call_id {
+                // Replace the ToolResult with a compact summary
+                for msg in messages.iter_mut() {
+                    if let Message::ToolResult {
+                        tool_call_id,
+                        content,
+                    } = msg
+                        && tool_call_id == &tc_id {
+                            let line_count = content.lines().count();
+                            *content = format!(
+                                "(previously read {} — {} lines, latest version kept in context)",
+                                path, line_count
+                            );
+                            replaced += 1;
+                            break;
+                        }
+                }
+            }
+        }
+    }
+    if replaced > 0 {
+        tracing::info!("[DEDUP] Summarized {} repeated file_read results", replaced);
+    }
+}
+
+/// 🚨 Filter out noisy intermediate messages that add little value.
+pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
+    if messages.len() < 5 {
+        return; // Only apply to longer conversations
+    }
+
+    let original_count = messages.len();
+    let mut filtered = Vec::with_capacity(messages.len());
+    let mut i = 0;
+
+    while i < messages.len() {
+        let current_msg = &messages[i];
+
+        // Check if this is a ToolResult with "Infinite Loop Detected"
+        if let Message::ToolResult { content, .. } = current_msg {
+            if content.contains("Infinite Loop Detected") {
+                // Look ahead to see if there are more infinite loop errors
+                let mut consecutive_errors = 1;
+                let mut j = i + 1;
+
+                while j < messages.len() {
+                    if let Message::ToolResult {
+                        content: next_content,
+                        ..
+                    } = &messages[j]
+                    {
+                        if next_content.contains("Infinite Loop Detected") {
+                            consecutive_errors += 1;
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                if consecutive_errors > 1 {
+                    // Keep only the LAST infinite loop error (most relevant)
+                    tracing::info!(
+                        "[NOISE_FILTER] Consolidated {} consecutive 'Infinite Loop' errors into 1",
+                        consecutive_errors
+                    );
+                    filtered.push(messages[j - 1].clone());
+                    i = j;
+                    continue;
+                }
+            }
+
+            // Check for repeated "File Not Found" errors
+            if content.contains("File Not Found") || content.contains("No file with ID") {
+                // Look ahead for similar errors
+                let mut consecutive_not_found = 1;
+                let mut j = i + 1;
+
+                while j < messages.len() {
+                    if let Message::ToolResult {
+                        content: next_content,
+                        ..
+                    } = &messages[j]
+                    {
+                        if next_content.contains("File Not Found")
+                            || next_content.contains("No file with ID")
+                        {
+                            consecutive_not_found += 1;
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                if consecutive_not_found > 2 {
+                    // Keep only the first and last "File Not Found" errors
+                    tracing::info!(
+                        "[NOISE_FILTER] Consolidated {} 'File Not Found' errors (kept first and last)",
+                        consecutive_not_found
+                    );
+                    filtered.push(messages[i].clone()); // Keep first
+                    if consecutive_not_found > 1 {
+                        filtered.push(messages[j - 1].clone()); // Keep last
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+
+        // Keep this message as-is
+        filtered.push(current_msg.clone());
+        i += 1;
+    }
+
+    let removed_count = original_count - filtered.len();
+    if removed_count > 0 {
+        tracing::info!(
+            "[NOISE_FILTER] Removed {} noisy messages ({} → {})",
+            removed_count,
+            original_count,
+            filtered.len()
+        );
+        *messages = filtered;
+    }
+}
+
+/// Demote old user messages that are before a `[ROUND_COMPLETE]` boundary by
+/// prepending a historical prefix, so the LLM sees them as completed history
+/// rather than active requests. This runs on the mutable copy of history, so
+/// the session store is never modified.
+pub fn demote_old_user_messages(messages: &mut [Message]) {
+    // Find the LAST [ROUND_COMPLETE] boundary
+    let last_boundary = messages.iter().rposition(|m| {
+        matches!(m, Message::System { content } if content.starts_with(
+            crate::agent::user_round::COMPLETE_BOUNDARY_TAG
+        ))
+    });
+    let Some(boundary) = last_boundary else {
+        return; // No completed rounds
+    };
+    // Any user message BEFORE the boundary is historical
+    for msg in &mut messages[..boundary] {
+        if let Message::User { content } = msg
+            && !content.starts_with("(HISTORICAL") {
+                let demoted = format!("(HISTORICAL - 已完成) {}", content);
+                *content = demoted.chars().take(2000).collect();
+            }
+    }
+}
+/// `history_budget` tokens. Process from earliest (index 0) → newest, replacing
+/// each completed round (everything before a `[ROUND_COMPLETE]` boundary) with
+/// a compact `[ROUND_HISTORY]` summary. The current incomplete round is never
+/// touched.
+///
+/// This is the "far to near" strategy: old finished work gets condensed first,
+/// respecting the token budget rather than a fixed round count.
+pub fn compact_completed_rounds(messages: &mut Vec<Message>, history_budget: usize) {
+    if messages.len() < 4 {
+        return;
+    }
+    let total_tokens: usize = messages.iter().map(estimate_message_tokens).sum();
+    if total_tokens <= history_budget {
+        return;
+    }
+
+    let mut compressed_count = 0;
+    let mut tokens_saved = 0;
+
+    loop {
+        // Re-collect boundaries each iteration (indices shift after compression)
+        let boundaries: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                matches!(m, Message::System { content } if content.starts_with(
+                    crate::agent::user_round::COMPLETE_BOUNDARY_TAG
+                ))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
+
+        // Need at least 2 boundaries to safely compress the oldest one
+        // (keep the newest completed round + current round intact)
+        if boundaries.len() < 2 {
+            break;
+        }
+
+        // Compress the OLDEST completed round: from boundaries[0] to boundaries[1]
+        let start = boundaries[0];
+        let end = boundaries[1];
+
+        let section_tokens: usize = messages[start..end]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum();
+
+        let summary = Message::system(
+            "[ROUND_HISTORY]\n✅ 已完成轮次（压缩摘要）".to_string(),
+        );
+        let summary_tokens = estimate_message_tokens(&summary);
+        let saved = section_tokens.saturating_sub(summary_tokens);
+
+        messages.splice(start..end, vec![summary]);
+        compressed_count += 1;
+        tokens_saved += saved;
+
+        // Check budget
+        let remaining: usize = messages.iter().map(estimate_message_tokens).sum();
+        if remaining <= history_budget {
+            break;
+        }
+    }
+
+    if compressed_count > 0 {
+        tracing::info!(
+            "[CONTEXT_COMPACT] Compressed {} old round(s), saved ~{} tokens, {} msgs",
+            compressed_count,
+            tokens_saved,
+            messages.len()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -885,298 +1172,5 @@ mod tests {
         } else {
             panic!("Expected Assistant message");
         }
-    }
-}
-
-/// Deduplicate repeated file_read results — keep only the most recent read per file.
-/// Older reads of the same file are replaced with a compact summary.
-fn deduplicate_file_reads(messages: &mut Vec<Message>) {
-    use std::collections::HashMap;
-
-    // Find all file_read tool_call IDs and their paths
-    let mut file_reads: Vec<(usize, String)> = Vec::new(); // (index, path)
-    for (i, msg) in messages.iter().enumerate() {
-        if let Message::Assistant { tool_calls, .. } = msg {
-            for tc in tool_calls {
-                if tc.name == "file_read" {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                            file_reads.push((i, path.to_string()));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if file_reads.len() < 2 {
-        return;
-    }
-
-    // Find repeated files — keep last occurrence, summarize earlier ones
-    let mut last_occurrence: HashMap<String, usize> = HashMap::new();
-    for (idx, path) in &file_reads {
-        last_occurrence.insert(path.clone(), *idx);
-    }
-
-    let mut replaced = 0;
-    for &(idx, ref path) in &file_reads {
-        let Some(last_idx) = last_occurrence.get(path).copied() else {
-            continue;
-        };
-        if idx != last_idx {
-            // Find the corresponding ToolResult for this older file_read. The
-            // latest read must stay intact; otherwise the model reasons from
-            // stale file contents after edits or re-reads.
-            let msg = &messages[idx];
-            let tool_call_id = if let Message::Assistant { tool_calls, .. } = msg {
-                tool_calls
-                    .iter()
-                    .find(|tc| {
-                        tc.name == "file_read"
-                            && serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                                .ok()
-                                .and_then(|args| {
-                                    args.get("path").and_then(|p| p.as_str()).map(str::to_owned)
-                                })
-                                .as_deref()
-                                == Some(path.as_str())
-                    })
-                    .map(|tc| tc.id.clone())
-            } else {
-                None
-            };
-
-            if let Some(tc_id) = tool_call_id {
-                // Replace the ToolResult with a compact summary
-                for msg in messages.iter_mut() {
-                    if let Message::ToolResult {
-                        tool_call_id,
-                        content,
-                    } = msg
-                    {
-                        if tool_call_id == &tc_id {
-                            let line_count = content.lines().count();
-                            *content = format!(
-                                "(previously read {} — {} lines, latest version kept in context)",
-                                path, line_count
-                            );
-                            replaced += 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if replaced > 0 {
-        tracing::info!("[DEDUP] Summarized {} repeated file_read results", replaced);
-    }
-}
-
-/// 🚨 Filter out noisy intermediate messages that add little value.
-pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
-    if messages.len() < 5 {
-        return; // Only apply to longer conversations
-    }
-
-    let original_count = messages.len();
-    let mut filtered = Vec::with_capacity(messages.len());
-    let mut i = 0;
-
-    while i < messages.len() {
-        let current_msg = &messages[i];
-
-        // Check if this is a ToolResult with "Infinite Loop Detected"
-        if let Message::ToolResult { content, .. } = current_msg {
-            if content.contains("Infinite Loop Detected") {
-                // Look ahead to see if there are more infinite loop errors
-                let mut consecutive_errors = 1;
-                let mut j = i + 1;
-
-                while j < messages.len() {
-                    if let Message::ToolResult {
-                        content: next_content,
-                        ..
-                    } = &messages[j]
-                    {
-                        if next_content.contains("Infinite Loop Detected") {
-                            consecutive_errors += 1;
-                            j += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                if consecutive_errors > 1 {
-                    // Keep only the LAST infinite loop error (most relevant)
-                    tracing::info!(
-                        "[NOISE_FILTER] Consolidated {} consecutive 'Infinite Loop' errors into 1",
-                        consecutive_errors
-                    );
-                    filtered.push(messages[j - 1].clone());
-                    i = j;
-                    continue;
-                }
-            }
-
-            // Check for repeated "File Not Found" errors
-            if content.contains("File Not Found") || content.contains("No file with ID") {
-                // Look ahead for similar errors
-                let mut consecutive_not_found = 1;
-                let mut j = i + 1;
-
-                while j < messages.len() {
-                    if let Message::ToolResult {
-                        content: next_content,
-                        ..
-                    } = &messages[j]
-                    {
-                        if next_content.contains("File Not Found")
-                            || next_content.contains("No file with ID")
-                        {
-                            consecutive_not_found += 1;
-                            j += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                if consecutive_not_found > 2 {
-                    // Keep only the first and last "File Not Found" errors
-                    tracing::info!(
-                        "[NOISE_FILTER] Consolidated {} 'File Not Found' errors (kept first and last)",
-                        consecutive_not_found
-                    );
-                    filtered.push(messages[i].clone()); // Keep first
-                    if consecutive_not_found > 1 {
-                        filtered.push(messages[j - 1].clone()); // Keep last
-                    }
-                    i = j;
-                    continue;
-                }
-            }
-        }
-
-        // Keep this message as-is
-        filtered.push(current_msg.clone());
-        i += 1;
-    }
-
-    let removed_count = original_count - filtered.len();
-    if removed_count > 0 {
-        tracing::info!(
-            "[NOISE_FILTER] Removed {} noisy messages ({} → {})",
-            removed_count,
-            original_count,
-            filtered.len()
-        );
-        *messages = filtered;
-    }
-}
-
-/// Demote old user messages that are before a `[ROUND_COMPLETE]` boundary by
-/// prepending a historical prefix, so the LLM sees them as completed history
-/// rather than active requests. This runs on the mutable copy of history, so
-/// the session store is never modified.
-pub fn demote_old_user_messages(messages: &mut [Message]) {
-    // Find the LAST [ROUND_COMPLETE] boundary
-    let last_boundary = messages.iter().rposition(|m| {
-        matches!(m, Message::System { content } if content.starts_with(
-            crate::agent::user_round::COMPLETE_BOUNDARY_TAG
-        ))
-    });
-    let Some(boundary) = last_boundary else {
-        return; // No completed rounds
-    };
-    // Any user message BEFORE the boundary is historical
-    for msg in &mut messages[..boundary] {
-        if let Message::User { content } = msg {
-            if !content.starts_with("(HISTORICAL") {
-                let demoted = format!("(HISTORICAL - 已完成) {}", content);
-                *content = demoted.chars().take(2000).collect();
-            }
-        }
-    }
-}
-/// `history_budget` tokens. Process from earliest (index 0) → newest, replacing
-/// each completed round (everything before a `[ROUND_COMPLETE]` boundary) with
-/// a compact `[ROUND_HISTORY]` summary. The current incomplete round is never
-/// touched.
-///
-/// This is the "far to near" strategy: old finished work gets condensed first,
-/// respecting the token budget rather than a fixed round count.
-pub fn compact_completed_rounds(messages: &mut Vec<Message>, history_budget: usize) {
-    if messages.len() < 4 {
-        return;
-    }
-    let total_tokens: usize = messages.iter().map(estimate_message_tokens).sum();
-    if total_tokens <= history_budget {
-        return;
-    }
-
-    let mut compressed_count = 0;
-    let mut tokens_saved = 0;
-
-    loop {
-        // Re-collect boundaries each iteration (indices shift after compression)
-        let boundaries: Vec<usize> = messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                matches!(m, Message::System { content } if content.starts_with(
-                    crate::agent::user_round::COMPLETE_BOUNDARY_TAG
-                ))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|(i, _)| i)
-            .collect();
-
-        // Need at least 2 boundaries to safely compress the oldest one
-        // (keep the newest completed round + current round intact)
-        if boundaries.len() < 2 {
-            break;
-        }
-
-        // Compress the OLDEST completed round: from boundaries[0] to boundaries[1]
-        let start = boundaries[0];
-        let end = boundaries[1];
-
-        let section_tokens: usize = messages[start..end]
-            .iter()
-            .map(estimate_message_tokens)
-            .sum();
-
-        let summary = Message::system(
-            "[ROUND_HISTORY]\n✅ 已完成轮次（压缩摘要）".to_string(),
-        );
-        let summary_tokens = estimate_message_tokens(&summary);
-        let saved = section_tokens.saturating_sub(summary_tokens);
-
-        messages.splice(start..end, vec![summary]);
-        compressed_count += 1;
-        tokens_saved += saved;
-
-        // Check budget
-        let remaining: usize = messages.iter().map(estimate_message_tokens).sum();
-        if remaining <= history_budget {
-            break;
-        }
-    }
-
-    if compressed_count > 0 {
-        tracing::info!(
-            "[CONTEXT_COMPACT] Compressed {} old round(s), saved ~{} tokens, {} msgs",
-            compressed_count,
-            tokens_saved,
-            messages.len()
-        );
     }
 }

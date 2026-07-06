@@ -22,11 +22,10 @@ pub fn record_file_read(engine: &WorkflowEngine, path: &str) {
         .get_variable(TURN_FILES_READ_KEY)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    if set.insert(norm) {
-        if let Ok(json) = serde_json::to_string(&set) {
+    if set.insert(norm)
+        && let Ok(json) = serde_json::to_string(&set) {
             engine.set_variable(TURN_FILES_READ_KEY, json);
         }
-    }
 }
 
 pub fn paths_read(engine: &WorkflowEngine) -> Vec<String> {
@@ -81,13 +80,12 @@ pub fn check(
             if !WorkflowEngine::shell_looks_like_file_read(cmd) {
                 return Ok(());
             }
-            if let Some(path) = extract_path_from_shell(cmd) {
-                if path_already_read(engine, &path) {
+            if let Some(path) = extract_path_from_shell(cmd)
+                && path_already_read(engine, &path) {
                     return Err(format!(
                         "禁止用 shell 重复读取 `{path}`（已 file_read）。请基于已有内容继续。"
                     ));
                 }
-            }
         }
         "find_symbol" | "code_search" | "file_search" => {
             if matches!(tool_name, "code_search" | "file_search" | "file_list")
@@ -99,12 +97,11 @@ pub fn check(
                     "审查报告已提交 — 禁止 {tool_name}；进入实施后可用 find_symbol。"
                 ));
             }
-            if let Some(query) = symbol_query_key(tool_name, args) {
-                if symbol_already_queried(engine, &query) {
+            if let Some(query) = symbol_query_key(tool_name, args)
+                && symbol_already_queried(engine, &query) {
                     // Don't block — just warn. LLM may have new context that makes retry useful.
                     tracing::info!("[READ_GUARD] allow retry: {}:{}", tool_name, query);
                 }
-            }
         }
         _ => {}
     }
@@ -120,11 +117,10 @@ pub fn record_symbol_query(engine: &WorkflowEngine, tool_name: &str, args: &serd
         .get_variable(TURN_SYMBOLS_QUERIED_KEY)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    if set.insert(norm) {
-        if let Ok(json) = serde_json::to_string(&set) {
+    if set.insert(norm)
+        && let Ok(json) = serde_json::to_string(&set) {
             engine.set_variable(TURN_SYMBOLS_QUERIED_KEY, json);
         }
-    }
 }
 
 fn symbol_already_queried(engine: &WorkflowEngine, query: &str) -> bool {

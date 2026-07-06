@@ -119,11 +119,10 @@ pub async fn await_decision(
                             "[SAFETY_GATE] 收到意外的 BusinessAck，business gate 可能超时"
                         );
                     }
-                    Some(ui_event::UiToAgentEvent::FinishAck { finished, .. }) => {
-                        if finished {
+                    Some(ui_event::UiToAgentEvent::FinishAck { finished, .. })
+                        if finished => {
                             return Err(SafetyGateCancelled);
                         }
-                    }
                     Some(ui_event::UiToAgentEvent::ScopeConfirmed) => {
                         tracing::warn!("[SAFETY_GATE] 收到意外的 ScopeConfirmed");
                     }

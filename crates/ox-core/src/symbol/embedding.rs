@@ -185,11 +185,10 @@ impl EmbeddingModel {
         if !config_endpoint.is_empty() {
             return config_endpoint.to_string();
         }
-        if let Ok(env_endpoint) = std::env::var("HF_ENDPOINT") {
-            if !env_endpoint.is_empty() {
+        if let Ok(env_endpoint) = std::env::var("HF_ENDPOINT")
+            && !env_endpoint.is_empty() {
                 return env_endpoint;
             }
-        }
         // Default to China mirror (hf-mirror.com)
         // Set hf_endpoint = "https://huggingface.co" in config for official endpoint
         "https://hf-mirror.com".to_string()
@@ -322,13 +321,13 @@ impl EmbeddingModel {
             let pad_len = max_len - ids.len();
 
             all_ids.extend(ids.iter().map(|&v| v as i64));
-            all_ids.extend(std::iter::repeat(0i64).take(pad_len));
+            all_ids.extend(std::iter::repeat_n(0i64, pad_len));
 
             all_mask.extend(mask.iter().map(|&v| v as i64));
-            all_mask.extend(std::iter::repeat(0i64).take(pad_len));
+            all_mask.extend(std::iter::repeat_n(0i64, pad_len));
 
             all_types.extend(types.iter().map(|&v| v as i64));
-            all_types.extend(std::iter::repeat(0i64).take(pad_len));
+            all_types.extend(std::iter::repeat_n(0i64, pad_len));
         }
 
         let batch = texts.len();

@@ -124,8 +124,8 @@ impl KnowledgeEngine {
         };
 
         // Try GitNexus first
-        if let Some(svc) = gitnexus {
-            if svc.is_ready().await {
+        if let Some(svc) = gitnexus
+            && svc.is_ready().await {
                 let mut params = QueryParams::new(q);
                 params.limit = Some(limit as u32);
                 params.include_content = Some(true);
@@ -138,7 +138,6 @@ impl KnowledgeEngine {
                     }
                 }
             }
-        }
 
         // Silent fallback to local BM25 + vector search
         self.retrieve_memory_nodes(q, project_id, limit)
@@ -165,8 +164,8 @@ fn parse_gitnexus_results(
     limit: usize,
 ) -> Vec<MemoryNode> {
     // Attempt JSON parse — GitNexus query typically returns a JSON array of objects
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(arr) = val.as_array() {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(arr) = val.as_array() {
             return arr
                 .iter()
                 .take(limit)
@@ -220,7 +219,6 @@ fn parse_gitnexus_results(
                 })
                 .collect();
         }
-    }
 
     // Fallback: treat the whole text as a single MemoryNode
     vec![MemoryNode {
