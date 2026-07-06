@@ -739,7 +739,43 @@ fn build_workspace_block(
         }
     }
 
-    // Session memory: inject multi-round file history
+    // Fallback: inject last session summary as a coherent batch
+    if let Some(json) = engine.get_variable("_last_session_summary")
+        && engine.get_variable("_memory_history").map_or(true, |h| h.trim().is_empty())
+    {
+        if let Ok(ss) = serde_json::from_str::<crate::agent::unified_action::SessionSummary>(&json) {
+            let mut has = false;
+            if !ss.learnings.is_empty() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let hour = (now / 3600) % 24;
+                let min = (now / 60) % 60;
+                b.push_str(&format!("\n📦 **上轮批次** ({:02}:{:02}): {}\n", hour, min, ss.learnings.chars().take(200).collect::<String>()));
+                has = true;
+            }
+            if !ss.key_facts.is_empty() {
+                b.push_str("  发现:\n");
+                for f in ss.key_facts.iter().take(5) {
+                    b.push_str(&format!("    • {}\n", f.fact.chars().take(120).collect::<String>()));
+                }
+                has = true;
+            }
+            if !ss.files_modified.is_empty() {
+                b.push_str("  修改:\n");
+                for m in &ss.files_modified {
+                    b.push_str(&format!("    • {}\n", m.path.rsplit('/').next().unwrap_or(&m.path)));
+                }
+                has = true;
+            }
+            if has {
+                b.push_str("  ─── 基于此继续，不要重复探索 ───\n");
+            }
+        }
+    }
+
+    // Multi-batch history from SQLite (if available)
     if let Some(history) = engine.get_variable("_memory_history")
         && !history.trim().is_empty() {
             b.push('\n');
@@ -3580,19 +3616,27 @@ pub async fn run_agent_turn(
                     ));
                     messages.push(Message::system(&prompt));
                 }
-                explore_reflect::ReflectAction::Stop(handoff) => {
+                explore_reflect::ReflectAction::Stop(_handoff) => {
                     tracing::warn!(
-                        "[EXPLORE_REFLECT] Stop at streak={} — ending turn (only read-only tools)",
+                        "[EXPLORE_REFLECT] Stop at streak={} — pausing for user input",
                         explore_streak
                     );
+                    // Instead of ending the turn, inject a gate and ask the user.
+                    // The user can type "c" to continue or anything else to stop.
+                    let gate_msg = format!(
+                        "⚠️ 你已连续探索 **{n}** 轮（仅只读工具），未开始动手或收尾。\n\n\
+                         **c** 继续探索\n\
+                         **其他** 结束本轮",
+                        n = explore_streak
+                    );
                     let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                        "🛑 连续 {explore_streak} 次只探索不动手 — 暂停本轮，等待你的指示。"
+                        "⏸️ 连续 {n} 轮只探索 — c 继续 · 其他结束",
+                        n = explore_streak
                     )));
-                    messages.push(Message::system(&handoff));
-                    new_messages.push(Message::system(&handoff));
-                    persist_turn_memory(&workflow_engine, &turn_memory);
-                    emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                    return;
+                    messages.push(Message::system(&gate_msg));
+                    new_messages.push(Message::system(&gate_msg));
+                    // Reset streak so next iteration starts fresh
+                    explore_streak = 0;
                 }
             }
         }
