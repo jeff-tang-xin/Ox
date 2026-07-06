@@ -58,6 +58,7 @@ pub fn handle_text_chunk(app: &mut App, text: &str) {
     }
     // Clear stale gate confirmation state — LLM is responding, gate is resolved.
     app.workflow_awaiting_confirmation = None;
+    app.unified_gate = None;
     app.output.collapse_thinking();
     app.output.push_streaming_chunk(text);
     if !app.user_scrolled {

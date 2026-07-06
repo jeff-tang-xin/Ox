@@ -419,9 +419,21 @@ where
         business_gate::BusinessGateResume::Acknowledged => {
             if let Some(wf) = workflow_engine {
                 if let Ok(engine) = wf.try_lock() {
-                    // Leaving discussion (if any) — re-enable write tools for implement.
                     crate::agent::workflow_session::clear_feedback_discuss(&engine);
                     crate::agent::phase::confirm_plan_enter_implement(&engine);
+                    // Record review findings as session facts so the LLM
+                    // doesn't re-analyze in implement phase.
+                    if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
+                        for f in &store.findings {
+                            let fact = format!(
+                                "{}: {} ({})",
+                                f.file.rsplit('/').next().unwrap_or(&f.file),
+                                f.issue.chars().take(100).collect::<String>(),
+                                f.severity.label()
+                            );
+                            crate::agent::blackboard::add_fact(&engine, &fact);
+                        }
+                    }
                 }
             }
             UnifiedHandleOutcome::Result {
@@ -494,6 +506,37 @@ async fn handle_finish(
 ) -> UnifiedHandleOutcome {
     let content = unified_action::finish_content(&req.params);
     let review_json = unified_action::finding_json(&req.params);
+    let session_summary = unified_action::parse_session_summary(&req.params);
+
+    // Persist session summary to SQLite memory store + engine variables.
+    if let Some(ref ss) = session_summary {
+        // Write to SQLite (cross-session persistence)
+        if let Some(ref store) = tool_ctx.memory_store {
+            let session_id = workflow_engine.as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .map(|e| e.session_id())
+                .unwrap_or_else(|| "default".to_string());
+            let task = workflow_engine.as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .and_then(|e| e.get_variable("_current_user_request"))
+                .unwrap_or_default();
+            if let Err(e) = store.save_session(&session_id, &task, ss) {
+                tracing::warn!("[MEMORY] Failed to save session: {e}");
+            }
+        }
+
+        // Also persist to engine variables (in-turn access via blackboard)
+        if let Some(wf) = workflow_engine {
+            if let Ok(engine) = wf.try_lock() {
+                if let Ok(json) = serde_json::to_string(ss) {
+                    engine.set_variable("_last_session_summary", json);
+                    for f in &ss.key_facts {
+                        crate::agent::blackboard::add_fact(&engine, &f.fact);
+                    }
+                }
+            }
+        }
+    }
 
     // ── Onboarding shortcut: no gate, no findings — just end the turn. ──
     if crate::agent::onboarding::is_onboarding_turn(messages) {
@@ -566,11 +609,28 @@ async fn handle_finish(
             if let Ok(mut engine) = wf.try_lock() {
                 // After scope confirmation, the LLM is in implement phase.
                 // A plain finish (no finding_json) after confirmation means
-                // the LLM is acknowledging — don't complete the workflow.
+                // the LLM is acknowledging — redirect to implementation.
+                // Track with a flag so a SECOND finish in the same turn ends
+                // the workflow instead of looping.
                 if business_gate::scope_implementation_unlocked(&engine)
                     && crate::agent::phase::get(&engine)
                         == crate::agent::phase::SingleFlowPhase::Implement
                 {
+                    let already_nudged = engine.get_variable("_impl_finish_nudge").as_deref() == Some("1");
+                    if already_nudged {
+                        // Second finish after nudge — LLM wants to end. Complete.
+                        let task = engine.get_variable("_current_user_request").unwrap_or_default();
+                        let _ = engine.complete_workflow();
+                        let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
+                            task_description: task,
+                            execution_summary: content.clone(),
+                        });
+                        drop(engine);
+                        return UnifiedHandleOutcome::TurnDone {
+                            summary: (!content.is_empty()).then(|| content.clone()),
+                        };
+                    }
+                    engine.set_variable("_impl_finish_nudge", "1".to_string());
                     drop(engine);
                     return UnifiedHandleOutcome::Result {
                         content: content.clone(),

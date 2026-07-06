@@ -25,6 +25,60 @@ pub struct UnifiedActionRequest {
     pub params: Value,
 }
 
+/// Structured session summary returned by the LLM on finish.
+/// Tells us what the LLM read, modified, and learned this session.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionSummary {
+    #[serde(default)]
+    pub learnings: String,
+    #[serde(default)]
+    pub key_facts: Vec<KeyFact>,
+    #[serde(default)]
+    pub files_read: Vec<FileReadRecord>,
+    #[serde(default)]
+    pub files_modified: Vec<FileModifiedRecord>,
+    #[serde(default)]
+    pub skills: Vec<SessionSkill>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyFact {
+    pub fact: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileReadRecord {
+    pub path: String,
+    #[serde(default)]
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileModifiedRecord {
+    pub path: String,
+    #[serde(default)]
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSkill {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Extract SessionSummary from finish params (if present).
+pub fn parse_session_summary(params: &Value) -> Option<SessionSummary> {
+    let v = params.get("session_summary")?;
+    serde_json::from_value(v.clone()).ok()
+}
+
 /// Gate classification for sparse human blocking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionGate {

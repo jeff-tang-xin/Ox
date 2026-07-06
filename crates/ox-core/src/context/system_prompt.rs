@@ -290,6 +290,13 @@ const UNIFIED_CORE_CODING: &str = "\
 - 门禁(finding_json)与工具只执行/校验，**永不替你结束**；即使 finding_json 确认并改完代码，也要由**你自己** finish 收尾。
 - 有需用户审核的内容 → `finish(params.finding_json=[{index,severity,file,issue,recommendation}])`（仅校验，确认后继续）
 - 已完成/纯分析/回答 → `finish(params.content=\"…\")` 收尾
+- **收尾时附带会话总结**（可选但推荐） — `finish(params.content=\"完成\", session_summary={...})`：
+  - `learnings`: 本次发现的关键业务知识（一句话）
+  - `key_facts`: 学到的事实列表，每条附上相关文件
+  - `files_read`: 本轮读过的文件（用于跨轮记忆新鲜度检查）
+  - `files_modified`: 本轮修改的文件及改动摘要
+  - `skills`: 可复用的技能/模式（scope: project|global）
+  - 这个总结不会给用户看到，只用于持久化记忆，帮助未来的自己
 
 【铁律】
 - arguments 用合法 JSON：`{\"action\":\"…\",\"params\":{…}}`，params 不要留空

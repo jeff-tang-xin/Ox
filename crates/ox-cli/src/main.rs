@@ -373,6 +373,15 @@ async fn run_app(
     app.gitnexus = Some(Arc::clone(&gitnexus));
 
     // ── Tool context ──
+    // ── Memory Store (SQLite-backed session memory) ──
+    let memory_store = {
+        let db_path = rt_env.effective_project_root().join(".ox").join("memory.db");
+        ox_core::memory::store::MemoryStore::open(&db_path)
+            .map(|s| Arc::new(s))
+            .map_err(|e| tracing::warn!("[MEMORY] Failed to open memory.db: {e}"))
+            .ok()
+    };
+
     let mut tool_ctx = Arc::new(
         ToolContext::new(
             rt_env.clone(),
@@ -380,7 +389,8 @@ async fn run_app(
             Arc::new(config.clone()),
             knowledge_engine.clone(),
         )
-        .with_gitnexus(Some(Arc::clone(&gitnexus))),
+        .with_gitnexus(Some(Arc::clone(&gitnexus)))
+        .with_memory_store(memory_store),
     );
 
     let mut model_name = provider

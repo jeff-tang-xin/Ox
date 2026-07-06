@@ -73,6 +73,8 @@ pub struct ToolContext {
     pub knowledge: Option<Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>>,
     /// GitNexus code-graph service (optional; None when unavailable/disabled).
     pub gitnexus: Option<Arc<crate::mcp::GitNexusService>>,
+    /// Cross-session memory store (SQLite-backed).
+    pub memory_store: Option<Arc<crate::memory::store::MemoryStore>>,
     /// Current tool call ID (for progress reporting)
     pub tool_call_id: String,
     /// Optional progress callback for real-time updates
@@ -102,6 +104,7 @@ impl ToolContext {
             config,
             knowledge,
             gitnexus: None,
+            memory_store: None,
             tool_call_id: String::new(),
             progress_callback: None,
         }
@@ -110,6 +113,12 @@ impl ToolContext {
     /// Attach the GitNexus code-graph service (builder style).
     pub fn with_gitnexus(mut self, gitnexus: Option<Arc<crate::mcp::GitNexusService>>) -> Self {
         self.gitnexus = gitnexus;
+        self
+    }
+
+    /// Attach the cross-session memory store (builder style).
+    pub fn with_memory_store(mut self, store: Option<Arc<crate::memory::store::MemoryStore>>) -> Self {
+        self.memory_store = store;
         self
     }
 
@@ -128,6 +137,7 @@ impl ToolContext {
             config,
             knowledge,
             gitnexus: None,
+            memory_store: None,
             tool_call_id,
             progress_callback: Some(Arc::new(progress_callback)),
         }

@@ -239,6 +239,13 @@ fn push_interjection_message(
                         "💬 User (Act 修复介入): {}",
                         text.trim().chars().take(120).collect::<String>()
                     )));
+                    // Inject a strong directive: don't re-analyze, use previous findings
+                    messages.push(Message::system(
+                        "【直接实施】用户要求你按上一轮的分析结果直接实施。\
+                         你刚才已经分析了代码并给出了方案。直接 edit_file 改代码，\
+                         不要重新读文件、不要重新探索、不要重复分析。\
+                         如果对方案细节不确定，直接按你刚才说的做。"
+                    ));
                     return;
                 }
                 tracing::info!("[WORKFLOW] Blocked mid-flight interjection in Act phase");
@@ -417,6 +424,37 @@ fn try_capture_review_findings(
     false
 }
 
+fn strip_tool_call_xml(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"<tool_call>") {
+            in_tag = true;
+            i += b"<tool_call>".len();
+        } else if in_tag && bytes[i..].starts_with(b"</tool_call>") {
+            in_tag = false;
+            i += b"</tool_call>".len();
+        } else if !in_tag {
+            let ch = text[i..].chars().next().unwrap_or(char::REPLACEMENT_CHARACTER);
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn extract_action_from_xml(text: &str) -> Option<String> {
+    let pattern = "<arg_key>action</arg_key><arg_value>";
+    let start = text.find(pattern)?;
+    let value_start = start + pattern.len();
+    let end = text[value_start..].find("</arg_value>")?;
+    Some(text[value_start..value_start + end].to_string())
+}
+
 fn refresh_turn_memory_for_implement(
     workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
     turn_memory: &mut turn_memory::TurnMemory,
@@ -433,6 +471,7 @@ fn refresh_turn_memory_for_implement(
         .unwrap_or_else(|| "实施修复".to_string());
     // Review → Implement is continuous: keep the in-flight turn memory (tool log +
     // decisions built during review) and only refresh the task anchor. Previously
+
     // this reset to a blank TurnMemory, which — combined with enter_implement's
     // clear — made the model forget everything it had just explored and re-read.
     if turn_memory.user_task.trim().is_empty() || turn_memory.user_task != task {
@@ -686,6 +725,14 @@ fn build_workspace_block(
         let ur = engine.user_round_memory_block();
         if !ur.is_empty() {
             b.push_str(&format!("\n上下文: {}\n", ur.chars().take(200).collect::<String>()));
+        }
+    }
+
+    // Session memory: inject multi-round file history
+    if let Some(history) = engine.get_variable("_memory_history") {
+        if !history.trim().is_empty() {
+            b.push('\n');
+            b.push_str(&history);
         }
     }
 
@@ -1031,6 +1078,43 @@ pub async fn run_agent_turn(
             crate::agent::idle_narrative::collapse_redundant_idle(&mut messages);
         }
 
+        // ── Query SQLite memory store for relevant file history ──
+        if let Some(ms) = &tool_ctx.memory_store {
+            if let Some(wf) = &workflow_engine {
+                if let Ok(engine) = wf.try_lock() {
+                    if let Some(json) = engine.get_variable("_last_session_summary") {
+                        if let Ok(ss) = serde_json::from_str::<crate::agent::unified_action::SessionSummary>(&json) {
+                            let mut history = String::from("📋 相关历史:\n");
+                            let mut has_any = false;
+                            // Query history for each modified file
+                            for m in &ss.files_modified {
+                                if let Ok(h) = ms.query_file_history(&m.path, 3) {
+                                    if !h.is_empty() {
+                                        let short = m.path.rsplit('/').next().unwrap_or(&m.path);
+                                        history.push_str(&format!("  [{short}]\n{}", h));
+                                        has_any = true;
+                                    }
+                                }
+                            }
+                            // Also query for each read file
+                            for r in &ss.files_read {
+                                if let Ok(h) = ms.query_file_history(&r.path, 2) {
+                                    if !h.is_empty() {
+                                        let short = r.path.rsplit('/').next().unwrap_or(&r.path);
+                                        history.push_str(&format!("  [{short}]\n{}", h));
+                                        has_any = true;
+                                    }
+                                }
+                            }
+                            if has_any {
+                                engine.set_variable("_memory_history", history);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Slim context injection (replaces 7 separate blocks) ──
         // One compact [TURN_CONTEXT] block: task anchor + progress + next action.
         // Static content (routes, full workspace) lives in the system prompt, not here.
@@ -1216,14 +1300,26 @@ pub async fn run_agent_turn(
                         let _ = ui_tx.send(AgentToUiEvent::ReasoningChunk(r));
                     }
                     let visible_piece = visible_delta.unwrap_or_default();
+                    // Strip <tool_call> XML tags from visible text so raw
+                    // tool syntax doesn't appear in the UI.
+                    let clean_visible = strip_tool_call_xml(&visible_piece);
+                    // Detect XML tool calls mid-stream and update status bar
+                    if clean_visible.len() < visible_piece.len() {
+                        // Something was stripped — a tool call was detected in the stream
+                        if let Some(action) = extract_action_from_xml(&visible_piece) {
+                            let _ = ui_tx.send(AgentToUiEvent::Status(
+                                format!("🔄 {} ...", action)
+                            ));
+                        }
+                    }
                     if let Some(ref mut filter) = findings_stream {
-                        if let Some(visible) = filter.push(&visible_piece) {
+                        if let Some(visible) = filter.push(&clean_visible) {
                             if !visible.is_empty() {
                                 let _ = ui_tx.send(AgentToUiEvent::TextChunk(visible));
                             }
                         }
-                    } else if !visible_piece.is_empty() {
-                        let _ = ui_tx.send(AgentToUiEvent::TextChunk(visible_piece));
+                    } else if !clean_visible.is_empty() {
+                        let _ = ui_tx.send(AgentToUiEvent::TextChunk(clean_visible));
                     }
                     full_text.push_str(&text);
                 }
@@ -1232,9 +1328,16 @@ pub async fn run_agent_turn(
                     let _ = ui_tx.send(AgentToUiEvent::ReasoningChunk(text));
                 }
                 LlmStreamEvent::ToolCallStart { id, name } => {
-                    // Don't show ToolStart in UI yet — the tool may be rejected
-                    // by workflow validation later. Only show when actually executing.
+                    // Show tool intent in status bar immediately
                     tracing::debug!("[AGENT] LLM requested tool: {} (id={})", name, id);
+                    if unified_tool_mode {
+                        let tool_display = if name == crate::agent::unified_action::TOOL_NAME {
+                            "准备执行...".to_string()
+                        } else {
+                            name.clone()
+                        };
+                        let _ = ui_tx.send(AgentToUiEvent::Status(format!("🔄 {tool_display}")));
+                    }
                     current_tool_args.insert(id.clone(), String::new());
                     tool_calls.push(ToolCall {
                         id,
@@ -1244,7 +1347,14 @@ pub async fn run_agent_turn(
                 }
                 LlmStreamEvent::ToolCallArgumentsDelta { id, delta } => {
                     if let Some(args) = current_tool_args.get_mut(&id) {
+                        let was_empty = args.is_empty();
                         args.push_str(&delta);
+                        // Once we have at least the action field, show it in status bar
+                        if was_empty && unified_tool_mode {
+                            if let Ok(action) = serde_json::from_str::<crate::agent::unified_action::UnifiedActionRequest>(args) {
+                                let _ = ui_tx.send(AgentToUiEvent::Status(format!("🔄 {} ...", action.action)));
+                            }
+                        }
                     }
                     if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
                         tc.arguments.push_str(&delta);
