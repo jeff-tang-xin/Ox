@@ -480,8 +480,9 @@ pub fn handle_turn_done(
                         _ => None,
                     })
                     .unwrap_or_default();
+                let react_summary = String::new();
                 let marker =
-                    ox_core::agent::user_round::format_complete_boundary_message(&task, &summary);
+                    ox_core::agent::user_round::format_complete_boundary_message(&task, &summary, &react_summary);
                 if let Err(e) = target_session.append_message(Message::system(marker)) {
                     tracing::error!("Failed to persist completion boundary: {e}");
                 }

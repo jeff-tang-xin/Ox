@@ -535,9 +535,23 @@ fn inject_slim_context(
     turn_memory: &turn_memory::TurnMemory,
     workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
     unified_tool_mode: bool,
+    memory_store: &Option<Arc<crate::memory::store::MemoryStore>>,
+    session_id: &str,
 ) {
     // ── 1. Strip all prior injection blocks in ONE pass ──
     strip_all_injection_blocks(messages);
+
+    // ── 1b. Rebuild [USER_ROUND] if stripped ──
+    let has_user_round = messages.iter().any(|m| match m {
+        Message::System { content } => content.contains("[USER_ROUND]"),
+        Message::User { content } => content.contains("[USER_ROUND]"),
+        Message::Assistant { content, .. } => content.contains("[USER_ROUND]"),
+        Message::ToolResult { content, .. } => content.contains("[USER_ROUND]"),
+    });
+    if !has_user_round && !user_task.is_empty() {
+        let user_round = format!("[USER_ROUND]\n{}\n[/USER_ROUND]", user_task);
+        messages.insert(0, Message::system(&user_round));
+    }
 
     // ── 2. Build compact block from helpers ──
     let mut block = String::with_capacity(1200);
@@ -561,6 +575,17 @@ fn inject_slim_context(
 
     block.push_str(&build_task_anchor_block(user_task, iteration, turn_memory, workflow_engine));
     block.push_str(&build_tool_trace_block(turn_memory, slim_phase));
+
+    // ── ReAct timeline: cross-turn action history ──
+    if let Some(ms) = memory_store {
+        if let Ok(timeline) = ms.get_react_timeline(session_id, 30) {
+            if !timeline.trim().is_empty() {
+                block.push_str("🔄 ReAct Timeline:\n");
+                block.push_str(&timeline);
+                block.push('\n');
+            }
+        }
+    }
 
     if let Some(wf) = workflow_engine
         && let Ok(engine) = wf.try_lock() {
@@ -1104,6 +1129,12 @@ pub async fn run_agent_turn(
             &turn_memory,
             &workflow_engine,
             unified_tool_mode,
+            &tool_ctx.memory_store,
+            &workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .map(|e| e.session_id().to_string())
+                .unwrap_or_default(),
         );
 
         // 🚨 Sanitize tool pairs before EVERY LLM call within the agent turn.

@@ -120,7 +120,7 @@ pub fn is_interrupt_boundary(content: &str) -> bool {
 /// and the LLM could not tell from message history whether that work had finished
 /// — so it re-explored or treated stale results as pending. This terminator makes
 /// completion explicit and machine-detectable.
-pub fn format_complete_boundary_message(task: &str, summary: &str) -> String {
+pub fn format_complete_boundary_message(task: &str, summary: &str, react_summary: &str) -> String {
     let task: String = task.trim().chars().take(1500).collect();
     let summary: String = summary.trim().chars().take(800).collect();
     let mut out = format!(
@@ -129,6 +129,10 @@ pub fn format_complete_boundary_message(task: &str, summary: &str) -> String {
     );
     if !summary.is_empty() {
         out.push_str(&format!("\n交付: {summary}"));
+    }
+    if !react_summary.trim().is_empty() {
+        let react_short: String = react_summary.trim().chars().take(600).collect();
+        out.push_str(&format!("\n📋 Recent actions:\n{react_short}"));
     }
     out.push_str("\n（时间线：旧批次在上，当前轮在下。此标记前为历史轮次。）");
     out
