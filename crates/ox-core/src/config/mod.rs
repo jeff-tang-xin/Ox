@@ -217,6 +217,7 @@ use_refined_context = true  # Enable refined context format (default: true)
 # review_model = "claude-sonnet-4"    # Code review / audit (read-only)
 # implement_model = "gpt-4o"          # Fix / implementation
 # qa_model = ""                       # Q&A (empty = default model)
+# summarizer_model = ""               # Memory-graph offload summarizer (empty = default model)
 
 # ── Memory System ────────────────────────────────────────
 [memory]
@@ -603,6 +604,8 @@ pub struct MemoryConfig {
     pub llm_judge_threshold: u8,
     /// Store refined summaries instead of raw conversations
     pub store_refined_memories: bool,
+    /// Hours between periodic L1→L2 memory-graph consolidation passes (default 24).
+    pub consolidation_interval_hours: u32,
 }
 
 impl Default for MemoryConfig {
@@ -642,6 +645,7 @@ impl Default for MemoryConfig {
             enable_llm_judge: true,       // Default: ENABLED
             llm_judge_threshold: 7,       // Only keep memories with score >= 7
             store_refined_memories: true, // Default: ENABLED for better memory quality
+            consolidation_interval_hours: 24,
         }
     }
 }
@@ -947,6 +951,10 @@ pub struct CollaborationConfig {
     pub implement_model: String,
     /// Model for Q&A. Empty = use default.
     pub qa_model: String,
+    /// Model for memory-graph summarization during budget offload.
+    /// Empty = use the session's default (main) provider. A small/cheap model
+    /// is a good fit here since the task is pure summarization.
+    pub summarizer_model: String,
 }
 
 

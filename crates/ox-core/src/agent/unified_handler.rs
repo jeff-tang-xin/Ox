@@ -364,7 +364,68 @@ pub async fn handle_complete_and_check(
             )
             .await
         }
+        UnifiedRoute::Recall => handle_recall(&req, tool_ctx).await,
         UnifiedRoute::Unknown => result_err(format!("unknown action: {}", req.action)),
+    }
+}
+
+/// Handle `recall` — memory-graph node replay or offloader ref retrieval.
+/// `node_id` starting with `#` (or a bare number) → replay the memory-graph
+/// node's full ReAct trace from SQLite. Otherwise → retrieve the offloaded
+/// `.ox/refs/<node_id>.md` content.
+async fn handle_recall(
+    req: &unified_action::UnifiedActionRequest,
+    tool_ctx: &Arc<ToolContext>,
+) -> UnifiedHandleOutcome {
+    let node_id = req
+        .params
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if node_id.is_empty() {
+        return result_err("recall 需要 node_id（记忆图谱用 #<编号>，或 offload 的 node_id）".into());
+    }
+
+    // Graph-node replay: `#N` or bare integer → SQLite lookup.
+    let graph_id: Option<i64> = node_id
+        .strip_prefix('#')
+        .unwrap_or(&node_id)
+        .parse::<i64>()
+        .ok();
+    if let Some(gid) = graph_id
+        && let Some(ref store) = tool_ctx.memory_store {
+            match store.get_react_batch_by_graph(gid) {
+                Ok(text) if !text.trim().is_empty() => {
+                    // Count the recall hit — drives L2→L3 promotion + anti-downgrade.
+                    let _ = store.touch_graph_hit(gid);
+                    return UnifiedHandleOutcome::Result {
+                        content: text,
+                        is_error: false,
+                        deferred_system: Vec::new(),
+                        delegate_meta: None,
+                    };
+                }
+                _ => {
+                    return result_err(format!("记忆图谱节点 #{gid} 无内容或不存在"));
+                }
+            }
+        }
+
+    // Offloader ref retrieval (file-based node_id).
+    let offloader = crate::agent::context_offloader::ContextOffloader::new(
+        &tool_ctx.working_dir,
+        "session",
+    );
+    match offloader.retrieve_full_content(&node_id) {
+        Some(content) => UnifiedHandleOutcome::Result {
+            content,
+            is_error: false,
+            deferred_system: Vec::new(),
+            delegate_meta: None,
+        },
+        None => result_err(format!("找不到 node_id={node_id} 的内容")),
     }
 }
 
@@ -421,6 +482,7 @@ where
                     // Record review findings as session facts so the LLM
                     // doesn't re-analyze in implement phase.
                     if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
+                        let mut facts = Vec::new();
                         for f in &store.findings {
                             let fact = format!(
                                 "{}: {} ({})",
@@ -429,7 +491,13 @@ where
                                 f.severity.label()
                             );
                             crate::agent::blackboard::add_fact(&engine, &fact);
+                            facts.push(fact);
                         }
+                        // (Historical batch summary via `_last_session_summary`
+                        // was retired — implement-phase history now comes from the
+                        // ReAct log / [MEMORY_GRAPH]. Findings still land in the
+                        // blackboard above.)
+                        let _ = facts;
                     }
                 }
             UnifiedHandleOutcome::Result {
@@ -522,15 +590,15 @@ async fn handle_finish(
             }
         }
 
-        // Also persist to engine variables (in-turn access via blackboard)
+        // Also surface key facts to the blackboard for in-turn access.
+        // (`_last_session_summary` engine var was retired — cross-session history
+        // is read from the SQLite store / [MEMORY_GRAPH], not this variable.)
         if let Some(wf) = workflow_engine
-            && let Ok(engine) = wf.try_lock()
-                && let Ok(json) = serde_json::to_string(ss) {
-                    engine.set_variable("_last_session_summary", json);
-                    for f in &ss.key_facts {
-                        crate::agent::blackboard::add_fact(&engine, &f.fact);
-                    }
+            && let Ok(engine) = wf.try_lock() {
+                for f in &ss.key_facts {
+                    crate::agent::blackboard::add_fact(&engine, &f.fact);
                 }
+            }
     }
 
     // ── Onboarding shortcut: no gate, no findings — just end the turn. ──

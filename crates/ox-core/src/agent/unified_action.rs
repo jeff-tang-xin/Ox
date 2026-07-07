@@ -94,6 +94,8 @@ pub enum UnifiedRoute {
     DelegateTool,
     /// Single terminal action: yields the turn. Gate decided by presence of `finding_json`.
     Finish,
+    /// Retrieve offloaded content: memory-graph node replay (`#N`) or offloader node_id.
+    Recall,
     Unknown,
 }
 
@@ -118,6 +120,7 @@ pub fn route(req: &UnifiedActionRequest) -> UnifiedRoute {
         // `finish` is the single terminal action. `deliver`/`report`/`done` alias to it
         // for backwards compatibility — behavior is decided solely by `finding_json`.
         "finish" | "deliver" | "report" | "done" | "complete" => UnifiedRoute::Finish,
+        "recall" => UnifiedRoute::Recall,
         a if action_to_tool_name(a).is_some() => UnifiedRoute::DelegateTool,
         _ => UnifiedRoute::Unknown,
     }

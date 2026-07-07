@@ -109,10 +109,13 @@ pub fn looks_like_implementation_request(user_text: &str) -> bool {
         "解决",
         "处理",
         "执行",
+        "实施",
         "implement",
         "/fix",
         "apply fix",
         "resolve finding",
+        "按你说的",
+        "动手",
     ]
     .iter()
     .any(|k| t.contains(k) || lower.contains(k))

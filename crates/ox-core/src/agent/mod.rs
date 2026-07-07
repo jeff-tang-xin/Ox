@@ -22,6 +22,7 @@ pub mod interjection;
 pub mod interrupt;
 pub mod intervention;
 pub mod memory_bridge; // Cross-turn durable memory injection
+pub mod memory_offload; // Budget-triggered memory-graph offload (unified compaction)
 pub mod onboarding; // First-time project skill generation
 pub mod perception; // Structured findings from perceive phase
 pub mod phase; // Review → Fix → Done phase transitions
@@ -513,6 +514,7 @@ fn strip_all_injection_blocks(messages: &mut Vec<Message>) {
             || c.starts_with("[USER_ROUND]")
             || c.starts_with("[DURABLE_MEMORY]")
             || c.starts_with("[TURN_INPUT]")
+            || c.starts_with(crate::agent::memory_offload::MEMORY_GRAPH_TAG)
             || c.starts_with("[WORKSPACE]")
             || c.starts_with("[UNIFIED_ROUTE]")
             || c.starts_with("[TOOL_ROUTE]")
@@ -546,6 +548,16 @@ fn inject_slim_context(
         .and_then(|wf| wf.try_lock().ok())
         .map(|e| crate::agent::context_slim::is_slim_phase(&e))
         .unwrap_or(false);
+
+    // Memory-graph pinned at the very top (only present after an offload has
+    // archived nodes this session). Highest-priority anchor, like the blackboard.
+    if let Some(wf) = workflow_engine
+        && let Ok(engine) = wf.try_lock()
+            && let Some(graph) = engine.get_variable(crate::agent::memory_offload::MEMORY_GRAPH_VAR)
+                && !graph.trim().is_empty() {
+                    block.push_str(&graph);
+                    block.push_str("\n\n");
+                }
 
     block.push_str(&build_task_anchor_block(user_task, iteration, turn_memory, workflow_engine));
     block.push_str(&build_tool_trace_block(turn_memory, slim_phase));
@@ -739,48 +751,10 @@ fn build_workspace_block(
         }
     }
 
-    // Fallback: inject last session summary as a coherent batch
-    if let Some(json) = engine.get_variable("_last_session_summary")
-        && engine.get_variable("_memory_history").map_or(true, |h| h.trim().is_empty())
-    {
-        if let Ok(ss) = serde_json::from_str::<crate::agent::unified_action::SessionSummary>(&json) {
-            let mut has = false;
-            if !ss.learnings.is_empty() {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let hour = (now / 3600) % 24;
-                let min = (now / 60) % 60;
-                b.push_str(&format!("\n📦 **上轮批次** ({:02}:{:02}): {}\n", hour, min, ss.learnings.chars().take(200).collect::<String>()));
-                has = true;
-            }
-            if !ss.key_facts.is_empty() {
-                b.push_str("  发现:\n");
-                for f in ss.key_facts.iter().take(5) {
-                    b.push_str(&format!("    • {}\n", f.fact.chars().take(120).collect::<String>()));
-                }
-                has = true;
-            }
-            if !ss.files_modified.is_empty() {
-                b.push_str("  修改:\n");
-                for m in &ss.files_modified {
-                    b.push_str(&format!("    • {}\n", m.path.rsplit('/').next().unwrap_or(&m.path)));
-                }
-                has = true;
-            }
-            if has {
-                b.push_str("  ─── 基于此继续，不要重复探索 ───\n");
-            }
-        }
-    }
-
-    // Multi-batch history from SQLite (if available)
-    if let Some(history) = engine.get_variable("_memory_history")
-        && !history.trim().is_empty() {
-            b.push('\n');
-            b.push_str(&history);
-        }
+    // Historical batch memory is now handled entirely by the [MEMORY_GRAPH]
+    // block (pinned at top of context after an offload) + `recall #<id>` node
+    // replay. The former `_prev_impl_edits` / `_memory_history` /
+    // `_last_session_summary` timeline was retired with the unified offload path.
 
     b
 }
@@ -936,8 +910,6 @@ pub async fn run_agent_turn(
     let mut total_usage = TokenUsage::default();
 
     const MAX_SAME_TOOL_CALLS: u32 = 5; // Maximum times the same tool can be called in one turn
-    const COMPACT_MESSAGES_AFTER_ITER: u32 = 999; // effectively disable; outer context_builder handles budget
-    const COMPACT_KEEP_TAIL: usize = 60; // keep enough messages for long tasks
 
     // Fresh symbol-search dedup each agent spawn (workflow vars may survive across sessions).
     if let Some(wf) = &workflow_engine
@@ -1073,24 +1045,11 @@ pub async fn run_agent_turn(
         turn_memory.bump_iteration();
         persist_turn_memory(&workflow_engine, &turn_memory);
 
-        // Compress bloated in-turn history before LLM call
-        let compact_after = workflow_engine
-            .as_ref()
-            .is_some_and(|wf| wf.try_lock().map(|e| e.is_task_step()).unwrap_or(false));
-        let compact_threshold = if compact_after {
-            8
-        } else {
-            COMPACT_MESSAGES_AFTER_ITER
-        };
-        let keep_tail = workflow_engine
-            .as_ref()
-            .and_then(|wf| wf.try_lock().ok())
-            .filter(|e| crate::agent::context_slim::is_slim_phase(e))
-            .map(|_| crate::agent::context_slim::compact_keep_tail())
-            .unwrap_or(COMPACT_KEEP_TAIL);
-        if iteration >= compact_threshold && messages.len() > keep_tail + 6 {
-            turn_memory::compact_turn_messages(&mut messages, keep_tail);
-        }
+        // In-turn message growth is handled by the unified offload path: after
+        // each LLM call, real prompt-token count is checked against the 80%
+        // window budget and, if exceeded, the ReAct log is archived + old tool
+        // messages placeholdered (memory_offload::offload_if_over_budget). The
+        // former iteration-count-based compact_turn_messages was retired.
 
         // NOTE: fold_review_exploration removed — it replaced tool results with
         // placeholders pointing to [WORKSPACE]/STEP_MEMORY blocks that no longer
@@ -1119,64 +1078,23 @@ pub async fn run_agent_turn(
             crate::agent::idle_narrative::collapse_redundant_idle(&mut messages);
         }
 
-        // ── Query SQLite memory store for relevant file history ──
-        // Prefer the **current turn's user input** as the topic anchor (fixes cross-session
-        // memory drift where _last_session_summary was empty or belonged to an unrelated turn).
-        if let Some(ms) = &tool_ctx.memory_store
-            && let Some(wf) = &workflow_engine
-                && let Ok(engine) = wf.try_lock() {
-                    // Topic key: first user message this turn → truncate 200 chars; fallback to summary.
-                    let topic_from_user: Option<String> = messages.iter().find_map(|m| {
-                        if let Message::User { content } = m {
-                            Some(content.chars().take(200).collect::<String>())
-                        } else {
-                            None
-                        }
-                    });
-                    let summary_json = engine.get_variable("_last_session_summary");
-                    // Only run history lookup if we have *something* to key on.
-                    if topic_from_user.is_some() || summary_json.is_some() {
-                        let mut history = String::from("📋 相关历史:\n");
-                        let mut has_any = false;
-                        if let Some(json) = summary_json
-                            && let Ok(ss) = serde_json::from_str::<crate::agent::unified_action::SessionSummary>(&json) {
-                                for m in &ss.files_modified {
-                                    if let Ok(h) = ms.query_file_history(&m.path, 3)
-                                        && !h.is_empty() {
-                                            let short = m.path.rsplit('/').next().unwrap_or(&m.path);
-                                            history.push_str(&format!("  [{short}]\n{}", h));
-                                            has_any = true;
-                                        }
-                                }
-                                for r in &ss.files_read {
-                                    if let Ok(h) = ms.query_file_history(&r.path, 2)
-                                        && !h.is_empty() {
-                                            let short = r.path.rsplit('/').next().unwrap_or(&r.path);
-                                            history.push_str(&format!("  [{short}]\n{}", h));
-                                            has_any = true;
-                                        }
-                                }
-                            }
-                        // Even without a prior summary, surface files that the user's current
-                        // topic explicitly names (path-like tokens).
-                        if let Some(topic) = topic_from_user.as_ref() {
-                            for tok in topic.split(|c: char| c.is_whitespace() || "()[]{}\"'`,;".contains(c)) {
-                                if tok.len() >= 4 && (tok.contains('/') || tok.contains('\\') || tok.ends_with(".rs"))
-                                    && let Ok(h) = ms.query_file_history(tok, 2)
-                                        && !h.is_empty() {
-                                            let short = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
-                                            history.push_str(&format!("  [{short}]\n{}", h));
-                                            has_any = true;
-                                        }
-                            }
-                        }
-                        if has_any {
-                            engine.set_variable("_memory_history", history);
+        // ── Query SQLite react_log for ReAct timeline ──
+        // This un-archived timeline (impacted=0) is the single source of recent
+        // cross-round history; older work lives in [MEMORY_GRAPH] after offload.
+        if let Some(ref ms) = tool_ctx.memory_store {
+            if let Some(wf) = &workflow_engine {
+                if let Ok(engine) = wf.try_lock() {
+                    let sid = engine.session_id();
+                    if let Ok(timeline) = ms.get_react_timeline(&sid, 50) {
+                        if !timeline.is_empty() {
+                            engine.set_variable("_react_timeline", timeline);
                         }
                     }
                 }
+            }
+        }
 
-        // ── Slim context injection (replaces 7 separate blocks) ──
+        // ── Slim context injection ──
         // One compact [TURN_CONTEXT] block: task anchor + progress + next action.
         // Static content (routes, full workspace) lives in the system prompt, not here.
         inject_slim_context(
@@ -1319,6 +1237,7 @@ pub async fn run_agent_turn(
             use_findings_stream.then(crate::agent::perception::FindingsStreamFilter::new);
         let mut think_stream = crate::agent::think_stream::ThinkTagStreamFilter::new();
         let mut last_stream_completion_tokens = 0u32;
+        let mut last_prompt_tokens = 0u32;
 
         // Timeout for the entire LLM response (stream first token → stream done).
         // Separate from the per-tool 300s timeout; prevents the agent hanging
@@ -1430,6 +1349,7 @@ pub async fn run_agent_turn(
                     total_usage.prompt_tokens += usage.prompt_tokens;
                     total_usage.completion_tokens += usage.completion_tokens;
                     total_usage.total_tokens += usage.total_tokens;
+                    last_prompt_tokens = usage.prompt_tokens;
 
                     // 📝 LOG RESPONSE SUMMARY (debug level)
                     tracing::debug!("\n{}", "-".repeat(80));
@@ -1496,6 +1416,56 @@ pub async fn run_agent_turn(
         if let Some(ref mut filter) = findings_stream
             && let Some(tail) = filter.flush_tail() {
                 let _ = ui_tx.send(AgentToUiEvent::TextChunk(tail));
+            }
+
+        // ── Unified budget offload ──
+        // When the API's real prompt-token count crosses 80% of the window,
+        // cluster the un-archived ReAct log into memory-graph nodes, persist
+        // them, and placeholder the old ReAct messages (one action = archive +
+        // compaction). Runs here, after the stream fully ends, so `messages`
+        // isn't borrowed mid-loop.
+        if last_prompt_tokens > 0
+            && let Some(ref ms) = tool_ctx.memory_store {
+                let session_id = workflow_engine
+                    .as_ref()
+                    .and_then(|wf| wf.try_lock().ok())
+                    .map(|e| e.session_id())
+                    .unwrap_or_else(|| "default".to_string());
+                let fail_streak = workflow_engine
+                    .as_ref()
+                    .and_then(|wf| wf.try_lock().ok())
+                    .and_then(|e| e.get_variable(memory_offload::OFFLOAD_FAIL_VAR))
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let context_window = active_provider.context_window_size();
+                let summarizer = tool_ctx.summarizer.clone();
+                let ui_tx_offload = ui_tx.clone();
+                let (outcome, new_streak) = memory_offload::offload_if_over_budget(
+                    last_prompt_tokens,
+                    context_window,
+                    &mut messages,
+                    summarizer,
+                    &active_provider,
+                    ms,
+                    &session_id,
+                    fail_streak,
+                    |s| {
+                        let _ = ui_tx_offload.send(AgentToUiEvent::Status(s));
+                    },
+                )
+                .await;
+                if let Some(wf) = &workflow_engine
+                    && let Ok(engine) = wf.try_lock() {
+                        engine.set_variable(
+                            memory_offload::OFFLOAD_FAIL_VAR,
+                            new_streak.to_string(),
+                        );
+                        // Refresh the top-of-context graph block after any archival.
+                        if matches!(outcome, memory_offload::OffloadOutcome::Archived { .. }) {
+                            let block = memory_offload::build_memory_graph_block(ms, &session_id);
+                            engine.set_variable(memory_offload::MEMORY_GRAPH_VAR, block);
+                        }
+                    }
             }
 
         // Repair malformed / empty tool arguments (GLM empty JSON, XML <tool_call> hallucinations).
@@ -2317,6 +2287,36 @@ pub async fn run_agent_turn(
                                 is_error,
                             )
                             .await;
+                            // ── Persist the ReAct triple to react_log (unified path) ──
+                            // This is the L0 memory ground truth: [user, assistant,
+                            // tool_result]. Previously only the legacy tool path wrote
+                            // here, so in unified mode react_log stayed empty.
+                            if let Some(ref ms) = tool_ctx.memory_store {
+                                let session_id = workflow_engine
+                                    .as_ref()
+                                    .and_then(|wf| wf.try_lock().ok())
+                                    .map(|e| e.session_id())
+                                    .unwrap_or_else(|| "default".to_string());
+                                let react_task = user_task.clone().unwrap_or_default();
+                                let decision = turn_memory
+                                    .decisions
+                                    .last()
+                                    .map(|d| d.chars().take(200).collect::<String>())
+                                    .unwrap_or_default();
+                                let assistant_text =
+                                    crate::agent::think_stream::visible_only(&full_text);
+                                let outcome = if is_error { "error" } else { "ok" };
+                                let _ = ms.record_react(
+                                    &session_id,
+                                    &react_task,
+                                    &meta.inner_tool,
+                                    &target,
+                                    outcome,
+                                    &decision,
+                                    &assistant_text,
+                                    &meta.live_output,
+                                );
+                            }
                         } else {
                             turn_memory.record_tool(&tc.name, &tc.arguments, is_error);
                         }
@@ -3091,6 +3091,47 @@ pub async fn run_agent_turn(
                 output: offloaded.to_context_message(),
                 is_error: result.is_error,
             });
+
+            // Record to SQLite react_log for cross-round memory
+            if let Some(ref ms) = tool_ctx.memory_store {
+                let session_id = workflow_engine.as_ref()
+                    .and_then(|wf| wf.try_lock().ok())
+                    .map(|e| e.session_id())
+                    .unwrap_or_else(|| "default".to_string());
+                let task = workflow_engine.as_ref()
+                    .and_then(|wf| wf.try_lock().ok())
+                    .and_then(|e| e.get_variable("_current_user_request"))
+                    .unwrap_or_default();
+                let target = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("params")
+                            .or_else(|| v.get("path"))
+                            .or_else(|| v.get("name"))
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_default();
+                let outcome = if result.is_error { "error" } else { "ok" };
+                // Attach the latest in-turn decision so the summarizer has "why".
+                let decision = turn_memory
+                    .decisions
+                    .last()
+                    .map(|d| d.chars().take(200).collect::<String>())
+                    .unwrap_or_default();
+                // ReAct triple: assistant reasoning (visible text this turn) + tool result.
+                let assistant_text = crate::agent::think_stream::visible_only(&full_text);
+                let _ = ms.record_react(
+                    &session_id,
+                    &task,
+                    &tc.name,
+                    &target,
+                    outcome,
+                    &decision,
+                    &assistant_text,
+                    &result.content,
+                );
+            }
 
             let mut result_content = format!(
                 "── DATA ({}) ──\n{}\n── END DATA ──",

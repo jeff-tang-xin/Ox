@@ -4,15 +4,43 @@
 //! request + outcome, clears ephemeral exploration state, and injects a
 //! high-priority anchor so the LLM focuses on the current request only.
 
-use serde::{Deserialize, Serialize};
-
 use crate::agent::engine::WorkflowEngine;
 
 pub const USER_ROUND_TAG: &str = "[USER_ROUND]";
 /// Latest user message that triggered the current agent turn (may differ from session task).
 pub const TURN_INPUT_TAG: &str = "[TURN_INPUT]";
+
+/// Format current UTC time as "YYYY-MM-DD HH:MM" (pure stdlib, no deps).
+pub fn format_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let time = secs % 86400;
+    let hh = time / 3600;
+    let mm = (time % 3600) / 60;
+    let mut y = 1970i64;
+    let mut d = days as i64;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let yd = if leap { 366 } else { 365 };
+        if d < yd { break; }
+        d -= yd;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mdays = if leap { [31,29,31,30,31,30,31,31,30,31,30,31] }
+                     else { [31,28,31,30,31,30,31,31,30,31,30,31] };
+    let mut m = 1u32;
+    for &md in &mdays {
+        if d < md { break; }
+        d -= md;
+        m += 1;
+    }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, (d + 1) as u32, hh, mm)
+}
 pub const TURN_INPUT_KEY: &str = "_turn_user_input";
-const MAX_HISTORY: usize = 8;
 pub const ROUND_FINALIZED_KEY: &str = "_round_finalized";
 
 /// Session-visible marker written when a new user round starts.
@@ -22,12 +50,6 @@ pub const INTERRUPT_BOUNDARY_TAG: &str = "[INTERRUPT_BOUNDARY]";
 /// Session-visible marker written when a round completes successfully (finish).
 pub const COMPLETE_BOUNDARY_TAG: &str = "[ROUND_COMPLETE]";
 const ROUND_INTERRUPTED_KEY: &str = "_round_interrupted";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserRoundArchive {
-    pub user_request: String,
-    pub outcome_summary: String,
-}
 
 /// Archive outcome, clear ephemeral workflow state, mark round closed.
 pub fn finalize_completed_round(engine: &mut WorkflowEngine) {
@@ -103,16 +125,12 @@ pub fn format_complete_boundary_message(task: &str, summary: &str) -> String {
     let summary: String = summary.trim().chars().take(800).collect();
     let mut out = format!(
         "{COMPLETE_BOUNDARY_TAG}\n\
-         ✅ **上一轮任务已完成并交付（COMPLETED — HISTORICAL）**\n\
-         任务: {task}"
+         ✅ **已完成（HISTORICAL）** — {task}"
     );
     if !summary.is_empty() {
-        out.push_str(&format!("\n交付摘要: {summary}"));
+        out.push_str(&format!("\n交付: {summary}"));
     }
-    out.push_str(
-        "\n此标记**之前**的工具输出与中间步骤均属**已完成**的历史轮次，仅供只读参考；\
-         **不要**重复执行、也**不要**当作未完成的待办。新需求以本轮用户输入为准。",
-    );
+    out.push_str("\n（时间线：旧批次在上，当前轮在下。此标记前为历史轮次。）");
     out
 }
 
@@ -149,24 +167,17 @@ pub fn format_turn_input_text(input: &str, session_task: Option<&str>) -> String
         return String::new();
     }
     let body: String = input.chars().take(2000).collect();
+    let time_str = format_now();
+
     let mut parts = vec![
         TURN_INPUT_TAG.to_string(),
-        format!(
-            "## ✉️ 本轮用户输入（**唯一待响应内容** — 覆盖历史误解）\n\
-             > {body}"
-        ),
-        "⚠️ **工具动作：** 以 [WORKSPACE]「本轮唯一动作」为准；本轮输入用于澄清意图、纠正历史误解。"
-            .to_string(),
-        "若历史 assistant 声称已做某事、或与本轮输入矛盾，**以本轮输入为准**；用户修正立即生效，不得沿用错误结论。"
-            .to_string(),
+        format!("## ✉️ 本轮 [{time_str}] {body}"),
     ];
     if let Some(task) = session_task {
         let task = task.trim();
         if !task.is_empty() && task != input {
             let snip: String = task.chars().take(400).collect();
-            parts.push(format!(
-                "（会话背景任务：「{snip}」— 仅作参考；**本轮须按上方输入执行**）"
-            ));
+            parts.push(format!("（会话背景: {snip}）"));
         }
     }
     parts.join("\n\n")
@@ -280,12 +291,7 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
 pub fn format_round_boundary_message(current_task: &str) -> String {
     format!(
         "{ROUND_BOUNDARY_TAG}\n\
-         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
-         🎯 **本轮任务开始**（CURRENT — 唯一执行目标）\n\
-         {}\n\
-         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
-         ⚠️ 此标记**之前**的对话、工具输出、知识库检索与持久记忆均属于**历史轮次（HISTORICAL）**。\n\
-         仅供只读参考，**不得**当作本轮待办或继续执行。",
+         🎯 **本轮**: {}",
         current_task.chars().take(2000).collect::<String>()
     )
 }
@@ -294,65 +300,15 @@ pub fn is_round_boundary(content: &str) -> bool {
     content.starts_with(ROUND_BOUNDARY_TAG)
 }
 
-fn archive_interrupted_round(engine: &WorkflowEngine, prev_user: &str) {
-    let outcome = build_round_outcome_summary(engine);
-    if outcome.is_empty() && !round_had_activity(engine) {
-        return;
-    }
-    let body = if outcome.is_empty() {
-        "（中断时无步骤记录）".to_string()
-    } else {
-        outcome
-    };
-    push_round_history(
-        engine,
-        prev_user,
-        format!("⏹️ **用户中断（未完成）**\n\n{body}"),
-    );
-}
+// Round archival is now handled by the ReAct log (each tool call is persisted
+// via record_react) + budget offload into memory-graph nodes. The former
+// `_round_history` engine-variable recap was retired; these hooks remain as
+// no-ops so the round-lifecycle call sites stay unchanged.
+fn archive_interrupted_round(_engine: &WorkflowEngine, _prev_user: &str) {}
 
-fn archive_completed_round(engine: &WorkflowEngine, prev_user: &str) {
-    let outcome = build_round_outcome_summary(engine);
-    if outcome.is_empty() && !round_had_activity(engine) {
-        return;
-    }
-    let body = if outcome.is_empty() {
-        "（无步骤记录）".to_string()
-    } else {
-        outcome
-    };
-    push_round_history(engine, prev_user, format!("✅ **本轮已完成**\n\n{body}"));
-}
+fn archive_completed_round(_engine: &WorkflowEngine, _prev_user: &str) {}
 
-fn archive_round(engine: &WorkflowEngine, prev_user: &str) {
-    let outcome = build_round_outcome_summary(engine);
-    if outcome.is_empty() && !round_had_activity(engine) {
-        return;
-    }
-    push_round_history(
-        engine,
-        prev_user,
-        if outcome.is_empty() {
-            "（未完成或无记录）".to_string()
-        } else {
-            outcome
-        },
-    );
-}
-
-fn push_round_history(engine: &WorkflowEngine, prev_user: &str, outcome_summary: String) {
-    let mut history = load_round_history(engine);
-    history.push(UserRoundArchive {
-        user_request: prev_user.to_string(),
-        outcome_summary,
-    });
-    while history.len() > MAX_HISTORY {
-        history.remove(0);
-    }
-    if let Ok(json) = serde_json::to_string(&history) {
-        engine.set_variable("_round_history", json);
-    }
-}
+fn archive_round(_engine: &WorkflowEngine, _prev_user: &str) {}
 
 fn round_had_activity(engine: &WorkflowEngine) -> bool {
     engine.get_current_step_index() > 0
@@ -365,49 +321,6 @@ fn round_had_activity(engine: &WorkflowEngine) -> bool {
             .is_some_and(|s| !s.is_empty())
 }
 
-pub fn build_round_outcome_summary(engine: &WorkflowEngine) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(reply) = engine.get_variable("_chat_reply")
-        && !reply.trim().is_empty() {
-            let snippet: String = reply.chars().take(1200).collect();
-            parts.push(format!("【回复】\n{snippet}"));
-        }
-
-    for (i, label, cap) in [
-        ("_step3_output", "执行结果", 2200usize),
-        ("_step2_output", "审阅", 1200),
-        ("_step1_output", "计划", 1200),
-        ("_step0_output", "意图", 800),
-    ] {
-        if let Some(raw) = engine.get_variable(i) {
-            if raw.trim().is_empty() {
-                continue;
-            }
-            let snippet: String = raw.chars().take(cap).collect();
-            parts.push(format!("【{label}】\n{snippet}"));
-        }
-    }
-
-    if let Some(tm) = engine.load_turn_memory()
-        && !tm.entries.is_empty() {
-            let mut lines = vec!["【工具调用/改动】".to_string()];
-            for e in tm.entries.iter().take(30) {
-                lines.push(format!("  - {}({}) → {}", e.tool, e.target, e.outcome));
-            }
-            parts.push(lines.join("\n"));
-        }
-
-    parts.join("\n\n")
-}
-
-pub fn load_round_history(engine: &WorkflowEngine) -> Vec<UserRoundArchive> {
-    engine
-        .get_variable("_round_history")
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
 /// High-priority block: current request + historical round recap (reference only).
 pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
     let current = engine
@@ -418,7 +331,8 @@ pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
     }
 
     let turn_input = get_turn_user_input(engine).unwrap_or_default();
-    let mut parts = vec![format!("{USER_ROUND_TAG}")];
+    let time_label = format!("[{}]", format_now());
+    let mut parts = vec![format!("{USER_ROUND_TAG} {time_label}")];
     if !turn_input.trim().is_empty() && turn_input.trim() != current.trim() {
         parts.push(format!(
             "## ✉️ 本轮用户输入（CURRENT — 优先于会话任务）\n\
@@ -441,22 +355,17 @@ pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
         ));
     }
 
-    let history = load_round_history(engine);
-    if !history.is_empty() {
-        let mut hist_lines = vec!["## 📚 历史轮次（HISTORICAL — 只读参考，禁止执行）".to_string()];
-        for (i, entry) in history.iter().enumerate() {
-            let n = i + 1;
-            let user_snip: String = entry.user_request.chars().take(500).collect();
-            let out_snip: String = entry.outcome_summary.chars().take(2500).collect();
-            hist_lines.push(format!(
-                "### 历史 #{n}\n\
-                 - 用户曾请求: {user_snip}\n\
-                 - 当时结果: {out_snip}\n\
-                 - 状态: 已结束，非本轮待办"
+    // Recent cross-round history now comes from the ReAct log (single source of
+    // truth), fetched into `_react_timeline` each turn. Older, archived history
+    // lives in the pinned [MEMORY_GRAPH] block. The former `_round_history`
+    // textual recap was retired.
+    if let Some(timeline) = engine.get_variable("_react_timeline")
+        && !timeline.trim().is_empty() {
+            parts.push(format!(
+                "## 📚 近期 ReAct（HISTORICAL — 只读参考，禁止重复执行）\n{}",
+                timeline.chars().take(3000).collect::<String>()
             ));
         }
-        parts.push(hist_lines.join("\n\n"));
-    }
 
     if engine.get_variable(ROUND_INTERRUPTED_KEY).as_deref() == Some("1") {
         parts.push(
@@ -543,8 +452,6 @@ mod tests {
 
         let current = engine.get_variable("_current_user_request").unwrap();
         assert_eq!(current, "fix bug A");
-        let history = load_round_history(&engine);
-        assert_eq!(history.len(), 0);
         let guidance = crate::agent::workflow_guidance::load(&engine);
         assert_eq!(guidance.len(), 1);
         assert_eq!(guidance[0].text, "add feature B");
@@ -570,9 +477,6 @@ mod tests {
             Some("1")
         );
         assert!(engine.get_variable("_step3_output").unwrap().is_empty());
-        let history = load_round_history(&engine);
-        assert_eq!(history.len(), 1);
-        assert!(history[0].outcome_summary.contains("本轮已完成"));
 
         engine.begin_user_round("完善 README");
         assert_eq!(
@@ -580,7 +484,6 @@ mod tests {
             "完善 README"
         );
         assert_eq!(engine.get_current_step_index(), 0);
-        assert_eq!(load_round_history(&engine).len(), 1);
     }
 
     #[test]
@@ -608,8 +511,7 @@ mod tests {
     fn round_boundary_message_tags_current_vs_historical() {
         let msg = format_round_boundary_message("完善 README");
         assert!(msg.contains(ROUND_BOUNDARY_TAG));
-        assert!(msg.contains("CURRENT"));
-        assert!(msg.contains("HISTORICAL"));
+        assert!(msg.contains("本轮"));
         assert!(msg.contains("完善 README"));
     }
 
@@ -617,7 +519,7 @@ mod tests {
     fn complete_boundary_marks_done_and_is_detectable() {
         let msg = format_complete_boundary_message("审查 Foo.java", "修复了空指针，新增 3 个测试");
         assert!(is_complete_boundary(&msg));
-        assert!(msg.contains("COMPLETED"));
+        assert!(msg.contains("HISTORICAL"));
         assert!(msg.contains("审查 Foo.java"));
         assert!(msg.contains("修复了空指针"));
         // Must not be mistaken for the other two boundary kinds.
@@ -642,7 +544,7 @@ mod tests {
         assert!(block.contains(TURN_INPUT_TAG));
         assert!(block.contains("先修复"));
         assert!(block.contains("审查 Foo"));
-        assert!(block.contains("以本轮输入为准"));
+        assert!(block.contains("会话背景"));
     }
 
     #[test]

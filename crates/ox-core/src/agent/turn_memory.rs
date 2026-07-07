@@ -286,67 +286,9 @@ pub fn strip_turn_memory(messages: &mut Vec<crate::message::Message>) {
     });
 }
 
-/// Compact in-turn message list when it grows too large.
-/// Keeps: system prompt, anchor user message, recent tail (up to `keep_tail`
-/// messages), strips middle bulk. Fixed message count — the outer
-/// `context_builder.build()` handles token-budget trimming.
-pub fn compact_turn_messages(messages: &mut Vec<crate::message::Message>, keep_tail: usize) {
-    if messages.len() <= keep_tail + 4 {
-        return;
-    }
-
-    let system = messages.first().cloned();
-    let anchor_user = messages
-        .iter()
-        .find(|m| matches!(m, crate::message::Message::User { .. }))
-        .cloned();
-
-    let tail_start = messages.len().saturating_sub(keep_tail);
-    let mut tail: Vec<_> = messages[tail_start..].to_vec();
-
-    // Ensure tail starts with a valid assistant+tool pair boundary
-    while !tail.is_empty() {
-        if matches!(
-            tail.first(),
-            Some(crate::message::Message::ToolResult { .. })
-        ) {
-            tail.remove(0);
-        } else {
-            break;
-        }
-    }
-
-    let dropped = messages.len().saturating_sub(keep_tail + 2);
-    if dropped < 3 {
-        return;
-    }
-
-    let mut compacted = Vec::new();
-    if let Some(s) = system {
-        compacted.push(s);
-    }
-    compacted.push(crate::message::Message::system(format!(
-        "[CONTEXT_COMPACTED]\n为控制上下文长度，已压缩本轮较早的 {dropped} 条消息。\n\
-         完整工具记录见 [TURN_MEMORY] / [STEP_MEMORY]。请基于最近消息和记忆块继续，勿从头探索。"
-    )));
-    if let Some(u) = anchor_user {
-        compacted.push(u);
-    }
-    compacted.append(&mut tail);
-
-    crate::context::sanitize_tool_pairs(&mut compacted);
-    *messages = compacted;
-    tracing::info!(
-        "[TURN_COMPACT] Reduced messages to {} (dropped ~{})",
-        messages.len(),
-        dropped
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Message;
 
     #[test]
     fn turn_memory_dedupes() {
@@ -372,24 +314,5 @@ mod tests {
         let tm = turn_memory_from_json(legacy).expect("legacy turn memory should load");
         assert!(tm.decisions.is_empty());
         assert_eq!(tm.iterations, 2);
-    }
-
-    #[test]
-    fn compact_preserves_tail() {
-        let mut msgs = vec![Message::system("sys")];
-        for i in 0..30 {
-            msgs.push(Message::user(format!("u{i}")));
-            msgs.push(Message::Assistant {
-                content: format!("a{i}"),
-                tool_calls: vec![],
-                reasoning_content: None,
-            });
-        }
-        compact_turn_messages(&mut msgs, 8);
-        assert!(msgs.len() < 60);
-        assert!(
-            msgs.iter()
-                .any(|m| matches!(m, Message::System { content } if content.contains("COMPACTED")))
-        );
     }
 }

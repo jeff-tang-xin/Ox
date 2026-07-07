@@ -592,7 +592,7 @@ fn estimate_tokens(blocks: &ContextBlocks) -> usize {
 /// Format the full context for injection into the system prompt.
 ///
 /// Produces three sections:
-/// ```
+/// ```text
 /// ## Knowledge Context (auto-retrieved)
 /// ### Recent Context (L0 — Working Memory)
 /// ...
