@@ -255,9 +255,35 @@ mod tests {
         engine
     }
 
+    /// Persist one Open finding so `is_pending_scope` (which now requires a
+    /// pending finding to exist) sees a real scope gate.
+    fn seed_pending_finding(engine: &WorkflowEngine) {
+        use crate::agent::findings::{Finding, FindingStatus, FindingsStore, Severity};
+        let store = FindingsStore {
+            summary: "1 issue".into(),
+            findings: vec![Finding {
+                index: 1,
+                severity: Severity::High,
+                file: "src/X.java".into(),
+                symbol: "doHandle".into(),
+                issue: "空指针风险".into(),
+                recommendation: "加 null 检查".into(),
+                fix_plan: String::new(),
+                status: FindingStatus::Open,
+                user_notes: vec![],
+                dispute: None,
+                impl_log: vec![],
+            }],
+            active_indices: Vec::new(),
+        };
+        findings::save(engine, &store);
+    }
+
     #[test]
     fn arm_sets_pending() {
         let engine = engine();
+        // is_pending_scope requires an actual pending finding, so seed one.
+        seed_pending_finding(&engine);
         arm_findings_scope(&engine);
         assert!(is_pending_scope(&engine));
         assert!(!scope_implementation_unlocked(&engine));

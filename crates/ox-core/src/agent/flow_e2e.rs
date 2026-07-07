@@ -195,7 +195,7 @@ fn workspace_includes_phase_and_directives_after_fix() {
 }
 
 #[test]
-fn scope_confirm_clears_turn_state_on_enter_implement() {
+fn scope_confirm_preserves_turn_state_on_enter_implement() {
     let engine = active_engine();
     phase::on_round_started(&engine, TaskIntent::Review);
     seed_findings(&engine);
@@ -204,15 +204,16 @@ fn scope_confirm_clears_turn_state_on_enter_implement() {
     engine.set_variable("_explored_paths", "[\"a\"]".into());
     phase::on_scope_selected(&engine);
     assert_eq!(phase::get(&engine), SingleFlowPhase::Implement);
-    assert!(
-        engine
-            .get_variable("_turn_memory")
-            .unwrap_or_default()
-            .is_empty()
+    // Review → Implement is one continuous investigation: turn memory and
+    // exploration provenance are deliberately PRESERVED (see enter_implement),
+    // so the model doesn't re-read code it just analyzed.
+    assert_eq!(
+        engine.get_variable("_turn_memory").unwrap_or_default(),
+        "stale"
     );
     assert_eq!(
         engine.get_variable("_explored_paths").unwrap_or_default(),
-        "[]"
+        "[\"a\"]"
     );
 }
 

@@ -75,6 +75,8 @@ pub struct ToolContext {
     pub gitnexus: Option<Arc<crate::mcp::GitNexusService>>,
     /// Cross-session memory store (SQLite-backed).
     pub memory_store: Option<Arc<crate::memory::store::MemoryStore>>,
+    /// Optional summarizer LLM for memory-graph offload (None = use main provider).
+    pub summarizer: Option<Arc<dyn crate::llm::LlmProvider>>,
     /// Current tool call ID (for progress reporting)
     pub tool_call_id: String,
     /// Optional progress callback for real-time updates
@@ -105,6 +107,7 @@ impl ToolContext {
             knowledge,
             gitnexus: None,
             memory_store: None,
+            summarizer: None,
             tool_call_id: String::new(),
             progress_callback: None,
         }
@@ -119,6 +122,12 @@ impl ToolContext {
     /// Attach the cross-session memory store (builder style).
     pub fn with_memory_store(mut self, store: Option<Arc<crate::memory::store::MemoryStore>>) -> Self {
         self.memory_store = store;
+        self
+    }
+
+    /// Attach the memory-graph offload summarizer (builder style).
+    pub fn with_summarizer(mut self, summarizer: Option<Arc<dyn crate::llm::LlmProvider>>) -> Self {
+        self.summarizer = summarizer;
         self
     }
 
@@ -138,6 +147,7 @@ impl ToolContext {
             knowledge,
             gitnexus: None,
             memory_store: None,
+            summarizer: None,
             tool_call_id,
             progress_callback: Some(Arc::new(progress_callback)),
         }

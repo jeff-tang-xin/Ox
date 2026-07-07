@@ -382,6 +382,22 @@ async fn run_app(
             .ok()
     };
 
+    // ── Summarizer provider for memory-graph offload (optional small model) ──
+    let summarizer: Option<Arc<dyn ox_core::llm::LlmProvider>> = {
+        let name = config.agent.collaboration.summarizer_model.trim();
+        if name.is_empty() {
+            None
+        } else {
+            match ox_core::llm::create_provider_with_info(name, &config.models) {
+                Ok((p, _)) => Some(Arc::from(p)),
+                Err(e) => {
+                    tracing::warn!("[MEMORY] summarizer_model `{name}` init failed: {e}");
+                    None
+                }
+            }
+        }
+    };
+
     let mut tool_ctx = Arc::new(
         ToolContext::new(
             rt_env.clone(),
@@ -390,7 +406,8 @@ async fn run_app(
             knowledge_engine.clone(),
         )
         .with_gitnexus(Some(Arc::clone(&gitnexus)))
-        .with_memory_store(memory_store),
+        .with_memory_store(memory_store)
+        .with_summarizer(summarizer),
     );
 
     let mut model_name = provider
@@ -1220,6 +1237,55 @@ fn spawn_agent_turn_for_text(
             // index is fresh without slowing down mid-turn queries.
             svc.reindex_if_dirty().await;
         }
+
+        // Memory archival is now handled by the unified budget-offload path in
+        // `run_agent_turn` (memory_offload::offload_if_over_budget): the ReAct
+        // log is clustered into memory-graph nodes when prompt tokens cross 80%
+        // of the window. The former `_prev_turn_memory` → `save_raw` consolidation
+        // (which referenced a nonexistent method) was retired here.
+
+        // ── Periodic L1→L2 memory-graph consolidation (time-gated) ──
+        // Sessions are permanent, so consolidation is periodic (not on session
+        // end): lazily checked here at turn start. Returns L3 (Skill) candidates
+        // which we route through the existing user-confirmed SkillDraftReady flow.
+        if let Some(ref store) = tool_ctx_clone.memory_store {
+            let session_id = workflow_engine_clone
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .map(|e| e.session_id())
+                .unwrap_or_else(|| "default".to_string());
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let interval_hours = config_clone.memory.consolidation_interval_hours;
+            let default_provider = provider_clone.clone();
+            let summarizer = tool_ctx_clone.summarizer.clone();
+            let status_for_consolidate = status_tx.clone();
+            let candidates = ox_core::agent::memory_offload::consolidate_if_due(
+                store,
+                summarizer,
+                &default_provider,
+                &session_id,
+                interval_hours,
+                now_unix,
+                |s| {
+                    let _ = status_for_consolidate.send(AgentToUiEvent::Status(s));
+                },
+            )
+            .await;
+            // Route L3 candidates to the user-confirmed Skill draft flow.
+            for c in candidates {
+                let _ = store.mark_promoted_l3(c.graph_id);
+                let desc: String = c.summary.chars().take(80).collect();
+                let _ = status_tx.send(AgentToUiEvent::SkillDraftReady {
+                    skill_id: format!("memory-l3-{}", c.graph_id),
+                    content: c.skill_draft,
+                    description: desc,
+                });
+            }
+        }
+
         let result = handlers::pre_turn::prepare_turn(
             &config_clone,
             &rt_env_clone,
