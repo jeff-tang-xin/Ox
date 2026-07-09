@@ -992,6 +992,9 @@ pub async fn run_agent_turn(
     let mut content_only_streak = 0u32;
     let mut explore_streak = 0u32;
     let mut explore_reflected = false;
+    // Implementation-phase reflection (consecutive no-edit turns once the plan is confirmed).
+    let mut impl_streak = 0u32;
+    let mut impl_reflected = false;
     let mut repeat_guard = repeat_guard::RepeatGuard::new();
     let mut unified_parse_error_streak = 0u32;
     let mut findings_deliver_error_streak = 0u32;
@@ -2024,6 +2027,127 @@ pub async fn run_agent_turn(
         } else {
             format!("{display}\n(本轮思考) {reasoning_digest_for_action}")
         };
+
+        // 🪞 Reflect-FIRST guard (fires BEFORE this turn's tools execute).
+        //
+        // Two separate loops we catch here:
+        //  • Exploration: read-after-read without ever acting (threshold 10).
+        //  • Implementation: plan confirmed, but drifting into no-edit turns
+        //    instead of editing (threshold 3, implementation phase only).
+        //
+        // When a threshold trips we DISCARD this turn's chosen tool batch,
+        // record the reasoning as a tool-call-free assistant message (so no
+        // ToolResult is orphaned), inject the reflection, and loop — forcing the
+        // model to re-decide with the reflection in view. A `finish` batch is
+        // treated as progress and never skipped.
+        {
+            let turn_tool_names: Vec<String> = tool_calls
+                .iter()
+                .map(|tc| {
+                    if unified_tool_mode {
+                        crate::agent::unified_action::parse_request(&tc.arguments)
+                            .ok()
+                            .and_then(|r| {
+                                crate::agent::unified_action::action_to_tool_name(&r.action)
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_else(|| tc.name.clone())
+                    } else {
+                        tc.name.clone()
+                    }
+                })
+                .collect();
+            let had_finish = tool_calls.iter().any(|tc| {
+                if unified_tool_mode {
+                    crate::agent::unified_action::parse_request(&tc.arguments)
+                        .ok()
+                        .map(|r| {
+                            matches!(
+                                crate::agent::unified_action::route(&r),
+                                crate::agent::unified_action::UnifiedRoute::Finish
+                            )
+                        })
+                        .unwrap_or(false)
+                } else {
+                    tc.name == "finish"
+                }
+            });
+            let user_task_str = user_task.as_deref().unwrap_or("");
+            let in_impl_phase = workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .map(|e| crate::agent::workflow_session::is_implementation_phase(&e))
+                .unwrap_or(false);
+
+            // Implementation phase → impl guard (no-edit streak); otherwise the
+            // exploration guard (read-only streak). Never both in one turn.
+            let action = if in_impl_phase {
+                explore_reflect::evaluate_impl(
+                    &mut impl_streak,
+                    &mut impl_reflected,
+                    &turn_tool_names,
+                    had_finish,
+                    user_task_str,
+                )
+            } else {
+                explore_reflect::evaluate(
+                    &mut explore_streak,
+                    &mut explore_reflected,
+                    &turn_tool_names,
+                    had_finish,
+                    user_task_str,
+                )
+            };
+
+            let reflect_prompt = match action {
+                explore_reflect::ReflectAction::Continue => None,
+                explore_reflect::ReflectAction::Reflect(prompt) => {
+                    let label = if in_impl_phase {
+                        "🛠️ 实施反思检查点 — 提示模型停止泛读、立即动手。"
+                    } else {
+                        "🪞 探索反思检查点 — 提示模型盘点已知信息后动手。"
+                    };
+                    tracing::info!(
+                        "[REFLECT] Pre-exec reflect (impl_phase={in_impl_phase}, explore_streak={explore_streak}, impl_streak={impl_streak}) — skipping this tool batch"
+                    );
+                    let _ = ui_tx.send(AgentToUiEvent::Status(label.to_string()));
+                    Some(prompt)
+                }
+                explore_reflect::ReflectAction::Stop(_handoff) => {
+                    // Exploration ran well past reflection without acting — inject a
+                    // gate and hand control back to the user (c = continue exploring).
+                    let gate_msg = format!(
+                        "⚠️ 你已连续探索 **{n}** 轮（仅只读工具），未开始动手或收尾。\n\n\
+                         **c** 继续探索\n\
+                         **其他** 结束本轮",
+                        n = explore_streak
+                    );
+                    let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                        "⏸️ 连续 {n} 轮只探索 — c 继续 · 其他结束",
+                        n = explore_streak
+                    )));
+                    explore_streak = 0;
+                    Some(gate_msg)
+                }
+            };
+
+            if let Some(prompt) = reflect_prompt {
+                // Record the reasoning without the (discarded) tool_calls so the
+                // model retains WHY it was about to act, then inject the reflection.
+                let reasoning_only = Message::Assistant {
+                    content: content_with_reasoning.clone(),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                };
+                new_messages.push(reasoning_only.clone());
+                messages.push(reasoning_only);
+                messages.push(Message::system(&prompt));
+                new_messages.push(Message::system(&prompt));
+                persist_turn_memory(&workflow_engine, &turn_memory);
+                iteration += 1;
+                continue;
+            }
+        }
 
         // Keep ALL tool_calls on the assistant message so every ToolResult has a matching id.
         // (Filtering caused orphaned ToolResults → API auto-fix → context amnesia.)
@@ -3646,70 +3770,6 @@ pub async fn run_agent_turn(
                 persist_turn_memory(&workflow_engine, &turn_memory);
                 emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                 return;
-            }
-        }
-
-        // 🪞 Explore-but-never-act guard: if the agent keeps reading without ever
-        // editing or finishing, reflect once, then stop if it still doesn't act.
-        // (Reaching the loop bottom means no finish ended the turn this iteration.)
-        {
-            let turn_tool_names: Vec<String> = tool_calls
-                .iter()
-                .map(|tc| {
-                    if unified_tool_mode {
-                        crate::agent::unified_action::parse_request(&tc.arguments)
-                            .ok()
-                            .and_then(|r| {
-                                crate::agent::unified_action::action_to_tool_name(&r.action)
-                                    .map(|s| s.to_string())
-                            })
-                            .unwrap_or_else(|| tc.name.clone())
-                    } else {
-                        tc.name.clone()
-                    }
-                })
-                .collect();
-            let user_task_str = user_task.as_deref().unwrap_or("");
-            match explore_reflect::evaluate(
-                &mut explore_streak,
-                &mut explore_reflected,
-                &turn_tool_names,
-                false,
-                user_task_str,
-            ) {
-                explore_reflect::ReflectAction::Continue => {}
-                explore_reflect::ReflectAction::Reflect(prompt) => {
-                    tracing::info!(
-                        "[EXPLORE_REFLECT] Reflect at streak={} — injecting self-assessment",
-                        explore_streak
-                    );
-                    let _ = ui_tx.send(AgentToUiEvent::Status(
-                        "🪞 探索反思检查点 — 提示模型盘点已知信息后动手。".to_string(),
-                    ));
-                    messages.push(Message::system(&prompt));
-                }
-                explore_reflect::ReflectAction::Stop(_handoff) => {
-                    tracing::warn!(
-                        "[EXPLORE_REFLECT] Stop at streak={} — pausing for user input",
-                        explore_streak
-                    );
-                    // Instead of ending the turn, inject a gate and ask the user.
-                    // The user can type "c" to continue or anything else to stop.
-                    let gate_msg = format!(
-                        "⚠️ 你已连续探索 **{n}** 轮（仅只读工具），未开始动手或收尾。\n\n\
-                         **c** 继续探索\n\
-                         **其他** 结束本轮",
-                        n = explore_streak
-                    );
-                    let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                        "⏸️ 连续 {n} 轮只探索 — c 继续 · 其他结束",
-                        n = explore_streak
-                    )));
-                    messages.push(Message::system(&gate_msg));
-                    new_messages.push(Message::system(&gate_msg));
-                    // Reset streak so next iteration starts fresh
-                    explore_streak = 0;
-                }
             }
         }
 

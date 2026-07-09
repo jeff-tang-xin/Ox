@@ -33,10 +33,16 @@ const READONLY_TOOLS: &[&str] = &[
 const PROGRESS_TOOLS: &[&str] = &["file_write", "edit_file", "delete_range"];
 
 /// Consecutive read-only turns before a reflection prompt is injected.
-pub const REFLECT_AT: u32 = 15;
+pub const REFLECT_AT: u32 = 6;
 
 /// Further read-only turns after reflection before handing back to the user.
-pub const STOP_AFTER_REFLECT: u32 = 15;
+pub const STOP_AFTER_REFLECT: u32 = 4;
+
+/// Consecutive no-edit turns **during the implementation phase** before an
+/// implementation-reflection prompt is injected. Far tighter than exploration:
+/// once the plan is confirmed, drifting into read-after-read instead of editing
+/// is the failure we want to catch quickly.
+pub const IMPL_REFLECT_AT: u32 = 3;
 
 /// What the loop should do after classifying one turn's tool batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +110,62 @@ pub fn evaluate(
     }
 
     ReflectAction::Continue
+}
+
+/// Implementation-phase reflection: catch the "confirmed the plan, then drifted
+/// back into read-after-read instead of editing" loop.
+///
+/// Unlike [`evaluate`], this is scoped to the implementation phase and fires on
+/// consecutive NON-EDIT turns — any turn without a progress tool
+/// (`file_write` / `edit_file` / `delete_range`) increments the streak; any edit
+/// resets it. `finish` also resets (the model chose to end, not drift).
+///
+/// Returns [`ReflectAction::Reflect`] exactly once per streak at
+/// [`IMPL_REFLECT_AT`]; never escalates to `Stop` (implementation should push
+/// toward acting, not hand back to the user).
+pub fn evaluate_impl(
+    streak: &mut u32,
+    reflected: &mut bool,
+    tool_names: &[String],
+    had_finish: bool,
+    user_task: &str,
+) -> ReflectAction {
+    let made_progress = had_finish
+        || tool_names
+            .iter()
+            .any(|t| PROGRESS_TOOLS.contains(&t.as_str()));
+
+    if made_progress {
+        *streak = 0;
+        *reflected = false;
+        return ReflectAction::Continue;
+    }
+
+    *streak += 1;
+
+    if !*reflected && *streak >= IMPL_REFLECT_AT {
+        *reflected = true;
+        return ReflectAction::Reflect(impl_reflect_message(*streak, user_task));
+    }
+
+    ReflectAction::Continue
+}
+
+fn impl_reflect_message(streak: u32, user_task: &str) -> String {
+    let task: String = user_task.chars().take(300).collect();
+    format!(
+        "🛠️ **实施反思检查点**：已进入实施阶段，但你连续 {streak} 轮没有动手改代码（无 edit_file / file_write / delete_range）。\n\
+         \n\
+         计划已确认，现在的目标是**改代码**，不是重新分析。请**立即**做以下之一：\n\
+         \n\
+         1. **直接改** — 对计划内的文件 `file_read`（每文件仅一次）后立刻 `edit_file`。\n\
+         \n\
+         2. **改完了 → 收尾** — `finish(content=...)` 说明改动与验证结果。\n\
+         \n\
+         3. **遇到计划外阻碍 → 问用户** — `finish(content=你的问题)`，不要自己扩大范围或反复泛读。\n\
+         \n\
+         原始任务：{task}"
+    )
 }
 
 fn reflect_message(streak: u32, user_task: &str) -> String {
@@ -200,5 +262,62 @@ mod tests {
         );
         assert_eq!(streak, 0);
         assert!(!reflected);
+    }
+
+    #[test]
+    fn impl_reflects_after_three_non_edit_turns() {
+        let mut streak = 0;
+        let mut reflected = false;
+        let reads = names(&["file_read"]);
+        // Turns 1..IMPL_REFLECT_AT-1: continue.
+        for _ in 0..(IMPL_REFLECT_AT - 1) {
+            assert_eq!(
+                evaluate_impl(&mut streak, &mut reflected, &reads, false, "task"),
+                ReflectAction::Continue
+            );
+        }
+        // Turn IMPL_REFLECT_AT: reflect once.
+        match evaluate_impl(&mut streak, &mut reflected, &reads, false, "task") {
+            ReflectAction::Reflect(_) => {}
+            other => panic!("expected Reflect, got {other:?}"),
+        }
+        // Does not fire again on the next non-edit turn.
+        assert_eq!(
+            evaluate_impl(&mut streak, &mut reflected, &reads, false, "task"),
+            ReflectAction::Continue
+        );
+    }
+
+    #[test]
+    fn impl_edit_resets_streak() {
+        let mut streak = 0;
+        let mut reflected = false;
+        let reads = names(&["file_read"]);
+        for _ in 0..(IMPL_REFLECT_AT - 1) {
+            evaluate_impl(&mut streak, &mut reflected, &reads, false, "task");
+        }
+        // An edit before the threshold resets the streak — no reflection.
+        assert_eq!(
+            evaluate_impl(&mut streak, &mut reflected, &names(&["edit_file"]), false, "task"),
+            ReflectAction::Continue
+        );
+        assert_eq!(streak, 0);
+        assert!(!reflected);
+    }
+
+    #[test]
+    fn impl_finish_resets_streak() {
+        let mut streak = 0;
+        let mut reflected = false;
+        let reads = names(&["file_read"]);
+        for _ in 0..(IMPL_REFLECT_AT - 1) {
+            evaluate_impl(&mut streak, &mut reflected, &reads, false, "task");
+        }
+        // A finishing turn counts as progress and resets.
+        assert_eq!(
+            evaluate_impl(&mut streak, &mut reflected, &reads, true, "task"),
+            ReflectAction::Continue
+        );
+        assert_eq!(streak, 0);
     }
 }

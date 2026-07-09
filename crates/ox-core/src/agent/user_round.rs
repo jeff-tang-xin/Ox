@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn complete_boundary_marks_done_and_is_detectable() {
-        let msg = format_complete_boundary_message("审查 Foo.java", "修复了空指针，新增 3 个测试");
+        let msg = format_complete_boundary_message("审查 Foo.java", "修复了空指针，新增 3 个测试", "");
         assert!(is_complete_boundary(&msg));
         assert!(msg.contains("HISTORICAL"));
         assert!(msg.contains("审查 Foo.java"));
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn complete_boundary_without_summary_still_valid() {
-        let msg = format_complete_boundary_message("修复登录 bug", "");
+        let msg = format_complete_boundary_message("修复登录 bug", "", "");
         assert!(is_complete_boundary(&msg));
         assert!(!msg.contains("交付摘要"));
     }
