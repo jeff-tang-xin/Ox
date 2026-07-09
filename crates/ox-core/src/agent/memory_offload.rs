@@ -245,6 +245,12 @@ fn placeholder_old_react(messages: &mut Vec<Message>, count: usize) {
     );
 }
 
+/// Public entry to the last-resort tail-trim, for the agent loop's bounded
+/// API-error recovery path (ARK 400 on an oversized/malformed body).
+pub fn hard_trim_public(messages: &mut Vec<Message>) {
+    hard_trim(messages);
+}
+
 /// Last-resort budget relief when summarization keeps failing: keep the leading
 /// system prompt + first user anchor + the tail, drop the middle. Mirrors the
 /// old `compact_turn_messages` shape but without any memory dependency.

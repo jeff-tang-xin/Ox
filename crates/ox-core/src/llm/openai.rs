@@ -482,9 +482,19 @@ fn message_to_openai(msg: &Message) -> serde_json::Value {
             tool_calls,
             reasoning_content,
         } => {
+            // OpenAI/ARK contract: a pure tool-call assistant message must carry
+            // `content: null`, NOT `content: ""`. ARK (Volcengine) rejects the
+            // empty-string form with `InvalidParameter` (empty `param`), which
+            // only surfaces in long, tool-heavy contexts where most assistant
+            // turns are tool calls with no prose. Send null when content is empty.
+            let content_value = if content.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(content.clone())
+            };
             let mut obj = serde_json::json!({
                 "role": "assistant",
-                "content": content,
+                "content": content_value,
             });
             // DeepSeek thinking mode: reasoning_content MUST be passed back to the API
             if let Some(reasoning) = reasoning_content
@@ -542,5 +552,40 @@ fn message_to_openai(msg: &Message) -> serde_json::Value {
             "tool_call_id": tool_call_id,
             "content": content,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::{Message, ToolCall};
+
+    #[test]
+    fn pure_tool_call_assistant_serializes_content_null_not_empty_string() {
+        // ARK/Volcengine rejects `content: ""` on a tool-call assistant message
+        // with `InvalidParameter`. The contract requires `content: null`.
+        let msg = Message::Assistant {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "code_search".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_content: None,
+        };
+        let v = message_to_openai(&msg);
+        assert!(v["content"].is_null(), "content must be null, got {:?}", v["content"]);
+        assert!(v["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn assistant_with_text_keeps_string_content() {
+        let msg = Message::Assistant {
+            content: "hello".into(),
+            tool_calls: vec![],
+            reasoning_content: None,
+        };
+        let v = message_to_openai(&msg);
+        assert_eq!(v["content"], serde_json::json!("hello"));
     }
 }

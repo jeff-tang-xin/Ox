@@ -998,6 +998,11 @@ pub async fn run_agent_turn(
     let mut repeat_guard = repeat_guard::RepeatGuard::new();
     let mut unified_parse_error_streak = 0u32;
     let mut findings_deliver_error_streak = 0u32;
+    // Bounded recovery for API errors (e.g. ARK 400 on an oversized/malformed
+    // body): trim context + retry the same iteration instead of aborting the
+    // whole turn. Capped so a persistent error can't spin forever.
+    let mut api_error_recovery_streak = 0u32;
+    const MAX_API_ERROR_RECOVERY: u32 = 2;
     let mut tools_used_this_turn: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
@@ -1429,9 +1434,38 @@ pub async fn run_agent_turn(
                 LlmStreamEvent::Error(err) => {
                     // Log the error to file.
                     tracing::error!("LLM error: {}", err);
-                    let _ = ui_tx.send(AgentToUiEvent::Error(err));
                     // Abort the stream task if still running, don't block on it.
                     stream_handle.abort();
+
+                    // Bounded self-heal for client-side API errors (HTTP 4xx):
+                    // ARK returns `400 InvalidParameter` when the request body is
+                    // malformed or oversized. Aborting the turn just resends the
+                    // same body next time, so instead we trim the context and
+                    // retry the same iteration a bounded number of times.
+                    let is_client_api_error = err.contains("API error 400")
+                        || err.contains("API error 413")
+                        || err.contains("API error 422");
+                    if is_client_api_error
+                        && api_error_recovery_streak < MAX_API_ERROR_RECOVERY
+                    {
+                        api_error_recovery_streak += 1;
+                        tracing::warn!(
+                            "[AGENT] API error recovery {}/{}: trimming context and retrying",
+                            api_error_recovery_streak,
+                            MAX_API_ERROR_RECOVERY
+                        );
+                        let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                            "⚠️ API 拒绝请求（{}/{}）— 正在裁剪上下文后重试…",
+                            api_error_recovery_streak, MAX_API_ERROR_RECOVERY
+                        )));
+                        crate::context::sanitize_tool_pairs(&mut messages);
+                        crate::context::filter_noisy_messages(&mut messages);
+                        memory_offload::hard_trim_public(&mut messages);
+                        continue;
+                    }
+
+                    // Give up: surface the error and end the turn.
+                    let _ = ui_tx.send(AgentToUiEvent::Error(err));
                     emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                     return;
                 }
