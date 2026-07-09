@@ -9,6 +9,15 @@ use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 pub const SMALL_FILE_THRESHOLD: u64 = 512 * 1024;
 pub const INLINE_CONTENT_THRESHOLD: usize = SMALL_FILE_THRESHOLD as usize;
 
+/// Hard character cap on a single file_read tool result. The line-based
+/// `limit` param does NOT bound output size: a minified file (e.g. a bundled
+/// `index.js` compressed onto ONE line) is a single "line" that can be
+/// hundreds of KB. Reading it dumps the whole file into one tool result,
+/// which — accumulated across a turn — overflows the model's context window
+/// and makes the API reject the request (ARK returns `InvalidParameter` 400).
+/// This cap is the byte/char-level backstop that the `limit` param is not.
+pub const MAX_READ_OUTPUT_CHARS: usize = 60_000;
+
 /// Read a line slice from a workspace-relative path (shared by tool + exploration cache).
 pub fn read_file_slice(
     working_dir: &std::path::Path,
@@ -57,6 +66,27 @@ fn format_read_output(
 ) -> String {
     let shown = content.matches('\n').count() + if content.is_empty() { 0 } else { 1 };
     let mut output = content;
+
+    // Char-level backstop: the line-based `limit` cannot bound a minified file
+    // where the whole content is one giant line. Truncate on a char boundary so
+    // a single read can never blow the context window / trip an API 400.
+    let mut truncated_note = String::new();
+    if output.chars().count() > MAX_READ_OUTPUT_CHARS {
+        let total_chars = output.chars().count();
+        let cut: String = output.chars().take(MAX_READ_OUTPUT_CHARS).collect();
+        output = cut;
+        truncated_note = format!(
+            "\n\n⚠️ 内容过大，已截断（显示前 {} / 共 {} 字符）。\
+             \n💡 此文件可能是压缩/单行文件（如 minified JS）。如需特定片段，用 code_search 定位，\
+             或用较小的 limit 分页续读: file_read {{\"path\":\"{}\", \"offset\":{}, \"limit\":{}}}",
+            MAX_READ_OUTPUT_CHARS,
+            total_chars,
+            path_str,
+            offset + shown,
+            limit
+        );
+    }
+
     if total_lines > 0 {
         output.push_str(&format!(
             "\n\n📄 {} lines total (showing {}-{})",
@@ -85,6 +115,7 @@ fn format_read_output(
             limit
         ));
     }
+    output.push_str(&truncated_note);
     output
 }
 
@@ -323,6 +354,29 @@ mod tests {
         let r = read_file_slice(&dir, &abs, 74, 30);
         assert!(r.is_ok(), "fail: {:?}", r.err());
         assert!(r.unwrap().contains("line 75"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn minified_single_line_file_is_truncated() {
+        // A minified file is one giant line — the line-based `limit` doesn't
+        // bound it, so the char-level cap must kick in.
+        let dir = std::env::temp_dir().join("ox_test_file_read_minified");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = dir.join("index.js");
+        let mut f = std::fs::File::create(&fp).unwrap();
+        // One line, well over the char cap.
+        let giant = "a".repeat(MAX_READ_OUTPUT_CHARS * 2);
+        write!(f, "!function(){{{giant}}}();").unwrap();
+        drop(f);
+        let abs = fp.to_string_lossy().replace('\\', "/");
+        let out = read_file_slice(&dir, &abs, 0, 200).unwrap();
+        assert!(
+            out.chars().count() < MAX_READ_OUTPUT_CHARS + 2000,
+            "output must be capped, got {} chars",
+            out.chars().count()
+        );
+        assert!(out.contains("已截断"), "must include truncation notice");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

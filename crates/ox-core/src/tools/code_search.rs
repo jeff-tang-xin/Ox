@@ -7,6 +7,13 @@ use std::sync::{Arc, Mutex};
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
+/// Hard char cap on a single matched line. A minified file (e.g. a bundled
+/// `index.js`) is one giant line — matching it would otherwise splice the
+/// whole file (hundreds of KB) into the search result, overflowing the model
+/// context and tripping an API `InvalidParameter` 400. `max_matches_per_file`
+/// bounds line COUNT, not line LENGTH; this is the length backstop.
+const MAX_MATCH_LINE_CHARS: usize = 500;
+
 pub struct CodeSearchTool;
 
 #[async_trait::async_trait]
@@ -223,11 +230,23 @@ fn search_with_ripgrep(
                 mat: &SinkMatch<'_>,
             ) -> Result<bool, Self::Error> {
                 if let Ok(text) = std::str::from_utf8(mat.bytes()) {
+                    let trimmed = text.trim();
+                    // Cap single-line length: a minified/single-line file would
+                    // otherwise dump the whole file as one "matching line".
+                    let capped = if trimmed.chars().count() > MAX_MATCH_LINE_CHARS {
+                        let head: String =
+                            trimmed.chars().take(MAX_MATCH_LINE_CHARS).collect();
+                        format!(
+                            "{head}… [行过长，已截断 — 疑似压缩/单行文件；用 file_read 分页或缩小 pattern]"
+                        )
+                    } else {
+                        trimmed.to_string()
+                    };
                     let line_with_num = format!(
                         "{}:{}: {}",
                         self.file_path,
                         mat.line_number().unwrap_or(0),
-                        text.trim()
+                        capped
                     );
 
                     let mut results = self.results.lock().unwrap();
@@ -284,5 +303,33 @@ fn search_with_ripgrep(
         };
 
         ToolOutput::success(format!("{}{}", final_results.join("\n"), truncated_msg))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn matched_minified_line_is_capped() {
+        let dir = std::env::temp_dir().join("ox_test_code_search_minified");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = dir.join("index.js");
+        let mut f = std::fs::File::create(&fp).unwrap();
+        // One giant line containing the pattern near the start.
+        write!(f, "!function(){{{}}}", "x".repeat(MAX_MATCH_LINE_CHARS * 4)).unwrap();
+        drop(f);
+
+        let out = search_with_ripgrep("function", &dir, "*", &dir, 20, 5, false);
+        let text = out.content;
+        // The matched line must be capped well below the raw file size.
+        assert!(
+            text.chars().count() < MAX_MATCH_LINE_CHARS + 400,
+            "match line must be capped, got {} chars",
+            text.chars().count()
+        );
+        assert!(text.contains("已截断"), "must include truncation marker");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
