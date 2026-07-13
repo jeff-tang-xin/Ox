@@ -38,11 +38,80 @@ pub const REFLECT_AT: u32 = 6;
 /// Further read-only turns after reflection before handing back to the user.
 pub const STOP_AFTER_REFLECT: u32 = 4;
 
+/// Absolute ceiling on **total** exploration turns in a single pre-implementation
+/// stretch, regardless of information gain. The low-gain streak ([`REFLECT_AT`])
+/// catches *circling* — repeated reads of the same thing — but a model that reads
+/// a fresh file every turn keeps resetting that streak and could wander the whole
+/// repo unbounded. This ceiling is the backstop: only real progress (an edit or
+/// `finish`) clears it; discovering new files does NOT. Set well above the
+/// low-gain threshold so legitimate deep exploration is never clipped early.
+pub const TOTAL_EXPLORE_CEILING: u32 = 20;
+
 /// Consecutive no-edit turns **during the implementation phase** before an
 /// implementation-reflection prompt is injected. Far tighter than exploration:
 /// once the plan is confirmed, drifting into read-after-read instead of editing
 /// is the failure we want to catch quickly.
 pub const IMPL_REFLECT_AT: u32 = 3;
+
+/// Render the exploration/implementation budget gauge for the turn-context block.
+///
+/// This makes the *cost* of continued exploration visible to the model every
+/// turn — not just at the moment a reflection fires. Returns an empty string
+/// when both counters are zero (normal cadence; no need to nag).
+///
+/// Two exploration signals are surfaced: the low-gain circling streak
+/// ([`REFLECT_AT`]) and the cumulative hard ceiling ([`TOTAL_EXPLORE_CEILING`],
+/// which discovery does NOT reset). Thresholds are the same constants the brakes
+/// use, so the gauge can never drift from when the guard actually trips.
+pub fn budget_gauge(
+    explore_streak: u32,
+    total_explore: u32,
+    impl_streak: u32,
+    in_impl_phase: bool,
+) -> String {
+    if in_impl_phase {
+        if impl_streak == 0 {
+            return String::new();
+        }
+        return format!(
+            "🛠️ 实施预算: 已连续 {impl_streak}/{IMPL_REFLECT_AT} 轮未改代码 · 下轮请 edit_file/file_write 或 finish\n"
+        );
+    }
+    if explore_streak == 0 && total_explore == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    // Low-gain circling line (only when a streak is building).
+    if explore_streak > 0 {
+        let stop_at = REFLECT_AT + STOP_AFTER_REFLECT;
+        if explore_streak >= REFLECT_AT {
+            let left = stop_at.saturating_sub(explore_streak);
+            out.push_str(&format!(
+                "🔍 探索预算: {explore_streak}/{REFLECT_AT}（连续无新发现，已超阈值）· ⚠️ 再 {left} 轮仍无进展将交还用户 — 立即动手/finish/说明唯一缺口\n"
+            ));
+        } else {
+            let left = REFLECT_AT.saturating_sub(explore_streak);
+            out.push_str(&format!(
+                "🔍 探索预算: 连续 {explore_streak}/{REFLECT_AT} 轮无新发现（重复读/重复搜）· 再 {left} 轮空转将强制收敛（读新文件不计入）\n"
+            ));
+        }
+    }
+    // Cumulative ceiling line — always shown once exploration has begun; nudges
+    // toward focus even while reading new files. Highlight when close.
+    if total_explore > 0 {
+        let left = TOTAL_EXPLORE_CEILING.saturating_sub(total_explore);
+        let warn = if total_explore * 4 >= TOTAL_EXPLORE_CEILING * 3 {
+            "⚠️ "
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "🧭 {warn}累计探索: {total_explore}/{TOTAL_EXPLORE_CEILING} 轮 · 再 {left} 轮（含读新文件）未动手将强制收敛\n"
+        ));
+    }
+    out
+}
 
 /// What the loop should do after classifying one turn's tool batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,17 +148,55 @@ pub fn is_pure_exploration(tool_names: &[String], had_finish: bool) -> bool {
 
 /// Update the streak for one turn and decide what the loop should do.
 ///
-/// `streak` is the caller-owned counter (consecutive pure-exploration turns).
-/// `reflected` tracks whether the reflection prompt has already been injected
-/// this streak, so it fires once rather than every turn past the threshold.
+/// `streak` is the caller-owned counter (consecutive *low-gain* exploration
+/// turns). `reflected` tracks whether the reflection prompt has already been
+/// injected this streak, so it fires once rather than every turn past the
+/// threshold.
+///
+/// `made_discovery` is the information-gain signal: true when this turn's
+/// read-only calls surfaced something new (an unread file, a further slice, a
+/// fresh symbol query, a structural listing). A discovering turn is genuine
+/// progress for the *low-gain* streak — that streak resets, exactly like an
+/// edit. This is what keeps the budget from punishing legitimate deep
+/// exploration in large projects: reading 30 *different* files never trips the
+/// low-gain guard; only reading the *same* things over and over does.
+///
+/// `total_explore` is the caller-owned **cumulative** exploration counter for
+/// this pre-implementation stretch. It increments on every pure-exploration turn
+/// — discovery included — and is only cleared by real progress (edit / finish).
+/// When it reaches [`TOTAL_EXPLORE_CEILING`] the guard stops regardless of gain:
+/// the backstop against unbounded breadth-first wandering that the low-gain
+/// streak alone cannot catch.
 pub fn evaluate(
     streak: &mut u32,
     reflected: &mut bool,
+    total_explore: &mut u32,
     tool_names: &[String],
     had_finish: bool,
+    made_discovery: bool,
     user_task: &str,
 ) -> ReflectAction {
+    // Real progress (edit / finish / non-exploration tool) clears BOTH counters.
     if !is_pure_exploration(tool_names, had_finish) {
+        *streak = 0;
+        *reflected = false;
+        *total_explore = 0;
+        return ReflectAction::Continue;
+    }
+
+    // This turn is pure exploration → it always counts toward the hard ceiling,
+    // whether or not it discovered anything new.
+    *total_explore += 1;
+    if *total_explore >= TOTAL_EXPLORE_CEILING {
+        // Reset so a user "continue" starts a fresh ceiling window.
+        *total_explore = 0;
+        *streak = 0;
+        *reflected = false;
+        return ReflectAction::Stop(ceiling_message(TOTAL_EXPLORE_CEILING));
+    }
+
+    // Discovery resets only the low-gain (circling) streak, not the ceiling.
+    if made_discovery {
         *streak = 0;
         *reflected = false;
         return ReflectAction::Continue;
@@ -171,7 +278,7 @@ fn impl_reflect_message(streak: u32, user_task: &str) -> String {
 fn reflect_message(streak: u32, user_task: &str) -> String {
     let task: String = user_task.chars().take(300).collect();
     format!(
-        "🪞 **反思检查点**：你已连续 {streak} 轮只做探索还没有动手或收尾。\n\
+        "🪞 **反思检查点**：你已连续 {streak} 轮探索却没有新发现（在重复读/重复搜同样的内容），也没有动手或收尾。\n\
          \n\
          请**立即**做以下三件事之一：\n\
          \n\
@@ -192,12 +299,57 @@ fn stop_message(streak: u32) -> String {
     )
 }
 
+fn ceiling_message(ceiling: u32) -> String {
+    format!(
+        "## Failed\n累计已探索 {ceiling} 轮（即便一直在读新文件）仍未开始动手或收尾 — 停止本轮。\n\
+         这通常意味着在做广度漫游而非聚焦目标。请缩小范围、明确要改什么，或直接给出下一步指示。"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn gauge_hidden_at_zero_streak() {
+        assert_eq!(budget_gauge(0, 0, 0, false), "");
+        assert_eq!(budget_gauge(0, 0, 0, true), "");
+    }
+
+    #[test]
+    fn gauge_shows_remaining_budget_before_threshold() {
+        let g = budget_gauge(4, 4, 0, false);
+        assert!(g.contains("4/"));
+        assert!(g.contains("无新发现"));
+        assert!(g.contains(&format!("再 {} 轮空转", REFLECT_AT - 4)));
+    }
+
+    #[test]
+    fn gauge_warns_past_threshold() {
+        let g = budget_gauge(REFLECT_AT, REFLECT_AT, 0, false);
+        assert!(g.contains("超阈值"));
+        assert!(g.contains("交还用户"));
+    }
+
+    #[test]
+    fn gauge_shows_cumulative_ceiling_even_without_low_gain_streak() {
+        // Discovering every turn keeps explore_streak at 0, but the cumulative
+        // line must still show so breadth-first wandering stays visible.
+        let g = budget_gauge(0, 8, 0, false);
+        assert!(g.contains("累计探索"));
+        assert!(g.contains(&format!("8/{TOTAL_EXPLORE_CEILING}")));
+        assert!(!g.contains("无新发现")); // no low-gain line
+    }
+
+    #[test]
+    fn gauge_impl_phase_uses_impl_streak() {
+        let g = budget_gauge(0, 0, 2, true);
+        assert!(g.contains(&format!("2/{IMPL_REFLECT_AT}")));
+        assert!(g.contains("未改代码"));
     }
 
     #[test]
@@ -220,44 +372,105 @@ mod tests {
     fn reflects_at_threshold_then_stops() {
         let mut streak = 0;
         let mut reflected = false;
+        let mut total = 0;
         let reads = names(&["file_read"]);
-        // Turns 1..REFLECT_AT-1: just continue.
+        // Turns 1..REFLECT_AT-1: just continue. made_discovery=false → low-gain.
         for _ in 0..(REFLECT_AT - 1) {
             assert_eq!(
-                evaluate(&mut streak, &mut reflected, &reads, false, "task"),
+                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task"),
                 ReflectAction::Continue
             );
         }
         // Turn REFLECT_AT: reflect.
-        match evaluate(&mut streak, &mut reflected, &reads, false, "task") {
+        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task") {
             ReflectAction::Reflect(_) => {}
             other => panic!("expected Reflect, got {other:?}"),
         }
         // Continues until the stop threshold.
         for _ in 0..(STOP_AFTER_REFLECT - 1) {
             assert_eq!(
-                evaluate(&mut streak, &mut reflected, &reads, false, "task"),
+                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task"),
                 ReflectAction::Continue
             );
         }
-        match evaluate(&mut streak, &mut reflected, &reads, false, "task") {
+        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task") {
             ReflectAction::Stop(_) => {}
             other => panic!("expected Stop, got {other:?}"),
         }
     }
 
     #[test]
+    fn discovery_resets_low_gain_but_ceiling_still_trips() {
+        // Reading NEW files every turn keeps the low-gain streak at 0, but the
+        // cumulative ceiling must eventually stop the breadth-first wander.
+        let mut streak = 0;
+        let mut reflected = false;
+        let mut total = 0;
+        let reads = names(&["file_read"]);
+        // Up to the ceiling minus one: always Continue, low-gain streak stays 0.
+        for _ in 0..(TOTAL_EXPLORE_CEILING - 1) {
+            assert_eq!(
+                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task"),
+                ReflectAction::Continue
+            );
+            assert_eq!(streak, 0);
+        }
+        // The ceiling turn stops regardless of discovery.
+        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task") {
+            ReflectAction::Stop(_) => {}
+            other => panic!("expected Stop at ceiling, got {other:?}"),
+        }
+        // Counters reset so a user "continue" starts a fresh window.
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn discovery_midway_resets_low_gain_streak() {
+        let mut streak = 0;
+        let mut reflected = false;
+        let mut total = 0;
+        let reads = names(&["file_read"]);
+        // Two low-gain turns build the streak.
+        evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task");
+        evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task");
+        assert_eq!(streak, 2);
+        // A discovering turn wipes the low-gain streak but not the total.
+        assert_eq!(
+            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task"),
+            ReflectAction::Continue
+        );
+        assert_eq!(streak, 0);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn edit_clears_cumulative_ceiling() {
+        let mut streak = 0;
+        let mut reflected = false;
+        let mut total = 0;
+        let reads = names(&["file_read"]);
+        for _ in 0..5 {
+            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task");
+        }
+        assert_eq!(total, 5);
+        // An edit is real progress → clears the cumulative counter too.
+        evaluate(&mut streak, &mut reflected, &mut total, &names(&["edit_file"]), false, false, "task");
+        assert_eq!(total, 0);
+    }
+
+    #[test]
     fn progress_resets_after_reflect() {
         let mut streak = 0;
         let mut reflected = false;
+        let mut total = 0;
         let reads = names(&["file_read"]);
         for _ in 0..REFLECT_AT {
-            evaluate(&mut streak, &mut reflected, &reads, false, "task");
+            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task");
         }
         assert!(reflected);
         // An edit resets everything.
         assert_eq!(
-            evaluate(&mut streak, &mut reflected, &names(&["edit_file"]), false, "task"),
+            evaluate(&mut streak, &mut reflected, &mut total, &names(&["edit_file"]), false, false, "task"),
             ReflectAction::Continue
         );
         assert_eq!(streak, 0);

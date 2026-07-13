@@ -537,6 +537,10 @@ fn inject_slim_context(
     unified_tool_mode: bool,
     memory_store: &Option<Arc<crate::memory::store::MemoryStore>>,
     session_id: &str,
+    explore_streak: u32,
+    total_explore: u32,
+    impl_streak: u32,
+    in_impl_phase: bool,
 ) {
     // ── 1. Strip all prior injection blocks in ONE pass ──
     strip_all_injection_blocks(messages);
@@ -573,7 +577,16 @@ fn inject_slim_context(
                     block.push_str("\n\n");
                 }
 
-    block.push_str(&build_task_anchor_block(user_task, iteration, turn_memory, workflow_engine));
+    block.push_str(&build_task_anchor_block(
+        user_task,
+        iteration,
+        turn_memory,
+        workflow_engine,
+        explore_streak,
+        total_explore,
+        impl_streak,
+        in_impl_phase,
+    ));
     block.push_str(&build_tool_trace_block(turn_memory, slim_phase));
 
     // ── ReAct timeline: cross-turn action history ──
@@ -605,6 +618,10 @@ fn build_task_anchor_block(
     iteration: u32,
     turn_memory: &turn_memory::TurnMemory,
     workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    explore_streak: u32,
+    total_explore: u32,
+    impl_streak: u32,
+    in_impl_phase: bool,
 ) -> String {
     let mut b = String::new();
     let task: String = user_task.chars().take(300).collect();
@@ -639,6 +656,16 @@ fn build_task_anchor_block(
     } else {
         b.push_str(&format!("📍 iteration {} · 工具 {} 次 · {phase_line}\n", iteration + 1, tool_count));
     }
+
+    // 🔍 Exploration/implementation budget gauge — makes the cost of continued
+    // exploration visible every turn (not just when a reflection fires), turning
+    // "look once more" from a free habit into a visible choice.
+    b.push_str(&crate::agent::explore_reflect::budget_gauge(
+        explore_streak,
+        total_explore,
+        impl_streak,
+        in_impl_phase,
+    ));
 
     // Todo-list recap
     if !plan_recap.is_empty() {
@@ -992,6 +1019,9 @@ pub async fn run_agent_turn(
     let mut content_only_streak = 0u32;
     let mut explore_streak = 0u32;
     let mut explore_reflected = false;
+    // Cumulative exploration hard ceiling — discovery does NOT reset this; only a
+    // real edit/finish does. Backstop against unbounded breadth-first wandering.
+    let mut total_explore = 0u32;
     // Implementation-phase reflection (consecutive no-edit turns once the plan is confirmed).
     let mut impl_streak = 0u32;
     let mut impl_reflected = false;
@@ -1130,6 +1160,11 @@ pub async fn run_agent_turn(
         // ── Slim context injection ──
         // One compact [TURN_CONTEXT] block: task anchor + progress + next action.
         // Static content (routes, full workspace) lives in the system prompt, not here.
+        let slim_in_impl_phase = workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .map(|e| crate::agent::workflow_session::is_implementation_phase(&e))
+            .unwrap_or(false);
         inject_slim_context(
             &mut messages,
             user_task.as_deref().unwrap_or(""),
@@ -1143,6 +1178,10 @@ pub async fn run_agent_turn(
                 .and_then(|wf| wf.try_lock().ok())
                 .map(|e| e.session_id().to_string())
                 .unwrap_or_default(),
+            explore_streak,
+            total_explore,
+            impl_streak,
+            slim_in_impl_phase,
         );
 
         // 🚨 Sanitize tool pairs before EVERY LLM call within the agent turn.
@@ -2113,8 +2152,49 @@ pub async fn run_agent_turn(
                 .map(|e| crate::agent::workflow_session::is_implementation_phase(&e))
                 .unwrap_or(false);
 
+            // 🔍 Information-gain signal: does this turn's read-only batch surface
+            // anything NEW (unread file, further slice, fresh query, structural
+            // listing)? Evaluated against engine state, which already records what
+            // prior turns read. A discovering turn is real progress and resets the
+            // exploration streak — so reading many *different* files in a large
+            // project never trips the budget; only repeated low-gain reads do.
+            let made_discovery = workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .map(|engine| {
+                    tool_calls.iter().any(|tc| {
+                        let (inner_name, inner_args) = if unified_tool_mode {
+                            match crate::agent::unified_action::parse_request(&tc.arguments) {
+                                Ok(r) => (
+                                    crate::agent::unified_action::action_to_tool_name(&r.action)
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| tc.name.clone()),
+                                    r.params,
+                                ),
+                                Err(_) => (
+                                    tc.name.clone(),
+                                    serde_json::from_str(&tc.arguments)
+                                        .unwrap_or(serde_json::json!({})),
+                                ),
+                            }
+                        } else {
+                            (
+                                tc.name.clone(),
+                                serde_json::from_str(&tc.arguments)
+                                    .unwrap_or(serde_json::json!({})),
+                            )
+                        };
+                        crate::agent::read_guard::is_discovery_call(
+                            &engine,
+                            &inner_name,
+                            &inner_args,
+                        )
+                    })
+                })
+                .unwrap_or(true); // No engine → don't penalize.
+
             // Implementation phase → impl guard (no-edit streak); otherwise the
-            // exploration guard (read-only streak). Never both in one turn.
+            // exploration guard (low-gain read streak). Never both in one turn.
             let action = if in_impl_phase {
                 explore_reflect::evaluate_impl(
                     &mut impl_streak,
@@ -2127,8 +2207,10 @@ pub async fn run_agent_turn(
                 explore_reflect::evaluate(
                     &mut explore_streak,
                     &mut explore_reflected,
+                    &mut total_explore,
                     &turn_tool_names,
                     had_finish,
+                    made_discovery,
                     user_task_str,
                 )
             };
@@ -2147,20 +2229,21 @@ pub async fn run_agent_turn(
                     let _ = ui_tx.send(AgentToUiEvent::Status(label.to_string()));
                     Some(prompt)
                 }
-                explore_reflect::ReflectAction::Stop(_handoff) => {
-                    // Exploration ran well past reflection without acting — inject a
-                    // gate and hand control back to the user (c = continue exploring).
+                explore_reflect::ReflectAction::Stop(handoff) => {
+                    // Exploration hit a stop threshold — either the low-gain streak
+                    // ran past reflection, or the cumulative ceiling tripped. The
+                    // handoff message already states which; keep the c/其他 gate so
+                    // the user can wave it on.
                     let gate_msg = format!(
-                        "⚠️ 你已连续探索 **{n}** 轮（仅只读工具），未开始动手或收尾。\n\n\
+                        "{handoff}\n\n\
                          **c** 继续探索\n\
-                         **其他** 结束本轮",
-                        n = explore_streak
+                         **其他** 结束本轮"
                     );
-                    let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                        "⏸️ 连续 {n} 轮只探索 — c 继续 · 其他结束",
-                        n = explore_streak
-                    )));
+                    let _ = ui_tx.send(AgentToUiEvent::Status(
+                        "⏸️ 探索预算耗尽 — c 继续 · 其他结束".to_string(),
+                    ));
                     explore_streak = 0;
+                    total_explore = 0;
                     Some(gate_msg)
                 }
             };

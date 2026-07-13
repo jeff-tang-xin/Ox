@@ -123,6 +123,44 @@ pub fn record_symbol_query(engine: &WorkflowEngine, tool_name: &str, args: &serd
         }
 }
 
+/// True when a read-only tool call would surface *new* information this turn —
+/// a not-yet-read file, a further slice of a file, or a not-yet-run symbol
+/// query. Structural listings count as discovery; status/recall calls do not.
+///
+/// Drives the exploration budget's information-gain accounting: a turn that
+/// discovers something new is genuine progress and must not be penalized as
+/// "circling", however large the project.
+pub fn is_discovery_call(
+    engine: &WorkflowEngine,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> bool {
+    match tool_name {
+        "file_read" => {
+            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            if path.is_empty() {
+                return false;
+            }
+            // Reading further into an already-read file still yields new content.
+            if args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) > 0 {
+                return true;
+            }
+            !path_already_read(engine, path)
+        }
+        "find_symbol" | "code_search" => match symbol_query_key(tool_name, args) {
+            Some(q) => !symbol_already_queried(engine, &q),
+            None => false,
+        },
+        // Structural exploration — almost always surfaces new layout/paths.
+        "file_list" | "file_search" | "project_detect" | "code_graph" => true,
+        // Read-only but not obviously novel — a repeat here is likely circling,
+        // so it must NOT count as discovery (otherwise the budget never trips).
+        "git_status" | "git_diff" | "load_skill" | "recall" | "web_fetch" => false,
+        // Unknown tool: treat as progress (don't penalize).
+        _ => true,
+    }
+}
+
 fn symbol_already_queried(engine: &WorkflowEngine, query: &str) -> bool {
     let norm = query.to_lowercase();
     engine
