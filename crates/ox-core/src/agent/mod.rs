@@ -641,9 +641,16 @@ fn build_task_anchor_block(
     // Progress + phase ripple
     let tool_count = turn_memory.entries.len();
     let mut plan_recap = String::new();
+    // Convergence action for the gauge depends on task intent: a review submits a
+    // plan (writes locked); a fix/general task edits directly (writes unlocked); a
+    // Q&A answers. Default to SubmitPlan when no engine (conservative — never nudges
+    // an edit when we can't confirm writes are unlocked).
+    let mut converge = crate::agent::explore_reflect::ConvergeMode::SubmitPlan;
     let phase_line = if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
             plan_recap = engine.plan_progress_summary();
+            converge =
+                crate::agent::explore_reflect::ConvergeMode::from_intent(engine.get_task_intent());
             format_phase_ripple(&crate::agent::phase::get(&engine), &engine)
         } else {
             String::new()
@@ -665,6 +672,7 @@ fn build_task_anchor_block(
         total_explore,
         impl_streak,
         in_impl_phase,
+        converge,
     ));
 
     // Todo-list recap
@@ -2204,6 +2212,15 @@ pub async fn run_agent_turn(
                     user_task_str,
                 )
             } else {
+                // Convergence action depends on task intent: review submits a plan
+                // (writes locked); fix/general edits directly (writes unlocked);
+                // Q&A answers. Default SubmitPlan when no engine — never nudge an
+                // edit unless we can confirm writes are unlocked.
+                let converge = workflow_engine
+                    .as_ref()
+                    .and_then(|wf| wf.try_lock().ok())
+                    .map(|e| explore_reflect::ConvergeMode::from_intent(e.get_task_intent()))
+                    .unwrap_or(explore_reflect::ConvergeMode::SubmitPlan);
                 explore_reflect::evaluate(
                     &mut explore_streak,
                     &mut explore_reflected,
@@ -2212,6 +2229,7 @@ pub async fn run_agent_turn(
                     had_finish,
                     made_discovery,
                     user_task_str,
+                    converge,
                 )
             };
 

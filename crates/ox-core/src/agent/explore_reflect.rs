@@ -33,7 +33,13 @@ const READONLY_TOOLS: &[&str] = &[
 const PROGRESS_TOOLS: &[&str] = &["file_write", "edit_file", "delete_range"];
 
 /// Consecutive read-only turns before a reflection prompt is injected.
-pub const REFLECT_AT: u32 = 6;
+///
+/// Deliberately tight: the goal is "don't over-explore, converge fast". Combined
+/// with the per-turn [`budget_gauge`] hint (which renders from the very first
+/// exploration turn), this keeps the model from circling — while `made_discovery`
+/// still lets legitimate deep reading of *new* files run uncapped up to the
+/// cumulative [`TOTAL_EXPLORE_CEILING`].
+pub const REFLECT_AT: u32 = 4;
 
 /// Further read-only turns after reflection before handing back to the user.
 pub const STOP_AFTER_REFLECT: u32 = 4;
@@ -53,6 +59,46 @@ pub const TOTAL_EXPLORE_CEILING: u32 = 20;
 /// is the failure we want to catch quickly.
 pub const IMPL_REFLECT_AT: u32 = 3;
 
+/// How the model should *converge* when it stops exploring — the crux of "reflect
+/// by phase, not blindly".
+///
+/// The old reflection was phase-blind: it always told the model the write lock was
+/// on and the only convergence action was submitting a `finding_json` plan. That is
+/// correct for a **review** (writes locked until the user picks scope), but wrong
+/// for a **fix / greenfield / general** task, where writes are already unlocked and
+/// the right move is to just `edit_file`. Telling those tasks to "submit a plan and
+/// wait for confirmation" stalls work that should proceed directly.
+///
+/// The caller derives this from [`crate::agent::task_intent::TaskIntent`] and passes
+/// it in, so the reflection prompt and the per-turn gauge speak the correct
+/// convergence action for the task at hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvergeMode {
+    /// Review / audit: writes are locked; converge by submitting a plan for the
+    /// user to confirm — `finish(finding_json=[…])`.
+    SubmitPlan,
+    /// Fix / greenfield / general coding: writes are unlocked; converge by acting
+    /// directly — `file_read` the target then `edit_file`.
+    DirectEdit,
+    /// Q&A / explanation: minimal exploration; converge by answering —
+    /// `finish(content=…)`.
+    Answer,
+}
+
+impl ConvergeMode {
+    /// Map task intent → convergence action. Fix and General share DirectEdit
+    /// (both have write access and should implement, not submit a plan). Review
+    /// submits a plan; Qa answers.
+    pub fn from_intent(intent: crate::agent::task_intent::TaskIntent) -> Self {
+        use crate::agent::task_intent::TaskIntent;
+        match intent {
+            TaskIntent::Review => Self::SubmitPlan,
+            TaskIntent::Qa => Self::Answer,
+            TaskIntent::Fix | TaskIntent::General => Self::DirectEdit,
+        }
+    }
+}
+
 /// Render the exploration/implementation budget gauge for the turn-context block.
 ///
 /// This makes the *cost* of continued exploration visible to the model every
@@ -68,6 +114,7 @@ pub fn budget_gauge(
     total_explore: u32,
     impl_streak: u32,
     in_impl_phase: bool,
+    converge: ConvergeMode,
 ) -> String {
     if in_impl_phase {
         if impl_streak == 0 {
@@ -81,6 +128,11 @@ pub fn budget_gauge(
         return String::new();
     }
 
+    // Convergence action differs by task: a review submits a plan; a fix/general
+    // task edits directly; a Q&A answers. Keep the gauge honest to the task so it
+    // never nags a fix task to "submit a plan and wait".
+    let converge_short = gauge_converge_hint(converge);
+
     let mut out = String::new();
     // Low-gain circling line (only when a streak is building).
     if explore_streak > 0 {
@@ -88,12 +140,12 @@ pub fn budget_gauge(
         if explore_streak >= REFLECT_AT {
             let left = stop_at.saturating_sub(explore_streak);
             out.push_str(&format!(
-                "🔍 探索预算: {explore_streak}/{REFLECT_AT}（连续无新发现，已超阈值）· ⚠️ 再 {left} 轮仍无进展将交还用户 — 立即 finish(finding_json=[…]) 提交计划 / finish(content=问题) 问用户 / 说明唯一缺口\n"
+                "🔍 探索预算: {explore_streak}/{REFLECT_AT}（连续无新发现，已超阈值）· ⚠️ 再 {left} 轮仍无进展将交还用户 — {converge_short}\n"
             ));
         } else {
             let left = REFLECT_AT.saturating_sub(explore_streak);
             out.push_str(&format!(
-                "🔍 探索预算: 连续 {explore_streak}/{REFLECT_AT} 轮无新发现（重复读/重复搜）· 再 {left} 轮空转将强制收敛（信息够了就 finish(finding_json=[…]) 提交计划等确认；读新文件不计入）\n"
+                "🔍 探索预算: 连续 {explore_streak}/{REFLECT_AT} 轮无新发现（重复读/重复搜）· 再 {left} 轮空转将强制收敛（信息够了就{converge_short}；读新文件不计入）\n"
             ));
         }
     }
@@ -107,10 +159,25 @@ pub fn budget_gauge(
             ""
         };
         out.push_str(&format!(
-            "🧭 {warn}累计探索: {total_explore}/{TOTAL_EXPLORE_CEILING} 轮 · 再 {left} 轮（含读新文件）仍不 finish(finding_json) 提交计划将强制收敛\n"
+            "🧭 {warn}累计探索: {total_explore}/{TOTAL_EXPLORE_CEILING} 轮 · 再 {left} 轮（含读新文件）仍不收敛（{converge_short}）将强制收敛\n"
         ));
     }
     out
+}
+
+/// Short convergence-action phrase for the per-turn gauge, by task mode.
+fn gauge_converge_hint(converge: ConvergeMode) -> &'static str {
+    match converge {
+        ConvergeMode::SubmitPlan => {
+            "立即 finish(finding_json=[…]) 提交计划 / finish(content=问题) 问用户 / 说明唯一缺口"
+        }
+        ConvergeMode::DirectEdit => {
+            "立即 file_read 目标文件后 edit_file 直接实施 / finish(content=问题) 问用户 / 说明唯一缺口"
+        }
+        ConvergeMode::Answer => {
+            "立即 finish(content=答案) 回答 / finish(content=问题) 问用户 / 说明唯一缺口"
+        }
+    }
 }
 
 /// What the loop should do after classifying one turn's tool batch.
@@ -175,6 +242,7 @@ pub fn evaluate(
     had_finish: bool,
     made_discovery: bool,
     user_task: &str,
+    converge: ConvergeMode,
 ) -> ReflectAction {
     // Real progress (edit / finish / non-exploration tool) clears BOTH counters.
     if !is_pure_exploration(tool_names, had_finish) {
@@ -213,7 +281,7 @@ pub fn evaluate(
 
     if *streak >= REFLECT_AT {
         *reflected = true;
-        return ReflectAction::Reflect(reflect_message(*streak, user_task));
+        return ReflectAction::Reflect(reflect_message(*streak, user_task, converge));
     }
 
     ReflectAction::Continue
@@ -275,21 +343,44 @@ fn impl_reflect_message(streak: u32, user_task: &str) -> String {
     )
 }
 
-fn reflect_message(streak: u32, user_task: &str) -> String {
+fn reflect_message(streak: u32, user_task: &str, converge: ConvergeMode) -> String {
     let task: String = user_task.chars().take(300).collect();
-    format!(
-        "🪞 **反思检查点**：你已连续 {streak} 轮探索却没有新发现（在重复读/重复搜同样的内容），也没有提交计划或收尾。\n\
-         \n\
-         注意：探索/评审阶段写权限是锁的，收敛动作是**提交计划**而非直接改代码。请**立即**做以下之一：\n\
-         \n\
-         1. **信息够了 → 提交计划** — `finish(finding_json=[{{index,severity,file,issue,recommendation,fix_plan}}])`，等用户 `c` 确认后再实施。\n\
-         \n\
-         2. **不确定 → 问用户** — 业务逻辑、命名意图、方案选择不明确时，直接 `finish(content=你的问题)` 问用户。不要自己猜。\n\
-         \n\
-         3. **真就差一个具体信息 → 只补那一个文件** — 说出缺什么，读完立即回头提交计划。禁止再泛读。\n\
-         \n\
-         原始任务：{task}"
-    )
+    let header = format!(
+        "🪞 **反思检查点**：你已连续 {streak} 轮探索却没有新发现（在重复读/重复搜同样的内容），也没有收尾。\n"
+    );
+    let body = match converge {
+        ConvergeMode::SubmitPlan => {
+            "\n\
+             注意：审查/评审阶段写权限是锁的，收敛动作是**提交计划**而非直接改代码。请**立即**做以下之一：\n\
+             \n\
+             1. **信息够了 → 提交计划** — `finish(finding_json=[{index,severity,file,issue,recommendation,fix_plan}])`，等用户 `c` 确认后再实施。\n\
+             \n\
+             2. **不确定 → 问用户** — 业务逻辑、命名意图、方案选择不明确时，直接 `finish(content=你的问题)` 问用户。不要自己猜。\n\
+             \n\
+             3. **真就差一个具体信息 → 只补那一个文件** — 说出缺什么，读完立即回头提交计划。禁止再泛读。\n"
+        }
+        ConvergeMode::DirectEdit => {
+            "\n\
+             注意：本任务写权限已解锁，收敛动作是**直接动手改代码**，不是再提交计划或反复泛读。请**立即**做以下之一：\n\
+             \n\
+             1. **信息够了 → 直接改** — 对目标文件 `file_read`（每文件仅一次）后立刻 `edit_file` / `file_write` 实施。\n\
+             \n\
+             2. **不确定 → 问用户** — 业务逻辑、命名意图、方案选择不明确时，直接 `finish(content=你的问题)` 问用户。不要自己猜。\n\
+             \n\
+             3. **真就差一个具体信息 → 只补那一个文件** — 说出缺什么，读完立即动手。禁止再泛读。\n"
+        }
+        ConvergeMode::Answer => {
+            "\n\
+             注意：这是问答/解释任务，收敛动作是**直接回答**，不需要全面探索。请**立即**做以下之一：\n\
+             \n\
+             1. **信息够了 → 回答** — `finish(content=你的答案)`，基于已读到的内容作答。\n\
+             \n\
+             2. **不确定 → 问用户** — 需求不明确时，直接 `finish(content=你的澄清问题)`。\n\
+             \n\
+             3. **真就差一个具体信息 → 只核对那一处** — 说出缺什么，单次读取后立即回答。禁止再泛读。\n"
+        }
+    };
+    format!("{header}{body}\n原始任务：{task}")
 }
 
 fn stop_message(streak: u32) -> String {
@@ -316,23 +407,31 @@ mod tests {
 
     #[test]
     fn gauge_hidden_at_zero_streak() {
-        assert_eq!(budget_gauge(0, 0, 0, false), "");
-        assert_eq!(budget_gauge(0, 0, 0, true), "");
+        assert_eq!(budget_gauge(0, 0, 0, false, ConvergeMode::SubmitPlan), "");
+        assert_eq!(budget_gauge(0, 0, 0, true, ConvergeMode::SubmitPlan), "");
     }
 
     #[test]
     fn gauge_shows_remaining_budget_before_threshold() {
-        let g = budget_gauge(4, 4, 0, false);
-        assert!(g.contains("4/"));
+        let g = budget_gauge(2, 2, 0, false, ConvergeMode::SubmitPlan);
+        assert!(g.contains("2/"));
         assert!(g.contains("无新发现"));
-        assert!(g.contains(&format!("再 {} 轮空转", REFLECT_AT - 4)));
-        // Exploration-phase convergence action is submitting a plan, not editing.
+        assert!(g.contains(&format!("再 {} 轮空转", REFLECT_AT - 2)));
+        // Review-mode convergence action is submitting a plan.
         assert!(g.contains("finding_json"));
     }
 
     #[test]
+    fn gauge_direct_edit_mode_says_edit_not_plan() {
+        // A fix/general task must be told to edit directly, never to submit a plan.
+        let g = budget_gauge(2, 2, 0, false, ConvergeMode::DirectEdit);
+        assert!(g.contains("edit_file"));
+        assert!(!g.contains("finding_json"));
+    }
+
+    #[test]
     fn gauge_warns_past_threshold() {
-        let g = budget_gauge(REFLECT_AT, REFLECT_AT, 0, false);
+        let g = budget_gauge(REFLECT_AT, REFLECT_AT, 0, false, ConvergeMode::SubmitPlan);
         assert!(g.contains("超阈值"));
         assert!(g.contains("交还用户"));
     }
@@ -341,7 +440,7 @@ mod tests {
     fn gauge_shows_cumulative_ceiling_even_without_low_gain_streak() {
         // Discovering every turn keeps explore_streak at 0, but the cumulative
         // line must still show so breadth-first wandering stays visible.
-        let g = budget_gauge(0, 8, 0, false);
+        let g = budget_gauge(0, 8, 0, false, ConvergeMode::SubmitPlan);
         assert!(g.contains("累计探索"));
         assert!(g.contains(&format!("8/{TOTAL_EXPLORE_CEILING}")));
         assert!(!g.contains("无新发现")); // no low-gain line
@@ -349,7 +448,7 @@ mod tests {
 
     #[test]
     fn gauge_impl_phase_uses_impl_streak() {
-        let g = budget_gauge(0, 0, 2, true);
+        let g = budget_gauge(0, 0, 2, true, ConvergeMode::DirectEdit);
         assert!(g.contains(&format!("2/{IMPL_REFLECT_AT}")));
         assert!(g.contains("未改代码"));
     }
@@ -379,25 +478,44 @@ mod tests {
         // Turns 1..REFLECT_AT-1: just continue. made_discovery=false → low-gain.
         for _ in 0..(REFLECT_AT - 1) {
             assert_eq!(
-                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task"),
+                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan),
                 ReflectAction::Continue
             );
         }
         // Turn REFLECT_AT: reflect.
-        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task") {
+        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan) {
             ReflectAction::Reflect(_) => {}
             other => panic!("expected Reflect, got {other:?}"),
         }
         // Continues until the stop threshold.
         for _ in 0..(STOP_AFTER_REFLECT - 1) {
             assert_eq!(
-                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task"),
+                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan),
                 ReflectAction::Continue
             );
         }
-        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task") {
+        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan) {
             ReflectAction::Stop(_) => {}
             other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reflect_message_direct_edit_pushes_edit_not_plan() {
+        // Fix/general convergence must push editing, never plan submission.
+        let mut streak = 0;
+        let mut reflected = false;
+        let mut total = 0;
+        let reads = names(&["file_read"]);
+        for _ in 0..(REFLECT_AT - 1) {
+            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::DirectEdit);
+        }
+        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::DirectEdit) {
+            ReflectAction::Reflect(msg) => {
+                assert!(msg.contains("edit_file"));
+                assert!(!msg.contains("finding_json"));
+            }
+            other => panic!("expected Reflect, got {other:?}"),
         }
     }
 
@@ -412,13 +530,13 @@ mod tests {
         // Up to the ceiling minus one: always Continue, low-gain streak stays 0.
         for _ in 0..(TOTAL_EXPLORE_CEILING - 1) {
             assert_eq!(
-                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task"),
+                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task", ConvergeMode::SubmitPlan),
                 ReflectAction::Continue
             );
             assert_eq!(streak, 0);
         }
         // The ceiling turn stops regardless of discovery.
-        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task") {
+        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task", ConvergeMode::SubmitPlan) {
             ReflectAction::Stop(_) => {}
             other => panic!("expected Stop at ceiling, got {other:?}"),
         }
@@ -433,12 +551,12 @@ mod tests {
         let mut total = 0;
         let reads = names(&["file_read"]);
         // Two low-gain turns build the streak.
-        evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task");
-        evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task");
+        evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan);
+        evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan);
         assert_eq!(streak, 2);
         // A discovering turn wipes the low-gain streak but not the total.
         assert_eq!(
-            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task"),
+            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task", ConvergeMode::SubmitPlan),
             ReflectAction::Continue
         );
         assert_eq!(streak, 0);
@@ -452,11 +570,11 @@ mod tests {
         let mut total = 0;
         let reads = names(&["file_read"]);
         for _ in 0..5 {
-            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task");
+            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task", ConvergeMode::SubmitPlan);
         }
         assert_eq!(total, 5);
         // An edit is real progress → clears the cumulative counter too.
-        evaluate(&mut streak, &mut reflected, &mut total, &names(&["edit_file"]), false, false, "task");
+        evaluate(&mut streak, &mut reflected, &mut total, &names(&["edit_file"]), false, false, "task", ConvergeMode::SubmitPlan);
         assert_eq!(total, 0);
     }
 
@@ -467,12 +585,12 @@ mod tests {
         let mut total = 0;
         let reads = names(&["file_read"]);
         for _ in 0..REFLECT_AT {
-            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task");
+            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan);
         }
         assert!(reflected);
         // An edit resets everything.
         assert_eq!(
-            evaluate(&mut streak, &mut reflected, &mut total, &names(&["edit_file"]), false, false, "task"),
+            evaluate(&mut streak, &mut reflected, &mut total, &names(&["edit_file"]), false, false, "task", ConvergeMode::SubmitPlan),
             ReflectAction::Continue
         );
         assert_eq!(streak, 0);
