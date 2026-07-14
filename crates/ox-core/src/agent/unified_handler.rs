@@ -638,6 +638,30 @@ async fn handle_finish(
         });
     }
 
+    // ── Guard: findings intended but not recognized. ──
+    // A `finish` that carries a `finding_json` / `findings` key (non-null) but
+    // whose value could not be parsed into any reviewable item (empty array,
+    // wrong nesting, non-array/object) would otherwise fall through to Path 1
+    // and SILENTLY end the turn with `is_error=false` — the model thinks it
+    // submitted a plan, the turn just stops, and no feedback ever reaches it.
+    // Return an explicit error instead so the model retries with a valid shape
+    // and the caller's `findings_deliver_error_streak` backstop can engage.
+    if review_json.is_none() {
+        let attempted_findings = ["finding_json", "findings"]
+            .iter()
+            .any(|k| req.params.get(*k).map(|v| !v.is_null()).unwrap_or(false));
+        if attempted_findings {
+            return result_err(
+                "finding_json 未被识别为有效的评审内容（可能是空数组、键名或结构不对）。\
+                 请按此形态重发：finish(params.finding_json={\"findings_summary\":\"…\",\
+                 \"findings\":[{\"index\":1,\"severity\":\"high\",\"file\":\"…\",\"issue\":\"…\",\
+                 \"recommendation\":\"…\",\"fix_plan\":\"第几行+怎么改+代码草图\"}]})。\
+                 若确实无需用户审核，请改用 finish(params.content=…) 结束。"
+                    .into(),
+            );
+        }
+    }
+
     // ── Path 1: no review content → LLM's explicit end. Hand the turn back to
     // the user WITHOUT locking the session. We finalize the round via
     // `complete_workflow()` (advances the step index so `is_workflow_complete()`

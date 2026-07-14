@@ -88,12 +88,12 @@ pub fn budget_gauge(
         if explore_streak >= REFLECT_AT {
             let left = stop_at.saturating_sub(explore_streak);
             out.push_str(&format!(
-                "🔍 探索预算: {explore_streak}/{REFLECT_AT}（连续无新发现，已超阈值）· ⚠️ 再 {left} 轮仍无进展将交还用户 — 立即动手/finish/说明唯一缺口\n"
+                "🔍 探索预算: {explore_streak}/{REFLECT_AT}（连续无新发现，已超阈值）· ⚠️ 再 {left} 轮仍无进展将交还用户 — 立即 finish(finding_json=[…]) 提交计划 / finish(content=问题) 问用户 / 说明唯一缺口\n"
             ));
         } else {
             let left = REFLECT_AT.saturating_sub(explore_streak);
             out.push_str(&format!(
-                "🔍 探索预算: 连续 {explore_streak}/{REFLECT_AT} 轮无新发现（重复读/重复搜）· 再 {left} 轮空转将强制收敛（读新文件不计入）\n"
+                "🔍 探索预算: 连续 {explore_streak}/{REFLECT_AT} 轮无新发现（重复读/重复搜）· 再 {left} 轮空转将强制收敛（信息够了就 finish(finding_json=[…]) 提交计划等确认；读新文件不计入）\n"
             ));
         }
     }
@@ -107,7 +107,7 @@ pub fn budget_gauge(
             ""
         };
         out.push_str(&format!(
-            "🧭 {warn}累计探索: {total_explore}/{TOTAL_EXPLORE_CEILING} 轮 · 再 {left} 轮（含读新文件）未动手将强制收敛\n"
+            "🧭 {warn}累计探索: {total_explore}/{TOTAL_EXPLORE_CEILING} 轮 · 再 {left} 轮（含读新文件）仍不 finish(finding_json) 提交计划将强制收敛\n"
         ));
     }
     out
@@ -278,15 +278,15 @@ fn impl_reflect_message(streak: u32, user_task: &str) -> String {
 fn reflect_message(streak: u32, user_task: &str) -> String {
     let task: String = user_task.chars().take(300).collect();
     format!(
-        "🪞 **反思检查点**：你已连续 {streak} 轮探索却没有新发现（在重复读/重复搜同样的内容），也没有动手或收尾。\n\
+        "🪞 **反思检查点**：你已连续 {streak} 轮探索却没有新发现（在重复读/重复搜同样的内容），也没有提交计划或收尾。\n\
          \n\
-         请**立即**做以下三件事之一：\n\
+         注意：探索/评审阶段写权限是锁的，收敛动作是**提交计划**而非直接改代码。请**立即**做以下之一：\n\
          \n\
-         1. **信息够了 → 动手** — 直接 `finish(finding_json=[...])` 提交计划，或 `edit_file` 改代码。\n\
+         1. **信息够了 → 提交计划** — `finish(finding_json=[{{index,severity,file,issue,recommendation,fix_plan}}])`，等用户 `c` 确认后再实施。\n\
          \n\
          2. **不确定 → 问用户** — 业务逻辑、命名意图、方案选择不明确时，直接 `finish(content=你的问题)` 问用户。不要自己猜。\n\
          \n\
-         3. **真就差一个具体信息 → 只补那一个文件** — 说出缺什么，读完立即回头动手。禁止再泛读。\n\
+         3. **真就差一个具体信息 → 只补那一个文件** — 说出缺什么，读完立即回头提交计划。禁止再泛读。\n\
          \n\
          原始任务：{task}"
     )
@@ -326,6 +326,8 @@ mod tests {
         assert!(g.contains("4/"));
         assert!(g.contains("无新发现"));
         assert!(g.contains(&format!("再 {} 轮空转", REFLECT_AT - 4)));
+        // Exploration-phase convergence action is submitting a plan, not editing.
+        assert!(g.contains("finding_json"));
     }
 
     #[test]

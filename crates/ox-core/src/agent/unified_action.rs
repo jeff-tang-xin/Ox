@@ -652,6 +652,28 @@ mod tests {
     }
 
     #[test]
+    fn finish_with_empty_findings_array_is_none() {
+        // Empty array yields None — handle_finish must catch this (key present,
+        // parse None) and error instead of silently ending the turn.
+        let req =
+            parse_request(r#"{"action":"finish","params":{"finding_json":[]}}"#).unwrap();
+        assert!(finding_json(&req.params).is_none());
+        // The key is nonetheless present and non-null → "attempted findings".
+        assert!(req.params.get("finding_json").map(|v| !v.is_null()).unwrap_or(false));
+    }
+
+    #[test]
+    fn finish_with_null_finding_json_is_not_attempted() {
+        // Explicit null must NOT count as an attempted-findings submission — it's
+        // a normal end-of-turn.
+        let req =
+            parse_request(r#"{"action":"finish","params":{"finding_json":null,"content":"done"}}"#)
+                .unwrap();
+        assert!(finding_json(&req.params).is_none());
+        assert!(!req.params.get("finding_json").map(|v| !v.is_null()).unwrap_or(false));
+    }
+
+    #[test]
     fn fallback_route_tag() {
         let b = build_unified_route_fallback();
         assert!(b.contains(crate::agent::workspace::WORKSPACE_TAG));
