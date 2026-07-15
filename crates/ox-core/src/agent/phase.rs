@@ -385,9 +385,9 @@ fn enter_implement(engine: &WorkflowEngine, user_text: &str) {
             if let Some(finding) = store.findings.iter_mut().find(|f| f.index == *idx)
                 && (finding.status == findings::FindingStatus::Open
                     || finding.status == findings::FindingStatus::Scoped)
-                {
-                    finding.status = findings::FindingStatus::InProgress;
-                }
+            {
+                finding.status = findings::FindingStatus::InProgress;
+            }
         }
         findings::save(engine, &store);
     }

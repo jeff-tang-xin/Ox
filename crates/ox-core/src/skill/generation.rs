@@ -412,7 +412,6 @@ impl SkillGenerator {
                     step_by_step_guide: pattern
                         .common_tool_sequence
                         .iter()
-                        
                         .map(|tool| format!("Use `{}` tool", tool))
                         .collect(),
                     example_tool_calls: vec![], // Would need to extract from traces

@@ -88,9 +88,10 @@ pub fn list_project_skill_ids(project_root: &Path) -> Vec<String> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("md")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    ids.push(stem.to_string());
-                }
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                ids.push(stem.to_string());
+            }
         }
     }
     ids.sort();
@@ -120,22 +121,23 @@ pub fn plan_skill_write(
 
     // Alias → canonical mandatory file
     if let Some(canonical) = canonical_mandatory_id(skill_id)
-        && skill_id != canonical {
-            let canonical_path = skills_dir.join(format!("{canonical}.md"));
-            if canonical_path.exists() || onboarding_turn {
-                return SkillWritePlan::RedirectToCanonical {
-                    canonical_id: canonical.to_string(),
-                    reason: format!(
-                        "Skill `{skill_id}` 与必填 Skill `{canonical}` 主题重复，禁止另建文件"
-                    ),
-                };
-            }
-            // No canonical yet — still redirect name on first create
+        && skill_id != canonical
+    {
+        let canonical_path = skills_dir.join(format!("{canonical}.md"));
+        if canonical_path.exists() || onboarding_turn {
             return SkillWritePlan::RedirectToCanonical {
                 canonical_id: canonical.to_string(),
-                reason: format!("请使用标准名称 `{canonical}.md`，不要创建 `{skill_id}.md`"),
+                reason: format!(
+                    "Skill `{skill_id}` 与必填 Skill `{canonical}` 主题重复，禁止另建文件"
+                ),
             };
         }
+        // No canonical yet — still redirect name on first create
+        return SkillWritePlan::RedirectToCanonical {
+            canonical_id: canonical.to_string(),
+            reason: format!("请使用标准名称 `{canonical}.md`，不要创建 `{skill_id}.md`"),
+        };
+    }
 
     let target = skills_dir.join(format!("{skill_id}.md"));
 
@@ -162,14 +164,13 @@ pub fn plan_skill_write(
     }
 
     // File exists
-    if allow_merge
-        && let Ok(existing) = std::fs::read_to_string(&target) {
-            let merged = merge_skill_markdown(&existing, new_content);
-            return SkillWritePlan::MergeIntoExisting {
-                target_path: target,
-                merged_markdown: merged,
-            };
-        }
+    if allow_merge && let Ok(existing) = std::fs::read_to_string(&target) {
+        let merged = merge_skill_markdown(&existing, new_content);
+        return SkillWritePlan::MergeIntoExisting {
+            target_path: target,
+            merged_markdown: merged,
+        };
+    }
 
     if is_mandatory_skill_file(skill_id) {
         return SkillWritePlan::OverwriteMandatory;
@@ -250,17 +251,19 @@ pub fn check_similar_skills(
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("md")
-                && let Ok(content) = std::fs::read_to_string(&path) {
-                    // 解析 description
-                    let desc = extract_description(&content);
-                    let id = path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !id.is_empty() {
-                        existing_skills.push((id, desc));
-                    }
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                // 解析 description
+                let desc = extract_description(&content);
+                let id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !id.is_empty() {
+                    existing_skills.push((id, desc));
                 }
+            }
         }
     }
 
@@ -290,7 +293,11 @@ pub fn check_similar_skills(
 
         // 关键词重叠 >= 2
         if intersection.len() >= 2 {
-            let overlap_list: Vec<String> = intersection.iter().take(5).map(|s| (*s).to_string()).collect();
+            let overlap_list: Vec<String> = intersection
+                .iter()
+                .take(5)
+                .map(|s| (*s).to_string())
+                .collect();
             return Some((
                 existing_id.clone(),
                 format!(
@@ -315,7 +322,11 @@ pub fn check_similar_skills(
             new_id_parts.intersection(&existing_id_parts).collect();
 
         if !id_overlap.is_empty() {
-            let overlap_list: Vec<String> = id_overlap.iter().take(3).map(|s| (*s).to_string()).collect();
+            let overlap_list: Vec<String> = id_overlap
+                .iter()
+                .take(3)
+                .map(|s| (*s).to_string())
+                .collect();
             return Some((
                 existing_id.clone(),
                 format!(
@@ -334,16 +345,17 @@ pub fn check_similar_skills(
 fn extract_description(content: &str) -> String {
     // 尝试从 frontmatter 提取
     if let Some(start) = content.find("---")
-        && let Some(end) = content[start + 3..].find("---") {
-            let yaml = &content[start + 3..start + 3 + end];
-            for line in yaml.lines() {
-                let line = line.trim();
-                if line.starts_with("description:") {
-                    let desc = line.trim_start_matches("description:").trim();
-                    return desc.trim_matches('"').trim_matches('\'').to_string();
-                }
+        && let Some(end) = content[start + 3..].find("---")
+    {
+        let yaml = &content[start + 3..start + 3 + end];
+        for line in yaml.lines() {
+            let line = line.trim();
+            if line.starts_with("description:") {
+                let desc = line.trim_start_matches("description:").trim();
+                return desc.trim_matches('"').trim_matches('\'').to_string();
             }
         }
+    }
     String::new()
 }
 

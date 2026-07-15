@@ -193,9 +193,10 @@ fn persist_turn_memory(
     turn_memory: &turn_memory::TurnMemory,
 ) {
     if let Some(wf) = workflow_engine
-        && let Ok(engine) = wf.try_lock() {
-            engine.save_turn_memory(turn_memory);
-        }
+        && let Ok(engine) = wf.try_lock()
+    {
+        engine.save_turn_memory(turn_memory);
+    }
 }
 
 /// Digest a reasoning blob for re-injection: keep the head and (more important)
@@ -222,59 +223,69 @@ fn push_interjection_message(
     ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
 ) {
     if let Some(wf) = workflow_engine
-        && let Ok(engine) = wf.try_lock() {
-            // Pin durable user constraints to the blackboard before any routing,
-            // so a rule stated mid-task survives compaction and phase switches.
-            if crate::agent::blackboard::looks_like_constraint(text) {
-                crate::agent::blackboard::add_constraint(&engine, text);
-            }
-            if !engine.allows_midflight_interjection() {
-                if crate::agent::workflow_session::looks_like_fix_continuation(text)
-                    || text.trim().starts_with("/fix")
-                {
-                    let result = crate::agent::phase::on_user_message(&engine, text);
-                    notify_workspace_state_if_changed(ui_tx, &engine, &result);
-                    user_round::set_turn_user_input(&engine, text);
-                    let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                        "💬 User (Act 修复介入): {}",
-                        text.trim().chars().take(120).collect::<String>()
-                    )));
-                    // Inject the last assistant message as reference so the LLM
-                    // doesn't need to re-read the history
-                    let last_assistant: String = messages.iter().rev()
-                        .filter_map(|m| {
-                            if let Message::Assistant { content, .. } = m {
-                                if !content.is_empty() { Some(content.clone()) } else { None }
-                            } else { None }
-                        })
-                        .next()
-                        .unwrap_or_default();
-                    let last_analysis = if last_assistant.chars().count() > 800 {
-                        format!("{}…", last_assistant.chars().take(800).collect::<String>())
-                    } else {
-                        last_assistant
-                    };
-                    let directive = if !last_analysis.is_empty() {
-                        format!(
-                            "【直接实施】用户要求你按上一轮的分析结果直接实施。\
+        && let Ok(engine) = wf.try_lock()
+    {
+        // Pin durable user constraints to the blackboard before any routing,
+        // so a rule stated mid-task survives compaction and phase switches.
+        if crate::agent::blackboard::looks_like_constraint(text) {
+            crate::agent::blackboard::add_constraint(&engine, text);
+        }
+        if !engine.allows_midflight_interjection() {
+            if crate::agent::workflow_session::looks_like_fix_continuation(text)
+                || text.trim().starts_with("/fix")
+            {
+                let result = crate::agent::phase::on_user_message(&engine, text);
+                notify_workspace_state_if_changed(ui_tx, &engine, &result);
+                user_round::set_turn_user_input(&engine, text);
+                let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                    "💬 User (Act 修复介入): {}",
+                    text.trim().chars().take(120).collect::<String>()
+                )));
+                // Inject the last assistant message as reference so the LLM
+                // doesn't need to re-read the history
+                let last_assistant: String = messages
+                    .iter()
+                    .rev()
+                    .filter_map(|m| {
+                        if let Message::Assistant { content, .. } = m {
+                            if !content.is_empty() {
+                                Some(content.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .next()
+                    .unwrap_or_default();
+                let last_analysis = if last_assistant.chars().count() > 800 {
+                    format!("{}…", last_assistant.chars().take(800).collect::<String>())
+                } else {
+                    last_assistant
+                };
+                let directive = if !last_analysis.is_empty() {
+                    format!(
+                        "【直接实施】用户要求你按上一轮的分析结果直接实施。\
                              你上一轮的分析原文:\n{} \
                              \n直接按此方案 edit_file 改代码，不要重新读文件、不要重新探索。",
-                            last_analysis
-                        )
-                    } else {
-                        "【直接实施】用户要求你按上一轮的分析结果直接实施。\
-                         直接 edit_file 改代码，不要重新读文件。".to_string()
-                    };
-                    messages.push(Message::system(&directive));
-                    return;
-                }
-                tracing::info!("[WORKFLOW] Blocked mid-flight interjection in Act phase");
-                let _ = ui_tx.send(AgentToUiEvent::Status(
-                    crate::agent::workflow_phases::act_interjection_blocked_message().to_string(),
-                ));
+                        last_analysis
+                    )
+                } else {
+                    "【直接实施】用户要求你按上一轮的分析结果直接实施。\
+                         直接 edit_file 改代码，不要重新读文件。"
+                        .to_string()
+                };
+                messages.push(Message::system(&directive));
                 return;
             }
+            tracing::info!("[WORKFLOW] Blocked mid-flight interjection in Act phase");
+            let _ = ui_tx.send(AgentToUiEvent::Status(
+                crate::agent::workflow_phases::act_interjection_blocked_message().to_string(),
+            ));
+            return;
         }
+    }
 
     let sanitized = if injection::is_suspicious(text) {
         let result = injection::detect(text);
@@ -317,9 +328,10 @@ fn push_interjection_message(
     };
 
     if let Some(wf) = workflow_engine
-        && let Ok(engine) = wf.try_lock() {
-            user_round::set_turn_user_input(&engine, &sanitized_for_user);
-        }
+        && let Ok(engine) = wf.try_lock()
+    {
+        user_round::set_turn_user_input(&engine, &sanitized_for_user);
+    }
 
     messages.push(Message::user(&formatted));
     let _ = ui_tx.send(AgentToUiEvent::Status(format!(
@@ -412,12 +424,13 @@ fn try_capture_review_findings(
         crate::agent::phase::transition(&engine, crate::agent::phase::PhaseEvent::FindingsStored);
     notify_workspace_state_if_changed(ui_tx, &engine, &result);
     if let Some(store) = crate::agent::findings::load_or_migrate(&engine)
-        && !store.findings.is_empty() {
-            let _ = ui_tx.send(AgentToUiEvent::FindingsPanel {
-                summary: crate::agent::presentation::panel_summary(&store),
-                rows: store.progress_rows(),
-            });
-        }
+        && !store.findings.is_empty()
+    {
+        let _ = ui_tx.send(AgentToUiEvent::FindingsPanel {
+            summary: crate::agent::presentation::panel_summary(&store),
+            rows: store.progress_rows(),
+        });
+    }
     if result.phase == crate::agent::phase::SingleFlowPhase::AwaitUser {
         // Don't re-arm if already confirmed
         if !crate::agent::business_gate::scope_implementation_unlocked(&engine) {
@@ -454,7 +467,10 @@ fn strip_tool_call_xml(text: &str) -> String {
             in_tag = false;
             i += b"</tool_call>".len();
         } else if !in_tag {
-            let ch = text[i..].chars().next().unwrap_or(char::REPLACEMENT_CHARACTER);
+            let ch = text[i..]
+                .chars()
+                .next()
+                .unwrap_or(char::REPLACEMENT_CHARACTER);
             out.push(ch);
             i += ch.len_utf8();
         } else {
@@ -571,11 +587,12 @@ fn inject_slim_context(
     // archived nodes this session). Highest-priority anchor, like the blackboard.
     if let Some(wf) = workflow_engine
         && let Ok(engine) = wf.try_lock()
-            && let Some(graph) = engine.get_variable(crate::agent::memory_offload::MEMORY_GRAPH_VAR)
-                && !graph.trim().is_empty() {
-                    block.push_str(&graph);
-                    block.push_str("\n\n");
-                }
+        && let Some(graph) = engine.get_variable(crate::agent::memory_offload::MEMORY_GRAPH_VAR)
+        && !graph.trim().is_empty()
+    {
+        block.push_str(&graph);
+        block.push_str("\n\n");
+    }
 
     block.push_str(&build_task_anchor_block(
         user_task,
@@ -601,9 +618,10 @@ fn inject_slim_context(
     }
 
     if let Some(wf) = workflow_engine
-        && let Ok(engine) = wf.try_lock() {
-            block.push_str(&build_workspace_block(&engine, unified_tool_mode));
-        }
+        && let Ok(engine) = wf.try_lock()
+    {
+        block.push_str(&build_workspace_block(&engine, unified_tool_mode));
+    }
 
     messages.push(Message::system(&block));
 }
@@ -625,18 +643,23 @@ fn build_task_anchor_block(
 ) -> String {
     let mut b = String::new();
     let task: String = user_task.chars().take(300).collect();
-    let ellipsis = if task.len() < user_task.len() { "…" } else { "" };
+    let ellipsis = if task.len() < user_task.len() {
+        "…"
+    } else {
+        ""
+    };
     b.push_str(&format!("[TURN_CONTEXT]\n🎯 任务: {task}{ellipsis}\n"));
 
     // Constraint blackboard — always visible
     if let Some(wf) = workflow_engine
-        && let Ok(engine) = wf.try_lock() {
-            let bb = crate::agent::blackboard::block(&engine);
-            if !bb.is_empty() {
-                b.push_str(&bb);
-                b.push('\n');
-            }
+        && let Ok(engine) = wf.try_lock()
+    {
+        let bb = crate::agent::blackboard::block(&engine);
+        if !bb.is_empty() {
+            b.push_str(&bb);
+            b.push('\n');
         }
+    }
 
     // Progress + phase ripple
     let tool_count = turn_memory.entries.len();
@@ -659,9 +682,17 @@ fn build_task_anchor_block(
         String::new()
     };
     if phase_line.is_empty() {
-        b.push_str(&format!("📍 iteration {} · 工具 {} 次\n", iteration + 1, tool_count));
+        b.push_str(&format!(
+            "📍 iteration {} · 工具 {} 次\n",
+            iteration + 1,
+            tool_count
+        ));
     } else {
-        b.push_str(&format!("📍 iteration {} · 工具 {} 次 · {phase_line}\n", iteration + 1, tool_count));
+        b.push_str(&format!(
+            "📍 iteration {} · 工具 {} 次 · {phase_line}\n",
+            iteration + 1,
+            tool_count
+        ));
     }
 
     // 🔍 Exploration/implementation budget gauge — makes the cost of continued
@@ -685,10 +716,7 @@ fn build_task_anchor_block(
 }
 
 /// Section 2: tool trace — edited files + recent tool log + decisions.
-fn build_tool_trace_block(
-    turn_memory: &turn_memory::TurnMemory,
-    slim_phase: bool,
-) -> String {
+fn build_tool_trace_block(turn_memory: &turn_memory::TurnMemory, slim_phase: bool) -> String {
     let mut b = String::new();
     const EDIT_TOOLS: [&str; 3] = ["file_write", "edit_file", "delete_range"];
     let is_edit = |tool: &str| EDIT_TOOLS.contains(&tool);
@@ -699,7 +727,13 @@ fn build_tool_trace_block(
         let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for e in turn_memory.entries.iter().filter(|e| is_edit(&e.tool)) {
             let target: String = e.target.chars().take(120).collect();
-            if counts.insert(target.clone(), counts.get(&target).copied().unwrap_or(0) + 1).is_none() {
+            if counts
+                .insert(
+                    target.clone(),
+                    counts.get(&target).copied().unwrap_or(0) + 1,
+                )
+                .is_none()
+            {
                 order.push(target);
             }
         }
@@ -717,21 +751,36 @@ fn build_tool_trace_block(
     // Recent tool log
     if !turn_memory.entries.is_empty() {
         let read_window = if slim_phase { 12 } else { 8 };
-        let edits: Vec<&turn_memory::TurnMemoryEntry> =
-            turn_memory.entries.iter().filter(|e| is_edit(&e.tool)).collect();
-        let all_reads: Vec<&turn_memory::TurnMemoryEntry> =
-            turn_memory.entries.iter().filter(|e| !is_edit(&e.tool)).collect();
+        let edits: Vec<&turn_memory::TurnMemoryEntry> = turn_memory
+            .entries
+            .iter()
+            .filter(|e| is_edit(&e.tool))
+            .collect();
+        let all_reads: Vec<&turn_memory::TurnMemoryEntry> = turn_memory
+            .entries
+            .iter()
+            .filter(|e| !is_edit(&e.tool))
+            .collect();
         let read_start = all_reads.len().saturating_sub(read_window);
         let recent_reads = &all_reads[read_start..];
-        let combined: Vec<&turn_memory::TurnMemoryEntry> =
-            edits.into_iter().chain(recent_reads.iter().copied()).collect();
+        let combined: Vec<&turn_memory::TurnMemoryEntry> = edits
+            .into_iter()
+            .chain(recent_reads.iter().copied())
+            .collect();
         if !combined.is_empty() {
             b.push_str("\n你刚才已经执行过:\n");
             for e in combined {
-                let icon = if e.outcome == "ok" || e.outcome.starts_with("ok") { "✅" } else { "⚠️" };
-                b.push_str(&format!("  {icon} {}({}) → {}\n", e.tool,
+                let icon = if e.outcome == "ok" || e.outcome.starts_with("ok") {
+                    "✅"
+                } else {
+                    "⚠️"
+                };
+                b.push_str(&format!(
+                    "  {icon} {}({}) → {}\n",
+                    e.tool,
                     e.target.chars().take(80).collect::<String>(),
-                    e.outcome.chars().take(160).collect::<String>()));
+                    e.outcome.chars().take(160).collect::<String>()
+                ));
             }
         }
     }
@@ -741,7 +790,10 @@ fn build_tool_trace_block(
         let window = if slim_phase { 8 } else { 4 };
         b.push_str("\n你刚才形成的判断（非原始 think 摘要）:\n");
         for d in turn_memory.decisions.iter().rev().take(window).rev() {
-            b.push_str(&format!("  - {}\n", d.chars().take(220).collect::<String>()));
+            b.push_str(&format!(
+                "  - {}\n",
+                d.chars().take(220).collect::<String>()
+            ));
         }
     }
     b
@@ -756,38 +808,54 @@ fn build_workspace_block(
 
     // Required action from workspace
     if crate::agent::phase::should_inject_workspace(engine)
-        && let Some(ws) = crate::agent::workspace::WorkflowWorkspace::build(engine) {
-            let action_text = if unified_tool_mode {
-                format_required_action_one_liner_unified(&ws.required_action)
-            } else {
-                format_required_action_one_liner(&ws.required_action)
-            };
-            b.push_str(&format!("\n下一步: {action_text}\n"));
-        }
+        && let Some(ws) = crate::agent::workspace::WorkflowWorkspace::build(engine)
+    {
+        let action_text = if unified_tool_mode {
+            format_required_action_one_liner_unified(&ws.required_action)
+        } else {
+            format_required_action_one_liner(&ws.required_action)
+        };
+        b.push_str(&format!("\n下一步: {action_text}\n"));
+    }
 
     // Scope gate
     if crate::agent::business_gate::is_pending_scope(engine) {
         b.push_str("\n⏸️ 门禁: 等待用户 c /confirm 确认范围\n");
         if let Some(store) = crate::agent::findings::load_or_migrate(engine)
-            && !store.findings.is_empty() {
-                b.push_str("\n📋 当前 findings (用户按编号讨论):\n");
-                for f in &store.findings {
-                    let icon = if store.active_indices.is_empty() || store.active_indices.contains(&f.index) { "☐" } else { "⊘" };
-                    b.push_str(&format!("  {icon} #{} [{}] {} — {}\n", f.index,
-                        f.severity.label(),
-                        f.file.rsplit('/').next().unwrap_or(&f.file),
-                        f.issue.chars().take(80).collect::<String>()));
-                }
+            && !store.findings.is_empty()
+        {
+            b.push_str("\n📋 当前 findings (用户按编号讨论):\n");
+            for f in &store.findings {
+                let icon =
+                    if store.active_indices.is_empty() || store.active_indices.contains(&f.index) {
+                        "☐"
+                    } else {
+                        "⊘"
+                    };
+                b.push_str(&format!(
+                    "  {icon} #{} [{}] {} — {}\n",
+                    f.index,
+                    f.severity.label(),
+                    f.file.rsplit('/').next().unwrap_or(&f.file),
+                    f.issue.chars().take(80).collect::<String>()
+                ));
             }
+        }
     }
 
     // Implement phase: review handoff files
     if crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::Implement {
         let mut files: Vec<String> = engine.review_handoff_files();
         if files.is_empty()
-            && let Some(store) = crate::agent::findings::load_or_migrate(engine) {
-                files = store.findings.iter().filter(|f| !f.file.is_empty()).map(|f| f.file.clone()).collect();
-            }
+            && let Some(store) = crate::agent::findings::load_or_migrate(engine)
+        {
+            files = store
+                .findings
+                .iter()
+                .filter(|f| !f.file.is_empty())
+                .map(|f| f.file.clone())
+                .collect();
+        }
         if !files.is_empty() {
             b.push_str("\n📂 审查阶段已读文件（内容在上文，直接编辑，勿重新探索）:\n");
             let mut seen = std::collections::HashSet::new();
@@ -803,11 +871,17 @@ fn build_workspace_block(
     if !crate::agent::phase::should_inject_workspace(engine) {
         let dm = engine.durable_memory_block();
         if !dm.is_empty() {
-            b.push_str(&format!("\n记忆: {}\n", dm.chars().take(400).collect::<String>()));
+            b.push_str(&format!(
+                "\n记忆: {}\n",
+                dm.chars().take(400).collect::<String>()
+            ));
         }
         let ur = engine.user_round_memory_block();
         if !ur.is_empty() {
-            b.push_str(&format!("\n上下文: {}\n", ur.chars().take(200).collect::<String>()));
+            b.push_str(&format!(
+                "\n上下文: {}\n",
+                ur.chars().take(200).collect::<String>()
+            ));
         }
     }
 
@@ -973,9 +1047,10 @@ pub async fn run_agent_turn(
 
     // Fresh symbol-search dedup each agent spawn (workflow vars may survive across sessions).
     if let Some(wf) = &workflow_engine
-        && let Ok(engine) = wf.try_lock() {
-            crate::agent::read_guard::clear_symbol_queries(&engine);
-        }
+        && let Ok(engine) = wf.try_lock()
+    {
+        crate::agent::read_guard::clear_symbol_queries(&engine);
+    }
 
     // 🎯 Anchor to the **current turn user input** (not session history)
     let user_task: Option<String> = workflow_engine
@@ -1018,7 +1093,9 @@ pub async fn run_agent_turn(
                 memory_bridge::inject_durable_memory(&mut messages, &block);
             }
         } else {
-            tracing::warn!("[run_agent_turn] Failed to acquire workflow_engine lock for memory injection");
+            tracing::warn!(
+                "[run_agent_turn] Failed to acquire workflow_engine lock for memory injection"
+            );
         }
     }
 
@@ -1087,12 +1164,13 @@ pub async fn run_agent_turn(
                     if is_confirm {
                         // Set pre-ack so scope gate skips waiting
                         if let Some(wf) = &workflow_engine
-                            && let Ok(engine) = wf.try_lock() {
-                                engine.set_variable(
-                                    crate::agent::business_gate::PRE_ACK_KEY,
-                                    "1".to_string(),
-                                );
-                            }
+                            && let Ok(engine) = wf.try_lock()
+                        {
+                            engine.set_variable(
+                                crate::agent::business_gate::PRE_ACK_KEY,
+                                "1".to_string(),
+                            );
+                        }
                     }
                     push_interjection_message(&workflow_engine, &mut messages, &text, &ui_tx);
                 }
@@ -1102,12 +1180,13 @@ pub async fn run_agent_turn(
                 ui_event::UiToAgentEvent::ScopeConfirmed
                 | ui_event::UiToAgentEvent::BusinessAck { .. } => {
                     if let Some(wf) = &workflow_engine
-                        && let Ok(engine) = wf.try_lock() {
-                            engine.set_variable(
-                                crate::agent::business_gate::PRE_ACK_KEY,
-                                "1".to_string(),
-                            );
-                        }
+                        && let Ok(engine) = wf.try_lock()
+                    {
+                        engine.set_variable(
+                            crate::agent::business_gate::PRE_ACK_KEY,
+                            "1".to_string(),
+                        );
+                    }
                 }
                 _ => {} // Other events ignored
             }
@@ -1136,9 +1215,10 @@ pub async fn run_agent_turn(
         turn_memory.sync_from_messages(&messages, include_writes);
         if let Some(wf) = &workflow_engine
             && let Ok(engine) = wf.try_lock()
-                && let Some(ti) = user_round::get_turn_user_input(&engine) {
-                    turn_memory.user_task = ti;
-                }
+            && let Some(ti) = user_round::get_turn_user_input(&engine)
+        {
+            turn_memory.user_task = ti;
+        }
 
         // Workflow: collapse repeated idle narration (keeps LLM context lean)
         if workflow_engine
@@ -1274,11 +1354,20 @@ pub async fn run_agent_turn(
 
         // Show system prompt preview (debug level)
         if let Some(first_msg) = msgs.first()
-            && let Message::System { content } = first_msg {
-                tracing::debug!("📋 SYSTEM PROMPT LENGTH: {} characters", content.chars().count());
-            }
-        tracing::debug!("Enabled tools: {}",
-            schemas.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+            && let Message::System { content } = first_msg
+        {
+            tracing::debug!(
+                "📋 SYSTEM PROMPT LENGTH: {} characters",
+                content.chars().count()
+            );
+        }
+        tracing::debug!(
+            "Enabled tools: {}",
+            schemas
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         tracing::debug!("{}", "=".repeat(80));
 
@@ -1328,8 +1417,7 @@ pub async fn run_agent_turn(
         // Timeout for the entire LLM response (stream first token → stream done).
         // Separate from the per-tool 300s timeout; prevents the agent hanging
         // for 15+ minutes when the API silently drops the connection.
-        const LLM_RESPONSE_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(180);
+        const LLM_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
         while let Some(event) = tokio::select! {
             ev = llm_rx.recv() => ev,
@@ -1372,16 +1460,16 @@ pub async fn run_agent_turn(
                     if clean_visible.len() < visible_piece.len() {
                         // Something was stripped — a tool call was detected in the stream
                         if let Some(action) = extract_action_from_xml(&visible_piece) {
-                            let _ = ui_tx.send(AgentToUiEvent::Status(
-                                format!("🔄 {} ...", action)
-                            ));
+                            let _ =
+                                ui_tx.send(AgentToUiEvent::Status(format!("🔄 {} ...", action)));
                         }
                     }
                     if let Some(ref mut filter) = findings_stream {
                         if let Some(visible) = filter.push(&clean_visible)
-                            && !visible.is_empty() {
-                                let _ = ui_tx.send(AgentToUiEvent::TextChunk(visible));
-                            }
+                            && !visible.is_empty()
+                        {
+                            let _ = ui_tx.send(AgentToUiEvent::TextChunk(visible));
+                        }
                     } else if !clean_visible.is_empty() {
                         let _ = ui_tx.send(AgentToUiEvent::TextChunk(clean_visible));
                     }
@@ -1414,10 +1502,15 @@ pub async fn run_agent_turn(
                         let was_empty = args.is_empty();
                         args.push_str(&delta);
                         // Once we have at least the action field, show it in status bar
-                        if was_empty && unified_tool_mode
-                            && let Ok(action) = serde_json::from_str::<crate::agent::unified_action::UnifiedActionRequest>(args) {
-                                let _ = ui_tx.send(AgentToUiEvent::Status(format!("🔄 {} ...", action.action)));
-                            }
+                        if was_empty
+                            && unified_tool_mode
+                            && let Ok(action) = serde_json::from_str::<
+                                crate::agent::unified_action::UnifiedActionRequest,
+                            >(args)
+                        {
+                            let _ = ui_tx
+                                .send(AgentToUiEvent::Status(format!("🔄 {} ...", action.action)));
+                        }
                     }
                     if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
                         tc.arguments.push_str(&delta);
@@ -1492,9 +1585,7 @@ pub async fn run_agent_turn(
                     let is_client_api_error = err.contains("API error 400")
                         || err.contains("API error 413")
                         || err.contains("API error 422");
-                    if is_client_api_error
-                        && api_error_recovery_streak < MAX_API_ERROR_RECOVERY
-                    {
+                    if is_client_api_error && api_error_recovery_streak < MAX_API_ERROR_RECOVERY {
                         api_error_recovery_streak += 1;
                         tracing::warn!(
                             "[AGENT] API error recovery {}/{}: trimming context and retrying",
@@ -1529,9 +1620,10 @@ pub async fn run_agent_turn(
         }
 
         if let Some(ref mut filter) = findings_stream
-            && let Some(tail) = filter.flush_tail() {
-                let _ = ui_tx.send(AgentToUiEvent::TextChunk(tail));
-            }
+            && let Some(tail) = filter.flush_tail()
+        {
+            let _ = ui_tx.send(AgentToUiEvent::TextChunk(tail));
+        }
 
         // ── Unified budget offload ──
         // When the API's real prompt-token count crosses 80% of the window,
@@ -1540,48 +1632,47 @@ pub async fn run_agent_turn(
         // compaction). Runs here, after the stream fully ends, so `messages`
         // isn't borrowed mid-loop.
         if last_prompt_tokens > 0
-            && let Some(ref ms) = tool_ctx.memory_store {
-                let session_id = workflow_engine
-                    .as_ref()
-                    .and_then(|wf| wf.try_lock().ok())
-                    .map(|e| e.session_id())
-                    .unwrap_or_else(|| "default".to_string());
-                let fail_streak = workflow_engine
-                    .as_ref()
-                    .and_then(|wf| wf.try_lock().ok())
-                    .and_then(|e| e.get_variable(memory_offload::OFFLOAD_FAIL_VAR))
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(0);
-                let context_window = active_provider.context_window_size();
-                let summarizer = tool_ctx.summarizer.clone();
-                let ui_tx_offload = ui_tx.clone();
-                let (outcome, new_streak) = memory_offload::offload_if_over_budget(
-                    last_prompt_tokens,
-                    context_window,
-                    &mut messages,
-                    summarizer,
-                    &active_provider,
-                    ms,
-                    &session_id,
-                    fail_streak,
-                    |s| {
-                        let _ = ui_tx_offload.send(AgentToUiEvent::Status(s));
-                    },
-                )
-                .await;
-                if let Some(wf) = &workflow_engine
-                    && let Ok(engine) = wf.try_lock() {
-                        engine.set_variable(
-                            memory_offload::OFFLOAD_FAIL_VAR,
-                            new_streak.to_string(),
-                        );
-                        // Refresh the top-of-context graph block after any archival.
-                        if matches!(outcome, memory_offload::OffloadOutcome::Archived { .. }) {
-                            let block = memory_offload::build_memory_graph_block(ms, &session_id);
-                            engine.set_variable(memory_offload::MEMORY_GRAPH_VAR, block);
-                        }
-                    }
+            && let Some(ref ms) = tool_ctx.memory_store
+        {
+            let session_id = workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .map(|e| e.session_id())
+                .unwrap_or_else(|| "default".to_string());
+            let fail_streak = workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .and_then(|e| e.get_variable(memory_offload::OFFLOAD_FAIL_VAR))
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let context_window = active_provider.context_window_size();
+            let summarizer = tool_ctx.summarizer.clone();
+            let ui_tx_offload = ui_tx.clone();
+            let (outcome, new_streak) = memory_offload::offload_if_over_budget(
+                last_prompt_tokens,
+                context_window,
+                &mut messages,
+                summarizer,
+                &active_provider,
+                ms,
+                &session_id,
+                fail_streak,
+                |s| {
+                    let _ = ui_tx_offload.send(AgentToUiEvent::Status(s));
+                },
+            )
+            .await;
+            if let Some(wf) = &workflow_engine
+                && let Ok(engine) = wf.try_lock()
+            {
+                engine.set_variable(memory_offload::OFFLOAD_FAIL_VAR, new_streak.to_string());
+                // Refresh the top-of-context graph block after any archival.
+                if matches!(outcome, memory_offload::OffloadOutcome::Archived { .. }) {
+                    let block = memory_offload::build_memory_graph_block(ms, &session_id);
+                    engine.set_variable(memory_offload::MEMORY_GRAPH_VAR, block);
+                }
             }
+        }
 
         // Repair malformed / empty tool arguments (GLM empty JSON, XML <tool_call> hallucinations).
         // If arguments are XML, return error immediately — don't silently repair.
@@ -1794,71 +1885,62 @@ pub async fn run_agent_turn(
             // Cross-step idle detection — break prose↔gate loops before stacking messages.
             if let Some(ref engine_arc) = workflow_engine
                 && let Ok(engine) = engine_arc.try_lock()
-                    && engine.is_workflow_active() && pre_llm_step_idx <= 3 {
-                        let ctx = crate::agent::idle_narrative::IdleContext {
-                            step_idx: pre_llm_step_idx,
-                            engine: Some(&*engine),
-                        };
-                        let visible_for_idle = crate::agent::think_stream::visible_only(&full_text);
-                        if !crate::agent::idle_narrative::is_step_deliverable(
-                            &ctx,
-                            &visible_for_idle,
-                        ) && crate::agent::idle_narrative::is_idle_narrative(&visible_for_idle)
-                        {
-                            match crate::agent::idle_narrative::handle_empty_response(
-                                &ctx,
-                                &visible_for_idle,
-                                &mut idle_streak,
-                                false,
-                                Some(last_stream_completion_tokens),
-                                unified_tool_mode,
-                            ) {
-                                crate::agent::idle_narrative::IdleAction::EndTurn {
-                                    user_status,
-                                } => {
-                                    tracing::warn!(
-                                        "[IDLE] step {} streak {} — ending turn",
-                                        pre_llm_step_idx,
-                                        idle_streak
-                                    );
-                                    let _ = ui_tx.send(AgentToUiEvent::Status(user_status));
-                                    persist_turn_memory(&workflow_engine, &turn_memory);
-                                    drop(engine);
-                                    emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                                    return;
-                                }
-                                crate::agent::idle_narrative::IdleAction::Continue {
-                                    directive,
-                                } => {
-                                    let msg = Message::Assistant {
-                                        content: crate::agent::think_stream::visible_only(
-                                            &full_text,
-                                        ),
-                                        tool_calls: Vec::new(),
-                                        reasoning_content: None,
-                                    };
-                                    crate::agent::idle_narrative::upsert_idle_assistant(
-                                        &mut messages,
-                                        &msg,
-                                    );
-                                    crate::agent::idle_narrative::upsert_idle_assistant(
-                                        &mut new_messages,
-                                        &msg,
-                                    );
-                                    if let Some(d) = directive {
-                                        crate::agent::idle_narrative::upsert_idle_hint(
-                                            &mut messages,
-                                            &d,
-                                        );
-                                    }
-                                    persist_turn_memory(&workflow_engine, &turn_memory);
-                                    drop(engine);
-                                    iteration += 1;
-                                    continue;
-                                }
+                && engine.is_workflow_active()
+                && pre_llm_step_idx <= 3
+            {
+                let ctx = crate::agent::idle_narrative::IdleContext {
+                    step_idx: pre_llm_step_idx,
+                    engine: Some(&*engine),
+                };
+                let visible_for_idle = crate::agent::think_stream::visible_only(&full_text);
+                if !crate::agent::idle_narrative::is_step_deliverable(&ctx, &visible_for_idle)
+                    && crate::agent::idle_narrative::is_idle_narrative(&visible_for_idle)
+                {
+                    match crate::agent::idle_narrative::handle_empty_response(
+                        &ctx,
+                        &visible_for_idle,
+                        &mut idle_streak,
+                        false,
+                        Some(last_stream_completion_tokens),
+                        unified_tool_mode,
+                    ) {
+                        crate::agent::idle_narrative::IdleAction::EndTurn { user_status } => {
+                            tracing::warn!(
+                                "[IDLE] step {} streak {} — ending turn",
+                                pre_llm_step_idx,
+                                idle_streak
+                            );
+                            let _ = ui_tx.send(AgentToUiEvent::Status(user_status));
+                            persist_turn_memory(&workflow_engine, &turn_memory);
+                            drop(engine);
+                            emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
+                            return;
+                        }
+                        crate::agent::idle_narrative::IdleAction::Continue { directive } => {
+                            let msg = Message::Assistant {
+                                content: crate::agent::think_stream::visible_only(&full_text),
+                                tool_calls: Vec::new(),
+                                reasoning_content: None,
+                            };
+                            crate::agent::idle_narrative::upsert_idle_assistant(
+                                &mut messages,
+                                &msg,
+                            );
+                            crate::agent::idle_narrative::upsert_idle_assistant(
+                                &mut new_messages,
+                                &msg,
+                            );
+                            if let Some(d) = directive {
+                                crate::agent::idle_narrative::upsert_idle_hint(&mut messages, &d);
                             }
+                            persist_turn_memory(&workflow_engine, &turn_memory);
+                            drop(engine);
+                            iteration += 1;
+                            continue;
                         }
                     }
+                }
+            }
 
             // Single-step model: always show the assistant's text to the user
             // (perception filter strips machine-only findings JSON when present).
@@ -1884,20 +1966,21 @@ pub async fn run_agent_turn(
                 upsert_review_report_assistant(&mut new_messages, &msg);
                 if let Some(ref engine_arc) = workflow_engine
                     && let Ok(engine) = engine_arc.try_lock()
-                        && engine.is_single_step() {
-                            let phase = crate::agent::phase::get(&engine);
-                            if matches!(
-                                phase,
-                                crate::agent::phase::SingleFlowPhase::Receive
-                                    | crate::agent::phase::SingleFlowPhase::Review
-                            ) {
-                                let result = crate::agent::phase::transition(
-                                    &engine,
-                                    crate::agent::phase::PhaseEvent::ReviewReportDelivered,
-                                );
-                                notify_workspace_state_if_changed(&ui_tx, &engine, &result);
-                            }
-                        }
+                    && engine.is_single_step()
+                {
+                    let phase = crate::agent::phase::get(&engine);
+                    if matches!(
+                        phase,
+                        crate::agent::phase::SingleFlowPhase::Receive
+                            | crate::agent::phase::SingleFlowPhase::Review
+                    ) {
+                        let result = crate::agent::phase::transition(
+                            &engine,
+                            crate::agent::phase::PhaseEvent::ReviewReportDelivered,
+                        );
+                        notify_workspace_state_if_changed(&ui_tx, &engine, &result);
+                    }
+                }
             } else if workflow_active
                 && crate::agent::idle_narrative::is_idle_narrative(&content_for_session)
             {
@@ -1911,99 +1994,94 @@ pub async fn run_agent_turn(
             // ── Implement: block re-emitting review findings instead of editing ──
             if let Some(ref engine_arc) = workflow_engine
                 && let Ok(engine) = engine_arc.try_lock()
-                    && crate::agent::phase::get(&engine)
-                        == crate::agent::phase::SingleFlowPhase::Implement
-                        && !crate::agent::engine::WorkflowEngine::text_signals_done(&full_text)
-                        && (crate::agent::engine::WorkflowEngine::looks_like_review_report(
-                            &full_text,
-                        ) || crate::agent::perception::extract_from_text(&full_text).is_some())
-                    {
-                        messages.push(Message::system(
-                            "【实施轮】禁止重新输出 findings / 审查报告。\
+                && crate::agent::phase::get(&engine)
+                    == crate::agent::phase::SingleFlowPhase::Implement
+                && !crate::agent::engine::WorkflowEngine::text_signals_done(&full_text)
+                && (crate::agent::engine::WorkflowEngine::looks_like_review_report(&full_text)
+                    || crate::agent::perception::extract_from_text(&full_text).is_some())
+            {
+                messages.push(Message::system(
+                    "【实施轮】禁止重新输出 findings / 审查报告。\
                              读 [TURN_CONTEXT]「下一步」，直接 file_read → edit_file。",
-                        ));
-                        persist_turn_memory(&workflow_engine, &turn_memory);
-                        iteration += 1;
-                        continue;
-                    }
+                ));
+                persist_turn_memory(&workflow_engine, &turn_memory);
+                iteration += 1;
+                continue;
+            }
 
             // ── ## Done → gatekeeper pipeline (single-step model) ──
             if crate::agent::engine::WorkflowEngine::text_signals_done(&full_text)
-                && let Some(ref engine_arc) = workflow_engine {
-                    let mut engine = engine_arc.lock().await;
-                    if engine.is_workflow_active() && !engine.is_workflow_complete() {
-                        let had_code = turn_memory.had_code_changes();
-                        match engine.run_done_gates(&full_text, had_code) {
-                            crate::agent::gatekeeper::GateReport::Pass => {
-                                engine.set_previous_output(&full_text);
-                                let had_receipt =
-                                    crate::agent::completion::extract_from_text(&full_text)
-                                        .is_some();
-                                if let Some(receipt) =
-                                    crate::agent::completion::extract_from_text(&full_text)
-                                    && let Some(mut store) =
-                                        crate::agent::findings::load_or_migrate(&engine)
-                                    {
-                                        crate::agent::completion::apply_receipt(
-                                            &mut store, &receipt,
-                                        );
-                                        crate::agent::findings::save(&engine, &store);
-                                    }
-                                let result = crate::agent::phase::transition(
+                && let Some(ref engine_arc) = workflow_engine
+            {
+                let mut engine = engine_arc.lock().await;
+                if engine.is_workflow_active() && !engine.is_workflow_complete() {
+                    let had_code = turn_memory.had_code_changes();
+                    match engine.run_done_gates(&full_text, had_code) {
+                        crate::agent::gatekeeper::GateReport::Pass => {
+                            engine.set_previous_output(&full_text);
+                            let had_receipt =
+                                crate::agent::completion::extract_from_text(&full_text).is_some();
+                            if let Some(receipt) =
+                                crate::agent::completion::extract_from_text(&full_text)
+                                && let Some(mut store) =
+                                    crate::agent::findings::load_or_migrate(&engine)
+                            {
+                                crate::agent::completion::apply_receipt(&mut store, &receipt);
+                                crate::agent::findings::save(&engine, &store);
+                            }
+                            let result = crate::agent::phase::transition(
+                                &engine,
+                                crate::agent::phase::PhaseEvent::DoneGatePassed {
+                                    had_completion_receipt: had_receipt,
+                                },
+                            );
+                            notify_workspace_state_if_changed(&ui_tx, &engine, &result);
+                            if result.phase == crate::agent::phase::SingleFlowPhase::Complete {
+                                let _ = engine.complete_workflow();
+                                emit_workflow_completed(
+                                    &ui_tx,
+                                    user_task.as_ref(),
                                     &engine,
-                                    crate::agent::phase::PhaseEvent::DoneGatePassed {
-                                        had_completion_receipt: had_receipt,
-                                    },
+                                    &full_text,
                                 );
-                                notify_workspace_state_if_changed(&ui_tx, &engine, &result);
-                                if result.phase == crate::agent::phase::SingleFlowPhase::Complete {
-                                    let _ = engine.complete_workflow();
-                                    emit_workflow_completed(
-                                        &ui_tx,
-                                        user_task.as_ref(),
-                                        &engine,
-                                        &full_text,
-                                    );
-                                    let _ =
-                                        ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
-                                } else if result.phase
-                                    == crate::agent::phase::SingleFlowPhase::AwaitUser
-                                {
-                                    let _ = ui_tx.send(AgentToUiEvent::Status(
-                                        "✅ 审查完成 — 门禁暂停，待用户在面板确认范围（c /confirm）"
-                                            .to_string(),
-                                    ));
-                                } else {
-                                    let _ =
-                                        ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
-                                }
-                                drop(engine);
-                                emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                                return;
+                                let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
+                            } else if result.phase
+                                == crate::agent::phase::SingleFlowPhase::AwaitUser
+                            {
+                                let _ = ui_tx.send(AgentToUiEvent::Status(
+                                    "✅ 审查完成 — 门禁暂停，待用户在面板确认范围（c /confirm）"
+                                        .to_string(),
+                                ));
+                            } else {
+                                let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
                             }
-                            crate::agent::gatekeeper::GateReport::Fail { gate, feedback } => {
-                                let recovery = gate_recovery_hint(&gate);
-                                messages.push(Message::system(format!(
-                                    "【门禁·{gate}】{feedback}\n\n\
+                            drop(engine);
+                            emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
+                            return;
+                        }
+                        crate::agent::gatekeeper::GateReport::Fail { gate, feedback } => {
+                            let recovery = gate_recovery_hint(&gate);
+                            messages.push(Message::system(format!(
+                                "【门禁·{gate}】{feedback}\n\n\
                                      👉 **恢复：** 按 [TURN_CONTEXT]「下一步」执行；{recovery}"
-                                )));
-                                persist_turn_memory(&workflow_engine, &turn_memory);
-                                drop(engine);
-                                iteration += 1;
-                                continue;
-                            }
-                            crate::agent::gatekeeper::GateReport::NeedsUser { gate, prompt } => {
-                                let status = format!("【门禁·{gate}】{prompt}");
-                                let _ = ui_tx.send(AgentToUiEvent::Status(status.clone()));
-                                messages.push(Message::system(&status));
-                                persist_turn_memory(&workflow_engine, &turn_memory);
-                                drop(engine);
-                                emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                                return;
-                            }
+                            )));
+                            persist_turn_memory(&workflow_engine, &turn_memory);
+                            drop(engine);
+                            iteration += 1;
+                            continue;
+                        }
+                        crate::agent::gatekeeper::GateReport::NeedsUser { gate, prompt } => {
+                            let status = format!("【门禁·{gate}】{prompt}");
+                            let _ = ui_tx.send(AgentToUiEvent::Status(status.clone()));
+                            messages.push(Message::system(&status));
+                            persist_turn_memory(&workflow_engine, &turn_memory);
+                            drop(engine);
+                            emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
+                            return;
                         }
                     }
                 }
+            }
 
             emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
             return;
@@ -2307,7 +2385,11 @@ pub async fn run_agent_turn(
         // captures WHY this action was chosen — not just that it was chosen.
         if visible_summary.trim().is_empty() && !reasoning_content.trim().is_empty() {
             let r = crate::agent::think_stream::visible_only(&reasoning_content);
-            let r = if r.is_empty() { reasoning_content.clone() } else { r };
+            let r = if r.is_empty() {
+                reasoning_content.clone()
+            } else {
+                r
+            };
             visible_summary = digest_reasoning(&r, 260);
         }
         let actions_summary = tool_calls
@@ -2459,12 +2541,10 @@ pub async fn run_agent_turn(
                             tool_calls.len(),
                             action_hint
                         );
-                        let _ = ui_tx.send(AgentToUiEvent::Status(
-                            format!(
-                                "⏱️ 操作超时 (300s) — 强制结束 | 已重试 {} 次",
-                                iteration
-                            )
-                        ));
+                        let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                            "⏱️ 操作超时 (300s) — 强制结束 | 已重试 {} 次",
+                            iteration
+                        )));
                         emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                         return;
                     }
@@ -2641,18 +2721,19 @@ pub async fn run_agent_turn(
                             }
                         }
                         if let Some(wf) = &workflow_engine
-                            && let Ok(engine) = wf.try_lock() {
-                                crate::agent::round_memory::append_round(
-                                    &engine,
-                                    crate::agent::round_memory::RoundRecord {
-                                        round_id: iteration,
-                                        user_intent: user_task.clone().unwrap_or_default(),
-                                        actions_summary: turn_memory.tool_names_summary(),
-                                        deliverables_summary: "finish confirmed".into(),
-                                        gate_outcomes: vec!["finish:user_finished".into()],
-                                    },
-                                );
-                            }
+                            && let Ok(engine) = wf.try_lock()
+                        {
+                            crate::agent::round_memory::append_round(
+                                &engine,
+                                crate::agent::round_memory::RoundRecord {
+                                    round_id: iteration,
+                                    user_intent: user_task.clone().unwrap_or_default(),
+                                    actions_summary: turn_memory.tool_names_summary(),
+                                    deliverables_summary: "finish confirmed".into(),
+                                    gate_outcomes: vec!["finish:user_finished".into()],
+                                },
+                            );
+                        }
                         emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                         return;
                     }
@@ -2850,23 +2931,23 @@ pub async fn run_agent_turn(
                 if let Err(e) = crate::agent::read_guard::check(&tc.name, &args_value, &engine) {
                     if tc.name == "file_read"
                         && let Some(path) = args_value.get("path").and_then(|p| p.as_str())
-                            && let Some(cached) =
-                                crate::agent::read_guard::cached_file_read_response(&engine, path)
-                            {
-                                let result_msg = Message::ToolResult {
-                                    tool_call_id: tc.id.clone(),
-                                    content: cached.clone(),
-                                };
-                                new_messages.push(result_msg.clone());
-                                messages.push(result_msg);
-                                turn_memory.record_tool(&tc.name, &tc.arguments, true);
-                                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                                    name: tc.name.clone(),
-                                    output: cached,
-                                    is_error: false,
-                                });
-                                continue;
-                            }
+                        && let Some(cached) =
+                            crate::agent::read_guard::cached_file_read_response(&engine, path)
+                    {
+                        let result_msg = Message::ToolResult {
+                            tool_call_id: tc.id.clone(),
+                            content: cached.clone(),
+                        };
+                        new_messages.push(result_msg.clone());
+                        messages.push(result_msg);
+                        turn_memory.record_tool(&tc.name, &tc.arguments, true);
+                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                            name: tc.name.clone(),
+                            output: cached,
+                            is_error: false,
+                        });
+                        continue;
+                    }
                     let result_msg = Message::ToolResult {
                         tool_call_id: tc.id.clone(),
                         content: format!("❌ {e}"),
@@ -2978,36 +3059,37 @@ pub async fn run_agent_turn(
                     &tool_ctx.config.enforcement_rules,
                     tc,
                     &messages,
-                ) {
-                    tracing::warn!(
-                        "🚫 Rule Enforcer blocked tool '{}': {}",
-                        tc.name,
-                        violation_msg
-                    );
+                )
+            {
+                tracing::warn!(
+                    "🚫 Rule Enforcer blocked tool '{}': {}",
+                    tc.name,
+                    violation_msg
+                );
 
-                    let error_result = Message::ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: violation_msg.clone(),
-                    };
-                    new_messages.push(error_result.clone());
-                    messages.push(error_result);
+                let error_result = Message::ToolResult {
+                    tool_call_id: tc.id.clone(),
+                    content: violation_msg.clone(),
+                };
+                new_messages.push(error_result.clone());
+                messages.push(error_result);
 
-                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                        name: tc.name.clone(),
-                        output: violation_msg,
-                        is_error: true,
-                    });
+                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                    name: tc.name.clone(),
+                    output: violation_msg,
+                    is_error: true,
+                });
 
-                    continue;
-                }
+                continue;
+            }
 
             let mut blacklist_warning: Option<String> = None;
             if tc.name == "shell_exec"
                 && let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                    && let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
-                        blacklist_warning =
-                            safety_gate::shell_blacklist_warning(&trust_manager, cmd);
-                    }
+                && let Some(cmd) = args_val.get("command").and_then(|v| v.as_str())
+            {
+                blacklist_warning = safety_gate::shell_blacklist_warning(&trust_manager, cmd);
+            }
 
             let should_confirm = safety_gate::needs_confirmation(
                 &trust_manager,
@@ -3145,7 +3227,6 @@ pub async fn run_agent_turn(
                             tc.name,
                             parse_err,
                             {
-                                
                                 if tc.arguments.chars().count() > 100 {
                                     tc.arguments.chars().take(100).collect::<String>()
                                 } else {
@@ -3179,12 +3260,13 @@ pub async fn run_agent_turn(
                     ui_event::UiToAgentEvent::ScopeConfirmed
                     | ui_event::UiToAgentEvent::BusinessAck { .. } => {
                         if let Some(wf) = &workflow_engine
-                            && let Ok(engine) = wf.try_lock() {
-                                engine.set_variable(
-                                    crate::agent::business_gate::PRE_ACK_KEY,
-                                    "1".to_string(),
-                                );
-                            }
+                            && let Ok(engine) = wf.try_lock()
+                        {
+                            engine.set_variable(
+                                crate::agent::business_gate::PRE_ACK_KEY,
+                                "1".to_string(),
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -3384,11 +3466,13 @@ pub async fn run_agent_turn(
 
             // Record to SQLite react_log for cross-round memory
             if let Some(ref ms) = tool_ctx.memory_store {
-                let session_id = workflow_engine.as_ref()
+                let session_id = workflow_engine
+                    .as_ref()
                     .and_then(|wf| wf.try_lock().ok())
                     .map(|e| e.session_id())
                     .unwrap_or_else(|| "default".to_string());
-                let task = workflow_engine.as_ref()
+                let task = workflow_engine
+                    .as_ref()
                     .and_then(|wf| wf.try_lock().ok())
                     .and_then(|e| e.get_variable("_current_user_request"))
                     .unwrap_or_default();
@@ -3436,47 +3520,48 @@ pub async fn run_agent_turn(
                 if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
                     let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as u32;
                     if let Some(ref engine_arc) = workflow_engine
-                        && let Ok(engine) = engine_arc.try_lock() {
-                            crate::agent::read_guard::record_file_read(&engine, path);
-                            crate::agent::tool_digest::record_read(
-                                &engine,
-                                path,
-                                &result.content,
-                                offset,
-                                None,
-                            );
-                            // Digest wrapping removed — LLM needs full file content.
-                            // Compaction at iteration 3 handles context bloat.
-                        }
+                        && let Ok(engine) = engine_arc.try_lock()
+                    {
+                        crate::agent::read_guard::record_file_read(&engine, path);
+                        crate::agent::tool_digest::record_read(
+                            &engine,
+                            path,
+                            &result.content,
+                            offset,
+                            None,
+                        );
+                        // Digest wrapping removed — LLM needs full file content.
+                        // Compaction at iteration 3 handles context bloat.
+                    }
                 }
             } else if matches!(tc.name.as_str(), "find_symbol" | "code_search")
                 && !result.is_error
                 && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                 && let Some(ref engine_arc) = workflow_engine
-                && let Ok(engine) = engine_arc.try_lock() {
-                    crate::agent::read_guard::record_symbol_query(&engine, &tc.name, &args);
-                }
+                && let Ok(engine) = engine_arc.try_lock()
+            {
+                crate::agent::read_guard::record_symbol_query(&engine, &tc.name, &args);
+            }
 
             // Snapshot tool results for Plan / Execute step iteration memory
             if !result.is_error
                 && let Some(ref engine_arc) = workflow_engine
-                    && let Ok(engine) = engine_arc.try_lock() {
-                        let step = engine.get_current_step_index();
-                        if crate::agent::exploration_snapshot::should_snapshot_for_step(
-                            step, &tc.name,
-                        ) {
-                            let target = crate::agent::exploration_snapshot::target_from_tool_args(
-                                &tc.name,
-                                &tc.arguments,
-                            );
-                            engine.record_exploration_result(
-                                &tool_ctx.working_dir,
-                                &tc.name,
-                                &target,
-                                &result_content,
-                            );
-                        }
-                    }
+                && let Ok(engine) = engine_arc.try_lock()
+            {
+                let step = engine.get_current_step_index();
+                if crate::agent::exploration_snapshot::should_snapshot_for_step(step, &tc.name) {
+                    let target = crate::agent::exploration_snapshot::target_from_tool_args(
+                        &tc.name,
+                        &tc.arguments,
+                    );
+                    engine.record_exploration_result(
+                        &tool_ctx.working_dir,
+                        &tc.name,
+                        &target,
+                        &result_content,
+                    );
+                }
+            }
 
             turn_memory.record_tool_with_result(
                 &tc.name,
@@ -3506,45 +3591,46 @@ pub async fn run_agent_turn(
 
             if tc.name == "shell_exec"
                 && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                    && let Some(cmd) = args.get("command").and_then(|c| c.as_str()) {
-                        let succeeded =
-                            post_edit_verification::shell_result_success(&sanitized_content);
-                        if let Some(ref engine_arc) = workflow_engine
-                            && let Ok(engine) = engine_arc.try_lock() {
-                                post_edit_verification::note_shell_verify_result(
-                                    &engine, cmd, succeeded,
-                                );
-                                if succeeded
-                                    && let Some(idx) = engine.get_plan_tracker().and_then(|t| {
-                                        t.steps
-                                            .iter()
-                                            .find(|s| !s.verify.is_empty() && s.awaiting_verify)
-                                            .map(|s| s.index)
-                                    }) {
-                                        crate::agent::verifier::after_verify_pass(&engine, idx);
-                                    }
-                            }
-                    }
-
-            if result.is_error && tc.name == "edit_file"
-                && let Some(ref engine_arc) = workflow_engine
+                && let Some(cmd) = args.get("command").and_then(|c| c.as_str())
+            {
+                let succeeded = post_edit_verification::shell_result_success(&sanitized_content);
+                if let Some(ref engine_arc) = workflow_engine
                     && let Ok(engine) = engine_arc.try_lock()
-                        && crate::agent::workflow_session::is_implementation_phase(&engine)
-                            && let Ok(args) =
-                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                                && let Some(path) = args.get("path").and_then(|p| p.as_str()) {
-                                    let hint = if engine.impl_file_already_read(path) {
-                                        "\n\n💡 **edit 恢复：** old_string 须与上条 file_read 内容**逐字一致**（含空格/缩进）。\
+                {
+                    post_edit_verification::note_shell_verify_result(&engine, cmd, succeeded);
+                    if succeeded
+                        && let Some(idx) = engine.get_plan_tracker().and_then(|t| {
+                            t.steps
+                                .iter()
+                                .find(|s| !s.verify.is_empty() && s.awaiting_verify)
+                                .map(|s| s.index)
+                        })
+                    {
+                        crate::agent::verifier::after_verify_pass(&engine, idx);
+                    }
+                }
+            }
+
+            if result.is_error
+                && tc.name == "edit_file"
+                && let Some(ref engine_arc) = workflow_engine
+                && let Ok(engine) = engine_arc.try_lock()
+                && crate::agent::workflow_session::is_implementation_phase(&engine)
+                && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                && let Some(path) = args.get("path").and_then(|p| p.as_str())
+            {
+                let hint = if engine.impl_file_already_read(path) {
+                    "\n\n💡 **edit 恢复：** old_string 须与上条 file_read 内容**逐字一致**（含空格/缩进）。\
                                          缩小到 3–8 行唯一片段重试；先 file_read 该文件再编辑。"
                                             .to_string()
-                                    } else {
-                                        format!(
-                                            "\n\n💡 **edit 恢复：** 先 `file_read` `{path}`（实施每文件 1 次），\
+                } else {
+                    format!(
+                        "\n\n💡 **edit 恢复：** 先 `file_read` `{path}`（实施每文件 1 次），\
                                              从返回内容复制 old_string，再 edit_file。"
-                                        )
-                                    };
-                                    result_content.push_str(&hint);
-                                }
+                    )
+                };
+                result_content.push_str(&hint);
+            }
 
             let result_msg = Message::ToolResult {
                 tool_call_id: tc.id.clone(),
@@ -3587,85 +3673,88 @@ pub async fn run_agent_turn(
 
                 // Track explored paths during Plan only (Execute may re-read files)
                 if matches!(tool_name.as_str(), "file_list" | "file_read")
-                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                        let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-                        if let Some(ref engine_arc) = workflow_engine
-                            && let Ok(engine) = engine_arc.try_lock() {
-                                if crate::agent::phase::get(&engine)
-                                    == crate::agent::phase::SingleFlowPhase::Review
-                                {
-                                    engine.record_explored_path(&tool_name, path);
-                                } else if engine.is_task_step() && tool_name == "file_list" {
-                                    engine.record_explored_path(&tool_name, path);
-                                }
-                            }
+                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                {
+                    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+                    if let Some(ref engine_arc) = workflow_engine
+                        && let Ok(engine) = engine_arc.try_lock()
+                    {
+                        if crate::agent::phase::get(&engine)
+                            == crate::agent::phase::SingleFlowPhase::Review
+                        {
+                            engine.record_explored_path(&tool_name, path);
+                        } else if engine.is_task_step() && tool_name == "file_list" {
+                            engine.record_explored_path(&tool_name, path);
+                        }
                     }
+                }
 
                 // Execute: update plan tracker for completing tools
                 if let Some(ref engine_arc) = workflow_engine
-                    && let Ok(engine) = engine_arc.try_lock() {
-                        if engine.is_task_step() {
-                            if tool_name == "file_read"
-                                && crate::agent::workflow_session::is_implementation_phase(&engine)
-                                && let Ok(args) =
-                                    serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                                    && let Some(path) = args.get("path").and_then(|p| p.as_str()) {
-                                        engine.record_impl_file_read(path, &tc.arguments);
-                                        if let Some(nudge) =
-                                            engine.impl_edit_nudge_after_read(path, &result_content)
-                                        {
-                                            deferred_tool_system.push(nudge);
-                                        }
-                                    }
-                            let (plan_changed, plan_hint) = engine.record_execute_tool_success(
-                                &tool_name,
-                                &tc.arguments,
-                                &result_content,
-                            );
-                            if let Some(hint) = plan_hint {
-                                deferred_tool_system.push(hint);
+                    && let Ok(engine) = engine_arc.try_lock()
+                {
+                    if engine.is_task_step() {
+                        if tool_name == "file_read"
+                            && crate::agent::workflow_session::is_implementation_phase(&engine)
+                            && let Ok(args) =
+                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                            && let Some(path) = args.get("path").and_then(|p| p.as_str())
+                        {
+                            engine.record_impl_file_read(path, &tc.arguments);
+                            if let Some(nudge) =
+                                engine.impl_edit_nudge_after_read(path, &result_content)
+                            {
+                                deferred_tool_system.push(nudge);
                             }
-                            if plan_changed
-                                && let Some(msg) =
-                                    engine.plan_progress_message_after_tool(&tool_name)
-                                {
-                                    deferred_tool_system.push(msg);
-                                }
-                            if matches!(
-                                tool_name.as_str(),
-                                "edit_file" | "file_write" | "delete_range"
-                            ) && crate::agent::workflow_session::is_implementation_phase(&engine)
-                                && let Ok(args) =
-                                    serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                                    && let Some(path) = args.get("path").and_then(|p| p.as_str()) {
-                                        engine.record_impl_file_edited(path);
-                                        let idx = engine
-                                            .get_plan_tracker()
-                                            .and_then(|t| t.current_step().map(|s| s.index))
-                                            .unwrap_or(1);
-                                        if let Some(note) = crate::agent::verifier::after_edit_note(
-                                            &engine,
-                                            idx,
-                                            path,
-                                            &result_content,
-                                        ) {
-                                            deferred_tool_system.push(note);
-                                        }
-                                    }
+                        }
+                        let (plan_changed, plan_hint) = engine.record_execute_tool_success(
+                            &tool_name,
+                            &tc.arguments,
+                            &result_content,
+                        );
+                        if let Some(hint) = plan_hint {
+                            deferred_tool_system.push(hint);
+                        }
+                        if plan_changed
+                            && let Some(msg) = engine.plan_progress_message_after_tool(&tool_name)
+                        {
+                            deferred_tool_system.push(msg);
                         }
                         if matches!(
                             tool_name.as_str(),
-                            "file_write" | "edit_file" | "delete_range"
-                        )
+                            "edit_file" | "file_write" | "delete_range"
+                        ) && crate::agent::workflow_session::is_implementation_phase(&engine)
                             && let Ok(args) =
                                 serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                                && let Some(path) = args.get("path").and_then(|p| p.as_str())
-                                    && let Some(verify) = engine.verify_hint_for_path(path) {
-                                        deferred_tool_system.push(format!(
+                            && let Some(path) = args.get("path").and_then(|p| p.as_str())
+                        {
+                            engine.record_impl_file_edited(path);
+                            let idx = engine
+                                .get_plan_tracker()
+                                .and_then(|t| t.current_step().map(|s| s.index))
+                                .unwrap_or(1);
+                            if let Some(note) = crate::agent::verifier::after_edit_note(
+                                &engine,
+                                idx,
+                                path,
+                                &result_content,
+                            ) {
+                                deferred_tool_system.push(note);
+                            }
+                        }
+                    }
+                    if matches!(
+                        tool_name.as_str(),
+                        "file_write" | "edit_file" | "delete_range"
+                    ) && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                        && let Some(path) = args.get("path").and_then(|p| p.as_str())
+                        && let Some(verify) = engine.verify_hint_for_path(path)
+                    {
+                        deferred_tool_system.push(format!(
                                             "📋 计划验证: `{verify}` — 请用 shell_exec 执行（需用户确认），验证通过后再继续下一项。"
                                         ));
-                                    }
                     }
+                }
             }
 
             // 📖 Verify-after-edit: prompt LLM to verify changes
@@ -3680,9 +3769,9 @@ pub async fn run_agent_turn(
                     && is_skill;
 
                 // Execute step skill creation: tell LLM to output ## Done
-                let is_execute_step = workflow_engine.as_ref().is_some_and(|wf| {
-                    wf.try_lock().is_ok_and(|e| e.is_task_step())
-                });
+                let is_execute_step = workflow_engine
+                    .as_ref()
+                    .is_some_and(|wf| wf.try_lock().is_ok_and(|e| e.is_task_step()));
 
                 if is_execute_step && is_skill {
                     deferred_tool_system.push(if unified_tool_mode {
@@ -3741,18 +3830,19 @@ pub async fn run_agent_turn(
                 if let Some(last_assistant_pos) = msgs
                     .iter()
                     .rposition(|m| matches!(m, Message::Assistant { .. }))
-                    && let Message::Assistant { tool_calls, .. } = &mut msgs[last_assistant_pos] {
-                        let before = tool_calls.len();
-                        tool_calls.retain(|tc| all_result_ids.contains(&tc.id));
-                        if tool_calls.len() != before {
-                            tracing::info!(
-                                "[POST-FILTER] Removed {} orphaned tool_calls from latest Assistant msg ({} → {})",
-                                before - tool_calls.len(),
-                                before,
-                                tool_calls.len()
-                            );
-                        }
+                    && let Message::Assistant { tool_calls, .. } = &mut msgs[last_assistant_pos]
+                {
+                    let before = tool_calls.len();
+                    tool_calls.retain(|tc| all_result_ids.contains(&tc.id));
+                    if tool_calls.len() != before {
+                        tracing::info!(
+                            "[POST-FILTER] Removed {} orphaned tool_calls from latest Assistant msg ({} → {})",
+                            before - tool_calls.len(),
+                            before,
+                            tool_calls.len()
+                        );
                     }
+                }
                 // Remove Assistant at that position if it became empty
                 if let Some(pos) = msgs.iter().rposition(|m| matches!(m, Message::Assistant { content, tool_calls, .. } if content.is_empty() && tool_calls.is_empty())) {
                     msgs.remove(pos);
@@ -3794,20 +3884,21 @@ pub async fn run_agent_turn(
                     .clone()
                     .unwrap_or_else(|| tool_ctx.working_dir.clone());
                 if let Some(ref engine_arc) = workflow_engine
-                    && let Ok(engine) = engine_arc.try_lock() {
-                        post_edit_verification::track_edits_and_verify_plan(
-                            &engine,
-                            &project_root,
-                            &tool_calls,
-                            &new_messages,
-                            true,
-                        );
-                        if !has_ast
-                            && let Some(hint) = post_edit_verification::verify_hint_message(&engine)
-                            {
-                                messages.push(Message::system(&hint));
-                            }
+                    && let Ok(engine) = engine_arc.try_lock()
+                {
+                    post_edit_verification::track_edits_and_verify_plan(
+                        &engine,
+                        &project_root,
+                        &tool_calls,
+                        &new_messages,
+                        true,
+                    );
+                    if !has_ast
+                        && let Some(hint) = post_edit_verification::verify_hint_message(&engine)
+                    {
+                        messages.push(Message::system(&hint));
                     }
+                }
             }
 
             if has_write && !onboarding::is_onboarding_turn(&messages) && !has_ast {
@@ -3872,9 +3963,10 @@ pub async fn run_agent_turn(
                 messages.push(Message::system(&handoff));
                 new_messages.push(Message::system(&handoff));
                 if let Some(wf) = &workflow_engine
-                    && let Ok(engine) = wf.try_lock() {
-                        post_edit_verification::reset_verify_failures(&engine);
-                    }
+                    && let Ok(engine) = wf.try_lock()
+                {
+                    post_edit_verification::reset_verify_failures(&engine);
+                }
                 persist_turn_memory(&workflow_engine, &turn_memory);
                 emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
                 return;
@@ -3985,10 +4077,10 @@ fn upsert_review_report_assistant(messages: &mut Vec<Message>, new_msg: &Message
         ..
     }) = messages.last()
         && prev_tc.is_empty()
-            && crate::agent::engine::WorkflowEngine::looks_like_review_report(prev)
-        {
-            messages.pop();
-        }
+        && crate::agent::engine::WorkflowEngine::looks_like_review_report(prev)
+    {
+        messages.pop();
+    }
     messages.push(new_msg.clone());
 }
 
@@ -4131,9 +4223,10 @@ async fn record_tool_live_update(
     };
     if let Some(knowledge) = &tool_ctx.knowledge
         && let Ok(mut engine) = knowledge.try_write()
-            && let Err(e) = engine.process_tool_execution(&ctx) {
-                tracing::warn!("[LIVE_UPDATE] apply failed: {e}");
-            }
+        && let Err(e) = engine.process_tool_execution(&ctx)
+    {
+        tracing::warn!("[LIVE_UPDATE] apply failed: {e}");
+    }
 }
 
 /// Remove think tags from text. LLMs sometimes include thinking content in tool

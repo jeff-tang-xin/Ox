@@ -125,19 +125,20 @@ impl KnowledgeEngine {
 
         // Try GitNexus first
         if let Some(svc) = gitnexus
-            && svc.is_ready().await {
-                let mut params = QueryParams::new(q);
-                params.limit = Some(limit as u32);
-                params.include_content = Some(true);
-                match svc.query(&params).await {
-                    Ok(result) if !result.is_error && !result.text.trim().is_empty() => {
-                        return parse_gitnexus_results(&result.text, project_id, limit);
-                    }
-                    _ => {
-                        // GitNexus returned error or empty — fall through to local
-                    }
+            && svc.is_ready().await
+        {
+            let mut params = QueryParams::new(q);
+            params.limit = Some(limit as u32);
+            params.include_content = Some(true);
+            match svc.query(&params).await {
+                Ok(result) if !result.is_error && !result.text.trim().is_empty() => {
+                    return parse_gitnexus_results(&result.text, project_id, limit);
+                }
+                _ => {
+                    // GitNexus returned error or empty — fall through to local
                 }
             }
+        }
 
         // Silent fallback to local BM25 + vector search
         self.retrieve_memory_nodes(q, project_id, limit)
@@ -158,67 +159,61 @@ impl KnowledgeEngine {
 ///
 /// GitNexus returns structured text (JSON or Markdown). This best-effort parser
 /// extracts entries and wraps them as `MemoryNode` for downstream consumption.
-fn parse_gitnexus_results(
-    text: &str,
-    project_id: Option<&str>,
-    limit: usize,
-) -> Vec<MemoryNode> {
+fn parse_gitnexus_results(text: &str, project_id: Option<&str>, limit: usize) -> Vec<MemoryNode> {
     // Attempt JSON parse — GitNexus query typically returns a JSON array of objects
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(text)
-        && let Some(arr) = val.as_array() {
-            return arr
-                .iter()
-                .take(limit)
-                .filter_map(|item| {
-                    let content = item
-                        .get("content")
-                        .or_else(|| item.get("text"))
+        && let Some(arr) = val.as_array()
+    {
+        return arr
+            .iter()
+            .take(limit)
+            .filter_map(|item| {
+                let content = item
+                    .get("content")
+                    .or_else(|| item.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if content.is_empty() {
+                    return None;
+                }
+                let id = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("gitnexus")
+                    .to_string();
+                Some(MemoryNode {
+                    id,
+                    content: content.to_string(),
+                    node_type: MemoryNodeType::Fact,
+                    depth: 1,
+                    project_id: project_id.map(|s| s.to_string()),
+                    language: item
+                        .get("language")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if content.is_empty() {
-                        return None;
-                    }
-                    let id = item
-                        .get("id")
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    source: MemorySource::LlmExtraction,
+                    created_at: item.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+                    last_accessed: item
+                        .get("last_accessed")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    is_project_critical: false,
+                    traces: [0.0; 5],
+                    language_weight: 1.0,
+                    avg_llm_score: 0.0,
+                    judge_eval_count: 0,
+                    recent_scores: [0.0; 5],
+                    related_files: item
+                        .get("file_path")
+                        .or_else(|| item.get("file"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or("gitnexus")
-                        .to_string();
-                    Some(MemoryNode {
-                        id,
-                        content: content.to_string(),
-                        node_type: MemoryNodeType::Fact,
-                        depth: 1,
-                        project_id: project_id.map(|s| s.to_string()),
-                        language: item
-                            .get("language")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        source: MemorySource::LlmExtraction,
-                        created_at: item
-                            .get("created_at")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0),
-                        last_accessed: item
-                            .get("last_accessed")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0),
-                        is_project_critical: false,
-                        traces: [0.0; 5],
-                        language_weight: 1.0,
-                        avg_llm_score: 0.0,
-                        judge_eval_count: 0,
-                        recent_scores: [0.0; 5],
-                        related_files: item
-                            .get("file_path")
-                            .or_else(|| item.get("file"))
-                            .and_then(|v| v.as_str())
-                            .map(|p| vec![p.to_string()])
-                            .unwrap_or_default(),
-                    })
+                        .map(|p| vec![p.to_string()])
+                        .unwrap_or_default(),
                 })
-                .collect();
-        }
+            })
+            .collect();
+    }
 
     // Fallback: treat the whole text as a single MemoryNode
     vec![MemoryNode {
@@ -240,4 +235,3 @@ fn parse_gitnexus_results(
         related_files: vec![],
     }]
 }
-

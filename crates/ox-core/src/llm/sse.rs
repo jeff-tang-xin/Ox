@@ -95,13 +95,14 @@ pub fn parse_json_values(
     if input.starts_with('[') {
         // Try to parse as array
         if let Ok(arr) = serde_json::from_str::<serde_json::Value>(input)
-            && let Some(items) = arr.as_array() {
-                return items
-                    .iter()
-                    .map(|v| Ok(v.clone()))
-                    .collect::<Vec<_>>()
-                    .into_iter();
-            }
+            && let Some(items) = arr.as_array()
+        {
+            return items
+                .iter()
+                .map(|v| Ok(v.clone()))
+                .collect::<Vec<_>>()
+                .into_iter();
+        }
         // Fallback: try to parse each element individually
     }
 

@@ -279,11 +279,13 @@ impl CodeIndexer {
             let current_mtime = Self::file_modified_secs(path).unwrap_or(0);
 
             if let Some(entry) = file_cache.get(&path_str)
-                && entry.modified_secs == current_mtime && !entry.symbols.is_empty() {
-                    // File unchanged — reuse cached symbols
-                    cached_symbols.extend(entry.symbols.clone());
-                    continue;
-                }
+                && entry.modified_secs == current_mtime
+                && !entry.symbols.is_empty()
+            {
+                // File unchanged — reuse cached symbols
+                cached_symbols.extend(entry.symbols.clone());
+                continue;
+            }
             // File is new or modified — needs re-indexing
             files_to_index.push(path.clone());
         }
@@ -445,13 +447,14 @@ impl CodeIndexer {
         {
             let mut vs_guard = self.vector_store.lock().await;
             if let Some(ref mut vs) = *vs_guard
-                && let Err(e) = vs.insert_symbols(&symbols) {
-                    tracing::debug!(
-                        "[VECTOR_STORE] Failed to batch insert for {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
+                && let Err(e) = vs.insert_symbols(&symbols)
+            {
+                tracing::debug!(
+                    "[VECTOR_STORE] Failed to batch insert for {}: {}",
+                    path.display(),
+                    e
+                );
+            }
         }
 
         Ok(count)

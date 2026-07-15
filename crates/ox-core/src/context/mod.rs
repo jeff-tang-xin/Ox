@@ -641,72 +641,73 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     let mut i = 0;
     while i < messages.len() {
         if let Message::Assistant { tool_calls, .. } = &messages[i]
-            && !tool_calls.is_empty() {
-                let expected_count = tool_calls.len();
-                let expected_ids: Vec<_> = tool_calls.iter().map(|tc| tc.id.clone()).collect();
+            && !tool_calls.is_empty()
+        {
+            let expected_count = tool_calls.len();
+            let expected_ids: Vec<_> = tool_calls.iter().map(|tc| tc.id.clone()).collect();
 
-                // Check if the next N messages are ToolResults in the correct order
-                let mut is_valid_sequence = true;
-                let mut found_ids = Vec::new();
+            // Check if the next N messages are ToolResults in the correct order
+            let mut is_valid_sequence = true;
+            let mut found_ids = Vec::new();
 
-                for j in 1..=expected_count {
-                    if i + j >= messages.len() {
-                        is_valid_sequence = false;
-                        break;
-                    }
-
-                    if let Message::ToolResult { tool_call_id, .. } = &messages[i + j] {
-                        found_ids.push(tool_call_id.clone());
-                    } else {
-                        is_valid_sequence = false;
-                        break;
-                    }
-                }
-
-                // Verify IDs match
-                if is_valid_sequence && found_ids != expected_ids {
+            for j in 1..=expected_count {
+                if i + j >= messages.len() {
                     is_valid_sequence = false;
+                    break;
                 }
 
-                if !is_valid_sequence {
-                    tracing::warn!(
-                        "[TOOL_PAIR_SANITIZATION] ⚠️ ORDER VIOLATION at index {}: Assistant has {} tool_calls but following messages are not valid ToolResults",
-                        i,
-                        expected_count
-                    );
-                    tracing::warn!("[TOOL_PAIR_SANITIZATION] Expected IDs: {:?}", expected_ids);
-
-                    // FIX: Remove all tool_calls from this Assistant message since we can't guarantee proper ordering
-                    if let Message::Assistant { tool_calls, .. } = &mut messages[i] {
-                        let removed = tool_calls.len();
-                        tool_calls.clear();
-                        tracing::warn!(
-                            "[TOOL_PAIR_SANITIZATION] Removed {} tool_calls from Assistant at index {} to fix ordering issue",
-                            removed,
-                            i
-                        );
-                    }
-
-                    // Mark corresponding ToolResults for removal (they're now orphaned)
-                    let indices_to_remove: Vec<usize> = (i + 1..i + 1 + expected_count)
-                        .filter(|&idx| idx < messages.len())
-                        .filter(|&idx| matches!(&messages[idx], Message::ToolResult { .. }))
-                        .collect();
-
-                    // Remove in reverse order to maintain indices
-                    for idx in indices_to_remove.into_iter().rev() {
-                        messages.remove(idx);
-                        tracing::debug!(
-                            "[TOOL_PAIR_SANITIZATION] Removed orphaned ToolResult at index {}",
-                            idx
-                        );
-                    }
+                if let Message::ToolResult { tool_call_id, .. } = &messages[i + j] {
+                    found_ids.push(tool_call_id.clone());
                 } else {
-                    // Valid sequence, skip past the ToolResults
-                    i += expected_count + 1;
-                    continue;
+                    is_valid_sequence = false;
+                    break;
                 }
             }
+
+            // Verify IDs match
+            if is_valid_sequence && found_ids != expected_ids {
+                is_valid_sequence = false;
+            }
+
+            if !is_valid_sequence {
+                tracing::warn!(
+                    "[TOOL_PAIR_SANITIZATION] ⚠️ ORDER VIOLATION at index {}: Assistant has {} tool_calls but following messages are not valid ToolResults",
+                    i,
+                    expected_count
+                );
+                tracing::warn!("[TOOL_PAIR_SANITIZATION] Expected IDs: {:?}", expected_ids);
+
+                // FIX: Remove all tool_calls from this Assistant message since we can't guarantee proper ordering
+                if let Message::Assistant { tool_calls, .. } = &mut messages[i] {
+                    let removed = tool_calls.len();
+                    tool_calls.clear();
+                    tracing::warn!(
+                        "[TOOL_PAIR_SANITIZATION] Removed {} tool_calls from Assistant at index {} to fix ordering issue",
+                        removed,
+                        i
+                    );
+                }
+
+                // Mark corresponding ToolResults for removal (they're now orphaned)
+                let indices_to_remove: Vec<usize> = (i + 1..i + 1 + expected_count)
+                    .filter(|&idx| idx < messages.len())
+                    .filter(|&idx| matches!(&messages[idx], Message::ToolResult { .. }))
+                    .collect();
+
+                // Remove in reverse order to maintain indices
+                for idx in indices_to_remove.into_iter().rev() {
+                    messages.remove(idx);
+                    tracing::debug!(
+                        "[TOOL_PAIR_SANITIZATION] Removed orphaned ToolResult at index {}",
+                        idx
+                    );
+                }
+            } else {
+                // Valid sequence, skip past the ToolResults
+                i += expected_count + 1;
+                continue;
+            }
+        }
         i += 1;
     }
 }
@@ -747,9 +748,10 @@ fn deduplicate_file_reads(messages: &mut Vec<Message>) {
             for tc in tool_calls {
                 if tc.name == "file_read"
                     && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                        && let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                            file_reads.push((i, path.to_string()));
-                        }
+                    && let Some(path) = args.get("path").and_then(|v| v.as_str())
+                {
+                    file_reads.push((i, path.to_string()));
+                }
             }
         }
     }
@@ -799,15 +801,16 @@ fn deduplicate_file_reads(messages: &mut Vec<Message>) {
                         tool_call_id,
                         content,
                     } = msg
-                        && tool_call_id == &tc_id {
-                            let line_count = content.lines().count();
-                            *content = format!(
-                                "(previously read {} — {} lines, latest version kept in context)",
-                                path, line_count
-                            );
-                            replaced += 1;
-                            break;
-                        }
+                        && tool_call_id == &tc_id
+                    {
+                        let line_count = content.lines().count();
+                        *content = format!(
+                            "(previously read {} — {} lines, latest version kept in context)",
+                            path, line_count
+                        );
+                        replaced += 1;
+                        break;
+                    }
                 }
             }
         }
@@ -923,7 +926,6 @@ pub fn filter_noisy_messages(messages: &mut Vec<Message>) {
         *messages = filtered;
     }
 }
-
 
 #[cfg(test)]
 mod tests {

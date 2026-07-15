@@ -205,9 +205,10 @@ impl UnifiedVectorStore {
         let mut seen: HashMap<String, ()> = HashMap::new();
         for e in entities {
             if let Some(fp) = e.file_path()
-                && seen.insert(fp.to_string(), ()).is_none() {
-                    self.remove_by_file(fp);
-                }
+                && seen.insert(fp.to_string(), ()).is_none()
+            {
+                self.remove_by_file(fp);
+            }
         }
     }
 
@@ -238,14 +239,15 @@ impl UnifiedVectorStore {
             return;
         }
         if let Ok(data) = std::fs::read_to_string(path)
-            && let Ok(map) = serde_json::from_str::<HashMap<String, Vec<u64>>>(&data) {
-                tracing::info!(
-                    "[UNIFIED_VECTOR] Loaded file_ids map ({} files) from {}",
-                    map.len(),
-                    path.display()
-                );
-                self.file_ids = map;
-            }
+            && let Ok(map) = serde_json::from_str::<HashMap<String, Vec<u64>>>(&data)
+        {
+            tracing::info!(
+                "[UNIFIED_VECTOR] Loaded file_ids map ({} files) from {}",
+                map.len(),
+                path.display()
+            );
+            self.file_ids = map;
+        }
     }
 
     /// Persist file→vector-id map to disk.
@@ -299,9 +301,10 @@ impl UnifiedVectorStore {
 
                 // Apply kind filter
                 if let Some(filter) = kind_filter
-                    && !filter.contains(&entity.kind) {
-                        return None;
-                    }
+                    && !filter.contains(&entity.kind)
+                {
+                    return None;
+                }
 
                 Some(SearchHit {
                     entity,

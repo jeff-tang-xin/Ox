@@ -54,10 +54,11 @@ impl SkillReflectBuffer {
         let threshold = Self::clamp_threshold(threshold);
         let path = Self::buffer_path(project_root);
         if let Ok(data) = fs::read_to_string(&path)
-            && let Ok(mut buf) = serde_json::from_str::<Self>(&data) {
-                buf.threshold = threshold;
-                return buf;
-            }
+            && let Ok(mut buf) = serde_json::from_str::<Self>(&data)
+        {
+            buf.threshold = threshold;
+            return buf;
+        }
         Self {
             threshold,
             rounds: Vec::new(),

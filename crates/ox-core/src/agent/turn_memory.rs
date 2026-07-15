@@ -88,13 +88,14 @@ impl TurnMemory {
                     | "shell_exec"
                     | "git_status"
                     | "git_diff"
-            ) {
-                let content = crate::agent::exploration_snapshot::extract_data_content(raw);
-                let excerpt = compact_result_excerpt(&content, 360);
-                if !excerpt.is_empty() {
-                    return format!("ok — {excerpt}");
-                }
+            )
+        {
+            let content = crate::agent::exploration_snapshot::extract_data_content(raw);
+            let excerpt = compact_result_excerpt(&content, 360);
+            if !excerpt.is_empty() {
+                return format!("ok — {excerpt}");
             }
+        }
         "ok".to_string()
     }
 
@@ -257,9 +258,10 @@ fn parse_progress_line(line: &str) -> Option<(String, String, bool)> {
     ] {
         let prefix = format!("{tool}(");
         if let Some(rest) = line.strip_prefix(&prefix)
-            && let Some((target, outcome)) = rest.split_once(") → ") {
-                return Some((tool.to_string(), target.to_string(), outcome == "成功"));
-            }
+            && let Some((target, outcome)) = rest.split_once(") → ")
+        {
+            return Some((tool.to_string(), target.to_string(), outcome == "成功"));
+        }
     }
     if let Some((left, outcome)) = line.rsplit_once(" → ") {
         let ok = outcome == "成功";

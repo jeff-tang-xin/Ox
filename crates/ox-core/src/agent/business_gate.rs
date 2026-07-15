@@ -85,12 +85,13 @@ pub async fn await_findings_scope_gate(
     // If user already pre-confirmed (typed "c" before gate opened), skip wait.
     if let Some(wf) = workflow_engine
         && let Ok(engine) = wf.try_lock()
-            && engine.get_variable(PRE_ACK_KEY).as_deref() == Some("1") {
-                engine.set_variable(PRE_ACK_KEY, String::new());
-                tracing::info!("[BUSINESS_GATE] Pre-ack detected, acknowledging");
-                ack_findings_scope(&engine);
-                return BusinessGateResume::Acknowledged;
-            }
+        && engine.get_variable(PRE_ACK_KEY).as_deref() == Some("1")
+    {
+        engine.set_variable(PRE_ACK_KEY, String::new());
+        tracing::info!("[BUSINESS_GATE] Pre-ack detected, acknowledging");
+        ack_findings_scope(&engine);
+        return BusinessGateResume::Acknowledged;
+    }
 
     let _ = ui_tx.send(super::AgentToUiEvent::Status(
         "⏸ 业务流程门禁：等待确认 findings 范围 — 面板选 finding 后 c /confirm；可输入讨论"
@@ -100,7 +101,7 @@ pub async fn await_findings_scope_gate(
     // Scan messages for a confirmation that was injected by the main loop's
     // FIX: Increased timeout and added auto-retry on timeout instead of hard cancel
     const INITIAL_TIMEOUT_SECS: u64 = 300;
-    const RETRY_TIMEOUT_SECS: u64 = 600;  // 10 minutes on retry
+    const RETRY_TIMEOUT_SECS: u64 = 600; // 10 minutes on retry
     let mut is_retry = false;
 
     loop {

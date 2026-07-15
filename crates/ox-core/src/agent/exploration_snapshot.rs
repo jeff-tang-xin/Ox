@@ -232,28 +232,29 @@ pub fn resolve_file_read_cache(
 
     if let Some(e) = entry {
         if let Some(ref rel) = e.ref_path
-            && let Some(full) = load_persisted_full(working_dir, rel) {
-                let lines: Vec<&str> = full.lines().collect();
-                let total = lines.len();
-                let start = offset.min(total);
-                let end = (start + limit).min(total);
-                let slice: String = lines[start..end]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| format!("{:>4}\t{line}", start + i + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let mut body = format!(
-                    "✅ 【快照恢复】`{path}` 来自探索存档 `{rel}`（{} 行全文，非预览）\n\n{slice}",
-                    total
-                );
-                if end < total {
-                    body.push_str(&format!(
+            && let Some(full) = load_persisted_full(working_dir, rel)
+        {
+            let lines: Vec<&str> = full.lines().collect();
+            let total = lines.len();
+            let start = offset.min(total);
+            let end = (start + limit).min(total);
+            let slice: String = lines[start..end]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| format!("{:>4}\t{line}", start + i + 1))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut body = format!(
+                "✅ 【快照恢复】`{path}` 来自探索存档 `{rel}`（{} 行全文，非预览）\n\n{slice}",
+                total
+            );
+            if end < total {
+                body.push_str(&format!(
                         "\n\n💡 续读: file_read {{\"path\":\"{path}\", \"offset\":{end}, \"limit\":{limit}}}"
                     ));
-                }
-                return body;
             }
+            return body;
+        }
         if e.full_chars <= e.content.chars().count().saturating_add(80) {
             return format!("✅ 【缓存】`{path}` 已探索过\n\n{}", e.content);
         }
@@ -301,9 +302,10 @@ fn persist_full_content(
 ) -> Option<String> {
     let path = exploration_ref_path(working_dir, tool, target);
     if let Some(parent) = path.parent()
-        && fs::create_dir_all(parent).is_err() {
-            return None;
-        }
+        && fs::create_dir_all(parent).is_err()
+    {
+        return None;
+    }
     let doc = format!(
         "# Exploration snapshot\n\n**Tool**: {tool}\n**Target**: {target}\n**Size**: {} chars\n\n---\n\n{content}",
         content.chars().count()

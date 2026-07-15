@@ -6,8 +6,8 @@ use serde_json::json;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::message::{Message, ToolCall};
 use crate::mcp::gitnexus::GraphResult;
+use crate::message::{Message, ToolCall};
 use crate::safety::TrustManager;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 
@@ -21,10 +21,7 @@ use super::unified_action::{self, ActionGate, TOOL_NAME, UnifiedActionRequest, U
 
 /// Analyze potential impact before edit_file operations using GitNexus.
 /// Returns a summary of affected symbols/functions, or None if unavailable.
-pub async fn analyze_edit_impact(
-    tool_ctx: &Arc<ToolContext>,
-    file_path: &str,
-) -> Option<String> {
+pub async fn analyze_edit_impact(tool_ctx: &Arc<ToolContext>, file_path: &str) -> Option<String> {
     let svc = tool_ctx.gitnexus.as_ref()?;
     if !svc.is_ready().await {
         return None;
@@ -38,7 +35,7 @@ pub async fn analyze_edit_impact(
     }
 
     let mut params = crate::mcp::gitnexus::ImpactParams::new(target, "downstream");
-    params.max_depth = Some(2);  // Limit depth for performance
+    params.max_depth = Some(2); // Limit depth for performance
 
     match svc.impact(&params).await {
         Ok(result) if !result.is_error && !result.text.is_empty() => {
@@ -82,9 +79,7 @@ fn summarize_impact(impact_text: &str, target: &str) -> String {
 
 /// Analyze git changes using GitNexus detect_changes when finishing a task.
 /// Returns a summary of affected files/processes, or None if unavailable.
-pub async fn analyze_finish_changes(
-    tool_ctx: &Arc<ToolContext>,
-) -> Option<String> {
+pub async fn analyze_finish_changes(tool_ctx: &Arc<ToolContext>) -> Option<String> {
     let svc = tool_ctx.gitnexus.as_ref()?;
     if !svc.is_ready().await {
         return None;
@@ -152,10 +147,13 @@ pub async fn analyze_api_impact(
 
     let shape_result: Option<GraphResult> = match svc.shape_check(&shape_check_params).await {
         Ok(r) if !r.is_error && !r.text.is_empty() => Some(r),
-        _ => None,  // shape_check is optional
+        _ => None, // shape_check is optional
     };
 
-    Some(summarize_api_impact(&route_result.text, shape_result.as_ref().map(|r| r.text.as_str())))
+    Some(summarize_api_impact(
+        &route_result.text,
+        shape_result.as_ref().map(|r| r.text.as_str()),
+    ))
 }
 
 /// Summarize API impact results into a concise message.
@@ -172,7 +170,10 @@ fn summarize_api_impact(route_text: &str, shape_text: Option<&str>) -> String {
             let trimmed = line.trim();
             if !trimmed.is_empty() && trimmed.len() < 100 {
                 // Highlight key information
-                if trimmed.contains("Handler") || trimmed.contains("Consumer") || trimmed.contains("->") {
+                if trimmed.contains("Handler")
+                    || trimmed.contains("Consumer")
+                    || trimmed.contains("->")
+                {
                     summary.push_str(&format!("  → {}\n", trimmed));
                 } else {
                     summary.push_str(&format!("  • {}\n", trimmed));
@@ -183,20 +184,24 @@ fn summarize_api_impact(route_text: &str, shape_text: Option<&str>) -> String {
 
     // Parse shape_check results if available
     if let Some(shape) = shape_text
-        && !shape.is_empty() {
-            summary.push_str("\n⚠️ **API 响应不匹配检查**:\n\n");
-            let lines: Vec<&str> = shape.lines().take(10).collect();
-            for line in lines {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && trimmed.len() < 100 {
-                    if trimmed.contains("MISMATCH") || trimmed.contains("error") || trimmed.contains("missing") {
-                        summary.push_str(&format!("  ⚡ {}\n", trimmed));
-                    } else {
-                        summary.push_str(&format!("  • {}\n", trimmed));
-                    }
+        && !shape.is_empty()
+    {
+        summary.push_str("\n⚠️ **API 响应不匹配检查**:\n\n");
+        let lines: Vec<&str> = shape.lines().take(10).collect();
+        for line in lines {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && trimmed.len() < 100 {
+                if trimmed.contains("MISMATCH")
+                    || trimmed.contains("error")
+                    || trimmed.contains("missing")
+                {
+                    summary.push_str(&format!("  ⚡ {}\n", trimmed));
+                } else {
+                    summary.push_str(&format!("  • {}\n", trimmed));
                 }
             }
         }
+    }
 
     if summary.is_empty() {
         summary.push_str("  (未发现路由信息)\n");
@@ -219,10 +224,10 @@ pub async fn preview_rename_impact(
 
     let params = crate::mcp::gitnexus::RenameParams {
         symbol_name: Some(symbol_name.to_string()),
-        new_name: format!("{}_NEW", symbol_name),  // Placeholder for preview
+        new_name: format!("{}_NEW", symbol_name), // Placeholder for preview
         file_path: file_path.map(|s| s.to_string()),
         repo: None,
-        dry_run: Some(true),  // Preview only
+        dry_run: Some(true), // Preview only
         symbol_uid: None,
     };
 
@@ -245,7 +250,10 @@ fn summarize_rename_preview(rename_text: &str, original_name: &str) -> String {
     if graph_matches > 0 || text_matches > 0 {
         summary.push_str(&format!("📍 高可信度引用 (graph): {} 处\n", graph_matches));
         if text_matches > 0 {
-            summary.push_str(&format!("⚠️  低可信度引用 (text_search): {} 处\n\n", text_matches));
+            summary.push_str(&format!(
+                "⚠️  低可信度引用 (text_search): {} 处\n\n",
+                text_matches
+            ));
         } else {
             summary.push('\n');
         }
@@ -385,7 +393,9 @@ async fn handle_recall(
         .trim()
         .to_string();
     if node_id.is_empty() {
-        return result_err("recall 需要 node_id（记忆图谱用 #<编号>，或 offload 的 node_id）".into());
+        return result_err(
+            "recall 需要 node_id（记忆图谱用 #<编号>，或 offload 的 node_id）".into(),
+        );
     }
 
     // Graph-node replay: `#N` or bare integer → SQLite lookup.
@@ -395,29 +405,28 @@ async fn handle_recall(
         .parse::<i64>()
         .ok();
     if let Some(gid) = graph_id
-        && let Some(ref store) = tool_ctx.memory_store {
-            match store.get_react_batch_by_graph(gid) {
-                Ok(text) if !text.trim().is_empty() => {
-                    // Count the recall hit — drives L2→L3 promotion + anti-downgrade.
-                    let _ = store.touch_graph_hit(gid);
-                    return UnifiedHandleOutcome::Result {
-                        content: text,
-                        is_error: false,
-                        deferred_system: Vec::new(),
-                        delegate_meta: None,
-                    };
-                }
-                _ => {
-                    return result_err(format!("记忆图谱节点 #{gid} 无内容或不存在"));
-                }
+        && let Some(ref store) = tool_ctx.memory_store
+    {
+        match store.get_react_batch_by_graph(gid) {
+            Ok(text) if !text.trim().is_empty() => {
+                // Count the recall hit — drives L2→L3 promotion + anti-downgrade.
+                let _ = store.touch_graph_hit(gid);
+                return UnifiedHandleOutcome::Result {
+                    content: text,
+                    is_error: false,
+                    deferred_system: Vec::new(),
+                    delegate_meta: None,
+                };
+            }
+            _ => {
+                return result_err(format!("记忆图谱节点 #{gid} 无内容或不存在"));
             }
         }
+    }
 
     // Offloader ref retrieval (file-based node_id).
-    let offloader = crate::agent::context_offloader::ContextOffloader::new(
-        &tool_ctx.working_dir,
-        "session",
-    );
+    let offloader =
+        crate::agent::context_offloader::ContextOffloader::new(&tool_ctx.working_dir, "session");
     match offloader.retrieve_full_content(&node_id) {
         Some(content) => UnifiedHandleOutcome::Result {
             content,
@@ -456,18 +465,19 @@ where
 {
     if let Some(wf) = workflow_engine
         && let Ok(engine) = wf.try_lock()
-            && let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
-                let md = crate::agent::presentation::format_findings_card(&store);
-                let _ = ui_tx.send(AgentToUiEvent::ScopeConfirmPrompt {
-                    summary: format!("{md}\n\nc 确认实施  ·  输入讨论  ·  /discuss"),
-                });
-            }
+        && let Some(store) = crate::agent::findings::load_or_migrate(&engine)
+    {
+        let md = crate::agent::presentation::format_findings_card(&store);
+        let _ = ui_tx.send(AgentToUiEvent::ScopeConfirmPrompt {
+            summary: format!("{md}\n\nc 确认实施  ·  输入讨论  ·  /discuss"),
+        });
+    }
 
     match business_gate::await_findings_scope_gate(
         ui_rx,
         cancel_token,
         workflow_engine,
-        messages,    // Pass messages so the gate can scan for pendings
+        messages, // Pass messages so the gate can scan for pendings
         ui_tx,
         push_interjection,
     )
@@ -476,30 +486,31 @@ where
         business_gate::BusinessGateResume::Cancelled => UnifiedHandleOutcome::Aborted,
         business_gate::BusinessGateResume::Acknowledged => {
             if let Some(wf) = workflow_engine
-                && let Ok(engine) = wf.try_lock() {
-                    crate::agent::workflow_session::clear_feedback_discuss(&engine);
-                    crate::agent::phase::confirm_plan_enter_implement(&engine);
-                    // Record review findings as session facts so the LLM
-                    // doesn't re-analyze in implement phase.
-                    if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
-                        let mut facts = Vec::new();
-                        for f in &store.findings {
-                            let fact = format!(
-                                "{}: {} ({})",
-                                f.file.rsplit('/').next().unwrap_or(&f.file),
-                                f.issue.chars().take(100).collect::<String>(),
-                                f.severity.label()
-                            );
-                            crate::agent::blackboard::add_fact(&engine, &fact);
-                            facts.push(fact);
-                        }
-                        // (Historical batch summary via `_last_session_summary`
-                        // was retired — implement-phase history now comes from the
-                        // ReAct log / [MEMORY_GRAPH]. Findings still land in the
-                        // blackboard above.)
-                        let _ = facts;
+                && let Ok(engine) = wf.try_lock()
+            {
+                crate::agent::workflow_session::clear_feedback_discuss(&engine);
+                crate::agent::phase::confirm_plan_enter_implement(&engine);
+                // Record review findings as session facts so the LLM
+                // doesn't re-analyze in implement phase.
+                if let Some(store) = crate::agent::findings::load_or_migrate(&engine) {
+                    let mut facts = Vec::new();
+                    for f in &store.findings {
+                        let fact = format!(
+                            "{}: {} ({})",
+                            f.file.rsplit('/').next().unwrap_or(&f.file),
+                            f.issue.chars().take(100).collect::<String>(),
+                            f.severity.label()
+                        );
+                        crate::agent::blackboard::add_fact(&engine, &fact);
+                        facts.push(fact);
                     }
+                    // (Historical batch summary via `_last_session_summary`
+                    // was retired — implement-phase history now comes from the
+                    // ReAct log / [MEMORY_GRAPH]. Findings still land in the
+                    // blackboard above.)
+                    let _ = facts;
                 }
+            }
             UnifiedHandleOutcome::Result {
                 content: ToolResultEnvelope::gate_status(
                     EnvelopeStatus::Confirmed,
@@ -578,12 +589,15 @@ async fn handle_finish(
         // Single lock acquisition to avoid two try_locks producing an inconsistent snapshot
         // (one field succeeds, the other fails / sees mid-mutation state).
         if let Some(ref store) = tool_ctx.memory_store {
-            let (session_id, task) = workflow_engine.as_ref()
+            let (session_id, task) = workflow_engine
+                .as_ref()
                 .and_then(|wf| wf.try_lock().ok())
-                .map(|e| (
-                    e.session_id(),
-                    e.get_variable("_current_user_request").unwrap_or_default(),
-                ))
+                .map(|e| {
+                    (
+                        e.session_id(),
+                        e.get_variable("_current_user_request").unwrap_or_default(),
+                    )
+                })
                 .unwrap_or_else(|| ("default".to_string(), String::new()));
             if let Err(e) = store.save_session(&session_id, &task, ss) {
                 tracing::warn!("[MEMORY] Failed to save session: {e}");
@@ -594,19 +608,21 @@ async fn handle_finish(
         // (`_last_session_summary` engine var was retired — cross-session history
         // is read from the SQLite store / [MEMORY_GRAPH], not this variable.)
         if let Some(wf) = workflow_engine
-            && let Ok(engine) = wf.try_lock() {
-                for f in &ss.key_facts {
-                    crate::agent::blackboard::add_fact(&engine, &f.fact);
-                }
+            && let Ok(engine) = wf.try_lock()
+        {
+            for f in &ss.key_facts {
+                crate::agent::blackboard::add_fact(&engine, &f.fact);
             }
+        }
     }
 
     // ── Onboarding shortcut: no gate, no findings — just end the turn. ──
     if crate::agent::onboarding::is_onboarding_turn(messages) {
         if let Some(wf) = workflow_engine
-            && let Ok(mut engine) = wf.try_lock() {
-                let _ = engine.complete_workflow();
-            }
+            && let Ok(mut engine) = wf.try_lock()
+        {
+            let _ = engine.complete_workflow();
+        }
         return UnifiedHandleOutcome::TurnDone {
             summary: (!content.is_empty()).then(|| content.clone()),
         };
@@ -692,48 +708,52 @@ async fn handle_finish(
             .await;
         }
         if let Some(wf) = workflow_engine
-            && let Ok(mut engine) = wf.try_lock() {
-                // After scope confirmation, the LLM is in implement phase.
-                // A plain finish (no finding_json) after confirmation means
-                // the LLM is acknowledging — redirect to implementation.
-                // Track with a flag so a SECOND finish in the same turn ends
-                // the workflow instead of looping.
-                if business_gate::scope_implementation_unlocked(&engine)
-                    && crate::agent::phase::get(&engine)
-                        == crate::agent::phase::SingleFlowPhase::Implement
-                {
-                    let already_nudged = engine.get_variable("_impl_finish_nudge").as_deref() == Some("1");
-                    if already_nudged {
-                        // Second finish after nudge — LLM wants to end. Complete.
-                        let task = engine.get_variable("_current_user_request").unwrap_or_default();
-                        let _ = engine.complete_workflow();
-                        let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
-                            task_description: task,
-                            execution_summary: content.clone(),
-                        });
-                        drop(engine);
-                        return UnifiedHandleOutcome::TurnDone {
-                            summary: (!content.is_empty()).then(|| content.clone()),
-                        };
-                    }
-                    engine.set_variable("_impl_finish_nudge", "1".to_string());
+            && let Ok(mut engine) = wf.try_lock()
+        {
+            // After scope confirmation, the LLM is in implement phase.
+            // A plain finish (no finding_json) after confirmation means
+            // the LLM is acknowledging — redirect to implementation.
+            // Track with a flag so a SECOND finish in the same turn ends
+            // the workflow instead of looping.
+            if business_gate::scope_implementation_unlocked(&engine)
+                && crate::agent::phase::get(&engine)
+                    == crate::agent::phase::SingleFlowPhase::Implement
+            {
+                let already_nudged =
+                    engine.get_variable("_impl_finish_nudge").as_deref() == Some("1");
+                if already_nudged {
+                    // Second finish after nudge — LLM wants to end. Complete.
+                    let task = engine
+                        .get_variable("_current_user_request")
+                        .unwrap_or_default();
+                    let _ = engine.complete_workflow();
+                    let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
+                        task_description: task,
+                        execution_summary: content.clone(),
+                    });
                     drop(engine);
-                    return UnifiedHandleOutcome::Result {
+                    return UnifiedHandleOutcome::TurnDone {
+                        summary: (!content.is_empty()).then(|| content.clone()),
+                    };
+                }
+                engine.set_variable("_impl_finish_nudge", "1".to_string());
+                drop(engine);
+                return UnifiedHandleOutcome::Result {
                         content: content.clone(),
                         is_error: false,
                         deferred_system: vec!["继续实施：逐项 file_read → edit_file → 验证。全部完成后 finish（无 finding_json）收尾。".into()],
                         delegate_meta: None,
                     };
-                }
-                let task = engine
-                    .get_variable("_current_user_request")
-                    .unwrap_or_default();
-                let _ = engine.complete_workflow();
-                let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
-                    task_description: task,
-                    execution_summary: content.clone(),
-                });
             }
+            let task = engine
+                .get_variable("_current_user_request")
+                .unwrap_or_default();
+            let _ = engine.complete_workflow();
+            let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
+                task_description: task,
+                execution_summary: content.clone(),
+            });
+        }
         return UnifiedHandleOutcome::TurnDone {
             summary: (!content.is_empty()).then(|| content.clone()),
         };
@@ -819,36 +839,37 @@ async fn handle_delegate(
 
     // Pre-execution validation + read guard (parity with legacy tool path).
     if let Some(wf) = workflow_engine
-        && let Ok(engine) = wf.try_lock() {
-            if let Err(e) = engine.validate_tool_call(inner_name, &req.params) {
-                return result_err(e);
-            }
-            if let Err(e) = crate::agent::read_guard::check(inner_name, &req.params, &engine) {
-                if inner_name == "file_read"
-                    && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
-                        && let Some(cached) =
-                            crate::agent::read_guard::cached_file_read_response(&engine, path)
-                        {
-                            return result_ok_envelope(
-                                json!({
-                                    "action": req.action,
-                                    "inner_tool": inner_name,
-                                    "output": cached,
-                                    "cached": true,
-                                }),
-                                vec![format!(
-                                    "📋 ✅ file_read → {path} — 本轮已读过（返回 digest，未重复 IO）"
-                                )],
-                                Some(DelegateMeta {
-                                    inner_tool: inner_name.to_string(),
-                                    inner_args: params_str,
-                                    live_output: cached.clone(),
-                                }),
-                            );
-                        }
-                return result_err(e);
-            }
+        && let Ok(engine) = wf.try_lock()
+    {
+        if let Err(e) = engine.validate_tool_call(inner_name, &req.params) {
+            return result_err(e);
         }
+        if let Err(e) = crate::agent::read_guard::check(inner_name, &req.params, &engine) {
+            if inner_name == "file_read"
+                && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
+                && let Some(cached) =
+                    crate::agent::read_guard::cached_file_read_response(&engine, path)
+            {
+                return result_ok_envelope(
+                    json!({
+                        "action": req.action,
+                        "inner_tool": inner_name,
+                        "output": cached,
+                        "cached": true,
+                    }),
+                    vec![format!(
+                        "📋 ✅ file_read → {path} — 本轮已读过（返回 digest，未重复 IO）"
+                    )],
+                    Some(DelegateMeta {
+                        inner_tool: inner_name.to_string(),
+                        inner_args: params_str,
+                        live_output: cached.clone(),
+                    }),
+                );
+            }
+            return result_err(e);
+        }
+    }
 
     let tool = match tool_registry.get(inner_name) {
         Some(t) => t,
@@ -873,9 +894,10 @@ async fn handle_delegate(
 
         let mut blacklist_warning = None;
         if inner_name == "shell_exec"
-            && let Some(cmd) = req.params.get("command").and_then(|v| v.as_str()) {
-                blacklist_warning = safety_gate::shell_blacklist_warning(trust_manager, cmd);
-            }
+            && let Some(cmd) = req.params.get("command").and_then(|v| v.as_str())
+        {
+            blacklist_warning = safety_gate::shell_blacklist_warning(trust_manager, cmd);
+        }
 
         // Option-2 flow: once the user confirmed the plan/findings scope (or we're in
         // Implement phase), the whole plan is pre-approved — writes/edits/shell auto-run
@@ -950,18 +972,19 @@ async fn handle_delegate(
     // ── Impact analysis before edit operations ──
     let _impact_warning = String::new();
     if (inner_name == "edit_file" || inner_name == "file_write" || inner_name == "delete_range")
-        && let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
-            // Run impact analysis asynchronously (non-blocking)
-            let ctx_clone = Arc::clone(tool_ctx);
-            let path_owned = path.to_string();
-            tokio::spawn(async move {
-                if let Some(impact) = analyze_edit_impact(&ctx_clone, &path_owned).await {
-                    tracing::info!("[IMPACT] edit impact analysis: {}", impact);
-                    // The impact analysis is logged for reference
-                    // Could be sent to UI if needed
-                }
-            });
-        }
+        && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
+    {
+        // Run impact analysis asynchronously (non-blocking)
+        let ctx_clone = Arc::clone(tool_ctx);
+        let path_owned = path.to_string();
+        tokio::spawn(async move {
+            if let Some(impact) = analyze_edit_impact(&ctx_clone, &path_owned).await {
+                tracing::info!("[IMPACT] edit impact analysis: {}", impact);
+                // The impact analysis is logged for reference
+                // Could be sent to UI if needed
+            }
+        });
+    }
 
     tracing::info!("[DELEGATE] Executing inner tool: {}", inner_name);
     let result = tool.execute(req.params.clone(), tool_ctx).await;
@@ -976,21 +999,22 @@ async fn handle_delegate(
         let mut err_text = result.content.clone();
         if inner_name == "edit_file"
             && let Some(wf) = workflow_engine
-                && let Ok(engine) = wf.try_lock()
-                    && crate::agent::workflow_session::is_implementation_phase(&engine)
-                        && let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
-                            let hint = if engine.impl_file_already_read(path) {
-                                "\n\n💡 **edit 恢复：** old_string 须与上条 file_read 内容**逐字一致**（含空格/缩进）。\
+            && let Ok(engine) = wf.try_lock()
+            && crate::agent::workflow_session::is_implementation_phase(&engine)
+            && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
+        {
+            let hint = if engine.impl_file_already_read(path) {
+                "\n\n💡 **edit 恢复：** old_string 须与上条 file_read 内容**逐字一致**（含空格/缩进）。\
                                  缩小到 3–8 行唯一片段重试；先 file_read 该文件再编辑。"
                                     .to_string()
-                            } else {
-                                format!(
-                                    "\n\n💡 **edit 恢复：** 先 `file_read` `{path}`（实施每文件 1 次），\
+            } else {
+                format!(
+                    "\n\n💡 **edit 恢复：** 先 `file_read` `{path}`（实施每文件 1 次），\
                                      从返回内容复制 old_string，再 edit_file。"
-                                )
-                            };
-                            err_text.push_str(&hint);
-                        }
+                )
+            };
+            err_text.push_str(&hint);
+        }
         return UnifiedHandleOutcome::Result {
             content: ToolResultEnvelope::err(err_text).to_compact(),
             is_error: true,
@@ -1048,9 +1072,10 @@ fn apply_delegate_success_effects(
     // (E) A successful code mutation puts the GitNexus index behind the tree.
     // Mark dirty so the next `code_graph` query refreshes before answering.
     if matches!(inner_name, "edit_file" | "file_write" | "delete_range")
-        && let Some(gn) = &tool_ctx.gitnexus {
-            gn.mark_dirty();
-        }
+        && let Some(gn) = &tool_ctx.gitnexus
+    {
+        gn.mark_dirty();
+    }
 
     if inner_name == "file_read" {
         if let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
@@ -1069,25 +1094,28 @@ fn apply_delegate_success_effects(
         // Record impact analysis so workspace.rs knows not to re-suggest it.
         if req.params.get("op").and_then(|o| o.as_str()) == Some("impact")
             && let Some(target) = req.params.get("target")
-                && let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
-                {
-                    engine.record_impl_impact(idx);
-                }
+            && let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
+        {
+            engine.record_impl_impact(idx);
+        }
         // Record any code_graph query/impact/context so the impact gate and
         // find_symbol gate unblock. Match the target/pattern/name to findings.
         if let Some(op) = req.params.get("op").and_then(|o| o.as_str()) {
             // Extract search target from the params (differs by op)
             let search_target = match op {
                 "impact" => req.params.get("target"),
-                "query" => req.params.get("pattern").or_else(|| req.params.get("query")),
+                "query" => req
+                    .params
+                    .get("pattern")
+                    .or_else(|| req.params.get("query")),
                 "context" => req.params.get("name").or_else(|| req.params.get("uid")),
                 _ => None,
             };
             if let Some(target) = search_target
                 && let Some(idx) = crate::agent::findings::finding_index_for_target(engine, target)
-                {
-                    engine.record_impl_impact(idx);
-                }
+            {
+                engine.record_impl_impact(idx);
+            }
         }
     }
 
@@ -1132,68 +1160,69 @@ fn apply_delegate_success_effects(
         }
     }
 
-    if inner_name == "file_read" && crate::agent::workflow_session::is_implementation_phase(engine)
-        && let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
-            engine.record_impl_file_read(path, &params_str);
-            if let Some(nudge) = engine.impl_edit_nudge_after_read(path, &result_content) {
-                deferred.push(nudge);
-            }
+    if inner_name == "file_read"
+        && crate::agent::workflow_session::is_implementation_phase(engine)
+        && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
+    {
+        engine.record_impl_file_read(path, &params_str);
+        if let Some(nudge) = engine.impl_edit_nudge_after_read(path, &result_content) {
+            deferred.push(nudge);
         }
+    }
     if engine.is_task_step() {
         let (plan_changed, plan_hint) =
             engine.record_execute_tool_success(inner_name, &params_str, &result_content);
         if let Some(hint) = plan_hint {
             deferred.push(hint);
         }
-        if plan_changed
-            && let Some(msg) = engine.plan_progress_message_after_tool(inner_name) {
-                deferred.push(msg);
-            }
+        if plan_changed && let Some(msg) = engine.plan_progress_message_after_tool(inner_name) {
+            deferred.push(msg);
+        }
         if inner_name == "shell_exec"
             && crate::agent::workflow_session::is_implementation_phase(engine)
-            && let Some(cmd) = req.params.get("command").and_then(|c| c.as_str()) {
-                let succeeded = !result.is_error;
-                crate::agent::post_edit_verification::note_shell_verify_result(
-                    engine, cmd, succeeded,
-                );
-                if succeeded {
-                    let idx = engine
-                        .get_plan_tracker()
-                        .and_then(|t| {
-                            t.steps
-                                .iter()
-                                .find(|s| s.awaiting_verify || !s.verify.is_empty())
-                                .map(|s| s.index)
-                        })
-                        .or_else(|| {
-                            crate::agent::findings::load_or_migrate(engine).and_then(|store| {
-                                store.scoped_findings().first().map(|finding| finding.index)
-                            })
-                        });
-                    if let Some(idx) = idx {
-                        crate::agent::verifier::after_verify_pass(engine, idx);
-                    }
-                }
-            }
-        if matches!(inner_name, "edit_file" | "file_write" | "delete_range")
-            && crate::agent::workflow_session::is_implementation_phase(engine)
-            && let Some(path) = req.params.get("path").and_then(|p| p.as_str()) {
-                engine.record_impl_file_edited(path);
+            && let Some(cmd) = req.params.get("command").and_then(|c| c.as_str())
+        {
+            let succeeded = !result.is_error;
+            crate::agent::post_edit_verification::note_shell_verify_result(engine, cmd, succeeded);
+            if succeeded {
                 let idx = engine
                     .get_plan_tracker()
-                    .and_then(|t| t.current_step().map(|s| s.index))
-                    .unwrap_or(1);
-                if let Some(note) =
-                    crate::agent::verifier::after_edit_note(engine, idx, path, &result_content)
-                {
-                    deferred.push(note);
-                }
-                if let Some(verify) = engine.verify_hint_for_path(path) {
-                    deferred.push(format!(
-                            "📋 计划验证: `{verify}` — 请用 shell_exec 执行（需用户确认），验证通过后再继续下一项。"
-                        ));
+                    .and_then(|t| {
+                        t.steps
+                            .iter()
+                            .find(|s| s.awaiting_verify || !s.verify.is_empty())
+                            .map(|s| s.index)
+                    })
+                    .or_else(|| {
+                        crate::agent::findings::load_or_migrate(engine).and_then(|store| {
+                            store.scoped_findings().first().map(|finding| finding.index)
+                        })
+                    });
+                if let Some(idx) = idx {
+                    crate::agent::verifier::after_verify_pass(engine, idx);
                 }
             }
+        }
+        if matches!(inner_name, "edit_file" | "file_write" | "delete_range")
+            && crate::agent::workflow_session::is_implementation_phase(engine)
+            && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
+        {
+            engine.record_impl_file_edited(path);
+            let idx = engine
+                .get_plan_tracker()
+                .and_then(|t| t.current_step().map(|s| s.index))
+                .unwrap_or(1);
+            if let Some(note) =
+                crate::agent::verifier::after_edit_note(engine, idx, path, &result_content)
+            {
+                deferred.push(note);
+            }
+            if let Some(verify) = engine.verify_hint_for_path(path) {
+                deferred.push(format!(
+                            "📋 计划验证: `{verify}` — 请用 shell_exec 执行（需用户确认），验证通过后再继续下一项。"
+                        ));
+            }
+        }
     }
 
     (deferred, output)

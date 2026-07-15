@@ -228,12 +228,13 @@ impl Tool for FileReadTool {
                     let knowledge = knowledge.clone();
                     tokio::spawn(async move {
                         if let Ok(mut engine) = knowledge.try_write()
-                            && let Err(e) = engine.index_file(&abs_path) {
-                                tracing::debug!(
-                                    "[FILE_READ] Auto-index failed for {}: {e}",
-                                    abs_path.display()
-                                );
-                            }
+                            && let Err(e) = engine.index_file(&abs_path)
+                        {
+                            tracing::debug!(
+                                "[FILE_READ] Auto-index failed for {}: {e}",
+                                abs_path.display()
+                            );
+                        }
                     });
                 }
 

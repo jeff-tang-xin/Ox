@@ -67,20 +67,20 @@ impl Tool for FindSymbolTool {
         // Timeout at 2s so it never slows down the symbol search.
         let mut graph_prefix = String::new();
         if let Some(ref svc) = ctx.gitnexus
-            && svc.is_ready().await {
-                let qp = crate::mcp::gitnexus::QueryParams::new(name);
-                if let Ok(graph) = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    svc.query(&qp),
-                ).await
-                    && let Ok(g) = graph
-                        && !g.is_error {
-                            let t = g.text.trim();
-                            if !t.is_empty() && t != "(空结果)" {
-                                graph_prefix = format!("── code_graph/query ──\n{t}\n\n");
-                            }
-                        }
+            && svc.is_ready().await
+        {
+            let qp = crate::mcp::gitnexus::QueryParams::new(name);
+            if let Ok(graph) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), svc.query(&qp)).await
+                && let Ok(g) = graph
+                && !g.is_error
+            {
+                let t = g.text.trim();
+                if !t.is_empty() && t != "(空结果)" {
+                    graph_prefix = format!("── code_graph/query ──\n{t}\n\n");
+                }
             }
+        }
 
         let result = tokio::task::spawn(async move {
             // ── Step 1: tree-sitter direct search (always available, no index needed) ──

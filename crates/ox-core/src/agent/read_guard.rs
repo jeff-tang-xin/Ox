@@ -23,9 +23,10 @@ pub fn record_file_read(engine: &WorkflowEngine, path: &str) {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     if set.insert(norm)
-        && let Ok(json) = serde_json::to_string(&set) {
-            engine.set_variable(TURN_FILES_READ_KEY, json);
-        }
+        && let Ok(json) = serde_json::to_string(&set)
+    {
+        engine.set_variable(TURN_FILES_READ_KEY, json);
+    }
 }
 
 pub fn paths_read(engine: &WorkflowEngine) -> Vec<String> {
@@ -81,11 +82,12 @@ pub fn check(
                 return Ok(());
             }
             if let Some(path) = extract_path_from_shell(cmd)
-                && path_already_read(engine, &path) {
-                    return Err(format!(
-                        "禁止用 shell 重复读取 `{path}`（已 file_read）。请基于已有内容继续。"
-                    ));
-                }
+                && path_already_read(engine, &path)
+            {
+                return Err(format!(
+                    "禁止用 shell 重复读取 `{path}`（已 file_read）。请基于已有内容继续。"
+                ));
+            }
         }
         "find_symbol" | "code_search" | "file_search" => {
             if matches!(tool_name, "code_search" | "file_search" | "file_list")
@@ -98,10 +100,11 @@ pub fn check(
                 ));
             }
             if let Some(query) = symbol_query_key(tool_name, args)
-                && symbol_already_queried(engine, &query) {
-                    // Don't block — just warn. LLM may have new context that makes retry useful.
-                    tracing::info!("[READ_GUARD] allow retry: {}:{}", tool_name, query);
-                }
+                && symbol_already_queried(engine, &query)
+            {
+                // Don't block — just warn. LLM may have new context that makes retry useful.
+                tracing::info!("[READ_GUARD] allow retry: {}:{}", tool_name, query);
+            }
         }
         _ => {}
     }
@@ -118,9 +121,10 @@ pub fn record_symbol_query(engine: &WorkflowEngine, tool_name: &str, args: &serd
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     if set.insert(norm)
-        && let Ok(json) = serde_json::to_string(&set) {
-            engine.set_variable(TURN_SYMBOLS_QUERIED_KEY, json);
-        }
+        && let Ok(json) = serde_json::to_string(&set)
+    {
+        engine.set_variable(TURN_SYMBOLS_QUERIED_KEY, json);
+    }
 }
 
 /// True when a read-only tool call would surface *new* information this turn —

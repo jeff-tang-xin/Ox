@@ -86,19 +86,39 @@ impl MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_key_facts_session ON key_facts(session_id);
             CREATE INDEX IF NOT EXISTS idx_files_read_session ON files_read(session_id);
             CREATE INDEX IF NOT EXISTS idx_files_read_path ON files_read(file_path);
-            CREATE INDEX IF NOT EXISTS idx_files_modified_session ON files_modified(session_id);"
+            CREATE INDEX IF NOT EXISTS idx_files_modified_session ON files_modified(session_id);",
         )?;
         // Migrate pre-existing DBs: add the ReAct-triple columns if missing.
         // ADD COLUMN errors when the column already exists — ignore that.
-        let _ = conn.execute("ALTER TABLE react_log ADD COLUMN assistant_text TEXT NOT NULL DEFAULT ''", []);
-        let _ = conn.execute("ALTER TABLE react_log ADD COLUMN tool_result TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute(
+            "ALTER TABLE react_log ADD COLUMN assistant_text TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE react_log ADD COLUMN tool_result TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         // Memory-graph tiering columns (L1/L2/L3 + downgrade). Idempotent.
-        let _ = conn.execute("ALTER TABLE memory_graphs ADD COLUMN tier INTEGER NOT NULL DEFAULT 1", []);
-        let _ = conn.execute("ALTER TABLE memory_graphs ADD COLUMN weight REAL NOT NULL DEFAULT 1.0", []);
-        let _ = conn.execute("ALTER TABLE memory_graphs ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE memory_graphs ADD COLUMN tier INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE memory_graphs ADD COLUMN weight REAL NOT NULL DEFAULT 1.0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE memory_graphs ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE memory_graphs ADD COLUMN last_hit_at TEXT", []);
-        let _ = conn.execute("ALTER TABLE memory_graphs ADD COLUMN merged_into INTEGER", []);
-        Ok(Self { conn: Mutex::new(conn) })
+        let _ = conn.execute(
+            "ALTER TABLE memory_graphs ADD COLUMN merged_into INTEGER",
+            [],
+        );
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Save a session summary for a completed session.
@@ -121,16 +141,28 @@ impl MemoryStore {
         let target_id = merged_id.as_deref().unwrap_or(session_id);
         let tx = conn.transaction()?;
 
-        tx.execute("DELETE FROM key_facts WHERE session_id = ?1", params![target_id])?;
-        tx.execute("DELETE FROM files_read WHERE session_id = ?1", params![target_id])?;
-        tx.execute("DELETE FROM files_modified WHERE session_id = ?1", params![target_id])?;
+        tx.execute(
+            "DELETE FROM key_facts WHERE session_id = ?1",
+            params![target_id],
+        )?;
+        tx.execute(
+            "DELETE FROM files_read WHERE session_id = ?1",
+            params![target_id],
+        )?;
+        tx.execute(
+            "DELETE FROM files_modified WHERE session_id = ?1",
+            params![target_id],
+        )?;
 
         // If merging, append learnings; otherwise use as-is
         let merged_learnings = if merged_id.is_some() {
-            let old: String = tx.query_row(
-                "SELECT learnings FROM sessions WHERE id = ?1", params![target_id],
-                |row| row.get(0),
-            ).unwrap_or_default();
+            let old: String = tx
+                .query_row(
+                    "SELECT learnings FROM sessions WHERE id = ?1",
+                    params![target_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
             if !old.is_empty() && !summary.learnings.is_empty() {
                 format!("{} → {}", old, summary.learnings)
             } else {
@@ -197,20 +229,25 @@ impl MemoryStore {
         }
 
         // Fallback: same modified files → same batch
-        let new_files: Vec<String> = summary.files_modified.iter()
+        let new_files: Vec<String> = summary
+            .files_modified
+            .iter()
             .map(|m| m.path.rsplit('/').next().unwrap_or(&m.path).to_lowercase())
             .collect();
         if new_files.is_empty() {
             return None;
         }
-        let mut stmt = conn.prepare(
-            "SELECT file_path FROM files_modified WHERE session_id = ?1"
-        ).ok()?;
-        let old_files: Vec<String> = stmt.query_map(params![last_id], |row| {
-            row.get::<_, String>(0).map(|p| {
-                p.rsplit('/').next().unwrap_or(&p).to_lowercase()
+        let mut stmt = conn
+            .prepare("SELECT file_path FROM files_modified WHERE session_id = ?1")
+            .ok()?;
+        let old_files: Vec<String> = stmt
+            .query_map(params![last_id], |row| {
+                row.get::<_, String>(0)
+                    .map(|p| p.rsplit('/').next().unwrap_or(&p).to_lowercase())
             })
-        }).ok()?.filter_map(|r| r.ok()).collect();
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
         if new_files.iter().any(|f| old_files.contains(f)) {
             return Some(last_id);
         }
@@ -229,7 +266,7 @@ impl MemoryStore {
              WHERE LOWER(REPLACE(m.file_path, '\\', '/')) = ?1
                 OR LOWER(REPLACE(m.file_path, '\\', '/')) LIKE ?2
              ORDER BY s.created_at DESC
-             LIMIT ?3"
+             LIMIT ?3",
         )?;
 
         let norm: String = file_path.replace('\\', "/").to_lowercase();
@@ -254,7 +291,10 @@ impl MemoryStore {
             let short: String = learnings.chars().take(120).collect();
             out.push_str(&format!("  • {} — {}\n", date, short));
             if !change.is_empty() {
-                out.push_str(&format!("    └ {}\n", change.chars().take(80).collect::<String>()));
+                out.push_str(&format!(
+                    "    └ {}\n",
+                    change.chars().take(80).collect::<String>()
+                ));
             }
         }
         Ok(out)
@@ -273,24 +313,32 @@ impl MemoryStore {
         let task_keywords: Vec<String> = current_task
             .split(|c: char| !c.is_alphanumeric() && c != '.')
             .filter(|w| w.len() > 2)
-            .filter(|w| !["fix", "改", "继续", "修", "this", "the", "for", "and", "not", "are", "was"].contains(w))
+            .filter(|w| {
+                ![
+                    "fix", "改", "继续", "修", "this", "the", "for", "and", "not", "are", "was",
+                ]
+                .contains(w)
+            })
             .map(|w| w.to_lowercase())
             .collect();
 
-        let file_bases: Vec<String> = file_paths.iter().map(|p| {
-            std::path::Path::new(&p.replace('\\', "/"))
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(p)
-                .to_lowercase()
-        }).collect();
+        let file_bases: Vec<String> = file_paths
+            .iter()
+            .map(|p| {
+                std::path::Path::new(&p.replace('\\', "/"))
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(p)
+                    .to_lowercase()
+            })
+            .collect();
 
         let mut stmt = conn.prepare(
             "SELECT s.task_desc, s.learnings, m.file_path, m.change_summary, s.created_at
              FROM sessions s
              JOIN files_modified m ON m.session_id = s.id
              ORDER BY s.created_at DESC
-             LIMIT 20"
+             LIMIT 20",
         )?;
 
         struct Scored {
@@ -324,12 +372,16 @@ impl MemoryStore {
 
             if file_bases.iter().any(|b| base == *b) {
                 score += 3.0;
-            } else if file_bases.iter().any(|b| base.contains(b) || b.contains(&base)) {
+            } else if file_bases
+                .iter()
+                .any(|b| base.contains(b) || b.contains(&base))
+            {
                 score += 1.0;
             }
 
             let task_lower = task_desc.to_lowercase();
-            let kw_matches = task_keywords.iter()
+            let kw_matches = task_keywords
+                .iter()
                 .filter(|k| task_lower.contains(k.as_str()))
                 .count();
             if kw_matches > 0 {
@@ -340,10 +392,19 @@ impl MemoryStore {
                 continue;
             }
 
-            scored.push(Scored { learnings, change_summary, created_at, score });
+            scored.push(Scored {
+                learnings,
+                change_summary,
+                created_at,
+                score,
+            });
         }
 
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(max_results);
         // Reverse: oldest first (top of context = least attention), newest last
         scored.reverse();
@@ -358,7 +419,10 @@ impl MemoryStore {
             let short: String = s.learnings.chars().take(120).collect();
             out.push_str(&format!("  ─ {} — {}\n", date, short));
             if !s.change_summary.is_empty() {
-                out.push_str(&format!("    └ {}\n", s.change_summary.chars().take(80).collect::<String>()));
+                out.push_str(&format!(
+                    "    └ {}\n",
+                    s.change_summary.chars().take(80).collect::<String>()
+                ));
             }
         }
         Ok(out)
@@ -402,7 +466,7 @@ impl MemoryStore {
              FROM react_log
              WHERE impacted = 0 AND session_id = ?1
              ORDER BY created_at ASC
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![session_id, limit as i64], |row| {
             Ok((
@@ -420,15 +484,24 @@ impl MemoryStore {
             let (ts, tool, target, outcome, decision) = row?;
             let date: String = ts.chars().take(16).collect();
             if date != time_group {
-                if !out.is_empty() { out.push('\n'); }
+                if !out.is_empty() {
+                    out.push('\n');
+                }
                 out.push_str(&format!("🔄 [{}]\n", date));
                 time_group = date;
             }
-            let icon = if outcome == "ok" || outcome.starts_with("ok") { "✅" } else { "⚠️" };
+            let icon = if outcome == "ok" || outcome.starts_with("ok") {
+                "✅"
+            } else {
+                "⚠️"
+            };
             let target_short: String = target.chars().take(50).collect();
             out.push_str(&format!("  {} {} {}\n", icon, tool, target_short));
             if !decision.is_empty() {
-                out.push_str(&format!("    → {}\n", decision.chars().take(100).collect::<String>()));
+                out.push_str(&format!(
+                    "    → {}\n",
+                    decision.chars().take(100).collect::<String>()
+                ));
             }
         }
         Ok(out)
@@ -461,9 +534,14 @@ impl MemoryStore {
             let (id, ts, tool, target, outcome, decision) = row?;
             let date: String = ts.chars().take(16).collect();
             let target_short: String = target.chars().take(60).collect();
-            out.push_str(&format!("[id={id}] [{date}] {tool} {target_short} → {outcome}\n"));
+            out.push_str(&format!(
+                "[id={id}] [{date}] {tool} {target_short} → {outcome}\n"
+            ));
             if !decision.is_empty() {
-                out.push_str(&format!("    判断: {}\n", decision.chars().take(120).collect::<String>()));
+                out.push_str(&format!(
+                    "    判断: {}\n",
+                    decision.chars().take(120).collect::<String>()
+                ));
             }
         }
         Ok(out)
@@ -729,19 +807,36 @@ impl MemoryStore {
         for row in rows {
             let (ts, task, tool, target, outcome, decision, assistant, tool_result) = row?;
             let date: String = ts.chars().take(19).collect();
-            let icon = if outcome == "ok" || outcome.starts_with("ok") { "✅" } else { "⚠️" };
+            let icon = if outcome == "ok" || outcome.starts_with("ok") {
+                "✅"
+            } else {
+                "⚠️"
+            };
             // [1] user (timestamped)
-            out.push_str(&format!("[user] {date} {}\n", task.chars().take(200).collect::<String>()));
+            out.push_str(&format!(
+                "[user] {date} {}\n",
+                task.chars().take(200).collect::<String>()
+            ));
             // [2] assistant — prefer the fuller assistant_text, fall back to decision
-            let think = if !assistant.trim().is_empty() { assistant } else { decision };
+            let think = if !assistant.trim().is_empty() {
+                assistant
+            } else {
+                decision
+            };
             if !think.trim().is_empty() {
-                out.push_str(&format!("[assistant] {}\n", think.chars().take(400).collect::<String>()));
+                out.push_str(&format!(
+                    "[assistant] {}\n",
+                    think.chars().take(400).collect::<String>()
+                ));
             }
             // [3] tool_result
             let target_short: String = target.chars().take(60).collect();
             out.push_str(&format!("[tool_result] {icon} {tool}({target_short})\n"));
             if !tool_result.trim().is_empty() {
-                out.push_str(&format!("  {}\n", tool_result.chars().take(500).collect::<String>()));
+                out.push_str(&format!(
+                    "  {}\n",
+                    tool_result.chars().take(500).collect::<String>()
+                ));
             }
             out.push('\n');
         }
@@ -751,18 +846,24 @@ impl MemoryStore {
 /// without tokenization or embedding.
 fn trigram_overlap(a: &str, b: &str) -> f64 {
     fn trigrams(s: &str) -> std::collections::HashSet<String> {
-        s.chars().collect::<Vec<_>>().windows(3).map(|w| w.iter().collect()).collect()
+        s.chars()
+            .collect::<Vec<_>>()
+            .windows(3)
+            .map(|w| w.iter().collect())
+            .collect()
     }
     let ta = trigrams(a);
     let tb = trigrams(b);
-    if ta.is_empty() || tb.is_empty() { return 0.0; }
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
     ta.intersection(&tb).count() as f64 / ta.union(&tb).count() as f64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::unified_action::{KeyFact, FileModifiedRecord};
+    use crate::agent::unified_action::{FileModifiedRecord, KeyFact};
 
     #[test]
     fn test_save_and_query() {
@@ -804,22 +905,46 @@ mod tests {
         // Seed react_log rows so archival has something to re-parent.
         for i in 0..4 {
             store
-                .record_react(sid, "重构记忆分层", "file_read", &format!("f{i}.rs"), "ok", "", "", "")
+                .record_react(
+                    sid,
+                    "重构记忆分层",
+                    "file_read",
+                    &format!("f{i}.rs"),
+                    "ok",
+                    "",
+                    "",
+                    "",
+                )
                 .unwrap();
         }
 
         // Archive into 3 tier-1 nodes; one carries an [IMPACT] weight.
         let clusters = vec![
-            GraphNode { topic: "[IMPACT] 分层设计".into(), summary: "L0-L3 tiering".into(), react_ids: vec![1] },
-            GraphNode { topic: "存储层".into(), summary: "sqlite schema".into(), react_ids: vec![2] },
-            GraphNode { topic: "归并策略".into(), summary: "LLM merge".into(), react_ids: vec![3] },
+            GraphNode {
+                topic: "[IMPACT] 分层设计".into(),
+                summary: "L0-L3 tiering".into(),
+                react_ids: vec![1],
+            },
+            GraphNode {
+                topic: "存储层".into(),
+                summary: "sqlite schema".into(),
+                react_ids: vec![2],
+            },
+            GraphNode {
+                topic: "归并策略".into(),
+                summary: "LLM merge".into(),
+                react_ids: vec![3],
+            },
         ];
         store.archive_react_batch(sid, &clusters).unwrap();
 
         let l1 = store.get_l1_nodes(sid, 60).unwrap();
         assert_eq!(l1.len(), 3, "3 tier-1 nodes archived");
         // Impact node weight preserved.
-        assert!(l1.iter().any(|(_, _, w)| *w >= 2.0), "[IMPACT] node weighted 2.0");
+        assert!(
+            l1.iter().any(|(_, _, w)| *w >= 2.0),
+            "[IMPACT] node weighted 2.0"
+        );
 
         // Merge two tier-1 nodes into one tier-2 node (impact weight carries over).
         let member_ids: Vec<i64> = l1.iter().take(2).map(|(id, _, _)| *id).collect();
@@ -833,7 +958,11 @@ mod tests {
 
         // Injection view: L2 ranks above L1 (tier DESC).
         let graphs = store.get_memory_graphs(sid, 20).unwrap();
-        assert_eq!(graphs.first().map(|(_, _, t, _)| *t), Some(2), "L2 pinned on top");
+        assert_eq!(
+            graphs.first().map(|(_, _, t, _)| *t),
+            Some(2),
+            "L2 pinned on top"
+        );
 
         // No L3 candidate before recall hits.
         assert!(store.get_l3_candidates(3, 5).unwrap().is_empty());
@@ -848,14 +977,19 @@ mod tests {
 
         // Promote to L3 → no longer re-suggested as an L2 candidate.
         store.mark_promoted_l3(l2_id).unwrap();
-        assert!(store.get_l3_candidates(3, 5).unwrap().is_empty(), "promoted node not re-offered");
+        assert!(
+            store.get_l3_candidates(3, 5).unwrap().is_empty(),
+            "promoted node not re-offered"
+        );
 
         // Downgrade is a safe no-op for fresh nodes (created within the current
         // second, so not yet `< now`) and never touches the promoted L3 node.
         let _ = store.downgrade_stale_nodes(0).unwrap();
         let graphs_after = store.get_memory_graphs(sid, 20).unwrap();
         assert!(
-            graphs_after.iter().any(|(id, _, t, _)| *id == l2_id && *t == 3),
+            graphs_after
+                .iter()
+                .any(|(id, _, t, _)| *id == l2_id && *t == 3),
             "promoted L3 node survives downgrade"
         );
 

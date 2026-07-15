@@ -367,9 +367,10 @@ pub fn sync_from_perception(engine: &WorkflowEngine, p: &PerceptionFindings) {
 /// Load store or build from legacy perception key.
 pub fn load_or_migrate(engine: &WorkflowEngine) -> Option<FindingsStore> {
     if let Some(store) = load(engine)
-        && !store.findings.is_empty() {
-            return Some(store);
-        }
+        && !store.findings.is_empty()
+    {
+        return Some(store);
+    }
     if let Some(p) = perception::load(engine) {
         let store = FindingsStore::from_perception(&p);
         save(engine, &store);
@@ -389,11 +390,7 @@ pub fn synthesize_from_review_prose(report: &str) -> Option<FindingsStore> {
     if tracker.steps.is_empty() {
         return None;
     }
-    let findings: Vec<Finding> = tracker
-        .steps
-        .iter()
-        .map(finding_from_plan_step)
-        .collect();
+    let findings: Vec<Finding> = tracker.steps.iter().map(finding_from_plan_step).collect();
     let summary = perception::extract_from_text(report)
         .map(|p| p.findings_summary)
         .filter(|s| s.chars().count() >= 8)
@@ -455,7 +452,10 @@ fn finding_from_plan_step(s: &PlanStep) -> Finding {
 
 /// Given a target (file path or symbol), find which finding index it belongs to.
 /// Used by unified_handler to record impact-analysis completion per finding.
-pub fn finding_index_for_target(engine: &WorkflowEngine, target: &serde_json::Value) -> Option<u32> {
+pub fn finding_index_for_target(
+    engine: &WorkflowEngine,
+    target: &serde_json::Value,
+) -> Option<u32> {
     let target_str = target.as_str()?;
     let store = load(engine)?;
     // Try exact file match first
@@ -472,13 +472,18 @@ pub fn finding_index_for_target(engine: &WorkflowEngine, target: &serde_json::Va
     }
     // Try class-name match: extract file name without extension from both sides.
     // E.g. target="OmsxTradingConfigurationDao" matches file ".../OmsxTradingConfigurationDao.java"
-    let target_name = target_str.rsplit('/').next()
+    let target_name = target_str
+        .rsplit('/')
+        .next()
         .or_else(|| target_str.rsplit('\\').next())
         .unwrap_or(target_str);
     // Strip file extension (.java, .kt, etc.) from target
     let target_class = target_name.split('.').next().unwrap_or(target_name);
     for f in &store.findings {
-        let fname = f.file.rsplit('/').next()
+        let fname = f
+            .file
+            .rsplit('/')
+            .next()
             .or_else(|| f.file.rsplit('\\').next())
             .unwrap_or(&f.file);
         let fclass = fname.split('.').next().unwrap_or(fname);
@@ -500,9 +505,11 @@ pub fn parse_scope_indices(text: &str) -> Vec<u32> {
                 i += 1;
             }
             if let Ok(n) = text[start..i].parse::<u32>()
-                && n > 0 && !indices.contains(&n) {
-                    indices.push(n);
-                }
+                && n > 0
+                && !indices.contains(&n)
+            {
+                indices.push(n);
+            }
             continue;
         }
         i += 1;

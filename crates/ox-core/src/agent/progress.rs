@@ -113,9 +113,10 @@ pub fn scan_all_progress(project_root: &Path) -> Vec<WorkflowProgress> {
             let progress_path = path.join("progress.json");
             if progress_path.exists()
                 && let Ok(content) = fs::read_to_string(&progress_path)
-                    && let Ok(progress) = serde_json::from_str::<WorkflowProgress>(&content) {
-                        progresses.push(progress);
-                    }
+                && let Ok(progress) = serde_json::from_str::<WorkflowProgress>(&content)
+            {
+                progresses.push(progress);
+            }
         }
     }
 

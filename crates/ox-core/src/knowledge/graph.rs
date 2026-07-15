@@ -167,9 +167,10 @@ impl EntityGraph {
                             continue;
                         }
                         if let Some(allowed) = relation_types
-                            && !allowed.contains(&edge.relation_type) {
-                                continue;
-                            }
+                            && !allowed.contains(&edge.relation_type)
+                        {
+                            continue;
+                        }
                         visited.insert(edge.to_id.clone());
                         let new_weight = path_weight * edge.weight;
                         if let Some(entity) = self.entities.get(&edge.to_id) {
@@ -301,9 +302,10 @@ impl EntityGraph {
                     .filter(|e| my_targets.contains(e.to_id.as_str()))
                     .count();
                 if overlap > 0
-                    && let Some(other) = self.entities.get(other_id) {
-                        scored.push((other, overlap));
-                    }
+                    && let Some(other) = self.entities.get(other_id)
+                {
+                    scored.push((other, overlap));
+                }
             }
         }
 

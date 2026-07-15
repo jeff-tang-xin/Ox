@@ -10,7 +10,7 @@
 //! that should be remembered across turns within the same session.
 //!
 //! Sources:
-//! - User mid-task input that reads as a constraint ("不要动 X", "必须保持兼容") 
+//! - User mid-task input that reads as a constraint ("不要动 X", "必须保持兼容")
 //! - LLM discoveries automatically extracted from finish summaries
 //! - Explicit facts from [TURN_CONTEXT].decisions
 

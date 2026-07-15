@@ -188,9 +188,10 @@ pub fn tool_progress_message(tool_name: &str) -> &'static str {
 /// Check if a tool call references a path outside the working directory.
 pub fn is_path_outside_workdir(args_json: &str, working_dir: &std::path::Path) -> bool {
     if let Ok(args_val) = serde_json::from_str::<Value>(args_json)
-        && let Some(path_str) = args_val.get("path").and_then(|v| v.as_str()) {
-            let resolved = working_dir.join(path_str);
-            return !crate::safety::is_path_within_workdir(&resolved, working_dir);
-        }
+        && let Some(path_str) = args_val.get("path").and_then(|v| v.as_str())
+    {
+        let resolved = working_dir.join(path_str);
+        return !crate::safety::is_path_within_workdir(&resolved, working_dir);
+    }
     false
 }

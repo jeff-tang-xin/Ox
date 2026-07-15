@@ -72,10 +72,7 @@ fn review_round_starts_in_review_phase() {
     let ws = WorkflowWorkspace::build(&engine).unwrap();
     assert_eq!(ws.mode, WorkspaceMode::ExecuteReview);
     // No findings yet → should suggest exploration via code_graph first
-    assert!(matches!(
-        ws.required_action,
-        RequiredAction::Explore { .. }
-    ));
+    assert!(matches!(ws.required_action, RequiredAction::Explore { .. }));
     assert!(format!("{:?}", ws.required_action).contains("code_graph"));
 }
 

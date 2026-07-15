@@ -112,9 +112,10 @@ impl Tool for CodeGraphTool {
             // search-text parameter key, but the LLM sends `query` (from Ox's
             // precheck error message). Normalize it here.
             if (op == "query" || op == "cypher")
-                && let Some(q) = obj.remove("query") {
-                    obj.insert("pattern".to_string(), q);
-                }
+                && let Some(q) = obj.remove("query")
+            {
+                obj.insert("pattern".to_string(), q);
+            }
         }
 
         match svc.call(&op, forwarded).await {
@@ -127,20 +128,23 @@ impl Tool for CodeGraphTool {
                 // knows which repo name to use.
                 if text.contains("Multiple repositories indexed")
                     && let Ok(repos) = svc.list_repos().await
-                        && !repos.is_error {
-                            let list = repos.text.trim();
-                            text.push_str(&format!(
-                                "\n\n📋 可用仓库:\n{list}\n请在下次调用时加上 repo 参数。"
-                            ));
-                        }
+                    && !repos.is_error
+                {
+                    let list = repos.text.trim();
+                    text.push_str(&format!(
+                        "\n\n📋 可用仓库:\n{list}\n请在下次调用时加上 repo 参数。"
+                    ));
+                }
                 // If GitNexus can't find the target (e.g. file not in git yet,
                 // or wrong repo parameter), append a helpful hint.
-                if text.contains("Target") && (text.contains("not found") || text.contains("NotFound")) {
+                if text.contains("Target")
+                    && (text.contains("not found") || text.contains("NotFound"))
+                {
                     text.push_str(
                         "\n\n⚠️ 目标不在代码图谱中，可能原因：\
                          \n1. 该文件是新增的，尚未 git add → 直接编辑，无需 impact 分析\
                          \n2. GitNexus 索引未覆盖此模块 → 可继续编辑，跳过 impact\
-                         \n3. repo 参数不正确 → 用上面的可用仓库列表重试"
+                         \n3. repo 参数不正确 → 用上面的可用仓库列表重试",
                     );
                 }
                 if text.len() > MAX_OUTPUT_CHARS {
@@ -167,14 +171,12 @@ impl Tool for CodeGraphTool {
 fn precheck(op: &str, args: &Value) -> Result<(), String> {
     let has = |k: &str| args.get(k).map(|v| !v.is_null()).unwrap_or(false);
     match op {
-        "query" | "cypher"
-            if !has("query") => {
-                return Err(format!("op={op} 需要 params.query"));
-            }
-        "context"
-            if !has("name") && !has("uid") => {
-                return Err("op=context 需要 params.name 或 params.uid".into());
-            }
+        "query" | "cypher" if !has("query") => {
+            return Err(format!("op={op} 需要 params.query"));
+        }
+        "context" if !has("name") && !has("uid") => {
+            return Err("op=context 需要 params.name 或 params.uid".into());
+        }
         "impact" => {
             if !has("target") && !has("target_uid") {
                 return Err("op=impact 需要 params.target（或 target_uid）".into());
@@ -183,10 +185,9 @@ fn precheck(op: &str, args: &Value) -> Result<(), String> {
                 return Err("op=impact 需要 params.direction（upstream 或 downstream）".into());
             }
         }
-        "api_impact"
-            if !has("route") && !has("file") => {
-                return Err("op=api_impact 需要 params.route 或 params.file".into());
-            }
+        "api_impact" if !has("route") && !has("file") => {
+            return Err("op=api_impact 需要 params.route 或 params.file".into());
+        }
         "rename" => {
             if !has("new_name") {
                 return Err("op=rename 需要 params.new_name".into());
@@ -195,10 +196,9 @@ fn precheck(op: &str, args: &Value) -> Result<(), String> {
                 return Err("op=rename 需要 params.symbol_name（或 symbol_uid）".into());
             }
         }
-        "group_sync"
-            if !has("name") => {
-                return Err("op=group_sync 需要 params.name".into());
-            }
+        "group_sync" if !has("name") => {
+            return Err("op=group_sync 需要 params.name".into());
+        }
         _ => {}
     }
     Ok(())

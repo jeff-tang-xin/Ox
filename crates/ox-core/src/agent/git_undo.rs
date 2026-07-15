@@ -87,7 +87,6 @@ pub fn git_checkout_paths(cwd: &Path, paths: &[String]) -> Result<String, String
 
 #[cfg(test)]
 mod tests {
-    
 
     #[test]
     fn git_path_arg() {

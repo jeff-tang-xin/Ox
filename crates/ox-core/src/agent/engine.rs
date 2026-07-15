@@ -190,36 +190,41 @@ impl WorkflowEngine {
             // finding-related files, so the LLM understands the blast radius.
             if matches!(tool_name, "file_read" | "edit_file")
                 && let Some(path) = args.get("path").and_then(|v| v.as_str())
-                    && !path.trim().is_empty() {
-                        let target_val = serde_json::Value::String(path.to_string());
-                        if let Some(idx) = crate::agent::findings::finding_index_for_target(self, &target_val)
-                            && !self.impl_impact_done(idx) {
-                                return Err(format!(
-                                    "📊 影响范围门禁 — 编辑 `{path}` 前请先评估改动影响。\n\
+                && !path.trim().is_empty()
+            {
+                let target_val = serde_json::Value::String(path.to_string());
+                if let Some(idx) =
+                    crate::agent::findings::finding_index_for_target(self, &target_val)
+                    && !self.impl_impact_done(idx)
+                {
+                    return Err(format!(
+                        "📊 影响范围门禁 — 编辑 `{path}` 前请先评估改动影响。\n\
                                      先调用 complete_and_check(action=\"code_graph\", \
                                      params={{\"op\":\"impact\",\"target\":\"{symbol}\",\"direction\":\"downstream\"}}) \
                                      查看调用链影响范围。",
-                                    symbol = path.rsplit('/')
-                                        .next_back()
-                                        .unwrap_or(path)
-                                        .rsplit('\\')
-                                        .next_back()
-                                        .unwrap_or(path)
-                                        .rsplit('.')
-                                        .next()
-                                        .unwrap_or(path)
-                                ));
-                            }
-                    }
+                        symbol = path
+                            .rsplit('/')
+                            .next_back()
+                            .unwrap_or(path)
+                            .rsplit('\\')
+                            .next_back()
+                            .unwrap_or(path)
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(path)
+                    ));
+                }
+            }
         }
 
         crate::agent::read_guard::check(tool_name, args, self)?;
 
         if tool_name == "file_read"
-            && let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
-                self.validate_impl_file_read(path, offset)?;
-            }
+            && let Some(path) = args.get("path").and_then(|v| v.as_str())
+        {
+            let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
+            self.validate_impl_file_read(path, offset)?;
+        }
 
         Ok(())
     }
@@ -759,9 +764,7 @@ impl WorkflowEngine {
 
     /// True when code_graph has been queried in this round (unblocks find_symbol).
     pub fn impl_code_graph_queried(&self) -> bool {
-        self.get_variable(Self::CODE_GRAPH_QUERIED_KEY)
-            .as_deref()
-            == Some("1")
+        self.get_variable(Self::CODE_GRAPH_QUERIED_KEY).as_deref() == Some("1")
     }
 
     /// Mark that code_graph was queried.
@@ -950,21 +953,21 @@ impl WorkflowEngine {
         }
 
         // Check tool whitelist (if specified)
-        if !step.allowed_tools.is_empty()
-            && !step.allowed_tools.contains(&tool_name.to_string()) {
-                return Err(format!(
-                    "Tool '{}' is not allowed in current step '{}'. Allowed tools: {}",
-                    tool_name,
-                    step.name,
-                    step.allowed_tools.join(", ")
-                ));
-            }
+        if !step.allowed_tools.is_empty() && !step.allowed_tools.contains(&tool_name.to_string()) {
+            return Err(format!(
+                "Tool '{}' is not allowed in current step '{}'. Allowed tools: {}",
+                tool_name,
+                step.name,
+                step.allowed_tools.join(", ")
+            ));
+        }
 
         if tool_name == "file_read"
-            && let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
-                self.validate_impl_file_read(path, offset)?;
-            }
+            && let Some(path) = args.get("path").and_then(|v| v.as_str())
+        {
+            let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
+            self.validate_impl_file_read(path, offset)?;
+        }
 
         crate::agent::workflow_phases::validate_act_tool(self, tool_name)?;
         crate::agent::workflow_session::validate_feedback_discuss_tool(self, tool_name)?;
@@ -1024,13 +1027,14 @@ impl WorkflowEngine {
     pub fn get_current_step_info(&self) -> Option<StepDisplayInfo> {
         if let Some(workflow) = &self.current_workflow
             && let Ok(session) = self.session_state.try_lock()
-                && let Some(step) = workflow.get_step(session.current_step_index) {
-                    return Some(StepDisplayInfo {
-                        name: step.name.clone(),
-                        current_step: session.current_step_index + 1,
-                        total_steps: workflow.total_steps(),
-                    });
-                }
+            && let Some(step) = workflow.get_step(session.current_step_index)
+        {
+            return Some(StepDisplayInfo {
+                name: step.name.clone(),
+                current_step: session.current_step_index + 1,
+                total_steps: workflow.total_steps(),
+            });
+        }
         None
     }
 
@@ -1284,9 +1288,9 @@ impl WorkflowEngine {
                 || last.ends_with("完成。")
                 || last.contains("审查完成")
                 || last.contains("检查完成"))
-            {
-                return true;
-            }
+        {
+            return true;
+        }
         false
     }
 
@@ -1398,27 +1402,28 @@ impl WorkflowEngine {
         let target = crate::agent::exploration_snapshot::target_from_tool_args(tool, arguments);
         if tool == "file_read"
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments)
-                && let Some(path) = v.get("path").and_then(|p| p.as_str()) {
-                    let entries = self.get_exploration_entries();
-                    if crate::agent::exploration_snapshot::find_file_read_entry(&entries, path)
-                        .is_some()
-                        || self.is_path_explored("file_read", path)
-                    {
-                        return Some(crate::agent::exploration_snapshot::resolve_file_read_cache(
-                            working_dir,
-                            &entries,
-                            path,
-                            arguments,
-                        ));
-                    }
-                }
+            && let Some(path) = v.get("path").and_then(|p| p.as_str())
+        {
+            let entries = self.get_exploration_entries();
+            if crate::agent::exploration_snapshot::find_file_read_entry(&entries, path).is_some()
+                || self.is_path_explored("file_read", path)
+            {
+                return Some(crate::agent::exploration_snapshot::resolve_file_read_cache(
+                    working_dir,
+                    &entries,
+                    path,
+                    arguments,
+                ));
+            }
+        }
         if let Some(hit) = self.lookup_exploration_cache(working_dir, tool, &target) {
             return Some(hit);
         }
         if matches!(tool, "code_search" | "find_symbol" | "file_search")
-            && self.is_path_explored(tool, &target) {
-                return self.lookup_exploration_cache(working_dir, tool, &target);
-            }
+            && self.is_path_explored(tool, &target)
+        {
+            return self.lookup_exploration_cache(working_dir, tool, &target);
+        }
         None
     }
 
@@ -1524,9 +1529,10 @@ impl WorkflowEngine {
         let key = format!("{}:{}", tool, Self::normalize_explore_path(path));
         let mut paths = self.get_explored_path_set();
         if paths.insert(key)
-            && let Ok(json) = serde_json::to_string(&paths) {
-                self.set_variable("_explored_paths", json);
-            }
+            && let Ok(json) = serde_json::to_string(&paths)
+        {
+            self.set_variable("_explored_paths", json);
+        }
     }
 
     /// Check whether this tool+path was already explored in the current workflow.
@@ -1639,9 +1645,10 @@ pub fn extract_json_block(text: &str) -> Option<String> {
     }
     // Try raw JSON object
     if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
-        && start < end {
-            return Some(text[start..=end].to_string());
-        }
+        && start < end
+    {
+        return Some(text[start..=end].to_string());
+    }
     None
 }
 

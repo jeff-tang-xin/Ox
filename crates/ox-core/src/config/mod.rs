@@ -916,7 +916,7 @@ impl Default for GitNexusConfig {
             augment_find_symbol: true,
             startup_timeout_ms: 30_000,
             request_timeout_ms: 30_000,
-            worker_timeout_sec: 300,  // 5 minutes for large codebases
+            worker_timeout_sec: 300, // 5 minutes for large codebases
         }
     }
 }
@@ -956,7 +956,6 @@ pub struct CollaborationConfig {
     /// is a good fit here since the task is pure summarization.
     pub summarizer_model: String,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

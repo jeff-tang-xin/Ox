@@ -163,15 +163,16 @@ fn find_findings_json_range(text: &str) -> Option<(usize, usize)> {
         while let Some(pos) = text[from..].find(marker) {
             let abs = from + pos;
             if let Some(open) = text[..abs].rfind('{')
-                && let Some(close_rel) = matching_close_brace(&text[open..]) {
-                    let end = open + close_rel + 1;
-                    let slice = &text[open..end];
-                    if slice.contains("\"findings\"")
-                        && serde_json::from_str::<serde_json::Value>(slice).is_ok()
-                    {
-                        best = Some((open, end));
-                    }
+                && let Some(close_rel) = matching_close_brace(&text[open..])
+            {
+                let end = open + close_rel + 1;
+                let slice = &text[open..end];
+                if slice.contains("\"findings\"")
+                    && serde_json::from_str::<serde_json::Value>(slice).is_ok()
+                {
+                    best = Some((open, end));
                 }
+            }
             from = abs + marker.len();
         }
     }
@@ -406,13 +407,14 @@ pub fn to_plan_tracker(findings: &PerceptionFindings) -> PlanTracker {
 pub fn freeze_from_output(engine: &super::engine::WorkflowEngine, output: &str) {
     crate::agent::findings::ensure_from_review_output(engine, output);
     if let Some(tracker) = plan_tracker::load_from_review_report(output)
-        && let Ok(json) = serde_json::to_string(&tracker) {
-            engine.set_variable("_plan_tracker", json);
-            tracing::info!(
-                "[PERCEPTION] derived plan tracker ({} steps) from review prose",
-                tracker.steps.len()
-            );
-        }
+        && let Ok(json) = serde_json::to_string(&tracker)
+    {
+        engine.set_variable("_plan_tracker", json);
+        tracing::info!(
+            "[PERCEPTION] derived plan tracker ({} steps) from review prose",
+            tracker.steps.len()
+        );
+    }
 }
 
 pub fn findings_summary_block(engine: &super::engine::WorkflowEngine) -> String {

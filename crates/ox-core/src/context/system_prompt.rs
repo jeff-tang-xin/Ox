@@ -178,9 +178,10 @@ fn build_system_prompt_inner(
             parts.push(dedup);
         }
         if wants_project_skills
-            && let Some(block) = crate::skill::policy::build_mandatory_injection(&skills) {
-                parts.push(block);
-            }
+            && let Some(block) = crate::skill::policy::build_mandatory_injection(&skills)
+        {
+            parts.push(block);
+        }
         if let Some(block) = crate::skill::policy::build_on_demand_manifest(&skills) {
             parts.push(block);
         } else if !is_wf && tool_registry.has_skills() {
@@ -198,9 +199,10 @@ fn build_system_prompt_inner(
     // Spec: Plan step or single-step task
     if (!is_wf || si == 0 || si == 1)
         && let Some(spec) = _spec_content
-            && !spec.trim().is_empty() {
-                parts.push(format!("【任务】\n{}\n", spec.trim()));
-            }
+        && !spec.trim().is_empty()
+    {
+        parts.push(format!("【任务】\n{}\n", spec.trim()));
+    }
 
     // User rules: single-step (0), Review (2+), Execute (3)
     if wants_user_rules {
@@ -476,16 +478,18 @@ fn load_user_rules(rt_env: &RuntimeEnvironment) -> Option<String> {
     let global_path = rt_env.ox_home_dir.join("rules.md");
     if global_path.exists()
         && let Ok(content) = std::fs::read_to_string(&global_path)
-            && !content.trim().is_empty() {
-                rules.push_str(&format!("[全局] {}\n", content.trim()));
-            }
+        && !content.trim().is_empty()
+    {
+        rules.push_str(&format!("[全局] {}\n", content.trim()));
+    }
     if let Some(ref proj_root) = rt_env.project_root {
         let proj_path = proj_root.join(".ox").join("rules.md");
         if proj_path.exists()
             && let Ok(content) = std::fs::read_to_string(&proj_path)
-                && !content.trim().is_empty() {
-                    rules.push_str(&format!("[项目] {}\n", content.trim()));
-                }
+            && !content.trim().is_empty()
+        {
+            rules.push_str(&format!("[项目] {}\n", content.trim()));
+        }
     }
     if rules.is_empty() { None } else { Some(rules) }
 }

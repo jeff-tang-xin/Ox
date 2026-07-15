@@ -78,12 +78,13 @@ impl OpenAiSseParser {
 
                 if let Some(finish_reason) = choice.get("finish_reason").and_then(|f| f.as_str())
                     && (finish_reason == "tool_calls" || finish_reason == "stop")
-                        && self.active_tool_calls.contains(&index) {
-                            if let Some(id) = self.tool_call_ids.get(&index) {
-                                events.push(LlmStreamEvent::ToolCallEnd { id: id.clone() });
-                            }
-                            self.active_tool_calls.remove(&index);
-                        }
+                    && self.active_tool_calls.contains(&index)
+                {
+                    if let Some(id) = self.tool_call_ids.get(&index) {
+                        events.push(LlmStreamEvent::ToolCallEnd { id: id.clone() });
+                    }
+                    self.active_tool_calls.remove(&index);
+                }
 
                 if let Some(delta) = choice.get("delta") {
                     events.extend(self.process_delta(delta, index));
@@ -190,10 +191,7 @@ impl OpenAiSseParser {
                     });
 
                 if let Some(args) = args {
-                    let buffer = self
-                        .argument_buffers
-                        .entry(tc_index)
-                        .or_default();
+                    let buffer = self.argument_buffers.entry(tc_index).or_default();
                     buffer.push_str(&args);
                     let tc_id = self
                         .tool_call_ids

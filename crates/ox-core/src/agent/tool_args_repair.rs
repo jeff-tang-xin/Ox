@@ -17,14 +17,16 @@ pub fn repair_unified_arguments(raw: &str) -> Option<String> {
     }
 
     if let Some(xml) = parse_xml_arg_pairs(trimmed)
-        && let Ok(req) = build_unified_from_pairs(&xml) {
-            return serde_json::to_string(&req).ok();
-        }
+        && let Ok(req) = build_unified_from_pairs(&xml)
+    {
+        return serde_json::to_string(&req).ok();
+    }
 
     if let Some(extracted) = extract_json_object_with_action(trimmed)
-        && let Ok(req) = try_parse_unified(&extracted) {
-            return serde_json::to_string(&req).ok();
-        }
+        && let Ok(req) = try_parse_unified(&extracted)
+    {
+        return serde_json::to_string(&req).ok();
+    }
 
     None
 }
@@ -118,51 +120,54 @@ pub fn normalize_delegate_params(action: &str, params: &mut Value) {
     };
 
     match action {
-        "find_symbol"
-            if !obj.contains_key("name") => {
-                for alias in ["symbol", "query", "pattern", "class", "type"] {
-                    if let Some(v) = obj.get(alias).cloned() {
-                        obj.insert("name".into(), v);
-                        break;
-                    }
+        "find_symbol" if !obj.contains_key("name") => {
+            for alias in ["symbol", "query", "pattern", "class", "type"] {
+                if let Some(v) = obj.get(alias).cloned() {
+                    obj.insert("name".into(), v);
+                    break;
                 }
             }
-        "file_read" | "file_write" | "edit_file" | "delete_range"
-            if !obj.contains_key("path") => {
-                for alias in ["file", "filepath", "file_path", "filename", "key"] {
-                    if let Some(v) = obj.get(alias).cloned() {
-                        obj.insert("path".into(), v);
-                        break;
-                    }
+        }
+        "file_read" | "file_write" | "edit_file" | "delete_range" if !obj.contains_key("path") => {
+            for alias in ["file", "filepath", "file_path", "filename", "key"] {
+                if let Some(v) = obj.get(alias).cloned() {
+                    obj.insert("path".into(), v);
+                    break;
                 }
             }
+        }
         "file_search" => {
             if !obj.contains_key("pattern")
-                && let Some(v) = obj.get("query").cloned() {
-                    obj.insert("pattern".into(), v);
-                }
+                && let Some(v) = obj.get("query").cloned()
+            {
+                obj.insert("pattern".into(), v);
+            }
             if !obj.contains_key("path")
-                && let Some(v) = obj.get("dir").or(obj.get("directory")).cloned() {
-                    obj.insert("path".into(), v);
-                }
+                && let Some(v) = obj.get("dir").or(obj.get("directory")).cloned()
+            {
+                obj.insert("path".into(), v);
+            }
         }
         "code_search" => {
             if !obj.contains_key("query")
-                && let Some(v) = obj.get("pattern").or(obj.get("q")).cloned() {
-                    obj.insert("query".into(), v);
-                }
+                && let Some(v) = obj.get("pattern").or(obj.get("q")).cloned()
+            {
+                obj.insert("query".into(), v);
+            }
         }
         "shell_exec" => {
             if !obj.contains_key("command")
-                && let Some(v) = obj.get("cmd").cloned() {
-                    obj.insert("command".into(), v);
-                }
+                && let Some(v) = obj.get("cmd").cloned()
+            {
+                obj.insert("command".into(), v);
+            }
         }
         "recall" => {
             if !obj.contains_key("node_id")
-                && let Some(v) = obj.get("key").or(obj.get("id")).cloned() {
-                    obj.insert("node_id".into(), v);
-                }
+                && let Some(v) = obj.get("key").or(obj.get("id")).cloned()
+            {
+                obj.insert("node_id".into(), v);
+            }
         }
         "finish" | "deliver" | "report" | "done" | "complete" => {
             // Normalize free-text aliases → content.
@@ -173,14 +178,15 @@ pub fn normalize_delegate_params(action: &str, params: &mut Value) {
                     .or(obj.get("summary"))
                     .or(obj.get("message"))
                     .cloned()
-                {
-                    obj.insert("content".into(), v);
-                }
+            {
+                obj.insert("content".into(), v);
+            }
             // Normalize review-item aliases → finding_json.
             if !obj.contains_key("finding_json")
-                && let Some(v) = obj.get("findings").or(obj.get("finding")).cloned() {
-                    obj.insert("finding_json".into(), v);
-                }
+                && let Some(v) = obj.get("findings").or(obj.get("finding")).cloned()
+            {
+                obj.insert("finding_json".into(), v);
+            }
         }
         _ => {}
     }

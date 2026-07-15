@@ -221,9 +221,10 @@ pub fn finding_json(params: &Value) -> Option<String> {
     // leading to a 300s timeout that kills the agent turn.
     let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
     if let Some(extracted) = crate::agent::perception::extract_json_block(content)
-        && serde_json::from_str::<serde_json::Value>(&extracted).is_ok() {
-            return Some(content.to_string());
-        }
+        && serde_json::from_str::<serde_json::Value>(&extracted).is_ok()
+    {
+        return Some(content.to_string());
+    }
     None
 }
 
@@ -655,11 +656,15 @@ mod tests {
     fn finish_with_empty_findings_array_is_none() {
         // Empty array yields None — handle_finish must catch this (key present,
         // parse None) and error instead of silently ending the turn.
-        let req =
-            parse_request(r#"{"action":"finish","params":{"finding_json":[]}}"#).unwrap();
+        let req = parse_request(r#"{"action":"finish","params":{"finding_json":[]}}"#).unwrap();
         assert!(finding_json(&req.params).is_none());
         // The key is nonetheless present and non-null → "attempted findings".
-        assert!(req.params.get("finding_json").map(|v| !v.is_null()).unwrap_or(false));
+        assert!(
+            req.params
+                .get("finding_json")
+                .map(|v| !v.is_null())
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -670,7 +675,12 @@ mod tests {
             parse_request(r#"{"action":"finish","params":{"finding_json":null,"content":"done"}}"#)
                 .unwrap();
         assert!(finding_json(&req.params).is_none());
-        assert!(!req.params.get("finding_json").map(|v| !v.is_null()).unwrap_or(false));
+        assert!(
+            !req.params
+                .get("finding_json")
+                .map(|v| !v.is_null())
+                .unwrap_or(false)
+        );
     }
 
     #[test]

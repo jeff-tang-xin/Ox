@@ -91,11 +91,12 @@ impl Bm25Index {
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         if let Some(&max_score) = ranked.first().map(|(_, s)| s)
-            && max_score > 0.0 {
-                for (_, s) in &mut ranked {
-                    *s /= max_score;
-                }
+            && max_score > 0.0
+        {
+            for (_, s) in &mut ranked {
+                *s /= max_score;
             }
+        }
 
         ranked.truncate(top_k);
         ranked

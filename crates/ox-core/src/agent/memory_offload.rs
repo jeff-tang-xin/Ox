@@ -184,7 +184,11 @@ fn parse_clusters(raw: &str) -> Option<Vec<GraphNode>> {
     let parsed: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
     let mut out = Vec::new();
     for v in parsed {
-        let topic = v.get("topic").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let topic = v
+            .get("topic")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
         let summary = v
             .get("summary")
             .and_then(|s| s.as_str())
@@ -225,7 +229,10 @@ fn placeholder_old_react(messages: &mut Vec<Message>, count: usize) {
         .unwrap_or(0);
 
     // Collapse tool results before the *last* third of the conversation.
-    let cut = messages.len().saturating_sub(messages.len() / 3).max(first_user + 1);
+    let cut = messages
+        .len()
+        .saturating_sub(messages.len() / 3)
+        .max(first_user + 1);
 
     let mut replaced = 0usize;
     for msg in messages.iter_mut().take(cut).skip(first_user) {
@@ -240,9 +247,7 @@ fn placeholder_old_react(messages: &mut Vec<Message>, count: usize) {
     // the placeholder still satisfies the tool_call↔result contract. Then run
     // correctness cleanup to drop anything now orphaned.
     cleanup_only(messages);
-    tracing::info!(
-        "[OFFLOAD] Placeholdered {replaced} old ReAct results (archived ~{count} rows)"
-    );
+    tracing::info!("[OFFLOAD] Placeholdered {replaced} old ReAct results (archived ~{count} rows)");
 }
 
 /// Public entry to the last-resort tail-trim, for the agent loop's bounded
@@ -398,7 +403,10 @@ async fn merge_l1_clusters(
     let mut listing = String::new();
     for (id, summary, weight) in nodes {
         let impact = if *weight >= 2.0 { " [IMPACT]" } else { "" };
-        listing.push_str(&format!("#{id}{impact}: {}\n", summary.chars().take(150).collect::<String>()));
+        listing.push_str(&format!(
+            "#{id}{impact}: {}\n",
+            summary.chars().take(150).collect::<String>()
+        ));
     }
 
     let prompt = format!(
@@ -440,8 +448,16 @@ fn parse_merge_groups(raw: &str) -> Option<Vec<MergeGroup>> {
     let parsed: Vec<serde_json::Value> = serde_json::from_str(&raw[start..=end]).ok()?;
     let mut out = Vec::new();
     for v in parsed {
-        let topic = v.get("topic").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        let summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let topic = v
+            .get("topic")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let summary = v
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
         let member_ids: Vec<i64> = v
             .get("member_ids")
             .and_then(|a| a.as_array())
@@ -450,7 +466,11 @@ fn parse_merge_groups(raw: &str) -> Option<Vec<MergeGroup>> {
         if member_ids.is_empty() {
             continue;
         }
-        out.push(MergeGroup { topic, summary, member_ids });
+        out.push(MergeGroup {
+            topic,
+            summary,
+            member_ids,
+        });
     }
     if out.is_empty() { None } else { Some(out) }
 }
@@ -483,7 +503,11 @@ async fn abstract_to_skill(provider: &Arc<dyn LlmProvider>, summary: &str) -> Op
         }
     }
     let trimmed = full.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(test)]

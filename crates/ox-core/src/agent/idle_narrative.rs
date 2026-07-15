@@ -261,14 +261,15 @@ pub fn upsert_idle_assistant(messages: &mut Vec<Message>, new_msg: &Message) {
         .iter()
         .rev()
         .find(|m| matches!(m, Message::Assistant { .. }))
-        && prev_tc.is_empty() && is_idle_narrative(prev)
-            && let Some(idx) = messages
-                .iter()
-                .rposition(|m| matches!(m, Message::Assistant { .. }))
-            {
-                messages[idx] = new_msg.clone();
-                return;
-            }
+        && prev_tc.is_empty()
+        && is_idle_narrative(prev)
+        && let Some(idx) = messages
+            .iter()
+            .rposition(|m| matches!(m, Message::Assistant { .. }))
+    {
+        messages[idx] = new_msg.clone();
+        return;
+    }
     messages.push(new_msg.clone());
 }
 

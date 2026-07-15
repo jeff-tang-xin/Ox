@@ -456,7 +456,10 @@ mod tests {
     #[test]
     fn edit_breaks_streak() {
         assert!(!is_pure_exploration(&names(&["edit_file"]), false));
-        assert!(!is_pure_exploration(&names(&["file_read", "edit_file"]), false));
+        assert!(!is_pure_exploration(
+            &names(&["file_read", "edit_file"]),
+            false
+        ));
     }
 
     #[test]
@@ -466,7 +469,10 @@ mod tests {
 
     #[test]
     fn pure_reads_are_exploration() {
-        assert!(is_pure_exploration(&names(&["file_read", "find_symbol"]), false));
+        assert!(is_pure_exploration(
+            &names(&["file_read", "find_symbol"]),
+            false
+        ));
     }
 
     #[test]
@@ -478,23 +484,59 @@ mod tests {
         // Turns 1..REFLECT_AT-1: just continue. made_discovery=false → low-gain.
         for _ in 0..(REFLECT_AT - 1) {
             assert_eq!(
-                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan),
+                evaluate(
+                    &mut streak,
+                    &mut reflected,
+                    &mut total,
+                    &reads,
+                    false,
+                    false,
+                    "task",
+                    ConvergeMode::SubmitPlan
+                ),
                 ReflectAction::Continue
             );
         }
         // Turn REFLECT_AT: reflect.
-        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan) {
+        match evaluate(
+            &mut streak,
+            &mut reflected,
+            &mut total,
+            &reads,
+            false,
+            false,
+            "task",
+            ConvergeMode::SubmitPlan,
+        ) {
             ReflectAction::Reflect(_) => {}
             other => panic!("expected Reflect, got {other:?}"),
         }
         // Continues until the stop threshold.
         for _ in 0..(STOP_AFTER_REFLECT - 1) {
             assert_eq!(
-                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan),
+                evaluate(
+                    &mut streak,
+                    &mut reflected,
+                    &mut total,
+                    &reads,
+                    false,
+                    false,
+                    "task",
+                    ConvergeMode::SubmitPlan
+                ),
                 ReflectAction::Continue
             );
         }
-        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan) {
+        match evaluate(
+            &mut streak,
+            &mut reflected,
+            &mut total,
+            &reads,
+            false,
+            false,
+            "task",
+            ConvergeMode::SubmitPlan,
+        ) {
             ReflectAction::Stop(_) => {}
             other => panic!("expected Stop, got {other:?}"),
         }
@@ -508,9 +550,27 @@ mod tests {
         let mut total = 0;
         let reads = names(&["file_read"]);
         for _ in 0..(REFLECT_AT - 1) {
-            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::DirectEdit);
+            evaluate(
+                &mut streak,
+                &mut reflected,
+                &mut total,
+                &reads,
+                false,
+                false,
+                "task",
+                ConvergeMode::DirectEdit,
+            );
         }
-        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::DirectEdit) {
+        match evaluate(
+            &mut streak,
+            &mut reflected,
+            &mut total,
+            &reads,
+            false,
+            false,
+            "task",
+            ConvergeMode::DirectEdit,
+        ) {
             ReflectAction::Reflect(msg) => {
                 assert!(msg.contains("edit_file"));
                 assert!(!msg.contains("finding_json"));
@@ -530,13 +590,31 @@ mod tests {
         // Up to the ceiling minus one: always Continue, low-gain streak stays 0.
         for _ in 0..(TOTAL_EXPLORE_CEILING - 1) {
             assert_eq!(
-                evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task", ConvergeMode::SubmitPlan),
+                evaluate(
+                    &mut streak,
+                    &mut reflected,
+                    &mut total,
+                    &reads,
+                    false,
+                    true,
+                    "task",
+                    ConvergeMode::SubmitPlan
+                ),
                 ReflectAction::Continue
             );
             assert_eq!(streak, 0);
         }
         // The ceiling turn stops regardless of discovery.
-        match evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task", ConvergeMode::SubmitPlan) {
+        match evaluate(
+            &mut streak,
+            &mut reflected,
+            &mut total,
+            &reads,
+            false,
+            true,
+            "task",
+            ConvergeMode::SubmitPlan,
+        ) {
             ReflectAction::Stop(_) => {}
             other => panic!("expected Stop at ceiling, got {other:?}"),
         }
@@ -551,12 +629,39 @@ mod tests {
         let mut total = 0;
         let reads = names(&["file_read"]);
         // Two low-gain turns build the streak.
-        evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan);
-        evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan);
+        evaluate(
+            &mut streak,
+            &mut reflected,
+            &mut total,
+            &reads,
+            false,
+            false,
+            "task",
+            ConvergeMode::SubmitPlan,
+        );
+        evaluate(
+            &mut streak,
+            &mut reflected,
+            &mut total,
+            &reads,
+            false,
+            false,
+            "task",
+            ConvergeMode::SubmitPlan,
+        );
         assert_eq!(streak, 2);
         // A discovering turn wipes the low-gain streak but not the total.
         assert_eq!(
-            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task", ConvergeMode::SubmitPlan),
+            evaluate(
+                &mut streak,
+                &mut reflected,
+                &mut total,
+                &reads,
+                false,
+                true,
+                "task",
+                ConvergeMode::SubmitPlan
+            ),
             ReflectAction::Continue
         );
         assert_eq!(streak, 0);
@@ -570,11 +675,29 @@ mod tests {
         let mut total = 0;
         let reads = names(&["file_read"]);
         for _ in 0..5 {
-            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, true, "task", ConvergeMode::SubmitPlan);
+            evaluate(
+                &mut streak,
+                &mut reflected,
+                &mut total,
+                &reads,
+                false,
+                true,
+                "task",
+                ConvergeMode::SubmitPlan,
+            );
         }
         assert_eq!(total, 5);
         // An edit is real progress → clears the cumulative counter too.
-        evaluate(&mut streak, &mut reflected, &mut total, &names(&["edit_file"]), false, false, "task", ConvergeMode::SubmitPlan);
+        evaluate(
+            &mut streak,
+            &mut reflected,
+            &mut total,
+            &names(&["edit_file"]),
+            false,
+            false,
+            "task",
+            ConvergeMode::SubmitPlan,
+        );
         assert_eq!(total, 0);
     }
 
@@ -585,12 +708,30 @@ mod tests {
         let mut total = 0;
         let reads = names(&["file_read"]);
         for _ in 0..REFLECT_AT {
-            evaluate(&mut streak, &mut reflected, &mut total, &reads, false, false, "task", ConvergeMode::SubmitPlan);
+            evaluate(
+                &mut streak,
+                &mut reflected,
+                &mut total,
+                &reads,
+                false,
+                false,
+                "task",
+                ConvergeMode::SubmitPlan,
+            );
         }
         assert!(reflected);
         // An edit resets everything.
         assert_eq!(
-            evaluate(&mut streak, &mut reflected, &mut total, &names(&["edit_file"]), false, false, "task", ConvergeMode::SubmitPlan),
+            evaluate(
+                &mut streak,
+                &mut reflected,
+                &mut total,
+                &names(&["edit_file"]),
+                false,
+                false,
+                "task",
+                ConvergeMode::SubmitPlan
+            ),
             ReflectAction::Continue
         );
         assert_eq!(streak, 0);
@@ -631,7 +772,13 @@ mod tests {
         }
         // An edit before the threshold resets the streak — no reflection.
         assert_eq!(
-            evaluate_impl(&mut streak, &mut reflected, &names(&["edit_file"]), false, "task"),
+            evaluate_impl(
+                &mut streak,
+                &mut reflected,
+                &names(&["edit_file"]),
+                false,
+                "task"
+            ),
             ReflectAction::Continue
         );
         assert_eq!(streak, 0);

@@ -190,12 +190,12 @@ fn search_with_ripgrep(
         // Apply file pattern filter
         if file_pattern != "*"
             && let Some(file_name) = entry.file_name().to_str()
-                && !glob::Pattern::new(file_pattern)
-                    .map(|pat| pat.matches(file_name))
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
+            && !glob::Pattern::new(file_pattern)
+                .map(|pat| pat.matches(file_name))
+                .unwrap_or(true)
+        {
+            continue;
+        }
 
         files_searched += 1;
 
@@ -234,8 +234,7 @@ fn search_with_ripgrep(
                     // Cap single-line length: a minified/single-line file would
                     // otherwise dump the whole file as one "matching line".
                     let capped = if trimmed.chars().count() > MAX_MATCH_LINE_CHARS {
-                        let head: String =
-                            trimmed.chars().take(MAX_MATCH_LINE_CHARS).collect();
+                        let head: String = trimmed.chars().take(MAX_MATCH_LINE_CHARS).collect();
                         format!(
                             "{head}… [行过长，已截断 — 疑似压缩/单行文件；用 file_read 分页或缩小 pattern]"
                         )

@@ -139,12 +139,13 @@ impl AstExtractor {
                         if (fc == "identifier"
                             || fc == "scoped_identifier"
                             || fc == "field_expression")
-                            && let Ok(text) = func_child.utf8_text(code.as_bytes()) {
-                                let name = text.trim().to_string();
-                                if !name.is_empty() && !calls.contains(&name) {
-                                    calls.push(name);
-                                }
+                            && let Ok(text) = func_child.utf8_text(code.as_bytes())
+                        {
+                            let name = text.trim().to_string();
+                            if !name.is_empty() && !calls.contains(&name) {
+                                calls.push(name);
                             }
+                        }
                     }
                 }
                 // Continue searching in child nodes

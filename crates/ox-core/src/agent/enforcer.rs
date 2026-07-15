@@ -103,32 +103,36 @@ impl RuleEnforcer {
         // Exception: Plan only needed for source code, not docs/config/system files
         if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
             && let Some(path) = args.get("path").and_then(|p| p.as_str())
-                && !is_source_file(path) {
-                    return Ok(());
-                }
+            && !is_source_file(path)
+        {
+            return Ok(());
+        }
 
         // 🎯 Trivial 编辑白名单：edit_file 的 old_string 很短时（如拼写修复），不需要 Plan
         // 只对 edit_file 生效（file_write 是全量写入，不适用）
-        if tc.name == "edit_file" && trivial_threshold > 0
-            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                // 检查单次编辑的 old_string 长度
-                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
-                    && old_str.len() <= trivial_threshold {
-                        return Ok(());
-                    }
-                // 检查批量编辑中是否所有 old_string 都很短
-                if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
-                    let all_trivial = edits.iter().all(|e| {
-                        e.get("old_string")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.len() <= trivial_threshold)
-                            .unwrap_or(false)
-                    });
-                    if all_trivial {
-                        return Ok(());
-                    }
+        if tc.name == "edit_file"
+            && trivial_threshold > 0
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        {
+            // 检查单次编辑的 old_string 长度
+            if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
+                && old_str.len() <= trivial_threshold
+            {
+                return Ok(());
+            }
+            // 检查批量编辑中是否所有 old_string 都很短
+            if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
+                let all_trivial = edits.iter().all(|e| {
+                    e.get("old_string")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.len() <= trivial_threshold)
+                        .unwrap_or(false)
+                });
+                if all_trivial {
+                    return Ok(());
                 }
             }
+        }
 
         // 🎯 只检查最近一次用户消息之后的消息（与 Steps Before Shell 逻辑一致）
         // 这样用户提一个问题 → LLM 计划一次 → 多次编辑操作都可通过
@@ -299,24 +303,27 @@ impl RuleEnforcer {
         }
 
         // 🎯 Trivial 编辑白名单：短修改不需要先读取（与 plan_before_edit 一致）
-        if tc.name == "edit_file" && trivial_threshold > 0
-            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
-                    && old_str.len() <= trivial_threshold {
-                        return Ok(());
-                    }
-                if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
-                    let all_trivial = edits.iter().all(|e| {
-                        e.get("old_string")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.len() <= trivial_threshold)
-                            .unwrap_or(false)
-                    });
-                    if all_trivial {
-                        return Ok(());
-                    }
+        if tc.name == "edit_file"
+            && trivial_threshold > 0
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        {
+            if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
+                && old_str.len() <= trivial_threshold
+            {
+                return Ok(());
+            }
+            if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
+                let all_trivial = edits.iter().all(|e| {
+                    e.get("old_string")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.len() <= trivial_threshold)
+                        .unwrap_or(false)
+                });
+                if all_trivial {
+                    return Ok(());
                 }
             }
+        }
 
         // 🎯 扫描最近一次用户消息之后的消息中是否有对同一路径的 file_read
         let last_user_idx = messages
@@ -430,24 +437,27 @@ impl RuleEnforcer {
         }
 
         // 🎯 Trivial 编辑白名单：短修改不需要 impact analysis
-        if tc.name == "edit_file" && trivial_threshold > 0
-            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
-                    && old_str.len() <= trivial_threshold {
-                        return Ok(());
-                    }
-                if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
-                    let all_trivial = edits.iter().all(|e| {
-                        e.get("old_string")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.len() <= trivial_threshold)
-                            .unwrap_or(false)
-                    });
-                    if all_trivial {
-                        return Ok(());
-                    }
+        if tc.name == "edit_file"
+            && trivial_threshold > 0
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        {
+            if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
+                && old_str.len() <= trivial_threshold
+            {
+                return Ok(());
+            }
+            if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
+                let all_trivial = edits.iter().all(|e| {
+                    e.get("old_string")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.len() <= trivial_threshold)
+                        .unwrap_or(false)
+                });
+                if all_trivial {
+                    return Ok(());
                 }
             }
+        }
 
         let target_basename = std::path::Path::new(&target_path)
             .file_name()
@@ -472,17 +482,17 @@ impl RuleEnforcer {
             if let Message::Assistant { tool_calls, .. } = msg {
                 tool_calls.iter().any(|tc| {
                     if tc.name == "code_search"
-                        && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                            let search_query =
-                                args.get("query").and_then(|q| q.as_str()).unwrap_or("");
-                            // code_search was called with the file name or path as query
-                            if search_query.contains(&target_basename)
-                                || search_query.contains(&target_path)
-                                || target_path.contains(search_query)
-                            {
-                                return true;
-                            }
+                        && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    {
+                        let search_query = args.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                        // code_search was called with the file name or path as query
+                        if search_query.contains(&target_basename)
+                            || search_query.contains(&target_path)
+                            || target_path.contains(search_query)
+                        {
+                            return true;
                         }
+                    }
                     false
                 })
             } else {

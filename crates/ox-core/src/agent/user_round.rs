@@ -25,20 +25,34 @@ pub fn format_now() -> String {
     loop {
         let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
         let yd = if leap { 366 } else { 365 };
-        if d < yd { break; }
+        if d < yd {
+            break;
+        }
         d -= yd;
         y += 1;
     }
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let mdays = if leap { [31,29,31,30,31,30,31,31,30,31,30,31] }
-                     else { [31,28,31,30,31,30,31,31,30,31,30,31] };
+    let mdays = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
     let mut m = 1u32;
     for &md in &mdays {
-        if d < md { break; }
+        if d < md {
+            break;
+        }
         d -= md;
         m += 1;
     }
-    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, (d + 1) as u32, hh, mm)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        y,
+        m,
+        (d + 1) as u32,
+        hh,
+        mm
+    )
 }
 pub const TURN_INPUT_KEY: &str = "_turn_user_input";
 pub const ROUND_FINALIZED_KEY: &str = "_round_finalized";
@@ -57,9 +71,10 @@ pub fn finalize_completed_round(engine: &mut WorkflowEngine) {
         return;
     }
     if let Some(prev) = engine.get_variable("_current_user_request")
-        && !prev.trim().is_empty() {
-            archive_completed_round(engine, &prev);
-        }
+        && !prev.trim().is_empty()
+    {
+        archive_completed_round(engine, &prev);
+    }
     engine.clear_ephemeral_workflow_state();
     engine.set_variable(ROUND_FINALIZED_KEY, "1".to_string());
 }
@@ -90,9 +105,11 @@ pub fn finalize_interrupted_on_exit(engine: &mut WorkflowEngine) {
     }
     let interrupted = engine.get_variable(ROUND_INTERRUPTED_KEY).as_deref() == Some("1");
     if let Some(prev) = engine.get_variable("_current_user_request")
-        && !prev.trim().is_empty() && (interrupted || round_had_activity(engine)) {
-            archive_interrupted_round(engine, &prev);
-        }
+        && !prev.trim().is_empty()
+        && (interrupted || round_had_activity(engine))
+    {
+        archive_interrupted_round(engine, &prev);
+    }
     engine.set_variable(ROUND_INTERRUPTED_KEY, String::new());
 }
 
@@ -184,8 +201,17 @@ pub fn format_turn_input_text(input: &str, session_task: Option<&str>) -> String
             parts.push(format!("（会话背景: {snip}）"));
         }
     }
+    parts.push(TURN_INPUT_GUIDANCE.to_string());
     parts.join("\n\n")
 }
+
+/// Anti-over-exploration guidance appended to every turn's user message.
+/// Reminds the agent to reuse prior tool results and act promptly once
+/// enough information is gathered.
+const TURN_INPUT_GUIDANCE: &str = "[TURN_GUIDANCE]\n\
+- 复用本轮已有 find_symbol / file_read / code_search 的结果，不要对同一符号或文件重复探索。\n\
+- 已掌握足够定位信息即进入编辑或收尾，不再无目的扩大探索面。\n\
+- 若用户命令与历史结论冲突，以用户最新命令为准。";
 
 pub fn inject_turn_input(messages: &mut Vec<crate::message::Message>, block: &str) {
     if block.is_empty() {
@@ -249,11 +275,11 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
         }
         if let Some(prev) = engine.get_variable("_current_user_request")
             && !prev.trim().is_empty()
-                && prev.trim() != user_message.trim()
-                && engine.get_variable(ROUND_FINALIZED_KEY).as_deref() != Some("1")
-            {
-                archive_round(engine, &prev);
-            }
+            && prev.trim() != user_message.trim()
+            && engine.get_variable(ROUND_FINALIZED_KEY).as_deref() != Some("1")
+        {
+            archive_round(engine, &prev);
+        }
         engine.reset_workflow();
         engine.clear_turn_provenance();
         let intent = crate::agent::task_intent::resolve_for_round(engine, user_message);
@@ -280,9 +306,11 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
     }
 
     if let Some(prev) = engine.get_variable("_current_user_request")
-        && !prev.trim().is_empty() && prev.trim() != user_message.trim() {
-            archive_round(engine, &prev);
-        }
+        && !prev.trim().is_empty()
+        && prev.trim() != user_message.trim()
+    {
+        archive_round(engine, &prev);
+    }
     engine.reset_workflow();
     engine.clear_turn_provenance();
     let intent = crate::agent::task_intent::resolve_for_round(engine, user_message);
@@ -364,12 +392,13 @@ pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
     // lives in the pinned [MEMORY_GRAPH] block. The former `_round_history`
     // textual recap was retired.
     if let Some(timeline) = engine.get_variable("_react_timeline")
-        && !timeline.trim().is_empty() {
-            parts.push(format!(
-                "## 📚 近期 ReAct（HISTORICAL — 只读参考，禁止重复执行）\n{}",
-                timeline.chars().take(3000).collect::<String>()
-            ));
-        }
+        && !timeline.trim().is_empty()
+    {
+        parts.push(format!(
+            "## 📚 近期 ReAct（HISTORICAL — 只读参考，禁止重复执行）\n{}",
+            timeline.chars().take(3000).collect::<String>()
+        ));
+    }
 
     if engine.get_variable(ROUND_INTERRUPTED_KEY).as_deref() == Some("1") {
         parts.push(
@@ -521,7 +550,8 @@ mod tests {
 
     #[test]
     fn complete_boundary_marks_done_and_is_detectable() {
-        let msg = format_complete_boundary_message("审查 Foo.java", "修复了空指针，新增 3 个测试", "");
+        let msg =
+            format_complete_boundary_message("审查 Foo.java", "修复了空指针，新增 3 个测试", "");
         assert!(is_complete_boundary(&msg));
         assert!(msg.contains("HISTORICAL"));
         assert!(msg.contains("审查 Foo.java"));

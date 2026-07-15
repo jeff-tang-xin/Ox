@@ -158,9 +158,10 @@ impl LlmProvider for AnthropicProvider {
                             &tx,
                             &mut block_index_to_id,
                             &mut prompt_tokens,
-                        ) {
-                            done_sent = true;
-                        }
+                        )
+                    {
+                        done_sent = true;
+                    }
 
                     sse_buffer.reset();
                 }

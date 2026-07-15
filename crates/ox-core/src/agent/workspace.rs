@@ -549,7 +549,8 @@ fn compute_required_action(
             if store.as_ref().is_none_or(|s| s.findings.is_empty()) {
                 return RequiredAction::Explore {
                     hint: "先用 code_graph 了解项目/模块结构（code_graph query + find_symbol），\
-                           再 file_read 深入具体文件".to_string(),
+                           再 file_read 深入具体文件"
+                        .to_string(),
                 };
             }
             RequiredAction::EmitFindingsAndDone
@@ -598,12 +599,13 @@ fn compute_required_action(
                 let has_impl_read = !f.file.is_empty() && engine.impl_file_already_read(&f.file);
 
                 if f.status == FindingStatus::AwaitingVerify
-                    && let Some(command) = verify_command_for_finding(engine, idx) {
-                        return RequiredAction::Verify {
-                            command,
-                            finding_index: idx,
-                        };
-                    }
+                    && let Some(command) = verify_command_for_finding(engine, idx)
+                {
+                    return RequiredAction::Verify {
+                        command,
+                        finding_index: idx,
+                    };
+                }
                 // Before reading/editing: suggest code_graph impact analysis
                 // so the LLM understands the blast radius of its changes.
                 if !f.file.is_empty() && !engine.impl_impact_done(idx) {
@@ -639,9 +641,10 @@ fn compute_required_action(
 fn verify_command_for_finding(engine: &WorkflowEngine, finding_index: u32) -> Option<String> {
     if let Some(tracker) = engine.get_plan_tracker()
         && let Some(step) = tracker.steps.iter().find(|s| s.index == finding_index)
-            && !step.verify.trim().is_empty() {
-                return Some(step.verify.clone());
-            }
+        && !step.verify.trim().is_empty()
+    {
+        return Some(step.verify.clone());
+    }
     let cmd = crate::agent::post_edit_verification::verify_command(engine);
     if cmd.trim().is_empty() {
         None

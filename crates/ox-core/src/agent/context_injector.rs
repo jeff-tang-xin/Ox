@@ -218,9 +218,9 @@ mod tests {
         // This test validates the constant still exists.
         assert_eq!(STEP_MEMORY_TAG, "[STEP_MEMORY]");
         // Strip by hand to verify the tag format
-        msgs.retain(|m| {
-            !matches!(m, Message::System { content } if content.starts_with(STEP_MEMORY_TAG))
-        });
+        msgs.retain(
+            |m| !matches!(m, Message::System { content } if content.starts_with(STEP_MEMORY_TAG)),
+        );
         assert_eq!(msgs.len(), 1);
         assert_eq!(before, 2);
     }

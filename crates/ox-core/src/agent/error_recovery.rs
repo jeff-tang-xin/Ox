@@ -67,7 +67,8 @@ pub fn check_and_recover(
                 }
 
                 let exit_code = content
-                    .lines().rfind(|l| l.contains("exit code:"))
+                    .lines()
+                    .rfind(|l| l.contains("exit code:"))
                     .unwrap_or("");
 
                 if exit_code.contains("exit code: 0") {
@@ -116,7 +117,8 @@ pub fn check_and_recover(
                             }
                         }) {
                             Some(result) if !result.is_error => {
-                                let summary = result.text.lines().take(10).collect::<Vec<_>>().join("\n");
+                                let summary =
+                                    result.text.lines().take(10).collect::<Vec<_>>().join("\n");
                                 Some(format!("\n📊 Code impact preview:\n```\n{}\n```", summary))
                             }
                             _ => None,
@@ -150,7 +152,11 @@ pub fn check_and_recover(
                          DO NOT guess. Read the source code first, then fix.",
                         error_summary,
                         impact_hint,
-                        if impact_info.is_some() { "\n💡 Use code_graph(op=\"context\", name=\"<symbol>\") for full impact view" } else { "" }
+                        if impact_info.is_some() {
+                            "\n💡 Use code_graph(op=\"context\", name=\"<symbol>\") for full impact view"
+                        } else {
+                            ""
+                        }
                     )
                 } else {
                     format!(
@@ -184,7 +190,9 @@ fn extract_symbol_from_error(error: &str) -> Option<String> {
     // Pattern: "cannot find symbol X in ..."
     if let Some(pos) = error.find("cannot find symbol ") {
         let rest = &error[pos + 19..];
-        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
         if end > 0 && end < 50 {
             return Some(rest[..end].to_string());
         }
@@ -192,7 +200,9 @@ fn extract_symbol_from_error(error: &str) -> Option<String> {
     // Pattern: "undefined: X" or "undefined method X"
     if let Some(pos) = error.find("undefined") {
         let rest = &error[pos + 9..];
-        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
         if end > 0 && end < 50 {
             return Some(rest[..end].to_string());
         }
@@ -200,7 +210,9 @@ fn extract_symbol_from_error(error: &str) -> Option<String> {
     // Pattern: "cannot find function X"
     if let Some(pos) = error.find("cannot find function ") {
         let rest = &error[pos + 21..];
-        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
         if end > 0 && end < 50 {
             return Some(rest[..end].to_string());
         }

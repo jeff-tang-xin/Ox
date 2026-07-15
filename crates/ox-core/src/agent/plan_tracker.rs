@@ -15,7 +15,6 @@ pub enum StepStatus {
     Skipped,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanStep {
     pub index: u32,
@@ -89,9 +88,10 @@ fn extract_json_block(text: &str) -> Option<String> {
         }
     }
     if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
-        && start < end {
-            return Some(text[start..=end].to_string());
-        }
+        && start < end
+    {
+        return Some(text[start..=end].to_string());
+    }
     None
 }
 
@@ -255,9 +255,10 @@ impl PlanTracker {
             self.steps[pos].status = StepStatus::InProgress;
             self.steps[pos].awaiting_verify = true;
             if self.steps[pos].verify.is_empty()
-                && let Some(ref cmd) = needs_verify {
-                    self.steps[pos].verify = cmd.clone();
-                }
+                && let Some(ref cmd) = needs_verify
+            {
+                self.steps[pos].verify = cmd.clone();
+            }
             return WriteCompletionOutcome::AwaitingVerify(needs_verify.unwrap_or_default());
         }
 
@@ -454,26 +455,27 @@ fn extract_review_items(report: &str) -> Vec<PlanStep> {
                 .collect();
             if cols.len() >= 3
                 && let Ok(n) = cols[0].parse::<u32>()
-                    && seen.insert(n) {
-                        let file = cols
-                            .iter()
-                            .find_map(|c| {
-                                let p = extract_path_from_text(c);
-                                if p.is_empty() { None } else { Some(p) }
-                            })
-                            .unwrap_or_else(|| extract_path_from_text(line));
-                        let target = cols
-                            .iter()
-                            .find_map(|c| {
-                                let t = extract_symbol_target(c);
-                                if t.is_empty() { None } else { Some(t) }
-                            })
-                            .unwrap_or_default();
-                        let desc = cols.last().copied().unwrap_or("").to_string();
-                        if desc.chars().count() >= 8 || !file.is_empty() {
-                            steps.push(make_impl_step(n, file, target, desc));
-                        }
-                    }
+                && seen.insert(n)
+            {
+                let file = cols
+                    .iter()
+                    .find_map(|c| {
+                        let p = extract_path_from_text(c);
+                        if p.is_empty() { None } else { Some(p) }
+                    })
+                    .unwrap_or_else(|| extract_path_from_text(line));
+                let target = cols
+                    .iter()
+                    .find_map(|c| {
+                        let t = extract_symbol_target(c);
+                        if t.is_empty() { None } else { Some(t) }
+                    })
+                    .unwrap_or_default();
+                let desc = cols.last().copied().unwrap_or("").to_string();
+                if desc.chars().count() >= 8 || !file.is_empty() {
+                    steps.push(make_impl_step(n, file, target, desc));
+                }
+            }
             continue;
         }
 
@@ -487,11 +489,12 @@ fn extract_review_items(report: &str) -> Vec<PlanStep> {
         }
 
         if let Some((n, rest)) = parse_bug_review_line(line)
-            && seen.insert(n) {
-                let file = extract_path_from_text(rest);
-                let target = extract_symbol_target(rest);
-                steps.push(make_impl_step(n, file, target, rest.to_string()));
-            }
+            && seen.insert(n)
+        {
+            let file = extract_path_from_text(rest);
+            let target = extract_symbol_target(rest);
+            steps.push(make_impl_step(n, file, target, rest.to_string()));
+        }
     }
 
     steps

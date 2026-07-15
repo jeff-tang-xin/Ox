@@ -186,9 +186,10 @@ impl EmbeddingModel {
             return config_endpoint.to_string();
         }
         if let Ok(env_endpoint) = std::env::var("HF_ENDPOINT")
-            && !env_endpoint.is_empty() {
-                return env_endpoint;
-            }
+            && !env_endpoint.is_empty()
+        {
+            return env_endpoint;
+        }
         // Default to China mirror (hf-mirror.com)
         // Set hf_endpoint = "https://huggingface.co" in config for official endpoint
         "https://hf-mirror.com".to_string()

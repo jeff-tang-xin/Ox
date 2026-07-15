@@ -64,8 +64,12 @@ impl AutoReflector {
 
         let existing_skills = crate::skill::dedup::list_project_skill_ids(&self.project_root);
 
-        let prompt =
-            self.build_reflection_prompt(task_description, execution_summary, conversation_history, &existing_skills);
+        let prompt = self.build_reflection_prompt(
+            task_description,
+            execution_summary,
+            conversation_history,
+            &existing_skills,
+        );
         let skill_content = self.call_llm_for_reflection(&prompt).await?;
 
         if skill_content.trim().is_empty() {
@@ -230,7 +234,11 @@ impl AutoReflector {
         let existing_skills_str = if existing_skills.is_empty() {
             "(none)".to_string()
         } else {
-            existing_skills.iter().map(|s| format!("- {}", s)).collect::<Vec<_>>().join("\n")
+            existing_skills
+                .iter()
+                .map(|s| format!("- {}", s))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
 
         SKILL_CREATION_PROMPT
@@ -279,56 +287,62 @@ impl AutoReflector {
 
     /// Write skill markdown to disk via dedup::plan_skill_write (shared by instance and static callers).
     fn write_skill_file(project_root: &Path, content: &str) -> Result<String> {
-        let (repaired_content, skill_id, scope, _description) = match Self::extract_frontmatter_static(content) {
-            Ok((metadata, body)) => {
-                let id = metadata.get("id").cloned().unwrap_or_else(|| {
-                    body.lines()
+        let (repaired_content, skill_id, scope, _description) =
+            match Self::extract_frontmatter_static(content) {
+                Ok((metadata, body)) => {
+                    let id = metadata.get("id").cloned().unwrap_or_else(|| {
+                        body.lines()
+                            .next()
+                            .and_then(|l| l.strip_prefix("# "))
+                            .unwrap_or("generated-skill")
+                            .to_lowercase()
+                            .replace(' ', "-")
+                    });
+                    let name = metadata
+                        .get("name")
+                        .cloned()
+                        .unwrap_or_else(|| id.replace('-', " "));
+                    let description = metadata
+                        .get("description")
+                        .cloned()
+                        .unwrap_or_else(|| "AI generated skill".to_string());
+                    let scope = metadata
+                        .get("scope")
+                        .cloned()
+                        .unwrap_or_else(|| "project".to_string());
+                    let scope = match scope.as_str() {
+                        "project" | "global" | "system" => scope,
+                        _ => "project".to_string(),
+                    };
+                    let fixed = format!(
+                        "---\nname: \"{}\"\ndescription: \"{}\"\nscope: \"{}\"\n---\n\n{}",
+                        name,
+                        description,
+                        scope,
+                        body.trim()
+                    );
+                    (fixed, id, scope, description)
+                }
+                Err(_) => {
+                    let body = content.trim();
+                    let title = body
+                        .lines()
                         .next()
                         .and_then(|l| l.strip_prefix("# "))
-                        .unwrap_or("generated-skill")
-                        .to_lowercase()
-                        .replace(' ', "-")
-                });
-                let name = metadata
-                    .get("name")
-                    .cloned()
-                    .unwrap_or_else(|| id.replace('-', " "));
-                let description = metadata
-                    .get("description")
-                    .cloned()
-                    .unwrap_or_else(|| "AI generated skill".to_string());
-                let scope = metadata
-                    .get("scope")
-                    .cloned()
-                    .unwrap_or_else(|| "project".to_string());
-                let scope = match scope.as_str() {
-                    "project" | "global" | "system" => scope,
-                    _ => "project".to_string(),
-                };
-                let fixed = format!(
-                    "---\nname: \"{}\"\ndescription: \"{}\"\nscope: \"{}\"\n---\n\n{}",
-                    name,
-                    description,
-                    scope,
-                    body.trim()
-                );
-                (fixed, id, scope, description)
-            }
-            Err(_) => {
-                let body = content.trim();
-                let title = body
-                    .lines()
-                    .next()
-                    .and_then(|l| l.strip_prefix("# "))
-                    .unwrap_or("generated-skill");
-                let id = title.to_lowercase().replace(' ', "-");
-                let fixed = format!(
-                    "---\nname: \"{}\"\ndescription: \"AI generated skill\"\nscope: \"project\"\n---\n\n{}",
-                    title, body
-                );
-                (fixed, id, "project".to_string(), "AI generated skill".to_string())
-            }
-        };
+                        .unwrap_or("generated-skill");
+                    let id = title.to_lowercase().replace(' ', "-");
+                    let fixed = format!(
+                        "---\nname: \"{}\"\ndescription: \"AI generated skill\"\nscope: \"project\"\n---\n\n{}",
+                        title, body
+                    );
+                    (
+                        fixed,
+                        id,
+                        "project".to_string(),
+                        "AI generated skill".to_string(),
+                    )
+                }
+            };
 
         let resolved_id = crate::skill::dedup::canonical_mandatory_id(&skill_id)
             .unwrap_or(skill_id.as_str())
@@ -364,7 +378,10 @@ impl AutoReflector {
                 Ok(resolved_id)
             }
             crate::skill::dedup::SkillWritePlan::OverwriteMandatory => {
-                let path = project_root.join(".ox").join("skills").join(format!("{resolved_id}.md"));
+                let path = project_root
+                    .join(".ox")
+                    .join("skills")
+                    .join(format!("{resolved_id}.md"));
                 fs::write(&path, &repaired_content)?;
                 tracing::info!("[AUTO-REFLECT] Overwrote mandatory skill: {:?}", path);
                 Ok(format!("{resolved_id} (overwritten)"))
@@ -395,7 +412,10 @@ impl AutoReflector {
                 merged_markdown,
             } => {
                 fs::write(&target_path, &merged_markdown)?;
-                tracing::info!("[AUTO-REFLECT] Merged into existing skill: {:?}", target_path);
+                tracing::info!(
+                    "[AUTO-REFLECT] Merged into existing skill: {:?}",
+                    target_path
+                );
                 Ok(format!("{resolved_id} (merged)"))
             }
             crate::skill::dedup::SkillWritePlan::RejectDuplicate { message } => {

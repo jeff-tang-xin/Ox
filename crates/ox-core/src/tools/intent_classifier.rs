@@ -97,7 +97,6 @@ pub enum MemoryScope {
     Both,
 }
 
-
 /// 基于规则的意图分类器
 pub struct RuleBasedClassifier {
     /// 多语言动词映射表
@@ -424,15 +423,14 @@ impl RuleBasedClassifier {
 
         // 规则 3: 复杂任务可能需要参考最佳实践
         match intent {
-            QuestionType::CodeWriting | QuestionType::Refactoring
-                if keywords.len() >= 3 => {
-                    // 任务较复杂
-                    return (
-                        true,
-                        Some(self.extract_memory_query(user_message, keywords)),
-                        MemoryScope::Both, // 可能用到全局知识
-                    );
-                }
+            QuestionType::CodeWriting | QuestionType::Refactoring if keywords.len() >= 3 => {
+                // 任务较复杂
+                return (
+                    true,
+                    Some(self.extract_memory_query(user_message, keywords)),
+                    MemoryScope::Both, // 可能用到全局知识
+                );
+            }
             QuestionType::Debugging => {
                 // Debug 时查找类似问题的解决方案
                 return (
@@ -546,33 +544,34 @@ impl Default for RuleBasedClassifier {
 pub fn extract_intent_from_llm_response(response: &str) -> Option<IntentInfo> {
     // 查找最后一个 JSON 代码块
     if let Some(json_start) = response.rfind("```json")
-        && let Some(json_end) = response[json_start..].find("```") {
-            // 使用字符边界安全的切片方法
-            let start_byte = json_start + 7; // "```json" 的长度是7
-            let end_byte = json_start + json_end;
+        && let Some(json_end) = response[json_start..].find("```")
+    {
+        // 使用字符边界安全的切片方法
+        let start_byte = json_start + 7; // "```json" 的长度是7
+        let end_byte = json_start + json_end;
 
-            // 确保字节索引在有效范围内且位于字符边界
-            if start_byte <= end_byte && end_byte <= response.len() {
-                // 使用 get() 方法进行安全切片
-                if let Some(json_str) = response.get(start_byte..end_byte) {
-                    match serde_json::from_str::<IntentInfo>(json_str.trim()) {
-                        Ok(info) => {
-                            tracing::info!(
-                                "Extracted intent from LLM: {:?} (confidence: {:.2})",
-                                info.intent,
-                                info.confidence
-                            );
-                            return Some(info);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse intent JSON: {}", e);
-                        }
+        // 确保字节索引在有效范围内且位于字符边界
+        if start_byte <= end_byte && end_byte <= response.len() {
+            // 使用 get() 方法进行安全切片
+            if let Some(json_str) = response.get(start_byte..end_byte) {
+                match serde_json::from_str::<IntentInfo>(json_str.trim()) {
+                    Ok(info) => {
+                        tracing::info!(
+                            "Extracted intent from LLM: {:?} (confidence: {:.2})",
+                            info.intent,
+                            info.confidence
+                        );
+                        return Some(info);
                     }
-                } else {
-                    tracing::warn!("Invalid UTF-8 boundaries in response");
+                    Err(e) => {
+                        tracing::warn!("Failed to parse intent JSON: {}", e);
+                    }
                 }
+            } else {
+                tracing::warn!("Invalid UTF-8 boundaries in response");
             }
         }
+    }
 
     None
 }

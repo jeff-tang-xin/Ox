@@ -240,15 +240,16 @@ pub fn generate_memory_summary(messages: &[Message]) -> Option<MemorySummary> {
         }
         // Look for successful patch in tool results
         if let Message::ToolResult { content, .. } = msg
-            && (content.contains("Successfully patched") || content.contains("Successfully written"))
-            {
-                let line = content
-                    .lines()
-                    .find(|l| l.contains("Successfully"))
-                    .unwrap_or("");
-                key_insights = line.trim().chars().take(200).collect();
-                break;
-            }
+            && (content.contains("Successfully patched")
+                || content.contains("Successfully written"))
+        {
+            let line = content
+                .lines()
+                .find(|l| l.contains("Successfully"))
+                .unwrap_or("");
+            key_insights = line.trim().chars().take(200).collect();
+            break;
+        }
     }
 
     // Fallback to first assistant summary if no Done block found

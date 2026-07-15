@@ -120,7 +120,10 @@ impl ToolContext {
     }
 
     /// Attach the cross-session memory store (builder style).
-    pub fn with_memory_store(mut self, store: Option<Arc<crate::memory::store::MemoryStore>>) -> Self {
+    pub fn with_memory_store(
+        mut self,
+        store: Option<Arc<crate::memory::store::MemoryStore>>,
+    ) -> Self {
         self.memory_store = store;
         self
     }

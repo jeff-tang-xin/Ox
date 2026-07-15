@@ -165,51 +165,48 @@ impl LlmProvider for OpenAiProvider {
             let mut i = 0;
             while i < messages.len() {
                 if let Message::Assistant { tool_calls, .. } = &messages[i]
-                    && !tool_calls.is_empty() {
-                        let expected = tool_calls.len();
-                        let expected_ids: Vec<_> =
-                            tool_calls.iter().map(|tc| tc.id.clone()).collect();
-                        let mut valid = true;
-                        let mut found_ids = Vec::new();
-                        for j in 1..=expected {
-                            if i + j >= messages.len() {
-                                valid = false;
-                                break;
-                            }
-                            if let Message::ToolResult { tool_call_id, .. } = &messages[i + j] {
-                                found_ids.push(tool_call_id.clone());
-                            } else {
-                                valid = false;
-                                break;
-                            }
+                    && !tool_calls.is_empty()
+                {
+                    let expected = tool_calls.len();
+                    let expected_ids: Vec<_> = tool_calls.iter().map(|tc| tc.id.clone()).collect();
+                    let mut valid = true;
+                    let mut found_ids = Vec::new();
+                    for j in 1..=expected {
+                        if i + j >= messages.len() {
+                            valid = false;
+                            break;
                         }
-                        if valid && found_ids == expected_ids {
-                            i += expected + 1;
-                            continue;
-                        }
-                        // Invalid sequence: strip tool_calls and remove dangling ToolResults
-                        tracing::warn!(
-                            "[OPENAI_API] Auto-fixing tool_call ordering at index {}",
-                            i
-                        );
-                        if let Message::Assistant { tool_calls, .. } = &mut messages[i] {
-                            tool_calls.clear();
-                        }
-                        // Remove dangling ToolResults that followed
-                        let mut remove_count = 0;
-                        for j in 1..=expected {
-                            if i + j < messages.len()
-                                && matches!(&messages[i + j], Message::ToolResult { .. })
-                            {
-                                remove_count += 1;
-                            }
-                        }
-                        for _ in 0..remove_count {
-                            if i + 1 < messages.len() {
-                                messages.remove(i + 1);
-                            }
+                        if let Message::ToolResult { tool_call_id, .. } = &messages[i + j] {
+                            found_ids.push(tool_call_id.clone());
+                        } else {
+                            valid = false;
+                            break;
                         }
                     }
+                    if valid && found_ids == expected_ids {
+                        i += expected + 1;
+                        continue;
+                    }
+                    // Invalid sequence: strip tool_calls and remove dangling ToolResults
+                    tracing::warn!("[OPENAI_API] Auto-fixing tool_call ordering at index {}", i);
+                    if let Message::Assistant { tool_calls, .. } = &mut messages[i] {
+                        tool_calls.clear();
+                    }
+                    // Remove dangling ToolResults that followed
+                    let mut remove_count = 0;
+                    for j in 1..=expected {
+                        if i + j < messages.len()
+                            && matches!(&messages[i + j], Message::ToolResult { .. })
+                        {
+                            remove_count += 1;
+                        }
+                    }
+                    for _ in 0..remove_count {
+                        if i + 1 < messages.len() {
+                            messages.remove(i + 1);
+                        }
+                    }
+                }
                 i += 1;
             }
         }
@@ -372,7 +369,9 @@ impl LlmProvider for OpenAiProvider {
 
                     let events = parser.parse_chunk(&chunk_str);
                     for event in events {
-                        if let LlmStreamEvent::Done { .. } = &event { done_sent = true }
+                        if let LlmStreamEvent::Done { .. } = &event {
+                            done_sent = true
+                        }
                         let _ = tx.send(event);
                     }
                 }
@@ -498,9 +497,10 @@ fn message_to_openai(msg: &Message) -> serde_json::Value {
             });
             // DeepSeek thinking mode: reasoning_content MUST be passed back to the API
             if let Some(reasoning) = reasoning_content
-                && !reasoning.is_empty() {
-                    obj["reasoning_content"] = serde_json::Value::String(reasoning.clone());
-                }
+                && !reasoning.is_empty()
+            {
+                obj["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+            }
             if !tool_calls.is_empty() {
                 let tcs: Vec<serde_json::Value> = tool_calls
                     .iter()
@@ -574,7 +574,11 @@ mod tests {
             reasoning_content: None,
         };
         let v = message_to_openai(&msg);
-        assert!(v["content"].is_null(), "content must be null, got {:?}", v["content"]);
+        assert!(
+            v["content"].is_null(),
+            "content must be null, got {:?}",
+            v["content"]
+        );
         assert!(v["tool_calls"].is_array());
     }
 

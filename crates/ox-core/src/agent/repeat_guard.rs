@@ -105,7 +105,10 @@ mod tests {
     fn distinct_outputs_continue() {
         let mut g = RepeatGuard::new();
         assert_eq!(g.observe("read file A"), RepeatAction::Continue);
-        assert_eq!(g.observe("now edit file B with the fix"), RepeatAction::Continue);
+        assert_eq!(
+            g.observe("now edit file B with the fix"),
+            RepeatAction::Continue
+        );
     }
 
     #[test]

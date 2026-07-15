@@ -125,9 +125,10 @@ pub fn run_retrieval(
                 *score = (*score + 0.5).min(2.0);
             }
             if let EntityMetadata::CodeSymbol { fq_name, .. } = &entity.metadata
-                && fq_name.eq_ignore_ascii_case(hint) {
-                    *score = (*score + 0.95).min(2.0);
-                }
+                && fq_name.eq_ignore_ascii_case(hint)
+            {
+                *score = (*score + 0.95).min(2.0);
+            }
         }
     }
 
@@ -470,10 +471,10 @@ fn cut_by_budget(entities: &[(Entity, f32)], max_tokens: usize) -> (Vec<Entity>,
         let formatted = format_entity_for_context(entity);
 
         // L3 SemanticMemory: only if highly relevant (score ≥ 0.5 per design doc)
-        if entity.kind == EntityKind::SemanticMemory
-            && (*score < 0.5 || entity.content.len() < 30) {
-                continue;
-            }
+        if entity.kind == EntityKind::SemanticMemory && (*score < 0.5 || entity.content.len() < 30)
+        {
+            continue;
+        }
 
         // Apply signal filter
         if !entity.has_signal() {
