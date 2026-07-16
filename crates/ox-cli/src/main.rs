@@ -434,46 +434,33 @@ async fn run_app(
         let ui = agent_tx.clone();
         let auto_index = config.gitnexus.auto_index;
         tokio::spawn(async move {
-            // FIX: Check if index exists AND is up-to-date. An existing
-            // .gitnexus/meta.json alone doesn't mean the graph reflects the
-            // current tree — external edits (git pull, IDE, previous
-            // shell_exec) can make the source newer than `built_at`.
+            // FIX: Check if index exists and is valid first
             let index_valid = bg.index_is_valid().await;
-            let needs_reindex = bg.needs_startup_reindex().await;
 
-            // FIX: Reindex when index is missing OR stale.
-            if auto_index && (!index_valid || needs_reindex) {
-                let notice = if !index_valid {
-                    "🔨 GitNexus：初始化代码图谱索引..."
-                } else {
-                    "🔨 GitNexus：检测到源码变更，重新构建代码图谱索引..."
-                };
-                let _ = ui.send(AgentToUiEvent::SystemNotice(notice.to_string()));
+            // FIX: If index doesn't exist or is invalid, need to run init first
+            if auto_index && !index_valid {
+                let _ = ui.send(AgentToUiEvent::SystemNotice(
+                    "🔨 GitNexus：初始化代码图谱索引...".to_string(),
+                ));
 
-                // Run init only when .gitnexus is missing — a stale but valid
-                // index just needs analyze, not a fresh init.
-                if !index_valid {
-                    match bg.cli_init().await {
-                        Ok(r) if r.success => {
-                            tracing::info!("[GitNexus] init succeeded");
-                        }
-                        Ok(r) => {
-                            tracing::warn!("[GitNexus] init exited {:?}: {}", r.exit_code, r.stderr.trim());
-                            // Continue anyway - analyze might still work
-                        }
-                        Err(e) => {
-                            tracing::warn!("[GitNexus] init failed: {e}");
-                            // Continue anyway - analyze might still work
-                        }
+                // Run init first to create .gitnexus directory
+                match bg.cli_init().await {
+                    Ok(r) if r.success => {
+                        tracing::info!("[GitNexus] init succeeded");
+                    }
+                    Ok(r) => {
+                        tracing::warn!("[GitNexus] init exited {:?}: {}", r.exit_code, r.stderr.trim());
+                        // Continue anyway - analyze might still work
+                    }
+                    Err(e) => {
+                        tracing::warn!("[GitNexus] init failed: {e}");
+                        // Continue anyway - analyze might still work
                     }
                 }
 
-                let build_notice = if !index_valid {
-                    "🔨 GitNexus：开始构建代码图谱，首次索引可能需要1-3分钟…"
-                } else {
-                    "🔨 GitNexus：增量重建代码图谱…"
-                };
-                let _ = ui.send(AgentToUiEvent::SystemNotice(build_notice.to_string()));
+                let _ = ui.send(AgentToUiEvent::SystemNotice(
+                    "🔨 GitNexus：开始构建代码图谱，首次索引可能需要1-3分钟…".to_string(),
+                ));
                 // Spawn a progress ticker so the user sees the index is still running.
                 let tick_ui = ui.clone();
                 let ticker = tokio::spawn(async move {
@@ -1248,12 +1235,6 @@ fn spawn_agent_turn_for_text(
             }
             // Reindex between turns (not during code_graph calls) so the
             // index is fresh without slowing down mid-turn queries.
-            // Cover both Ox-driven edits (dirty flag set by edit/write/shell)
-            // and external edits (source tree newer than index built_at, e.g.
-            // IDE saves, git pull, other tooling touching files).
-            if svc.needs_startup_reindex().await {
-                svc.mark_dirty();
-            }
             svc.reindex_if_dirty().await;
         }
 

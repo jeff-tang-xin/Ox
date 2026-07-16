@@ -1069,14 +1069,11 @@ fn apply_delegate_success_effects(
     let params_str = req.params.to_string();
     let result_content = format!("── DATA ({inner_name}) ──\n{output}\n── END DATA ──");
 
-    // (E) Any tool that can mutate the workspace puts the GitNexus index
-    // behind the tree. edit_file/file_write/delete_range are direct mutations;
-    // shell_exec is treated as "potentially mutating" (cargo add / cp / mv /
-    // codegen / git checkout / git pull / npm install ...) so the next
-    // pre-turn analyze picks up any new/changed files.
-    let mutates = matches!(inner_name, "edit_file" | "file_write" | "delete_range")
-        || (inner_name == "shell_exec" && !result.is_error);
-    if mutates && let Some(gn) = &tool_ctx.gitnexus {
+    // (E) A successful code mutation puts the GitNexus index behind the tree.
+    // Mark dirty so the next `code_graph` query refreshes before answering.
+    if matches!(inner_name, "edit_file" | "file_write" | "delete_range")
+        && let Some(gn) = &tool_ctx.gitnexus
+    {
         gn.mark_dirty();
     }
 
