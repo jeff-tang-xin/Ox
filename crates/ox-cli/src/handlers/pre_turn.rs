@@ -141,7 +141,6 @@ pub async fn prepare_turn(
         let mut turn_messages = crate::helpers::build_context_with_option(
             &context_builder_clone,
             &system_prompt,
-            "",
             &effective_messages,
             context_window,
             use_refined,

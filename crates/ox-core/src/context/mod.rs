@@ -7,8 +7,7 @@ mod system_prompt;
 
 pub use effort::{EffortLevel, estimate_effort};
 pub use refinement::{
-    MemorySummary, RefinedTurn, build_refined_context, generate_memory_summary,
-    refine_assistant_response, refine_conversation,
+    RefinedTurn, build_refined_context, refine_assistant_response, refine_conversation,
 };
 pub use skill_prompts::SKILL_CREATION_PROMPT;
 pub use spec::{TASK_TYPE_PROMPT, load_spec, save_spec, spec_exists};
@@ -128,7 +127,6 @@ pub fn extract_recent_files(history: &[Message], max_files: usize) -> Vec<String
 #[derive(Debug, Clone)]
 pub struct TokenBudgets {
     pub system_prompt: u32,
-    pub memory: u32,
     pub history: u32,
     pub reply_reserve: u32,
     pub total: u32,
@@ -138,7 +136,6 @@ pub struct TokenBudgets {
 #[derive(Clone)]
 pub struct ContextBuilder {
     system_prompt_ratio: f32,
-    memory_ratio: f32,
     history_ratio: f32,
     reply_reserve_ratio: f32,
 }
@@ -155,26 +152,21 @@ impl ContextBuilder {
     pub fn new() -> Self {
         Self {
             system_prompt_ratio: 0.02,
-            memory_ratio: 0.03,
             history_ratio: 0.18, // 18% for history - more room for conversation
-            reply_reserve_ratio: 0.77,
+            reply_reserve_ratio: 0.80,
         }
     }
 
     /// Validate that ratios sum to 1.0 (with epsilon tolerance)
     fn validate_ratios(&self) -> bool {
-        let sum = self.system_prompt_ratio
-            + self.memory_ratio
-            + self.history_ratio
-            + self.reply_reserve_ratio;
+        let sum = self.system_prompt_ratio + self.history_ratio + self.reply_reserve_ratio;
         (sum - 1.0).abs() < 0.001
     }
 
     /// Create a ContextBuilder from ContextConfig ratios.
     /// FIX: Ensure ratios sum to 1.0 by normalizing if needed.
     pub fn from_config(config: &crate::config::ContextConfig) -> Self {
-        let user_ratio_sum =
-            config.history_ratio + config.memory_ratio + config.system_prompt_ratio;
+        let user_ratio_sum = config.history_ratio + config.system_prompt_ratio;
 
         // Clamp reply_reserve to [0.0, 1.0] and normalize if ratios > 1.0
         let reply_reserve = if user_ratio_sum >= 1.0 {
@@ -186,7 +178,6 @@ impl ContextBuilder {
 
         let builder = Self {
             system_prompt_ratio: config.system_prompt_ratio.clamp(0.0, 1.0),
-            memory_ratio: config.memory_ratio.clamp(0.0, 1.0),
             history_ratio: config.history_ratio.clamp(0.0, 1.0),
             reply_reserve_ratio: reply_reserve.clamp(0.0, 1.0),
         };
@@ -194,9 +185,8 @@ impl ContextBuilder {
         // Debug validate (doesn't enforce, but warns)
         if !builder.validate_ratios() {
             tracing::warn!(
-                "ContextBuilder ratios don't sum to 1.0: sys={}, mem={}, hist={}, reply={}",
+                "ContextBuilder ratios don't sum to 1.0: sys={}, hist={}, reply={}",
                 builder.system_prompt_ratio,
-                builder.memory_ratio,
                 builder.history_ratio,
                 builder.reply_reserve_ratio
             );
@@ -215,7 +205,6 @@ impl ContextBuilder {
     pub fn budgets(&self, context_window: u32) -> TokenBudgets {
         TokenBudgets {
             system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
-            memory: (context_window as f32 * self.memory_ratio) as u32,
             history: (context_window as f32 * self.history_ratio) as u32,
             reply_reserve: (context_window as f32 * self.reply_reserve_ratio) as u32,
             total: context_window,
@@ -230,36 +219,30 @@ impl ContextBuilder {
         msg_count: usize,
     ) -> TokenBudgets {
         // Dynamic adjustment based on conversation length
-        let (mem_r, hist_r) = if msg_count < 20 {
-            // Short: give more to history, reply reserve is still large
-            (0.02, 0.20)
+        let hist_r = if msg_count < 20 {
+            0.20
         } else if msg_count < 100 {
-            // Medium: default ratios
-            (self.memory_ratio, self.history_ratio)
+            self.history_ratio
         } else {
-            // Long: more memory, less history to avoid context bloat
-            (0.05, 0.08)
+            0.08
         };
-        let reply = (1.0 - self.system_prompt_ratio - mem_r - hist_r).max(0.5);
+        let reply = (1.0 - self.system_prompt_ratio - hist_r).max(0.5);
 
         match intent {
             UserIntent::Exploration => TokenBudgets {
                 system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
-                memory: (context_window as f32 * 0.01) as u32,
                 history: (context_window as f32 * 0.15) as u32,
                 reply_reserve: (context_window as f32 * 0.83) as u32,
                 total: context_window,
             },
             UserIntent::CodeUnderstanding | UserIntent::CodeModification => TokenBudgets {
                 system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
-                memory: (context_window as f32 * mem_r) as u32,
                 history: (context_window as f32 * hist_r) as u32,
                 reply_reserve: (context_window as f32 * reply) as u32,
                 total: context_window,
             },
             UserIntent::General => TokenBudgets {
                 system_prompt: (context_window as f32 * self.system_prompt_ratio) as u32,
-                memory: (context_window as f32 * mem_r) as u32,
                 history: (context_window as f32 * hist_r) as u32,
                 reply_reserve: (context_window as f32 * reply) as u32,
                 total: context_window,
@@ -274,7 +257,6 @@ impl ContextBuilder {
     pub fn build(
         &self,
         system_prompt: &str,
-        memory_context: &str,
         history: &[Message],
         context_window: u32,
     ) -> Vec<Message> {
@@ -282,19 +264,11 @@ impl ContextBuilder {
 
         let mut result = Vec::new();
 
-        // 1. System prompt + Memory context (merged into ONE system message for MiniMax compatibility).
+        // 1. System prompt.
         // 🚨 FIX: Check if history already starts with a system message (e.g., compression notice)
         let has_leading_system = matches!(history.first(), Some(Message::System { .. }));
 
-        let combined_system = if !memory_context.is_empty() {
-            format!(
-                "{}\n\n{}",
-                system_prompt.trim_end_matches('\n'),
-                memory_context.trim_start_matches('\n')
-            )
-        } else {
-            system_prompt.to_string()
-        };
+        let combined_system = system_prompt.to_string();
 
         // If history already has a system message, merge it with our system prompt
         if has_leading_system {
@@ -402,7 +376,6 @@ impl ContextBuilder {
     pub fn build_refined(
         &self,
         system_prompt: &str,
-        memory_context: &str,
         history: &[Message],
         context_window: u32,
         max_turns: usize,
@@ -411,18 +384,10 @@ impl ContextBuilder {
 
         let mut result = Vec::new();
 
-        // 1. System prompt + Memory context (merged into ONE system message for MiniMax compatibility).
+        // 1. System prompt.
         let has_leading_system = matches!(history.first(), Some(Message::System { .. }));
 
-        let combined_system = if !memory_context.is_empty() {
-            format!(
-                "{}\n\n{}",
-                system_prompt.trim_end_matches('\n'),
-                memory_context.trim_start_matches('\n')
-            )
-        } else {
-            system_prompt.to_string()
-        };
+        let combined_system = system_prompt.to_string();
 
         // If history already has a system message, merge it with our system prompt
         if has_leading_system {

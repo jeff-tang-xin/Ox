@@ -11,7 +11,6 @@ use ox_core::message::Message;
 pub fn build_context_with_option(
     builder: &ContextBuilder,
     system_prompt: &str,
-    memory_ctx: &str,
     messages: &[Message],
     max_tokens: u32,
     use_refined: bool,
@@ -19,9 +18,9 @@ pub fn build_context_with_option(
     if use_refined {
         tracing::debug!("Using refined context format");
         // Use default max_turns of 10 for refined context
-        builder.build_refined(system_prompt, memory_ctx, messages, max_tokens, 10)
+        builder.build_refined(system_prompt, messages, max_tokens, 10)
     } else {
         tracing::debug!("Using standard context format");
-        builder.build(system_prompt, memory_ctx, messages, max_tokens)
+        builder.build(system_prompt, messages, max_tokens)
     }
 }

@@ -20,7 +20,6 @@ pub struct OxConfig {
     pub tools: ToolsConfig,
     pub models: ModelsConfig,
     pub agent: AgentConfig,
-    pub memory: MemoryConfig,
     pub behavior_rules: BehaviorRulesConfig,
     pub enforcement_rules: rules::EnforcementRules,
     pub safety: SafetyConfig,
@@ -581,130 +580,6 @@ impl ModelsConfig {
     }
 }
 
-// ──────────────────── Memory ────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MemoryConfig {
-    pub max_nodes: usize,
-    pub alpha: f64,
-    pub time_decay: f64,
-    pub isolation_application: bool,
-    pub share_session_group: bool,
-    pub share_request: bool,
-    pub export_format: String,
-    pub janitor_run_on_startup_prob: f64,
-    pub project_decay: ProjectDecayConfig,
-    pub overall_decay: OverallDecayConfig,
-    pub language_config: HashMap<String, LanguageDecayConfig>,
-    pub transform: MemoryTransformConfig,
-    // 🆕 LLM Judge re-ranking configuration
-    pub enable_llm_judge: bool,
-    pub llm_judge_threshold: u8,
-    /// Store refined summaries instead of raw conversations
-    pub store_refined_memories: bool,
-    /// Hours between periodic L1→L2 memory-graph consolidation passes (default 24).
-    pub consolidation_interval_hours: u32,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        let mut lang_config = HashMap::new();
-        lang_config.insert(
-            "rust".into(),
-            LanguageDecayConfig {
-                lambda: 0.02,
-                max_retention_days: 30,
-                traces: vec![0.1, 0.2, 0.3, 0.4, 0.5],
-            },
-        );
-        lang_config.insert(
-            "python".into(),
-            LanguageDecayConfig {
-                lambda: 0.01,
-                max_retention_days: 90,
-                traces: vec![0.05, 0.15, 0.25, 0.35, 0.5],
-            },
-        );
-
-        Self {
-            max_nodes: 1000,
-            alpha: 0.8,
-            time_decay: 0.01,
-            isolation_application: true,
-            share_session_group: true,
-            share_request: true,
-            export_format: "json".into(),
-            janitor_run_on_startup_prob: 0.2,
-            project_decay: ProjectDecayConfig::default(),
-            overall_decay: OverallDecayConfig::default(),
-            language_config: lang_config,
-            transform: MemoryTransformConfig::default(),
-            // 🆕 LLM Judge defaults (enabled by default)
-            enable_llm_judge: true,       // Default: ENABLED
-            llm_judge_threshold: 7,       // Only keep memories with score >= 7
-            store_refined_memories: true, // Default: ENABLED for better memory quality
-            consolidation_interval_hours: 24,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProjectDecayConfig {
-    pub base_half_life: u32,
-    pub critical_threshold: f64,
-}
-
-impl Default for ProjectDecayConfig {
-    fn default() -> Self {
-        Self {
-            base_half_life: 30,
-            critical_threshold: 0.3,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct OverallDecayConfig {
-    pub beta: f64,
-}
-
-impl Default for OverallDecayConfig {
-    fn default() -> Self {
-        Self { beta: 0.015 }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LanguageDecayConfig {
-    pub lambda: f64,
-    pub max_retention_days: u32,
-    pub traces: Vec<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MemoryTransformConfig {
-    pub interval_days: u32,
-    pub batch_size: u32,
-    pub daily_token_cap: u32,
-    pub trigger: String,
-}
-
-impl Default for MemoryTransformConfig {
-    fn default() -> Self {
-        Self {
-            interval_days: 7,
-            batch_size: 20,
-            daily_token_cap: 10000,
-            trigger: "manual".into(),
-        }
-    }
-}
-
-// ──────────────────── Behavior / Safety / Cost ────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

@@ -115,11 +115,6 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     registry.register(trust::BLOCK_COMMAND);
     registry.register(trust::UNBLOCK_COMMAND);
 
-    // Memory management
-    registry.register(memory::REMEMBER_COMMAND);
-    registry.register(memory::FORGET_COMMAND);
-    registry.register(memory::MEMORY_COMMAND);
-
     // Feedback
     registry.register(feedback::FEEDBACK_COMMAND);
 
@@ -141,11 +136,10 @@ fn register_builtin_commands(registry: &mut CommandRegistry) {
     registry.register(index::INDEX_COMMAND);
 }
 
-// Import command modules (removed spec, council, workflow)
+// Import command modules (removed spec, council, workflow, memory)
 mod feedback;
 mod help;
 mod index;
-mod memory;
 mod model;
 mod session;
 mod skill;

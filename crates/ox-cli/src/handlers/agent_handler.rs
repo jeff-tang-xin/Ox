@@ -43,7 +43,6 @@ pub enum HandleResult {
     /// Interjection was processed — trigger a new agent turn.
     InterjectionTriggered {
         text: String,
-        memory_ctx: String,
         turn_messages: Vec<Message>,
     },
     /// Background session completed — no further action needed.
@@ -566,7 +565,6 @@ pub fn handle_turn_done(
                 let turn_messages = crate::helpers::build_context_with_option(
                     context_builder,
                     system_prompt,
-                    "",
                     &session.messages,
                     context_window,
                     config.context.use_refined_context,
@@ -579,7 +577,6 @@ pub fn handle_turn_done(
 
                 return HandleResult::InterjectionTriggered {
                     text: last.clone(),
-                    memory_ctx: String::new(),
                     turn_messages,
                 };
             }

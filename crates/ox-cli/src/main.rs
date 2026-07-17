@@ -1242,7 +1242,7 @@ fn spawn_agent_turn_for_text(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let interval_hours = config_clone.memory.consolidation_interval_hours;
+            let interval_hours: u32 = 24;
             let default_provider = provider_clone.clone();
             let summarizer = tool_ctx_clone.summarizer.clone();
             let status_for_consolidate = status_tx.clone();
@@ -2373,7 +2373,6 @@ fn spawn_next_workflow_step_if_needed(
     let mut turn_messages = crate::helpers::build_context_with_option(
         context_builder,
         &system_prompt,
-        "",
         &session.messages,
         context_window,
         false,
