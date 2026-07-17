@@ -1124,7 +1124,6 @@ pub fn handle_working_dir_changed(
                     rt_env.clone(),
                     new_dir.clone(),
                     Arc::new(config.clone()),
-                    knowledge_engine.clone(),
                 )
                 .with_gitnexus(gitnexus),
             );

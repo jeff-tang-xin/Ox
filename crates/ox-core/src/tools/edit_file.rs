@@ -306,42 +306,8 @@ impl EditFileTool {
 
         match result {
             Ok(Ok(msg)) => {
-                // ── AST syntax check after edit ──
-                let ast_warning = {
-                    let knowledge = ctx.knowledge.clone();
-                    let check_path = path.to_path_buf();
-                    tokio::spawn(async move {
-                        let Some(ref knowledge) = knowledge else {
-                            return None;
-                        };
-                        let mut engine = match knowledge.try_write() {
-                            Ok(e) => e,
-                            Err(_) => return None,
-                        };
-                        if let Ok(code) = std::fs::read_to_string(&check_path) {
-                            engine.check_syntax(&check_path, &code)
-                        } else {
-                            None
-                        }
-                    })
-                    .await
-                };
-                let ast_suffix = match ast_warning {
-                    Ok(Some(errors)) => {
-                        let mut warn =
-                            format!("\n\n⚠️ AST Syntax Check: {} issue(s):", errors.len());
-                        for (i, err) in errors.iter().take(5).enumerate() {
-                            warn.push_str(&format!("\n   {}. {}", i + 1, err.description));
-                        }
-                        if errors.len() > 5 {
-                            warn.push_str(&format!("\n   ... and {} more", errors.len() - 5));
-                        }
-                        warn.push_str("\n   💡 Fix syntax errors before proceeding.");
-                        warn
-                    }
-                    _ => String::new(),
-                };
-                ToolOutput::success(format!("{}{}", msg, ast_suffix))
+                // AST syntax check removed — KnowledgeEngine disabled
+                ToolOutput::success(msg)
             }
             Ok(Err(e)) => ToolOutput::error(e),
             Err(join_err) => ToolOutput::error(format!("Edit task panicked: {join_err}")),

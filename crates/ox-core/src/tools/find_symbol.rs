@@ -57,9 +57,9 @@ impl Tool for FindSymbolTool {
             .map(|v| v as usize)
             .unwrap_or(10);
 
-        let knowledge = ctx.knowledge.clone();
         let name_owned = name.to_string();
         let working_dir = ctx.working_dir.clone();
+        let _ = top_k;
 
         // Before tree-sitter search, try code_graph query to get execution flow
         // context. The LLM doesn't need to call code_graph separately —
@@ -88,40 +88,21 @@ impl Tool for FindSymbolTool {
             let ts_hits = search_with_treesitter(&mut extractor, &working_dir, &name_owned);
             if !ts_hits.is_empty() {
                 let primary_file = ts_hits.first().map(|h| h.file_path.clone());
-                return Ok(SearchOutcome {
+                return Ok::<SearchOutcome, String>(SearchOutcome {
                     output: format_treesitter_results(&name_owned, &ts_hits),
                     primary_file,
                 });
             }
 
-            // ── Step 2: vector fallback (only if knowledge engine is available) ──
-            if let Some(knowledge) = knowledge {
-                let engine = knowledge.read().await;
-                match engine.retrieve_code(&name_owned, top_k) {
-                    Ok(hits) if !hits.is_empty() => Ok(SearchOutcome {
-                        output: format_vector_results(&name_owned, &hits, &engine),
-                        primary_file: vector_primary_file(&hits),
-                    }),
-                    Ok(_) => Ok(SearchOutcome {
-                        output: format!(
-                            "🔍 No symbols found for '{}'.\n\
-                             💡 Try a more specific name, or use file_read + code_search.",
-                            name_owned
-                        ),
-                        primary_file: None,
-                    }),
-                    Err(e) => Err(e.to_string()),
-                }
-            } else {
-                Ok(SearchOutcome {
-                    output: format!(
-                        "🔍 No symbols found for '{}'.\n\
-                         💡 Try a more specific name, or use code_search to find usages.",
-                        name_owned
-                    ),
-                    primary_file: None,
-                })
-            }
+            // ── Vector fallback removed — KnowledgeEngine disabled ──
+            Ok(SearchOutcome {
+                output: format!(
+                    "🔍 No symbols found for '{}'.\n\
+                     💡 Try a more specific name, or use code_search to find usages.",
+                    name_owned
+                ),
+                primary_file: None,
+            })
         })
         .await;
 

@@ -403,7 +403,6 @@ async fn run_app(
             rt_env.clone(),
             rt_env.working_dir.clone(),
             Arc::new(config.clone()),
-            knowledge_engine.clone(),
         )
         .with_gitnexus(Some(Arc::clone(&gitnexus)))
         .with_memory_store(memory_store)

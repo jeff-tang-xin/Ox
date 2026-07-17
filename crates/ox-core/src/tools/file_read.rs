@@ -223,20 +223,8 @@ impl Tool for FileReadTool {
 
         match result {
             Ok((content, total_lines)) => {
-                let abs_path = path.to_path_buf();
-                if let Some(ref knowledge) = ctx.knowledge {
-                    let knowledge = knowledge.clone();
-                    tokio::spawn(async move {
-                        if let Ok(mut engine) = knowledge.try_write()
-                            && let Err(e) = engine.index_file(&abs_path)
-                        {
-                            tracing::debug!(
-                                "[FILE_READ] Auto-index failed for {}: {e}",
-                                abs_path.display()
-                            );
-                        }
-                    });
-                }
+                let _ = path.to_path_buf();
+                // KnowledgeEngine auto-index removed (embedding disabled)
 
                 let output = format_read_output(&path_str, content, offset, limit, total_lines);
                 ToolOutput::success(output)

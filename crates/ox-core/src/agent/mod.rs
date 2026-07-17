@@ -2430,16 +2430,8 @@ pub async fn run_agent_turn(
             assistant_preview,
             assistant_truncated
         );
-        {
-            if let Some(knowledge) = tool_ctx.knowledge.clone() {
-                tokio::task::spawn(async move {
-                    if let Ok(mut engine) = knowledge.try_write() {
-                        let _ =
-                            engine.record_turn("current", &l0_content, None, None, vec![], true);
-                    }
-                });
-            }
-        }
+        // record_turn removed — KnowledgeEngine disabled at runtime
+        let _ = l0_content;
 
         // ── Context Offloader: created once and reused across all tools in this iteration ──
         let mut offloader = context_offloader::ContextOffloader::new(
@@ -2652,16 +2644,8 @@ pub async fn run_agent_turn(
                                 "你刚才执行 {}({}) {status}; 观察到: {}; 后续避免重复同一查询",
                                 meta.inner_tool, target, observation
                             ));
-                            record_tool_live_update(
-                                &tool_ctx,
-                                &workflow_engine,
-                                &user_task,
-                                &meta.inner_tool,
-                                &meta.inner_args,
-                                &meta.live_output,
-                                is_error,
-                            )
-                            .await;
+                            // record_tool_live_update removed — KnowledgeEngine disabled
+                            let _ = (&meta.inner_args, &meta.live_output);
                             // ── Persist the ReAct triple to react_log (unified path) ──
                             // This is the L0 memory ground truth: [user, assistant,
                             // tool_result]. Previously only the legacy tool path wrote
@@ -3340,7 +3324,6 @@ pub async fn run_agent_turn(
                     tool_ctx.runtime.clone(),
                     tool_ctx.working_dir.clone(),
                     tool_ctx.config.clone(),
-                    tool_ctx.knowledge.clone(),
                     tc.id.clone(),
                     move |progress: crate::tools::ToolProgress| {
                         let _ = ui_tx_clone.send(AgentToUiEvent::ToolProgress {
@@ -3391,16 +3374,8 @@ pub async fn run_agent_turn(
                 result_preview
             );
 
-            record_tool_live_update(
-                &tool_ctx,
-                &workflow_engine,
-                &user_task,
-                &tc.name,
-                &tc.arguments,
-                &result.content,
-                result.is_error,
-            )
-            .await;
+            // record_tool_live_update removed — KnowledgeEngine disabled at runtime
+            let _ = (&workflow_engine, &user_task, &tc.arguments);
 
             // Send completion progress event only if tool executed successfully
             if !result.is_error {
@@ -3418,7 +3393,6 @@ pub async fn run_agent_turn(
                     tool_ctx.runtime.clone(),
                     new_dir.clone(),
                     tool_ctx.config.clone(),
-                    tool_ctx.knowledge.clone(),
                 ));
                 let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
             }
@@ -4199,38 +4173,6 @@ pub fn tool_loop_key(name: &str, arguments: &str) -> String {
                 other.to_string()
             }
         }
-    }
-}
-
-/// Push L0 working-memory + symbol relations into the knowledge graph after each tool call.
-async fn record_tool_live_update(
-    tool_ctx: &Arc<ToolContext>,
-    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
-    user_task: &Option<String>,
-    tool_name: &str,
-    tool_args: &str,
-    tool_result: &str,
-    is_error: bool,
-) {
-    let session_id = workflow_engine
-        .as_ref()
-        .and_then(|wf| wf.try_lock().ok())
-        .map(|e| e.session_id())
-        .unwrap_or_else(|| "default".to_string());
-    let ctx = crate::knowledge::live_update::ToolExecutionContext {
-        session_id,
-        user_message: user_task.clone().unwrap_or_default(),
-        tool_name: tool_name.to_string(),
-        tool_args: tool_args.to_string(),
-        tool_result: tool_result.chars().take(4000).collect(),
-        is_error,
-        project_root: tool_ctx.working_dir.to_string_lossy().to_string(),
-    };
-    if let Some(knowledge) = &tool_ctx.knowledge
-        && let Ok(mut engine) = knowledge.try_write()
-        && let Err(e) = engine.process_tool_execution(&ctx)
-    {
-        tracing::warn!("[LIVE_UPDATE] apply failed: {e}");
     }
 }
 

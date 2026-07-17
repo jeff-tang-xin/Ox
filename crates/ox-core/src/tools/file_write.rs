@@ -349,44 +349,8 @@ impl Tool for FileWriteTool {
                     None => "UTF-8",
                 };
 
-                // ── AST syntax check: parse the written file and warn on errors ──
-                let ast_warning = {
-                    let knowledge = ctx.knowledge.clone();
-                    let check_path = display_path.clone();
-                    tokio::spawn(async move {
-                        let Some(ref knowledge) = knowledge else {
-                            return None;
-                        };
-                        let mut engine = match knowledge.try_write() {
-                            Ok(e) => e,
-                            Err(_) => return None,
-                        };
-                        // Re-read the written file for syntax check
-                        if let Ok(code) = std::fs::read_to_string(&check_path) {
-                            engine.check_syntax(&check_path, &code)
-                        } else {
-                            None
-                        }
-                    })
-                    .await
-                };
-                let ast_warning = match ast_warning {
-                    Ok(Some(errors)) => {
-                        let mut warn = format!(
-                            "\n\n⚠️ AST Syntax Check: {} issue(s) detected:",
-                            errors.len()
-                        );
-                        for (i, err) in errors.iter().take(5).enumerate() {
-                            warn.push_str(&format!("\n   {}. {}", i + 1, err.description));
-                        }
-                        if errors.len() > 5 {
-                            warn.push_str(&format!("\n   ... and {} more", errors.len() - 5));
-                        }
-                        warn.push_str("\n   💡 Fix syntax errors before proceeding.");
-                        warn
-                    }
-                    _ => String::new(),
-                };
+                // AST syntax check removed — KnowledgeEngine disabled
+                let ast_warning = String::new();
 
                 ToolOutput::success(format!(
                     "✅ Successfully written {} bytes to {}{}\n\

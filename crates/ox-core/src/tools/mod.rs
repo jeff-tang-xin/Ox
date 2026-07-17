@@ -70,8 +70,6 @@ pub struct ToolContext {
     pub runtime: RuntimeEnvironment,
     pub working_dir: std::path::PathBuf,
     pub config: Arc<OxConfig>,
-    /// Unified knowledge engine (optional; disabled when embedding is removed)
-    pub knowledge: Option<Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>>,
     /// GitNexus code-graph service (optional; None when unavailable/disabled).
     pub gitnexus: Option<Arc<crate::mcp::GitNexusService>>,
     /// Cross-session memory store (SQLite-backed).
@@ -99,13 +97,11 @@ impl ToolContext {
         runtime: RuntimeEnvironment,
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
-        knowledge: Option<Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>>,
     ) -> Self {
         Self {
             runtime,
             working_dir,
             config,
-            knowledge,
             gitnexus: None,
             memory_store: None,
             summarizer: None,
@@ -140,7 +136,6 @@ impl ToolContext {
         runtime: RuntimeEnvironment,
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
-        knowledge: Option<Arc<tokio::sync::RwLock<crate::knowledge::KnowledgeEngine>>>,
         tool_call_id: String,
         progress_callback: impl Fn(ToolProgress) + Send + Sync + 'static,
     ) -> Self {
@@ -148,7 +143,6 @@ impl ToolContext {
             runtime,
             working_dir,
             config,
-            knowledge,
             gitnexus: None,
             memory_store: None,
             summarizer: None,
