@@ -17,6 +17,10 @@ pub const UNIFIED_ROUTE_TAG: &str = "[UNIFIED_ROUTE]";
 pub const UNIFIED_CALL_EXAMPLE: &str =
     r#"complete_and_check({"action":"file_read","params":{"path":"src/main.rs"}})"#;
 
+/// Authoritative whitelist of legal `action` values, shown to the LLM in every
+/// prompt block. Keep in sync with `action_to_tool_name` + `route`.
+pub const UNIFIED_ACTIONS_LIST: &str = "file_read | file_write | edit_file | delete_range | file_list | file_search | code_search | find_symbol | read_symbol | shell_exec | git_status | git_diff | project_detect | web_fetch | code_graph | load_skill | recall | finish";
+
 /// Parsed LLM request body for `complete_and_check`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedActionRequest {

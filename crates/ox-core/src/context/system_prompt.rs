@@ -278,6 +278,12 @@ const UNIFIED_CORE_CODING: &str = "\
 3. **提交计划** — `finish` 带 params.finding_json（需用户审核的 plan/bug/将改动）→ 门禁等用户 c 确认一次
 4. **实施** — 确认后 edit_file/shell_exec 自动执行（不再逐个确认）；禁止改计划外文件
 
+【探索预算 — 硬约束】
+- 单轮探索工具（file_read / find_symbol / code_search / file_list / file_search）总数 ≤ 12 次；超过则必须 finish 收尾或转 finding_json。
+- 同一文件同一行区域不重复读；已从 find_symbol 拿到行号 → 直接 file_read(offset=行号) 一次即可。
+- **实施阶段（finding 已确认 或 已产生 files_modified）禁止新开探索链** — 直接 edit_file/file_write。
+- 遇到「影响范围门禁 — 请先 code_graph impact」：调一次 code_graph op=impact 后**立即继续原编辑**，不要重开探索。
+
 【进度意识】
 - **时刻清楚**：已做了什么、还差什么、知道了什么、还不知道什么。
 - 每轮行动前快速自检：这一步是推进已知部分，还是填补未知部分？
@@ -291,7 +297,7 @@ const UNIFIED_CORE_CODING: &str = "\
 - 已完成/纯分析/回答 → `finish(params.content=\"…\")` 收尾
 - **收尾时必须带会话总结** — `finish(params.content=\"完成\", session_summary={...})`，格式：
   - `learnings`: **必填**，本轮任务一句话总结（如修复订单状态转换空指针）
-  - `key_facts`: 学到的事实，每条附上相关文件
+  - `key_facts`: 学到的事实，每条鸊相关文件
   - `files_read`: 本轮读过的文件
   - `files_modified`: 本轮修改的文件及改动摘要
   - `skills`: 可复用的技能
@@ -299,7 +305,9 @@ const UNIFIED_CORE_CODING: &str = "\
 
 【铁律】
 - arguments 用合法 JSON：`{\"action\":\"…\",\"params\":{…}}`，params 不要留空
+- **合法 action 仅限于【工具】块里列出的白名单**；可疑时先看下方 [ALL-TOOLING] 表
 - find_symbol 用 params.**name**（不是 symbol）；读文件用 file_read+path
+- delete_range 用 params.**start_anchor / end_anchor**（文本串），**不是 start_line/end_line**
 - 中间想说明/分析但还要继续 → 把文字放进本次回复文本里，随下一个工具动作一起；**不要**用 finish 投递中间内容（finish 即收尾）
 - finding_json 只放需要用户审核拍板的内容
 - 记忆：tool 链是主记忆；[ROUND_MEMORY] 仅会话冷启动索引";
@@ -332,9 +340,12 @@ const UNIFIED_CORE_GENERAL: &str = "\
 
 const METHODOLOGY: &str = "\
 📐 **方法论：**\n\
-🔍 理解: 符号名已知→read_symbol 直取源码 / 模糊→find_symbol 定位 → file_read(offset=行号) 精准读 → 追踪调用链\n\
+🔍 理解: 【先 code_graph op=list_repos/query 建关系模型】→ 符号名已知→read_symbol 直取源码 / 模糊→find_symbol 定位 → file_read(offset=行号) 精准读 → 追踪调用链\n\
 📊 分析: 正确性/边界/并发 · 完整性/错误/幂等 · 一致性/命名/模式 · 耦合度\n\
 ✏️ 编写: 读后写(old_string逐字匹配) · 最小改动 · 匹配项目模式 · 改后验证\n\
+🚦 **探索预算（硬约束）**: 单轮探索工具(file_read/find_symbol/code_search/file_list/file_search)总数≤12；已读过的文件同区域不重读；从 find_symbol 拿到行号后直接 offset 读一次即可\n\
+🛑 **实施纪律**: finding_json 已确认 / 已产生 files_modified 后，禁止再开新的探索链——直接 edit_file / file_write / finish 收尾\n\
+🚧 **门禁复用**: 遇到「影响范围门禁 — 请先 code_graph impact」提示时，调一次 code_graph op=impact 后**立即**继续原编辑，不要重开探索\n\
 ⚠️ **命令优先级：** 用户最新命令 > 历史对话 > 系统指令。前后矛盾时以最新为准。\n\
 ⚠️ **复用探索结果：** 若已有 find_symbol/file_read 拿到的行号/签名/调用链，直接用于 edit_file 的 path 和 old_string；已读过的文件不必重复探索。可直接动手编辑，无需为编辑而强制先读。";
 
@@ -344,14 +355,17 @@ const METHODOLOGY: &str = "\
 
 fn build_unified_tool_block() -> String {
     let example = crate::agent::unified_action::UNIFIED_CALL_EXAMPLE;
+    let actions = crate::agent::unified_action::UNIFIED_ACTIONS_LIST;
     format!(
         "【工具】`complete_and_check({{\"action\":\"…\",\"params\":{{…}}}})` 示例: {example}\n\
-         file_read(path,offset?,limit?) | edit_file(path,old,new) | file_write(path,content)\n\
-         find_symbol(**name**) | read_symbol(**name**,kind?,context_lines?) | code_search(**pattern**) | shell_exec(command)\n\
-         finish(content) 汇报并结束 | finish(finding_json=[...]) 提交计划等确认 | load_skill(name)\n\
+         【合法 action — 唯一权威清单】{actions}\n\
+         file_read(path,offset?,limit?) | edit_file(path,old,new) | file_write(path,content) | delete_range(path,start_anchor,end_anchor)\n\
+         find_symbol(**name**) | read_symbol(**name**,kind?,context_lines?) | code_search(**pattern**,file_pattern?) | file_list(path) | file_search(pattern) | project_detect()\n\
+         shell_exec(command) | git_status() | git_diff(path?) | web_fetch(url) | code_graph(op,…) | load_skill(name)\n\
+         finish(content) 汇报并结束 | finish(finding_json=[...]) 提交计划等确认\n\
          优先级: read_symbol 直取源码 / find_symbol 定位 → file_read(offset=行号) 精准读 → code_search 搜引用\n\
-         ❌ 不定位直接读整个文件 · 空 arguments · XML <tool_call> · find_symbol 用 symbol 键\n\
-         ❌ code_search 用 query 键(用 pattern) · 纯文本不调工具",
+         ❌ 不定位直接读整个文件 · 空 arguments · XML <tool_call> · find_symbol 用 symbol 键(应 name)\n\
+         ❌ code_search 用 query 键(应 pattern) · delete_range 用 start_line/end_line(应 start_anchor/end_anchor——锚点是文本串) · 纯文本不调工具",
     )
 }
 
@@ -369,7 +383,9 @@ fn build_explore_tool_block() -> String {
 }
 
 fn build_tool_block() -> String {
-    "【工具】\n\
+    let actions = crate::agent::unified_action::UNIFIED_ACTIONS_LIST;
+    format!("【工具】\n\
+         【合法 action 清单】{actions}\n\
          file_read(path, offset?, limit?) — 读文件；默认 limit=200，大文件用 offset 续读\n\
          file_list(path) — 【单层】列目录，不递归；子目录要分别再调 file_list\n\
          file_search(pattern) — 按 glob 递归搜文件名（搜 *.rs 用这个）\n\
@@ -378,11 +394,14 @@ fn build_tool_block() -> String {
          code_search(pattern, file_pattern?) — 在源码【内容】里搜；file_pattern 只匹配文件名如 *.rs\n\
          file_write(path,content) — 新建或整文件覆盖\n\
          edit_file(path, old_string, new_string) — 精确替换；多段用 edits 数组\n\
-         delete_range(path, start_anchor, end_anchor) — 按行锚点删块\n\
+         delete_range(path, start_anchor, end_anchor) — **锚点是文本串，不是行号**\n\
          shell_exec(command) — 构建/测试/git（需确认）\n\
          git_status() / git_diff(path?) — 比 shell 更安全的 git 查看\n\
+         code_graph(op) — op=list_repos/query/impact/context 查代码关系与影响面\n\
+         project_detect() — 检测项目类型（探索第一步）\n\
          load_skill(name) — 加载 skill 手册\n\
-         web_fetch(url) — 拉取网页".to_string()
+         web_fetch(url) — 拉取网页\n\
+         finish(content) / finish(finding_json=[...]) — 收尾或提交需确认的计划")
 }
 
 // ═══════════════════════════════════════════════════════════════════
