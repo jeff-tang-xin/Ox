@@ -26,7 +26,6 @@ pub struct OxConfig {
     pub safety: SafetyConfig,
     pub cost: CostConfig,
     pub spec: SpecConfig,
-    pub embedding: EmbeddingConfig,
     pub gitnexus: GitNexusConfig,
 }
 
@@ -777,77 +776,6 @@ impl Default for CostConfig {
             max_daily_cost: 2.0,
             budget_alert_threshold: 0.8,
             cost_transparency: true,
-        }
-    }
-}
-
-// ──────────────────── Embedding ────────────────────
-
-/// Configuration for the local embedding model (symbol vector search).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct EmbeddingConfig {
-    /// Enable semantic symbol search via local embeddings.
-    pub enabled: bool,
-    /// Model source: "modelscope", "huggingface", or "local".
-    /// - "modelscope": git clone from modelscope.cn (default, fast in China)
-    /// - "huggingface": download from hf_endpoint (hf-mirror.com fallback)
-    /// - "local": load from local_model_dir (must contain config.json, model.safetensors, tokenizer.json)
-    pub model_source: String,
-    /// ModelScope base URL. Default: https://www.modelscope.cn
-    /// Full clone URL is: {modelscope_url}/{model_id}.git
-    pub modelscope_url: String,
-    /// HuggingFace endpoint URL. Leave empty for auto-detect:
-    ///   1. $HF_ENDPOINT environment variable
-    ///   2. Fallback to https://hf-mirror.com (China mirror)
-    /// Set to "https://huggingface.co" for official endpoint.
-    pub hf_endpoint: String,
-    /// Model identifier (e.g. "intfloat/multilingual-e5-small").
-    pub model_id: String,
-    /// Local directory containing model files (used when model_source = "local").
-    pub local_model_dir: String,
-    /// Embedding vector dimension (multilingual-e5-small = 384).
-    pub dimension: usize,
-    /// E5-style query prefix (e.g. "query: ").
-    pub query_prefix: String,
-    /// E5-style passage prefix for prose (e.g. "passage: ").
-    pub passage_prefix: String,
-    /// Prefix for code passages (e.g. "code: ").
-    pub code_passage_prefix: String,
-    /// Startup indexer: symbols embedded per batch (default 128).
-    pub index_embed_chunk_size: usize,
-    /// Progress/UI update step during startup embed (default 40; 30-50 is a good range).
-    pub index_embed_progress_step: usize,
-    /// Safety ceiling for embedding text length (code symbols use structured headers).
-    pub index_embed_max_chars: usize,
-    /// When true, skip blocking full-project embed at startup; index on demand per turn.
-    pub lazy_index: bool,
-    /// Max files to embed per user message when lazy_index is enabled.
-    pub lazy_index_max_files_per_turn: usize,
-    /// When lazy_index is true, continue full-project embed in background (non-blocking).
-    /// Default off — use on-demand paths + findings-first lazy embed instead.
-    pub background_full_index: bool,
-}
-
-impl Default for EmbeddingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            model_source: "modelscope".into(),
-            modelscope_url: "https://www.modelscope.cn".into(),
-            hf_endpoint: String::new(), // auto: env HF_ENDPOINT → hf-mirror.com
-            model_id: "intfloat/multilingual-e5-small".into(),
-            local_model_dir: String::new(),
-            dimension: 384,
-            query_prefix: "query: ".into(),
-            passage_prefix: "passage: ".into(),
-            code_passage_prefix: "code: ".into(),
-            index_embed_chunk_size: 128,
-            index_embed_progress_step: 40,
-            index_embed_max_chars: 2048,
-            lazy_index: true,
-            lazy_index_max_files_per_turn: 20,
-            background_full_index: false,
         }
     }
 }
