@@ -127,16 +127,6 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
         ),
     ];
-    if !app.embedding_model.is_empty() {
-        title_spans.push(Span::styled(
-            " │ embed: ".to_string(),
-            Style::default().fg(TEXT_DIM),
-        ));
-        title_spans.push(Span::styled(
-            app.embedding_model.clone(),
-            Style::default().fg(Color::Rgb(140, 200, 255)),
-        ));
-    }
     title_spans.push(Span::raw(" "));
     lines.push(Line::from(title_spans));
 

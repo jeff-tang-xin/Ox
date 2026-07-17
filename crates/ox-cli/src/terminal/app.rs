@@ -175,8 +175,6 @@ pub struct App {
     pub dirty: bool,
     pub spinner_frame: u64,
     pub model_name: String,
-    /// Short embedding model label (e.g. `multilingual-e5-small`).
-    pub embedding_model: String,
     pub working_dir: String,
     pub cost_summary: String,
     pub message_count: usize,
@@ -243,9 +241,6 @@ pub struct App {
     pub session_action: SessionAction,
     /// Provider resolution info for debugging commands.
     pub resolve_info: Option<ox_core::llm::ProviderResolveInfo>,
-    /// Unified knowledge engine (AST + memory + vector store)
-    pub knowledge_engine: Option<Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>>,
-
     // Indexing progress
     /// Whether background indexing is still in progress
     pub indexing: bool,
@@ -300,7 +295,6 @@ impl App {
             dirty: true,
             spinner_frame: 0,
             model_name: String::new(),
-            embedding_model: String::new(),
             working_dir: String::new(),
             cost_summary: String::new(),
             message_count: 0,
@@ -348,7 +342,6 @@ impl App {
             // Slash command context fields
             session_action: SessionAction::None,
             resolve_info: None,
-            knowledge_engine: None,
 
             // Indexing progress
             indexing: false,

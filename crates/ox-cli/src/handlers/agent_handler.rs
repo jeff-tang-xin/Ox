@@ -10,7 +10,6 @@ use ox_core::agent::AgentToUiEvent;
 use ox_core::config::OxConfig;
 use ox_core::context::ContextBuilder;
 use ox_core::cost::CostTracker;
-use ox_core::knowledge::KnowledgeEngine;
 use ox_core::llm::LlmProvider;
 use ox_core::message::{Message, Session};
 use ox_core::runtime::RuntimeEnvironment;
@@ -191,7 +190,6 @@ pub fn handle_turn_done(
     has_provider: bool,
     rt_env: &mut RuntimeEnvironment,
     tool_registry: &Arc<ToolRegistry>,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
     cost_tracker: &mut CostTracker,
     model_name: &str,
     compressed_cache: &Option<(Vec<Message>, usize)>,
@@ -491,54 +489,7 @@ pub fn handle_turn_done(
     }
     cost_tracker.record(model_name, usage);
 
-    // Async: store turn summary + extract facts via KnowledgeEngine
-    let knowledge_for_turn = knowledge_engine.clone();
-    let new_msgs_for_store = new_messages.to_vec();
-    let pid_for_store = rt_env.project_id.clone();
-    let lang_for_store = rt_env.project_language.clone();
-    tokio::spawn(async move {
-        let Some(ref knowledge_for_turn) = knowledge_for_turn else {
-            return;
-        };
-        let mut engine = knowledge_for_turn.write().await;
-        if let Some(summary) =
-            ox_core::context::refinement::generate_memory_summary(&new_msgs_for_store)
-        {
-            let _ = engine.record_turn(
-                "current",
-                &summary.format_for_storage(),
-                Some(&summary.topic),
-                Some(&summary.key_insights),
-                summary.tools_used.clone(),
-                summary.has_code_changes,
-            );
-            let _ = engine.record_atomic_fact(
-                &summary.format_for_storage(),
-                "BestPractice",
-                Some(&pid_for_store),
-                &lang_for_store,
-                "RefinedSummary",
-            );
-        } else if let Some(last_user) = new_msgs_for_store.iter().rev().find_map(|m| {
-            if let Message::User { content } = m {
-                Some(content.as_str())
-            } else {
-                None
-            }
-        }) {
-            let _ = engine.record_turn(
-                "current",
-                &format!(
-                    "User asked: {}",
-                    last_user.chars().take(200).collect::<String>()
-                ),
-                None,
-                None,
-                vec![],
-                false,
-            );
-        }
-    });
+    // KnowledgeEngine turn recording removed — memory now lives in ox_core::memory + session files.
 
     // Implicit feedback: evaluate satisfaction
     let explicit_rate = if app.explicit_feedback_count > 0 {
@@ -1097,7 +1048,6 @@ pub fn handle_working_dir_changed(
     new_dir: std::path::PathBuf,
     has_provider: bool,
     config: &OxConfig,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
     gitnexus: Option<Arc<ox_core::mcp::GitNexusService>>,
 ) -> Option<Arc<ToolContext>> {
     use ox_core::runtime;
@@ -1146,7 +1096,6 @@ pub fn handle_workflow_completed(
     provider: &Option<Arc<dyn LlmProvider>>,
     rt_env: &RuntimeEnvironment,
     agent_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>>,
     task_description: String,
     execution_summary: String,
     agent_config: &Arc<ox_core::config::AgentConfig>,
@@ -1159,19 +1108,7 @@ pub fn handle_workflow_completed(
         execution_summary
     );
 
-    // Memory episode + consolidation
-    let ke = knowledge_engine.clone();
-    let pid = rt_env.project_id.clone();
-    let task = task_description.clone();
-    let summary = execution_summary.clone();
-    tokio::spawn(async move {
-        let Some(ref ke) = ke else { return };
-        let mut engine = ke.write().await;
-        let _ = engine.record_workflow_episode("current", Some(&pid), &task, &summary);
-        if let Err(e) = engine.run_consolidation("current", Some(&pid)) {
-            tracing::warn!("[KNOWLEDGE] Consolidation failed: {e}");
-        }
-    });
+    // KnowledgeEngine episode/consolidation removed — workflow completion no longer stores memory here.
 
     if !agent_config.skill_reflect_enabled {
         return;

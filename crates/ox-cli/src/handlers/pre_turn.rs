@@ -44,7 +44,6 @@ pub async fn prepare_turn(
     tool_registry: &Arc<ToolRegistry>,
     context_builder: &ContextBuilder,
     context_window: u32,
-    _knowledge_engine: &Option<Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>>,
     user_text: &str,
     session_messages: &[Message],
     compressed_cache: &Option<(Vec<Message>, usize)>,

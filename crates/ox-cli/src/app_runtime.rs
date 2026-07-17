@@ -11,7 +11,6 @@ use ox_core::config::{AgentConfig, OxConfig};
 use ox_core::context::ContextBuilder;
 use ox_core::context::compressed_store::CompressedContextStore;
 use ox_core::cost::CostTracker;
-use ox_core::knowledge::KnowledgeEngine;
 use ox_core::llm::{LlmProvider, ProviderResolveInfo};
 use ox_core::message::{Message, Session};
 use ox_core::runtime::RuntimeEnvironment;
@@ -36,7 +35,6 @@ pub struct AppRuntime {
     pub context_builder: ContextBuilder,
     pub context_window: u32,
     pub compressed_ctx_store: Arc<CompressedContextStore>,
-    pub knowledge_engine: Arc<tokio::sync::RwLock<KnowledgeEngine>>,
     pub trust_manager: Arc<std::sync::Mutex<TrustManager>>,
     pub cost_tracker: CostTracker,
     pub agent_tx: mpsc::UnboundedSender<AgentToUiEvent>,
@@ -64,7 +62,6 @@ impl AppRuntime {
         context_builder: ContextBuilder,
         context_window: u32,
         compressed_ctx_store: Arc<CompressedContextStore>,
-        knowledge_engine: Arc<tokio::sync::RwLock<KnowledgeEngine>>,
         trust_manager: Arc<std::sync::Mutex<TrustManager>>,
         cost_tracker: CostTracker,
         agent_tx: mpsc::UnboundedSender<AgentToUiEvent>,
@@ -84,7 +81,6 @@ impl AppRuntime {
             context_builder,
             context_window,
             compressed_ctx_store,
-            knowledge_engine,
             trust_manager,
             cost_tracker,
             agent_tx,

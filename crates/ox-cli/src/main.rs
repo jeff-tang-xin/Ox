@@ -27,7 +27,6 @@ use ox_core::agent::{self, AgentToUiEvent};
 use ox_core::config::{AgentConfig, OxConfig};
 use ox_core::context::{self, ContextBuilder};
 use ox_core::cost::CostTracker;
-use ox_core::knowledge::KnowledgeEngine;
 use ox_core::llm::{self, LlmProvider, ProviderResolveInfo};
 use ox_core::message::{Message, Session};
 use ox_core::runtime;
@@ -44,7 +43,6 @@ use handlers::agent_handler::{self, HandleResult};
 use handlers::key_handler::{self, KeyResult};
 use handlers::pre_turn::TurnVariant;
 use handlers::session_handler;
-use helpers::formatting::short_model_id;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -200,7 +198,6 @@ async fn run_app(
         .map(|p| p.model_name().to_string())
         .unwrap_or_else(|| "echo".to_string());
     app.working_dir = rt_env.working_dir.display().to_string();
-    app.embedding_model = short_model_id(&config.embedding.model_id);
     app.message_count = 0;
 
     // Header
@@ -313,11 +310,7 @@ async fn run_app(
     });
 
     // ── Knowledge Engine — disabled (embedding/vector retrieval removed) ──
-    // No vector indexing, no background embedding, no pre-turn retrieval.
-    // find_symbol uses tree-sitter directly; skills are file-based.
-    let knowledge_engine: Option<Arc<tokio::sync::RwLock<ox_core::knowledge::KnowledgeEngine>>> =
-        None;
-
+    // KnowledgeEngine + embedding stack fully removed — tree-sitter + GitNexus only.
     let ema_metrics_path = rt_env.ox_home_dir.join("ema_metrics.json");
     if let Err(e) = app
         .ema_manager
@@ -575,7 +568,6 @@ async fn run_app(
 
     // Workflow engine
     app.init_workflow_engine(&session.meta.id, &session.meta);
-    app.knowledge_engine = knowledge_engine.clone();
 
     // ── Onboarding check ──
     let mut needs_onboarding = false;
@@ -616,7 +608,6 @@ async fn run_app(
                     &tool_registry,
                     &context_builder,
                     context_window,
-                    &knowledge_engine,
                     &onboarding_prompt_text,
                     &session.messages,
                     &compressed_cache,
@@ -714,7 +705,6 @@ async fn run_app(
                                 &mut interjection_buf, &resolve_info,
                                 config, &agent_config, &compressed_ctx_store,
                                 &mut compressed_cache, &command_registry,
-                                &knowledge_engine,
                             );
                         }
 
@@ -723,7 +713,7 @@ async fn run_app(
                             let action = std::mem::replace(&mut app.session_action, SessionAction::None);
                             process_session_action(
                                 &mut app, &mut session, &mut background_session,
-                                action, &mut rt_env, &knowledge_engine, &sessions_root,
+                                action, &mut rt_env, &sessions_root,
                                 &compressed_ctx_store, &mut compressed_cache,
                                 provider.is_some(),
                             );
@@ -774,7 +764,7 @@ async fn run_app(
                         &mut cost_tracker, &trust_manager, &mut model_name,
                         &mut rt_env, &mut interrupt_ctrl,
                         &mut interjection_buf, config, &agent_config,
-                        &compressed_cache, &knowledge_engine,
+                        &compressed_cache,
                         &system_prompt,
                     );
                 }
@@ -843,7 +833,6 @@ fn process_key_event(
     _compressed_ctx_store: &Arc<ox_core::context::compressed_store::CompressedContextStore>,
     compressed_cache: &mut Option<(Vec<Message>, usize)>,
     command_registry: &slash_commands::CommandRegistry,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
 ) {
     // Handle Ctrl+C/D — check both with modifiers and without (cross-platform)
     let is_ctrl_c = matches!(key.code, KeyCode::Char('c'))
@@ -966,7 +955,6 @@ fn process_key_event(
                         model_name,
                         command_registry,
                         compressed_cache,
-                        knowledge_engine,
                     );
                 }
                 UserInput::Text(text) => {
@@ -1021,7 +1009,6 @@ fn process_slash_command(
     _model_name: &str,
     command_registry: &slash_commands::CommandRegistry,
     compressed_cache: &Option<(Vec<Message>, usize)>,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
 ) {
     let workflow_line = if args.is_empty() {
         format!("/{cmd}")
@@ -1098,7 +1085,6 @@ fn process_slash_command(
                     rt_env,
                     config,
                     compressed_cache,
-                    knowledge_engine,
                 );
             }
             _ => {}
@@ -1210,7 +1196,6 @@ fn spawn_agent_turn_for_text(
     let compressed_cache_data = compressed_cache.clone();
     let workflow_engine_clone = app.workflow_engine.clone();
     let session_id = session.meta.id.clone();
-    let knowledge_engine_clone = app.knowledge_engine.clone();
     let tx = agent_tx.clone();
     let provider_clone = Arc::clone(provider.as_ref().unwrap());
     let tool_ctx_clone = Arc::clone(tool_ctx);
@@ -1291,7 +1276,6 @@ fn spawn_agent_turn_for_text(
             &tool_registry_clone,
             &context_builder_clone,
             context_window,
-            &knowledge_engine_clone,
             &text,
             &session_messages,
             &compressed_cache_data,
@@ -1346,7 +1330,9 @@ fn process_text_input(
     _model_name: &mut String,
     _cost_tracker: &mut CostTracker,
 ) {
-    if app.indexing && !config.embedding.lazy_index {
+    // Indexing is disabled globally; keep the guard as a no-op cheap check.
+    let _ = config;
+    if app.indexing {
         app.output
             .push_system("⏳ Please wait — indexing in progress...");
         app.dirty = true;
@@ -1591,7 +1577,6 @@ fn process_text_input(
     let compressed_cache_data = compressed_cache.clone();
     let workflow_engine_clone = app.workflow_engine.clone();
     let session_id = session.meta.id.clone();
-    let knowledge_engine_clone = app.knowledge_engine.clone();
     let tx = agent_tx.clone();
     let provider_clone = Arc::clone(provider.as_ref().unwrap());
     let tool_ctx_clone = Arc::clone(tool_ctx);
@@ -1620,7 +1605,6 @@ fn process_text_input(
             &tool_registry_clone,
             &context_builder_clone,
             context_window,
-            &knowledge_engine_clone,
             &text,
             &session_messages,
             &compressed_cache_data,
@@ -1713,9 +1697,9 @@ fn spawn_agent_turn_from_slash(
     rt_env: &runtime::RuntimeEnvironment,
     config: &OxConfig,
     compressed_cache: &Option<(Vec<Message>, usize)>,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
 ) {
-    if app.indexing && !config.embedding.lazy_index {
+    let _ = config;
+    if app.indexing {
         app.output
             .push_system("⏳ Please wait — indexing in progress...");
         app.dirty = true;
@@ -1749,7 +1733,6 @@ fn spawn_agent_turn_from_slash(
     let rt_env = rt_env.clone();
     let session_messages = session.messages.clone();
     let session_id = session.meta.id.clone();
-    let knowledge = knowledge_engine.clone();
     let compressed_cache = compressed_cache.clone();
     let prompt = prompt.to_string();
     let description = description.to_string();
@@ -1775,7 +1758,6 @@ fn spawn_agent_turn_from_slash(
             &registry,
             &context_builder,
             context_window,
-            &knowledge,
             &prompt,
             &session_messages,
             &compressed_cache,
@@ -1814,7 +1796,6 @@ fn process_session_action(
     background_session: &mut Option<Session>,
     action: SessionAction,
     rt_env: &mut runtime::RuntimeEnvironment,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
     sessions_root: &std::path::Path,
     compressed_ctx_store: &Arc<ox_core::context::compressed_store::CompressedContextStore>,
     compressed_cache: &mut Option<(Vec<Message>, usize)>,
@@ -1835,7 +1816,7 @@ fn process_session_action(
                 *compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
             } else {
                 let _ =
-                    session_handler::handle_session_new(app, session, rt_env, &knowledge_engine);
+                    session_handler::handle_session_new(app, session, rt_env);
                 app.init_workflow_engine(&session.meta.id, &session.meta);
                 *compressed_cache = compressed_ctx_store.load(&session.meta.id).unwrap_or(None);
             }
@@ -2040,7 +2021,6 @@ fn process_agent_event(
     config: &OxConfig,
     agent_config: &Arc<AgentConfig>,
     compressed_cache: &Option<(Vec<Message>, usize)>,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
     system_prompt: &str,
 ) {
     let target_session = background_session.as_mut().unwrap_or(session);
@@ -2092,7 +2072,6 @@ fn process_agent_event(
                 provider.is_some(),
                 rt_env,
                 tool_registry,
-                knowledge_engine,
                 cost_tracker,
                 model_name,
                 compressed_cache,
@@ -2231,7 +2210,6 @@ fn process_agent_event(
                 new_dir,
                 provider.is_some(),
                 config,
-                knowledge_engine,
                 carry_gitnexus,
             ) {
                 *tool_ctx = new_ctx;
@@ -2274,7 +2252,6 @@ fn process_agent_event(
                 provider,
                 rt_env,
                 agent_tx,
-                knowledge_engine,
                 task_description,
                 execution_summary,
                 agent_config,

@@ -1,45 +1,66 @@
-use ox_core::knowledge::KeywordExtraction;
+//! Keyword JSON block extraction/stripping.
+//!
+//! Historically bound to `KnowledgeEngine::KeywordExtraction`; the type is now
+//! self-contained here so this file can survive the KnowledgeEngine removal.
+//! The functions are still referenced from `main.rs`; keep them wired so LLM
+//! responses that emit ```json keyword blocks are cleaned before display.
+
 use regex::Regex;
 
-/// 从 LLM 响应中提取关键词 JSON 块
-pub fn extract_keywords_from_response(response: &str) -> Option<KeywordExtraction> {
-    // 查找 ```json ... ``` 代码块
-    let json_pattern = Regex::new(r"```json\s*([\s\S]*?)\s*```").ok()?;
-
-    if let Some(caps) = json_pattern.captures(response) {
-        let json_str = caps.get(1)?.as_str();
-
-        // 尝试解析 JSON
-        match serde_json::from_str::<KeywordExtraction>(json_str) {
-            Ok(keywords) => {
-                tracing::info!(
-                    "[KEYWORD EXTRACTION] ✅ Extracted {} keywords, {} topics, {} files",
-                    keywords.keywords.len(),
-                    keywords.topics.len(),
-                    keywords.related_files.len()
-                );
-                tracing::debug!("[KEYWORD EXTRACTION] Keywords: {:?}", keywords.keywords);
-                return Some(keywords);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[KEYWORD EXTRACTION] ❌ Failed to parse JSON: {}\nJSON content: {}",
-                    e,
-                    json_str.chars().take(200).collect::<String>()
-                );
-                return None;
-            }
-        }
-    }
-
-    tracing::debug!(
-        "[KEYWORD EXTRACTION] ⚠️ No JSON block found in response (length: {} chars)",
-        response.len()
-    );
-    None
+/// Simple JSON-parsed keyword extraction result.
+#[derive(Debug, Clone, Default)]
+pub struct KeywordExtraction {
+    pub keywords: Vec<String>,
+    pub topics: Vec<String>,
+    pub related_files: Vec<String>,
 }
 
-/// 从响应中移除关键词 JSON 块（返回干净的文本）
+fn parse_string_array(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract a ```json { keywords, topics, related_files } ``` block from an LLM response.
+pub fn extract_keywords_from_response(response: &str) -> Option<KeywordExtraction> {
+    let json_pattern = Regex::new(r"```json\s*([\s\S]*?)\s*```").ok()?;
+    let caps = json_pattern.captures(response)?;
+    let json_str = caps.get(1)?.as_str();
+
+    match serde_json::from_str::<serde_json::Value>(json_str) {
+        Ok(v) => {
+            let keywords = parse_string_array(&v["keywords"]);
+            let topics = parse_string_array(&v["topics"]);
+            let related_files = parse_string_array(&v["related_files"]);
+            tracing::info!(
+                "[KEYWORD EXTRACTION] ✅ Extracted {} keywords, {} topics, {} files",
+                keywords.len(),
+                topics.len(),
+                related_files.len()
+            );
+            Some(KeywordExtraction {
+                keywords,
+                topics,
+                related_files,
+            })
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[KEYWORD EXTRACTION] ❌ Failed to parse JSON: {}\nJSON content: {}",
+                e,
+                json_str.chars().take(200).collect::<String>()
+            );
+            None
+        }
+    }
+}
+
+/// Strip the ```json keyword block from a response so the user sees clean text.
 pub fn remove_keyword_json_block(response: &str) -> String {
     let json_pattern = Regex::new(r"\n?```json\s*[\s\S]*?\s*```\n?").unwrap();
     json_pattern.replace_all(response, "").to_string()

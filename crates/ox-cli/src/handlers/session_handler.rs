@@ -1,9 +1,6 @@
 //! Session lifecycle handlers.
 
-use std::sync::Arc;
-
 use crate::terminal::app::App;
-use ox_core::knowledge::KnowledgeEngine;
 use ox_core::message::Session;
 use ox_core::runtime::RuntimeEnvironment;
 
@@ -55,28 +52,10 @@ pub fn handle_session_new(
     app: &mut App,
     session: &mut Session,
     rt_env: &RuntimeEnvironment,
-    knowledge_engine: &Option<Arc<tokio::sync::RwLock<KnowledgeEngine>>>,
 ) -> Result<(), String> {
     let session_dir = rt_env.ox_home_dir.join("sessions").join(&rt_env.project_id);
 
-    if session.messages.len() >= 10 {
-        tracing::info!(
-            "Triggering knowledge consolidation for session with {} messages",
-            session.messages.len()
-        );
-        if let Some(knowledge) = knowledge_engine {
-            if let Ok(mut engine) = knowledge.try_write() {
-                match engine.run_consolidation("current", Some(&rt_env.project_id)) {
-                    Ok(n) => {
-                        app.output.push_system(&format!(
-                            "🧠 Knowledge consolidation complete — {n} entities promoted."
-                        ));
-                    }
-                    Err(e) => tracing::error!("Knowledge consolidation failed: {e}"),
-                }
-            }
-        }
-    }
+    // Knowledge consolidation removed — sessions are now archived to disk directly.
 
     if let Err(e) = session.archive(&session_dir) {
         tracing::warn!("Failed to archive current session: {e}");
