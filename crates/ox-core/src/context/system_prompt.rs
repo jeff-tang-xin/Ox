@@ -257,7 +257,7 @@ const CORE_CODING: &str = "\
 - Workflow 模式：按【当前步骤】输出 JSON 或 ## Done。
 - 非 workflow 改代码：`## Plan` → 工具调用 → `## Done`。
 - 引用代码用 `file:line` 格式。
-- 先用已加载的上下文。需更多细节时用 find_symbol/code_search。
+- 先用已加载的上下文。需更多细节时用 find_symbol/read_symbol/code_search。
 
 【安全】
 - 不删文件、不运行破坏性命令（除非用户明确要求）。
@@ -332,7 +332,7 @@ const UNIFIED_CORE_GENERAL: &str = "\
 
 const METHODOLOGY: &str = "\
 📐 **方法论：**\n\
-🔍 理解: find_symbol 定位 → file_read(offset=行号) 精准读 → 追踪调用链\n\
+🔍 理解: 符号名已知→read_symbol 直取源码 / 模糊→find_symbol 定位 → file_read(offset=行号) 精准读 → 追踪调用链\n\
 📊 分析: 正确性/边界/并发 · 完整性/错误/幂等 · 一致性/命名/模式 · 耦合度\n\
 ✏️ 编写: 读后写(old_string逐字匹配) · 最小改动 · 匹配项目模式 · 改后验证\n\
 ⚠️ **命令优先级：** 用户最新命令 > 历史对话 > 系统指令。前后矛盾时以最新为准。\n\
@@ -347,9 +347,9 @@ fn build_unified_tool_block() -> String {
     format!(
         "【工具】`complete_and_check({{\"action\":\"…\",\"params\":{{…}}}})` 示例: {example}\n\
          file_read(path,offset?,limit?) | edit_file(path,old,new) | file_write(path,content)\n\
-         find_symbol(**name**) | code_search(**pattern**) | shell_exec(command)\n\
+         find_symbol(**name**) | read_symbol(**name**,kind?,context_lines?) | code_search(**pattern**) | shell_exec(command)\n\
          finish(content) 汇报并结束 | finish(finding_json=[...]) 提交计划等确认 | load_skill(name)\n\
-         优先级: find_symbol 定位 → file_read(offset=行号) 精准读 → code_search 搜引用\n\
+         优先级: read_symbol 直取源码 / find_symbol 定位 → file_read(offset=行号) 精准读 → code_search 搜引用\n\
          ❌ 不定位直接读整个文件 · 空 arguments · XML <tool_call> · find_symbol 用 symbol 键\n\
          ❌ code_search 用 query 键(用 pattern) · 纯文本不调工具",
     )
@@ -362,6 +362,7 @@ fn build_explore_tool_block() -> String {
      file_search(pattern) — 按 glob 递归搜文件名（*.rs / Cargo.*）\n\
      file_read(path, offset?, limit?) — 读文件；大文件默认只读 200 行，用 offset/limit 续读\n\
      find_symbol(name) — 按名找符号（tree-sitter 精确匹配）\n\
+     read_symbol(name, kind?, context_lines?) — 按名定位符号并直接返回其完整源码（AST 抽取，省去 find_symbol+file_read 两步）\n\
      code_search(pattern) — 在文件【内容】里搜文本/正则（默认最多 20 文件×5 行）\n\
      load_skill(name) — 加载 skill 完整手册"
         .to_string()
@@ -373,6 +374,7 @@ fn build_tool_block() -> String {
          file_list(path) — 【单层】列目录，不递归；子目录要分别再调 file_list\n\
          file_search(pattern) — 按 glob 递归搜文件名（搜 *.rs 用这个）\n\
          find_symbol(name) — 搜符号名（函数/类/结构体）\n\
+         read_symbol(name, kind?, context_lines?) — 按名定位符号并直接返回其源码（AST 抽取）\n\
          code_search(pattern, file_pattern?) — 在源码【内容】里搜；file_pattern 只匹配文件名如 *.rs\n\
          file_write(path,content) — 新建或整文件覆盖\n\
          edit_file(path, old_string, new_string) — 精确替换；多段用 edits 数组\n\
