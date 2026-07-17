@@ -698,12 +698,17 @@ fn build_task_anchor_block(
     // 🔍 Exploration/implementation budget gauge — makes the cost of continued
     // exploration visible every turn (not just when a reflection fires), turning
     // "look once more" from a free habit into a visible choice.
+    let intent_reason = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .and_then(|e| e.get_task_intent_reason());
     b.push_str(&crate::agent::explore_reflect::budget_gauge(
         explore_streak,
         total_explore,
         impl_streak,
         in_impl_phase,
         converge,
+        intent_reason.as_deref(),
     ));
 
     // Todo-list recap

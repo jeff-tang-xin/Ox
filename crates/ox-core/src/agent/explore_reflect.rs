@@ -39,19 +39,30 @@ const PROGRESS_TOOLS: &[&str] = &["file_write", "edit_file", "delete_range"];
 /// exploration turn), this keeps the model from circling — while `made_discovery`
 /// still lets legitimate deep reading of *new* files run uncapped up to the
 /// cumulative [`TOTAL_EXPLORE_CEILING`].
-pub const REFLECT_AT: u32 = 4;
+pub const REFLECT_AT: u32 = 3;
 
 /// Further read-only turns after reflection before handing back to the user.
-pub const STOP_AFTER_REFLECT: u32 = 4;
+pub const STOP_AFTER_REFLECT: u32 = 2;
 
 /// Absolute ceiling on **total** exploration turns in a single pre-implementation
 /// stretch, regardless of information gain. The low-gain streak ([`REFLECT_AT`])
 /// catches *circling* — repeated reads of the same thing — but a model that reads
 /// a fresh file every turn keeps resetting that streak and could wander the whole
 /// repo unbounded. This ceiling is the backstop: only real progress (an edit or
-/// `finish`) clears it; discovering new files does NOT. Set well above the
-/// low-gain threshold so legitimate deep exploration is never clipped early.
-pub const TOTAL_EXPLORE_CEILING: u32 = 20;
+/// `finish`) clears it; discovering new files does NOT.
+///
+/// Reduced 20 → 12: 20 rounds of read-only tool calls almost always means
+/// breadth-first wandering, not focused investigation. Fix / Qa tasks use even
+/// tighter effective ceilings via [`effective_ceiling`], so the plan-submission
+/// path (Review) retains the widest budget.
+pub const TOTAL_EXPLORE_CEILING: u32 = 12;
+
+/// Q&A / explanation ceiling — answering rarely needs deep investigation.
+pub const QA_EXPLORE_CEILING: u32 = 6;
+
+/// Fix / DirectEdit ceiling — once the bug is understood the model should
+/// implement, not keep reading.
+pub const FIX_EXPLORE_CEILING: u32 = 10;
 
 /// Consecutive no-edit turns **during the implementation phase** before an
 /// implementation-reflection prompt is injected. Far tighter than exploration:
@@ -86,15 +97,32 @@ pub enum ConvergeMode {
 }
 
 impl ConvergeMode {
-    /// Map task intent → convergence action. Fix and General share DirectEdit
-    /// (both have write access and should implement, not submit a plan). Review
-    /// submits a plan; Qa answers.
+    /// Map task intent → convergence action.
+    /// - Review → SubmitPlan (writes locked; produce a plan)
+    /// - Qa     → Answer     (minimal exploration; answer directly)
+    /// - Fix    → DirectEdit (writes unlocked; edit directly)
+    /// - General → SubmitPlan (classifier had no confidence; give the widest
+    ///   ceiling as a safe default rather than compressing an unclear task
+    ///   into the Fix budget)
     pub fn from_intent(intent: crate::agent::task_intent::TaskIntent) -> Self {
         use crate::agent::task_intent::TaskIntent;
         match intent {
             TaskIntent::Review => Self::SubmitPlan,
             TaskIntent::Qa => Self::Answer,
-            TaskIntent::Fix | TaskIntent::General => Self::DirectEdit,
+            TaskIntent::Fix => Self::DirectEdit,
+            TaskIntent::General => Self::SubmitPlan,
+        }
+    }
+
+    /// Effective per-mode exploration ceiling — the hard stop applied inside
+    /// [`evaluate`] and rendered by [`budget_gauge`]. Review keeps the widest
+    /// budget because it must produce a full plan; Fix/Qa are tightened so
+    /// small tasks don't burn 20 rounds of breadth-first wandering.
+    pub const fn ceiling(self) -> u32 {
+        match self {
+            Self::Answer => QA_EXPLORE_CEILING,
+            Self::DirectEdit => FIX_EXPLORE_CEILING,
+            Self::SubmitPlan => TOTAL_EXPLORE_CEILING,
         }
     }
 }
@@ -115,6 +143,7 @@ pub fn budget_gauge(
     impl_streak: u32,
     in_impl_phase: bool,
     converge: ConvergeMode,
+    intent_reason: Option<&str>,
 ) -> String {
     if in_impl_phase {
         if impl_streak == 0 {
@@ -132,6 +161,7 @@ pub fn budget_gauge(
     // task edits directly; a Q&A answers. Keep the gauge honest to the task so it
     // never nags a fix task to "submit a plan and wait".
     let converge_short = gauge_converge_hint(converge);
+    let mode_label = mode_label(converge, intent_reason);
 
     let mut out = String::new();
     // Low-gain circling line (only when a streak is building).
@@ -140,29 +170,46 @@ pub fn budget_gauge(
         if explore_streak >= REFLECT_AT {
             let left = stop_at.saturating_sub(explore_streak);
             out.push_str(&format!(
-                "🔍 探索预算: {explore_streak}/{REFLECT_AT}（连续无新发现，已超阈值）· ⚠️ 再 {left} 轮仍无进展将交还用户 — {converge_short}\n"
+                "🔍 探索预算 [{mode_label}]: {explore_streak}/{REFLECT_AT}（连续无新发现，已超阈值）· ⚠️ 再 {left} 轮仍无进展将交还用户 — {converge_short}\n"
             ));
         } else {
             let left = REFLECT_AT.saturating_sub(explore_streak);
             out.push_str(&format!(
-                "🔍 探索预算: 连续 {explore_streak}/{REFLECT_AT} 轮无新发现（重复读/重复搜）· 再 {left} 轮空转将强制收敛（信息够了就{converge_short}；读新文件不计入）\n"
+                "🔍 探索预算 [{mode_label}]: 连续 {explore_streak}/{REFLECT_AT} 轮无新发现（重复读/重复搜）· 再 {left} 轮空转将强制收敛（信息够了就{converge_short}；读新文件不计入）\n"
             ));
         }
     }
     // Cumulative ceiling line — always shown once exploration has begun; nudges
     // toward focus even while reading new files. Highlight when close.
     if total_explore > 0 {
-        let left = TOTAL_EXPLORE_CEILING.saturating_sub(total_explore);
-        let warn = if total_explore * 4 >= TOTAL_EXPLORE_CEILING * 3 {
+        let ceiling = converge.ceiling();
+        let left = ceiling.saturating_sub(total_explore);
+        let warn = if total_explore * 4 >= ceiling * 3 {
             "⚠️ "
         } else {
             ""
         };
         out.push_str(&format!(
-            "🧭 {warn}累计探索: {total_explore}/{TOTAL_EXPLORE_CEILING} 轮 · 再 {left} 轮（含读新文件）仍不收敛（{converge_short}）将强制收敛\n"
+            "🧭 {warn}累计探索 [{mode_label}]: {total_explore}/{ceiling} 轮 · 再 {left} 轮（含读新文件）仍不收敛将强制收敛 — {converge_short}\n"
         ));
     }
     out
+}
+
+/// Compose the mode label shown in the gauge, combining the convergence mode
+/// with the *why* recorded by the classifier. Making the reason visible lets
+/// the model detect misclassification and ask for clarification instead of
+/// silently exhausting the budget under the wrong ceiling.
+fn mode_label(converge: ConvergeMode, reason: Option<&str>) -> String {
+    let mode = match converge {
+        ConvergeMode::Answer => "Qa",
+        ConvergeMode::DirectEdit => "Fix",
+        ConvergeMode::SubmitPlan => "Review/General",
+    };
+    match reason {
+        Some(r) if !r.is_empty() => format!("{mode} · {r}"),
+        _ => mode.to_string(),
+    }
 }
 
 /// Short convergence-action phrase for the per-turn gauge, by task mode.
@@ -252,15 +299,19 @@ pub fn evaluate(
         return ReflectAction::Continue;
     }
 
-    // This turn is pure exploration → it always counts toward the hard ceiling,
-    // whether or not it discovered anything new.
+    // This turn is pure exploration — it always counts toward the hard ceiling,
+    // whether or not it discovered anything new. Ceiling is per-mode: Qa tasks
+    // stop earliest (answer, don't spelunk); Fix/DirectEdit next (implement,
+    // don't keep reading); Review keeps the widest budget (a full plan is
+    // expected).
     *total_explore += 1;
-    if *total_explore >= TOTAL_EXPLORE_CEILING {
+    let ceiling = converge.ceiling();
+    if *total_explore >= ceiling {
         // Reset so a user "continue" starts a fresh ceiling window.
         *total_explore = 0;
         *streak = 0;
         *reflected = false;
-        return ReflectAction::Stop(ceiling_message(TOTAL_EXPLORE_CEILING));
+        return ReflectAction::Stop(ceiling_message(ceiling));
     }
 
     // Discovery resets only the low-gain (circling) streak, not the ceiling.
@@ -407,13 +458,19 @@ mod tests {
 
     #[test]
     fn gauge_hidden_at_zero_streak() {
-        assert_eq!(budget_gauge(0, 0, 0, false, ConvergeMode::SubmitPlan), "");
-        assert_eq!(budget_gauge(0, 0, 0, true, ConvergeMode::SubmitPlan), "");
+        assert_eq!(
+            budget_gauge(0, 0, 0, false, ConvergeMode::SubmitPlan, None),
+            ""
+        );
+        assert_eq!(
+            budget_gauge(0, 0, 0, true, ConvergeMode::SubmitPlan, None),
+            ""
+        );
     }
 
     #[test]
     fn gauge_shows_remaining_budget_before_threshold() {
-        let g = budget_gauge(2, 2, 0, false, ConvergeMode::SubmitPlan);
+        let g = budget_gauge(2, 2, 0, false, ConvergeMode::SubmitPlan, None);
         assert!(g.contains("2/"));
         assert!(g.contains("无新发现"));
         assert!(g.contains(&format!("再 {} 轮空转", REFLECT_AT - 2)));
@@ -424,14 +481,21 @@ mod tests {
     #[test]
     fn gauge_direct_edit_mode_says_edit_not_plan() {
         // A fix/general task must be told to edit directly, never to submit a plan.
-        let g = budget_gauge(2, 2, 0, false, ConvergeMode::DirectEdit);
+        let g = budget_gauge(2, 2, 0, false, ConvergeMode::DirectEdit, None);
         assert!(g.contains("edit_file"));
         assert!(!g.contains("finding_json"));
     }
 
     #[test]
     fn gauge_warns_past_threshold() {
-        let g = budget_gauge(REFLECT_AT, REFLECT_AT, 0, false, ConvergeMode::SubmitPlan);
+        let g = budget_gauge(
+            REFLECT_AT,
+            REFLECT_AT,
+            0,
+            false,
+            ConvergeMode::SubmitPlan,
+            None,
+        );
         assert!(g.contains("超阈值"));
         assert!(g.contains("交还用户"));
     }
@@ -440,7 +504,7 @@ mod tests {
     fn gauge_shows_cumulative_ceiling_even_without_low_gain_streak() {
         // Discovering every turn keeps explore_streak at 0, but the cumulative
         // line must still show so breadth-first wandering stays visible.
-        let g = budget_gauge(0, 8, 0, false, ConvergeMode::SubmitPlan);
+        let g = budget_gauge(0, 8, 0, false, ConvergeMode::SubmitPlan, None);
         assert!(g.contains("累计探索"));
         assert!(g.contains(&format!("8/{TOTAL_EXPLORE_CEILING}")));
         assert!(!g.contains("无新发现")); // no low-gain line
@@ -448,9 +512,25 @@ mod tests {
 
     #[test]
     fn gauge_impl_phase_uses_impl_streak() {
-        let g = budget_gauge(0, 0, 2, true, ConvergeMode::DirectEdit);
+        let g = budget_gauge(0, 0, 2, true, ConvergeMode::DirectEdit, None);
         assert!(g.contains(&format!("2/{IMPL_REFLECT_AT}")));
         assert!(g.contains("未改代码"));
+    }
+
+    #[test]
+    fn gauge_shows_intent_reason_when_present() {
+        // When the classifier records why it picked the intent, the gauge must
+        // echo it so the model can spot misclassification.
+        let g = budget_gauge(
+            0,
+            3,
+            0,
+            false,
+            ConvergeMode::Answer,
+            Some("关键词: qa类"),
+        );
+        assert!(g.contains("Qa"));
+        assert!(g.contains("关键词: qa类"));
     }
 
     #[test]

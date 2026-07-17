@@ -567,16 +567,38 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
                         similar.join("\n")
                     )
                 };
+                // Emit the current file window around the top similar hit so
+                // the LLM can rebuild `old_string` without another file_read.
+                let snippet = if let Some(first) = similar.first() {
+                    let ln: usize = first
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.trim_end_matches(':').parse().ok())
+                        .unwrap_or(1);
+                    let start = ln.saturating_sub(10).max(1);
+                    let end = (ln + 10).min(n_file);
+                    let mut buf = String::from(
+                        "\n📄 Current file window (±10 lines — use as-is to rebuild old_string):\n```\n",
+                    );
+                    for i in start..=end {
+                        buf.push_str(&format!("{:>5} | {}\n", i, file_lines[i - 1]));
+                    }
+                    buf.push_str("```\n");
+                    buf
+                } else {
+                    String::new()
+                };
                 Err(format!(
                     "❌ old_string not found in {}.\n\n\
                      🔍 Searched for {} bytes; file is {} lines / {} bytes.\n\
-                     {}\
-                     💡 Fix: use file_read to get the EXACT current content, then retry.",
+                     {}{}\
+                     💡 Fix: rebuild old_string from the window above (no extra file_read needed).",
                     display_path,
                     old.len(),
                     n_file,
                     content.len(),
                     hint,
+                    snippet,
                 ))
             }
         }

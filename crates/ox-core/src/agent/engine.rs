@@ -239,6 +239,20 @@ impl WorkflowEngine {
             .unwrap_or(crate::agent::task_intent::TaskIntent::General)
     }
 
+    /// Record the human-readable reason the classifier picked the current
+    /// intent (which keyword / rule fired). Rendered in the budget gauge so
+    /// the model can spot misclassification and ask for clarification instead
+    /// of silently exhausting the exploration budget.
+    pub fn set_task_intent_reason(&self, reason: &str) {
+        self.set_variable("_task_intent_reason", reason.to_string());
+    }
+
+    /// Retrieve the reason recorded by [`set_task_intent_reason`], if any.
+    pub fn get_task_intent_reason(&self) -> Option<String> {
+        self.get_variable("_task_intent_reason")
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn clear_turn_provenance(&self) {
         self.set_variable("_explored_paths", "[]".to_string());
         self.set_variable("_exploration_snapshot", "[]".to_string());

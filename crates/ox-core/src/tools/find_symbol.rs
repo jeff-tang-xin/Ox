@@ -236,14 +236,14 @@ async fn enrich_with_graph(
 }
 
 /// Lightweight symbol info from tree-sitter direct search.
-struct TsSymbol {
-    symbol_type: String,
-    name: String,
-    file_path: String,
-    line: usize,
-    signature: String,
-    parent: Option<String>,
-    calls: Vec<String>,
+pub(crate) struct TsSymbol {
+    pub(crate) symbol_type: String,
+    pub(crate) name: String,
+    pub(crate) file_path: String,
+    pub(crate) line: usize,
+    pub(crate) signature: String,
+    pub(crate) parent: Option<String>,
+    pub(crate) calls: Vec<String>,
 }
 
 /// Search project source files with tree-sitter for a symbol name.
@@ -454,6 +454,16 @@ fn extract_file_symbols(
     }
     let code = std::fs::read_to_string(file_path)?;
     extractor.extract_entities(file_path, &code)
+}
+
+/// Public wrapper so sibling tools (e.g. `read_symbol`) can reuse the
+/// tree-sitter search without duplicating the file-walk logic.
+pub(crate) fn search_symbols_public(
+    extractor: &mut crate::knowledge::extractor::AstExtractor,
+    project_dir: &Path,
+    name: &str,
+) -> Vec<TsSymbol> {
+    search_with_treesitter(extractor, project_dir, name)
 }
 
 #[cfg(test)]

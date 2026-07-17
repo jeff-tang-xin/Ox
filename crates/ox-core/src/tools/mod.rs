@@ -13,6 +13,7 @@ pub mod git;
 pub mod intent_classifier;
 pub mod load_skill;
 pub mod project_detect;
+pub mod read_symbol;
 pub mod shell_exec;
 pub mod web_fetch;
 
@@ -217,6 +218,7 @@ impl ToolRegistry {
         registry.register(Box::new(code_search::CodeSearchTool));
         registry.register(Box::new(delete_range::DeleteRangeTool));
         registry.register(Box::new(find_symbol::FindSymbolTool));
+        registry.register(Box::new(read_symbol::ReadSymbolTool));
         registry.register(Box::new(load_skill::LoadSkillTool));
         registry.register(Box::new(shell_exec::ShellExecTool));
         registry.register(Box::new(project_detect::ProjectDetectTool));

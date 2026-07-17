@@ -282,9 +282,11 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
         }
         engine.reset_workflow();
         engine.clear_turn_provenance();
-        let intent = crate::agent::task_intent::resolve_for_round(engine, user_message);
+        let decision =
+            crate::agent::task_intent::resolve_for_round_with_reason(engine, user_message);
+        engine.set_task_intent_reason(decision.reason);
         engine.set_variable("_current_user_request", user_message.to_string());
-        crate::agent::phase::on_round_started(engine, intent);
+        crate::agent::phase::on_round_started(engine, decision.intent);
         return true;
     }
 
@@ -313,9 +315,11 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
     }
     engine.reset_workflow();
     engine.clear_turn_provenance();
-    let intent = crate::agent::task_intent::resolve_for_round(engine, user_message);
+    let decision =
+        crate::agent::task_intent::resolve_for_round_with_reason(engine, user_message);
+    engine.set_task_intent_reason(decision.reason);
     engine.set_variable("_current_user_request", user_message.to_string());
-    crate::agent::phase::on_round_started(engine, intent);
+    crate::agent::phase::on_round_started(engine, decision.intent);
     true
 }
 

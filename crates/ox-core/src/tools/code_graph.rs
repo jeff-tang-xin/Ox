@@ -155,7 +155,16 @@ impl Tool for CodeGraphTool {
                     text.truncate(cut);
                     text.push_str("\n…(结果已截断；用更具体的参数缩小范围)");
                 }
-                let header = format!("── code_graph/{op} ──\n");
+                // Prefix a freshness banner when the index is missing/stale
+                // so the LLM can distinguish "truly not found" from
+                // "index hasn't caught up". Never triggers a reindex.
+                let banner_line = svc
+                    .freshness_snapshot()
+                    .await
+                    .banner()
+                    .map(|b| format!("{b}\n"))
+                    .unwrap_or_default();
+                let header = format!("{banner_line}── code_graph/{op} ──\n");
                 if result.is_error {
                     ToolOutput::error(format!("{header}{text}"))
                 } else {

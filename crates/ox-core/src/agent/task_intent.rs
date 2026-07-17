@@ -84,17 +84,53 @@ pub fn classify(user_text: &str) -> TaskIntent {
 }
 
 /// Session-aware intent for a new user round (production routing).
+///
+/// Backwards-compatible wrapper around [`resolve_for_round_with_reason`] —
+/// callers that only need the intent keep working unchanged; callers that
+/// also want to record *why* it was classified this way (for the budget
+/// gauge / diagnostics) call `resolve_for_round_with_reason` directly.
 pub fn resolve_for_round(engine: &WorkflowEngine, user_text: &str) -> TaskIntent {
+    resolve_for_round_with_reason(engine, user_text).intent
+}
+
+/// Classification result carrying both the intent and the rule / keyword that
+/// caused it. `reason` is `&'static str` so it can be stored on the engine
+/// and echoed in the budget gauge cheaply, without allocation churn.
+#[derive(Debug, Clone, Copy)]
+pub struct IntentDecision {
+    pub intent: TaskIntent,
+    pub reason: &'static str,
+}
+
+/// Same as [`resolve_for_round`] but also returns a short human-readable reason
+/// for the classification (which rule / keyword fired). The reason is stored
+/// on the engine (`_task_intent_reason`) and rendered in the per-turn budget
+/// gauge, so the model can see *why* it was classified this way — useful for
+/// spotting misclassification and requesting clarification instead of
+/// exhausting the exploration budget in silence.
+pub fn resolve_for_round_with_reason(
+    engine: &WorkflowEngine,
+    user_text: &str,
+) -> IntentDecision {
     let t = user_text.trim();
     if t.is_empty() {
-        return TaskIntent::General;
+        return IntentDecision {
+            intent: TaskIntent::General,
+            reason: "空输入",
+        };
     }
 
     if t.starts_with("/fix") {
-        return TaskIntent::Fix;
+        return IntentDecision {
+            intent: TaskIntent::Fix,
+            reason: "/fix 命令",
+        };
     }
     if t.starts_with("/review") {
-        return TaskIntent::Review;
+        return IntentDecision {
+            intent: TaskIntent::Review,
+            reason: "/review 命令",
+        };
     }
 
     let has_findings = findings::load_or_migrate(engine)
@@ -106,35 +142,82 @@ pub fn resolve_for_round(engine: &WorkflowEngine, user_text: &str) -> TaskIntent
     // After review: fix only with findings or explicit greenfield implementation.
     if report_delivered || has_findings {
         if looks_like_fix_request(t) && (has_findings || looks_like_greenfield_impl(t)) {
-            return TaskIntent::Fix;
+            return IntentDecision {
+                intent: TaskIntent::Fix,
+                reason: "已有 findings + 修复词",
+            };
         }
         if crate::agent::workflow_session::looks_like_review_follow_up(t) {
-            return TaskIntent::Review;
+            return IntentDecision {
+                intent: TaskIntent::Review,
+                reason: "Review 后续追问",
+            };
         }
         if raw == TaskIntent::Qa {
-            return TaskIntent::Qa;
+            return IntentDecision {
+                intent: TaskIntent::Qa,
+                reason: classify_reason(t),
+            };
         }
         if raw == TaskIntent::Fix && !has_findings {
-            return TaskIntent::General;
+            return IntentDecision {
+                intent: TaskIntent::General,
+                reason: "无 findings 的修复词 → 降为 General",
+            };
         }
         if report_delivered && !looks_like_fix_request(t) {
             return if raw == TaskIntent::Review {
-                TaskIntent::Review
+                IntentDecision {
+                    intent: TaskIntent::Review,
+                    reason: classify_reason(t),
+                }
             } else {
-                TaskIntent::Qa
+                IntentDecision {
+                    intent: TaskIntent::Qa,
+                    reason: "Review 后中性发言 → 默认 Qa",
+                }
             };
         }
     }
 
     if raw == TaskIntent::Fix && !has_findings && !looks_like_greenfield_impl(t) {
         return if looks_like_review(t, &t.to_lowercase()) {
-            TaskIntent::Review
+            IntentDecision {
+                intent: TaskIntent::Review,
+                reason: "fix词+review词 → Review",
+            }
         } else {
-            TaskIntent::General
+            IntentDecision {
+                intent: TaskIntent::General,
+                reason: "无 findings 的修复词 → 降为 General",
+            }
         };
     }
 
-    raw
+    IntentDecision {
+        intent: raw,
+        reason: classify_reason(t),
+    }
+}
+
+/// Short reason string derived purely from keyword matching (no session state).
+/// Kept as `&'static str` so it can live in engine variables and gauge output
+/// without allocation churn.
+fn classify_reason(user_text: &str) -> &'static str {
+    let t = user_text.trim();
+    if t.is_empty() {
+        return "空输入";
+    }
+    let lower = t.to_lowercase();
+    if looks_like_fix(t, &lower) {
+        "关键词: fix类"
+    } else if looks_like_review(t, &lower) {
+        "关键词: review类"
+    } else if looks_like_qa(t, &lower) {
+        "关键词: qa类"
+    } else {
+        "无关键词 → General"
+    }
 }
 
 /// True when user wants to implement something new (not review-then-fix).

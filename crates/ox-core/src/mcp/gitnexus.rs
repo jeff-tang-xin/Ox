@@ -308,6 +308,63 @@ pub struct GroupSyncParams {
     pub exact_only: Option<bool>,
 }
 
+// ──────────────────────────── freshness ────────────────────────────
+
+/// Snapshot of index freshness — read-only, cheap fs stat. Never triggers reindex.
+#[derive(Debug, Clone, Default)]
+pub struct IndexFreshness {
+    pub built_at: Option<SystemTime>,
+    pub staleness_seconds: Option<u64>,
+    /// Ox edited files but reindex hasn't caught up.
+    pub dirty: bool,
+    /// Source tree mtime is newer than the index build time.
+    pub stale_source: bool,
+    /// A CLI `analyze` is currently running.
+    pub is_building: bool,
+}
+
+impl IndexFreshness {
+    /// Render a one-line banner when the caller should treat results as suspect.
+    /// Returns `None` when the index is fresh enough to stay silent.
+    pub fn banner(&self) -> Option<String> {
+        if self.built_at.is_none() {
+            return Some(
+                "⚠️ INDEX MISSING (从未构建 — 结果可能不完整；先跑 code_graph analyze 或忽略图谱)"
+                    .into(),
+            );
+        }
+        let mut flags = Vec::new();
+        if self.dirty {
+            flags.push("pending Ox edits");
+        }
+        if self.stale_source {
+            flags.push("source newer than index");
+        }
+        if self.is_building {
+            flags.push("rebuild in progress");
+        }
+        let old = self.staleness_seconds.unwrap_or(0);
+        if flags.is_empty() && old < 600 {
+            return None;
+        }
+        let age = if old >= 3600 {
+            format!("{}h old", old / 3600)
+        } else if old >= 60 {
+            format!("{}m old", old / 60)
+        } else {
+            format!("{}s old", old)
+        };
+        let extra = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", flags.join(", "))
+        };
+        Some(format!(
+            "⚠️ INDEX STALE ({age}{extra}) — 结果可能过时；改动前用 code_graph impact 请确认"
+        ))
+    }
+}
+
 // ──────────────────────────── service ────────────────────────────
 
 /// Owns the GitNexus child process and exposes its full capability surface.
@@ -648,6 +705,33 @@ impl GitNexusService {
         })
         .await
         .unwrap_or(true)
+    }
+
+    /// Read-only freshness snapshot for observability. Cheap fs stat only;
+    /// never spawns, restarts, or reindexes. Callers (e.g. `code_graph`) use
+    /// [`IndexFreshness::banner`] to warn the LLM when results may be stale.
+    pub async fn freshness_snapshot(&self) -> IndexFreshness {
+        let root = self.project_root.clone();
+        let dirty = self.is_dirty();
+        let is_building = self.is_building();
+        tokio::task::spawn_blocking(move || {
+            let built_at = index_built_at(&root);
+            let stale_source = built_at
+                .map(|t| source_tree_newer_than(&root, t))
+                .unwrap_or(true);
+            let staleness_seconds = built_at
+                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .map(|d| d.as_secs());
+            IndexFreshness {
+                built_at,
+                staleness_seconds,
+                dirty,
+                stale_source,
+                is_building,
+            }
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// (E) If edits happened since the last index, stop the reader, run
