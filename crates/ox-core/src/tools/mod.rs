@@ -1,4 +1,5 @@
 pub mod code_graph;
+pub mod ast_extractor;
 pub mod code_search;
 pub mod complete_and_check;
 pub mod content_validation;

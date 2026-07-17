@@ -1,8 +1,9 @@
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
-/// find_symbol — tree-sitter exact match + knowledge engine semantic fallback.
+/// find_symbol — tree-sitter symbol locator (no vector fallback).
 ///
-/// 1. First: tree-sitter (in-memory, always available) for exact/prefix name match
-/// 2. If no results: knowledge engine vector search for semantic fallback
+/// 1. tree-sitter (in-memory, always available) for exact/prefix name match
+/// 2. Optional GitNexus code_graph prefix + relationship suffix when the graph
+///    server is ready.
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -83,8 +84,8 @@ impl Tool for FindSymbolTool {
         }
 
         let result = tokio::task::spawn(async move {
-            // ── Step 1: tree-sitter direct search (always available, no index needed) ──
-            let mut extractor = crate::knowledge::extractor::AstExtractor::new();
+            // ── tree-sitter direct search (always available, no index needed) ──
+            let mut extractor = crate::tools::ast_extractor::AstExtractor::new();
             let ts_hits = search_with_treesitter(&mut extractor, &working_dir, &name_owned);
             if !ts_hits.is_empty() {
                 let primary_file = ts_hits.first().map(|h| h.file_path.clone());
@@ -93,8 +94,6 @@ impl Tool for FindSymbolTool {
                     primary_file,
                 });
             }
-
-            // ── Vector fallback removed — KnowledgeEngine disabled ──
             Ok(SearchOutcome {
                 output: format!(
                     "🔍 No symbols found for '{}'.\n\
@@ -161,15 +160,6 @@ fn truncate_on_line_boundary(text: &str, max_chars: usize) -> String {
     )
 }
 
-fn vector_primary_file(hits: &[crate::knowledge::vector_store::SearchHit]) -> Option<String> {
-    hits.iter().find_map(|h| match &h.entity.metadata {
-        crate::knowledge::entity::EntityMetadata::CodeSymbol { file_path, .. } => {
-            Some(file_path.clone())
-        }
-        _ => None,
-    })
-}
-
 /// Append GitNexus `context` (360° relationship view) for the searched symbol.
 ///
 /// Strictly latency-safe: returns `None` (no enrichment) unless the server is
@@ -230,13 +220,11 @@ pub(crate) struct TsSymbol {
 /// Search project source files with tree-sitter for a symbol name.
 /// Uses AstExtractor directly — no KnowledgeEngine or embedding needed.
 fn search_with_treesitter(
-    extractor: &mut crate::knowledge::extractor::AstExtractor,
+    extractor: &mut crate::tools::ast_extractor::AstExtractor,
     project_dir: &Path,
     name: &str,
 ) -> Vec<TsSymbol> {
     let mut results = Vec::new();
-
-    // Source file extensions to scan
     let exts = [
         "rs", "py", "js", "ts", "go", "java", "c", "cpp", "h", "hpp", "toml", "json", "md", "html",
         "css", "yaml", "yml",
@@ -245,7 +233,6 @@ fn search_with_treesitter(
 
     for ext in &exts {
         let pattern = format!("**/*.{}", ext);
-        // 使用安全的路径连接
         let full_pattern = project_dir.join(&pattern);
         let pattern_str = full_pattern.to_string_lossy();
 
@@ -254,46 +241,29 @@ fn search_with_treesitter(
                 if results.len() >= 20 {
                     return results;
                 }
-
-                // Quick pre-filter: check if file might contain the symbol
                 if let Ok(code) = std::fs::read_to_string(&entry) {
                     if !code.contains(name) && !code.to_lowercase().contains(&name_lower) {
                         continue;
                     }
-
-                    // Use tree-sitter to extract symbols from this file
-                    if let Ok(entities) = extract_file_symbols(extractor, &entry) {
-                        for entity in entities {
-                            if let crate::knowledge::entity::EntityMetadata::CodeSymbol {
-                                ref symbol_type,
-                                ref fq_name,
-                                ref file_path,
-                                start_line,
-                                ref signature,
-                                ref parent,
-                                ref calls,
-                                ..
-                            } = entity.metadata
+                    if let Ok(symbols) = extract_file_symbols(extractor, &entry) {
+                        for s in symbols {
+                            let entity_name = s.fq_name.rsplit("::").next().unwrap_or(&s.fq_name);
+                            if entity_name == name
+                                || entity_name.to_lowercase() == name_lower
+                                || s.fq_name.contains(name)
+                                || s.fq_name.to_lowercase().contains(&name_lower)
                             {
-                                // Match: exact name or contains
-                                let entity_name = fq_name.rsplit("::").next().unwrap_or(fq_name);
-                                if entity_name == name
-                                    || entity_name.to_lowercase() == name_lower
-                                    || fq_name.contains(name)
-                                    || fq_name.to_lowercase().contains(&name_lower)
-                                {
-                                    results.push(TsSymbol {
-                                        symbol_type: symbol_type.to_string(),
-                                        name: fq_name.clone(),
-                                        file_path: file_path.clone(),
-                                        line: start_line,
-                                        signature: signature.clone(),
-                                        parent: parent.clone(),
-                                        calls: calls.clone(),
-                                    });
-                                    if results.len() >= 20 {
-                                        return results;
-                                    }
+                                results.push(TsSymbol {
+                                    symbol_type: s.symbol_type,
+                                    name: s.fq_name,
+                                    file_path: s.file_path,
+                                    line: s.start_line,
+                                    signature: s.signature,
+                                    parent: s.parent,
+                                    calls: s.calls,
+                                });
+                                if results.len() >= 20 {
+                                    return results;
                                 }
                             }
                         }
@@ -302,7 +272,6 @@ fn search_with_treesitter(
             }
         }
     }
-
     results
 }
 
@@ -344,103 +313,24 @@ fn format_treesitter_results(name: &str, hits: &[TsSymbol]) -> String {
     output
 }
 
-fn format_vector_results(
-    name: &str,
-    hits: &[crate::knowledge::vector_store::SearchHit],
-    engine: &crate::knowledge::KnowledgeEngine,
-) -> String {
-    let mut output = format!(
-        "🔍 [semantic] Found {} symbol(s) for '{}':\n\n",
-        hits.len(),
-        name
-    );
-    for hit in hits.iter().take(15) {
-        let entity = &hit.entity;
-        if let crate::knowledge::entity::EntityMetadata::CodeSymbol {
-            ref symbol_type,
-            ref fq_name,
-            ref file_path,
-            start_line,
-            end_line: _,
-            ref signature,
-            ref parent,
-            ..
-        } = entity.metadata
-        {
-            output.push_str(&format!(
-                "  [{}] `{}` @ {}:{}\n",
-                symbol_type, fq_name, file_path, start_line
-            ));
-            if let Some(p) = parent {
-                output.push_str(&format!("       └ in {}\n", p));
-            }
-            if !signature.is_empty() {
-                let sig: String = signature.chars().take(100).collect();
-                output.push_str(&format!("       └ {}\n", sig));
-            }
-            output.push_str(&format_graph_edges(engine, &entity.id));
-        }
-    }
-    output.push_str("\n💡 Use file_read to view full source. Use edit_file to modify.");
-    output
-}
+// Legacy vector/graph formatters removed — tree-sitter is the sole backend.
 
-fn format_graph_edges(engine: &crate::knowledge::KnowledgeEngine, symbol_id: &str) -> String {
-    let callers = engine.graph_callers(symbol_id, 3);
-    let callees = engine.graph_callees(symbol_id, 3);
-    if callers.is_empty() && callees.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("       📎 graph:");
-    if !callers.is_empty() {
-        let names: Vec<String> = callers
-            .iter()
-            .filter_map(|e| match &e.metadata {
-                crate::knowledge::entity::EntityMetadata::CodeSymbol { fq_name, .. } => {
-                    Some(fq_name.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        if !names.is_empty() {
-            out.push_str(&format!(" callers=[{}]", names.join(", ")));
-        }
-    }
-    if !callees.is_empty() {
-        let names: Vec<String> = callees
-            .iter()
-            .filter_map(|e| match &e.metadata {
-                crate::knowledge::entity::EntityMetadata::CodeSymbol { fq_name, .. } => {
-                    Some(fq_name.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        if !names.is_empty() {
-            out.push_str(&format!(" calls=[{}]", names.join(", ")));
-        }
-    }
-    out.push('\n');
-    out
-}
-
-/// Standalone tree-sitter extraction — no KnowledgeEngine needed.
-/// Mirrors KnowledgeEngine::extract_file_symbols but works without the embedding stack.
+/// Standalone tree-sitter extraction — uses tools::ast_extractor directly.
 fn extract_file_symbols(
-    extractor: &mut crate::knowledge::extractor::AstExtractor,
+    extractor: &mut crate::tools::ast_extractor::AstExtractor,
     file_path: &Path,
-) -> anyhow::Result<Vec<crate::knowledge::entity::Entity>> {
+) -> anyhow::Result<Vec<crate::tools::ast_extractor::CodeSymbolInfo>> {
     if extractor.detect_language(file_path).is_none() {
         return Ok(Vec::new());
     }
     let code = std::fs::read_to_string(file_path)?;
-    extractor.extract_entities(file_path, &code)
+    extractor.extract_symbols(file_path, &code)
 }
 
 /// Public wrapper so sibling tools (e.g. `read_symbol`) can reuse the
 /// tree-sitter search without duplicating the file-walk logic.
 pub(crate) fn search_symbols_public(
-    extractor: &mut crate::knowledge::extractor::AstExtractor,
+    extractor: &mut crate::tools::ast_extractor::AstExtractor,
     project_dir: &Path,
     name: &str,
 ) -> Vec<TsSymbol> {

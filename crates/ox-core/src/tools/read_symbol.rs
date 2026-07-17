@@ -66,7 +66,7 @@ impl Tool for ReadSymbolTool {
             .min(50) as usize;
 
         // Reuse find_symbol's tree-sitter search.
-        let mut extractor = crate::knowledge::extractor::AstExtractor::new();
+        let mut extractor = crate::tools::ast_extractor::AstExtractor::new();
         let hits = crate::tools::find_symbol::search_symbols_public(
             &mut extractor,
             &ctx.working_dir,
@@ -114,20 +114,12 @@ impl Tool for ReadSymbolTool {
                 ));
             }
         };
-        let entities = extractor.extract_entities(&path, &code).unwrap_or_default();
+        let symbols = extractor.extract_symbols(&path, &code).unwrap_or_default();
         let short_name = hit.name.rsplit("::").next().unwrap_or(&hit.name);
         let mut end_line = hit.line;
-        for e in &entities {
-            if let crate::knowledge::entity::EntityMetadata::CodeSymbol {
-                start_line,
-                end_line: el,
-                fq_name,
-                ..
-            } = &e.metadata
-                && *start_line == hit.line
-                && fq_name.ends_with(short_name)
-            {
-                end_line = *el;
+        for s in &symbols {
+            if s.start_line == hit.line && s.fq_name.ends_with(short_name) {
+                end_line = s.end_line;
                 break;
             }
         }
