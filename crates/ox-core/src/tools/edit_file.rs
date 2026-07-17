@@ -216,7 +216,7 @@ impl EditFileTool {
         &self,
         path: &std::path::Path,
         edits: &[SingleEdit],
-        ctx: &ToolContext,
+        _ctx: &ToolContext,
     ) -> ToolOutput {
         let path_clone = path.to_path_buf();
         let display_path = path.display().to_string();
