@@ -7,7 +7,10 @@ pub mod middleware;
 pub mod slash_commands;
 mod terminal;
 
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +19,7 @@ use crossterm::event::KeyCode;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use fs2::FileExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -46,11 +50,47 @@ use handlers::session_handler;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging()?;
     install_panic_hook();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let head = args.first().map(String::as_str);
+    match head {
+        None => run_tui().await,
+        Some("--help" | "-h" | "help") => {
+            print_help();
+            Ok(())
+        }
+        Some(other) => {
+            eprintln!("ox: unknown subcommand `{}`\n", other);
+            print_help();
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        "Usage: ox [SUBCOMMAND]\n\n\
+         (no args)     Launch the interactive TUI (default).\n\
+         help          Print this message.\n"
+    );
+}
+
+async fn run_tui() -> anyhow::Result<()> {
+    init_logging()?;
 
     let config = OxConfig::load(None)?;
     let rt_env = runtime::detect_runtime();
+
+    // Single-instance guard (OS-level file lock — auto-released on any exit,
+    // including panic/kill/power-off, so no stale-lock cleanup is ever needed).
+    let _instance_lock = match acquire_instance_lock(&rt_env) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("ox: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let (provider, resolve_info, provider_error) = create_provider(&config);
     if let Some(ref err) = provider_error {
@@ -89,6 +129,61 @@ async fn main() -> anyhow::Result<()> {
 // ============================================================================
 // Helper Functions (unchanged)
 // ============================================================================
+
+/// Acquire an exclusive per-project lock; return the held File (must live for app lifetime).
+///
+/// Uses `fs2::FileExt::try_lock_exclusive()` — an OS-level advisory lock
+/// (Windows: `LockFileEx`, Unix: `flock`). The kernel releases the lock the
+/// moment the process handle disappears, so panic / kill / power-off leave no
+/// stale lock behind. The lock-file contents (pid / started_at / working_dir)
+/// are informational only — used just to give a helpful error when another
+/// instance is holding the lock.
+fn acquire_instance_lock(rt_env: &runtime::RuntimeEnvironment) -> anyhow::Result<std::fs::File> {
+    // Prefer <project_root>/.ox/ox.lock; fall back to <working_dir>/.ox/ox.lock.
+    let lock_dir: PathBuf = rt_env
+        .project_ox_dir
+        .clone()
+        .unwrap_or_else(|| rt_env.working_dir.join(".ox"));
+    std::fs::create_dir_all(&lock_dir)?;
+    let lock_path = lock_dir.join("ox.lock");
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            // Overwrite with fresh diagnostics (previous holder is gone).
+            let _ = file.set_len(0);
+            let mut f = &file;
+            let _ = writeln!(
+                f,
+                "pid={}\nstarted_at={}\nworking_dir={}",
+                std::process::id(),
+                chrono::Local::now().to_rfc3339(),
+                rt_env.working_dir.display(),
+            );
+            Ok(file)
+        }
+        Err(_) => {
+            let info = std::fs::read_to_string(&lock_path).unwrap_or_default();
+            let info_trim = info.trim();
+            let detail = if info_trim.is_empty() {
+                String::new()
+            } else {
+                format!("\n  {}", info_trim.replace('\n', "\n  "))
+            };
+            anyhow::bail!(
+                "another ox instance is already running in this project\n  lock: {}{}\nIf you are certain no ox is running, delete the lock file and retry.",
+                lock_path.display(),
+                detail
+            )
+        }
+    }
+}
 
 fn init_logging() -> anyhow::Result<()> {
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -548,6 +643,42 @@ async fn run_app(
         ));
     }
 
+    // ── In-process GitNexus periodic watcher (same lifecycle as ox) ──
+    // Spawns a background task that periodically runs `gitnexus status` +
+    // `gitnexus analyze` to keep the code graph fresh. The task is aborted when
+    // the main event loop exits, so it lives exactly as long as ox itself.
+    let _watcher_handle: Option<tokio::task::JoinHandle<()>> = if gitnexus_launchable {
+        let svc = Arc::clone(&gitnexus);
+        Some(tokio::spawn(async move {
+            const INTERVAL: Duration = Duration::from_secs(300);
+            loop {
+                // status
+                match svc.cli_status().await {
+                    Ok(r) => tracing::info!(
+                        "[GitNexus Watcher] status exit={:?} success={}",
+                        r.exit_code, r.success
+                    ),
+                    Err(e) => tracing::warn!("[GitNexus Watcher] status error: {e}"),
+                }
+                // analyze (skip if initial index build still in progress)
+                if !svc.is_building() {
+                    svc.set_building(true);
+                    match svc.cli_analyze().await {
+                        Ok(r) => tracing::info!(
+                            "[GitNexus Watcher] analyze exit={:?} success={}",
+                            r.exit_code, r.success
+                        ),
+                        Err(e) => tracing::warn!("[GitNexus Watcher] analyze error: {e}"),
+                    }
+                    svc.set_building(false);
+                }
+                tokio::time::sleep(INTERVAL).await;
+            }
+        }))
+    } else {
+        None
+    };
+
     let compressed_ctx_store = Arc::new(
         ox_core::context::compressed_store::CompressedContextStore::open(
             &db_dir.join("compressed_context.db"),
@@ -775,6 +906,11 @@ async fn run_app(
             suspend_workflow_on_exit(&mut app, &mut session);
             break;
         }
+    }
+
+    // Abort the in-process GitNexus watcher so it dies with ox.
+    if let Some(h) = _watcher_handle {
+        h.abort();
     }
 
     Ok(())
