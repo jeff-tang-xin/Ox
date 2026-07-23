@@ -4,23 +4,24 @@ use super::engine::WorkflowEngine;
 
 const FEEDBACK_DISCUSS_KEY: &str = "_feedback_discuss";
 
-pub fn is_parked(_: &WorkflowEngine) -> bool {
-    false
-}
-pub fn park(_: &WorkflowEngine) {}
-pub fn unpark(_: &WorkflowEngine) {}
+// ── Feedback-discuss flag ────────────────────────────────────────────
+
 pub fn clear_session_flags(engine: &WorkflowEngine) {
     clear_feedback_discuss(engine);
 }
+
 pub fn is_feedback_discuss(engine: &WorkflowEngine) -> bool {
     engine.get_variable(FEEDBACK_DISCUSS_KEY).as_deref() == Some("1")
 }
+
 pub fn enter_feedback_discuss(engine: &WorkflowEngine) {
     engine.set_variable(FEEDBACK_DISCUSS_KEY, "1".to_string());
 }
+
 pub fn clear_feedback_discuss(engine: &WorkflowEngine) {
     engine.set_variable(FEEDBACK_DISCUSS_KEY, String::new());
 }
+
 pub fn validate_feedback_discuss_tool(
     engine: &WorkflowEngine,
     tool_name: &str,
@@ -42,56 +43,21 @@ pub fn validate_feedback_discuss_tool(
     }
     Ok(())
 }
-pub fn compact_discuss_session(_: &mut Vec<crate::message::Message>) {}
-pub fn is_implementation_phase(engine: &WorkflowEngine) -> bool {
-    matches!(
-        crate::agent::phase::get(engine),
-        crate::agent::phase::SingleFlowPhase::Implement
-    )
-}
-pub fn enter_implementation_phase(_: &WorkflowEngine) {}
-pub fn mark_execute_approved(_: &WorkflowEngine) {}
+
+// ── Phase helpers ────────────────────────────────────────────────────
+
 pub fn is_execute_user_approved(engine: &WorkflowEngine) -> bool {
-    crate::agent::business_gate::scope_implementation_unlocked(engine)
+    crate::agent::gate::business_gate::scope_implementation_unlocked(engine)
 }
+
 pub fn is_scope_confirm(engine: &WorkflowEngine) -> bool {
     crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::AwaitUser
         && !is_feedback_discuss(engine)
         && crate::agent::findings::load_or_migrate(engine).is_some_and(|s| !s.findings.is_empty())
 }
-pub fn enter_scope_confirm(_: &WorkflowEngine) {}
-pub fn leave_scope_confirm(_: &WorkflowEngine) {}
-pub fn is_paused(_: &WorkflowEngine) -> bool {
-    false
-}
-pub fn enter_paused(_: &WorkflowEngine) {}
-pub fn leave_paused(_: &WorkflowEngine) {}
-pub fn validate_session_tool(_: &WorkflowEngine, _: &str) -> Result<(), String> {
-    Ok(())
-}
-pub fn looks_like_workflow_continuation(user_text: &str) -> bool {
-    looks_like_fix_continuation(user_text)
-}
-pub fn looks_like_post_failure_fix(user_text: &str) -> bool {
-    let t = user_text.trim();
-    if t.is_empty() {
-        return false;
-    }
-    let lower = t.to_lowercase();
-    [
-        "还有报错",
-        "仍有错误",
-        "编译失败",
-        "构建失败",
-        "没通过",
-        "build failed",
-    ]
-    .iter()
-    .any(|k| t.contains(k) || lower.contains(k))
-        && ["修复", "fix", "改", "解决", "处理"]
-            .iter()
-            .any(|k| t.contains(k) || lower.contains(k))
-}
+
+// ── Text pattern matching ────────────────────────────────────────────
+
 pub fn looks_like_fix_continuation(user_text: &str) -> bool {
     looks_like_implementation_request(user_text) || looks_like_post_failure_fix(user_text)
 }
@@ -119,6 +85,27 @@ pub fn looks_like_implementation_request(user_text: &str) -> bool {
     ]
     .iter()
     .any(|k| t.contains(k) || lower.contains(k))
+}
+
+pub fn looks_like_post_failure_fix(user_text: &str) -> bool {
+    let t = user_text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    [
+        "还有报错",
+        "仍有错误",
+        "编译失败",
+        "构建失败",
+        "没通过",
+        "build failed",
+    ]
+    .iter()
+    .any(|k| t.contains(k) || lower.contains(k))
+        && ["修复", "fix", "改", "解决", "处理"]
+            .iter()
+            .any(|k| t.contains(k) || lower.contains(k))
 }
 
 pub fn looks_like_review_follow_up(user_text: &str) -> bool {
@@ -149,16 +136,8 @@ pub fn looks_like_review_follow_up(user_text: &str) -> bool {
     .iter()
     .any(|k| t.contains(k) || lower.contains(k))
 }
+
 pub fn looks_like_new_task(user_text: &str) -> bool {
     let t = user_text.trim();
     t.starts_with("/new") || t.starts_with("/reset")
-}
-pub fn implementation_phase_system_note() -> &'static str {
-    ""
-}
-pub fn resume_message(user_text: &str, _: Option<&str>) -> String {
-    user_text.to_string()
-}
-pub fn looks_like_workflow_continuation_alias(user_text: &str) -> bool {
-    looks_like_workflow_continuation(user_text)
 }

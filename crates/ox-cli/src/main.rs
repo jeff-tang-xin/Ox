@@ -1280,7 +1280,7 @@ fn spawn_agent_turn_for_text(
             if let Ok(mut engine) = wf.try_lock() {
                 if !engine.accepts_user_round_input(text) {
                     app.output.push_system(
-                        ox_core::agent::workflow_phases::act_interjection_blocked_message(),
+                        "",
                     );
                     app.status.clear();
                     app.dirty = true;
@@ -1382,7 +1382,7 @@ fn spawn_agent_turn_for_text(
             let default_provider = provider_clone.clone();
             let summarizer = tool_ctx_clone.summarizer.clone();
             let status_for_consolidate = status_tx.clone();
-            let candidates = ox_core::agent::memory_offload::consolidate_if_due(
+            let candidates = ox_core::memory::memory_offload::consolidate_if_due(
                 store,
                 summarizer,
                 &default_provider,
@@ -1577,7 +1577,7 @@ fn process_text_input(
                 .unwrap_or(false);
             if blocked {
                 app.output.push_system(
-                    ox_core::agent::workflow_phases::act_interjection_blocked_message(),
+                    "",
                 );
                 app.scroll_to_bottom();
                 app.dirty = true;
@@ -1668,7 +1668,7 @@ fn process_text_input(
         if let Ok(mut engine) = wf.try_lock() {
             if !engine.accepts_user_round_input(&text) {
                 app.output.push_system(
-                    ox_core::agent::workflow_phases::act_interjection_blocked_message(),
+                    "",
                 );
                 app.dirty = true;
                 return;

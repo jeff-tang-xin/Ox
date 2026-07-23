@@ -41,7 +41,7 @@ fn route_spec(engine: &WorkflowEngine) -> ToolRouteSpec {
             "本轮已收尾 — 等用户新输入；如需继续可只读探索。",
         ),
         SingleFlowPhase::AwaitUser => {
-            if super::business_gate::scope_implementation_unlocked(engine) {
+            if super::gate::business_gate::scope_implementation_unlocked(engine) {
                 (
                     vec!["file_read", "edit_file", "shell_exec"],
                     vec![

@@ -1,7 +1,7 @@
 //! Implement-phase context diet — fold review exploration, minimal injections.
 
-use super::engine::WorkflowEngine;
-use super::phase::{self, SingleFlowPhase};
+use crate::agent::engine::WorkflowEngine;
+use crate::agent::phase::{self, SingleFlowPhase};
 use crate::message::Message;
 
 const EXPLORE_TOOL_MARKERS: &[&str] = &[
@@ -38,7 +38,7 @@ pub fn fold_review_exploration(messages: &mut [Message], engine: &WorkflowEngine
             } if tool_calls.is_empty() => {
                 if WorkflowEngine::looks_like_review_report(content) {
                     *content = "（审查报告已归档 — 细节见 [WORKSPACE].findings）".into();
-                } else if crate::agent::idle_narrative::is_idle_narrative(content)
+                } else if crate::agent::gate::idle_narrative::is_idle_narrative(content)
                     && content.chars().count() > 40
                 {
                     *content = "（已折叠空转叙述）".into();
@@ -74,7 +74,7 @@ pub fn build_recent_tool_progress(
     include_writes: bool,
     max_lines: usize,
 ) -> String {
-    let full = crate::agent::context_injector::build_tool_progress(messages, include_writes);
+    let full = crate::context::context_injector::build_tool_progress(messages, include_writes);
     if full.is_empty() {
         return String::new();
     }

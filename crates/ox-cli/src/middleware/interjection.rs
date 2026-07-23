@@ -25,7 +25,7 @@ pub fn handle_interjection(app: &mut App, text: &str, interjection_buf: &mut Int
             .unwrap_or(false);
         if blocked {
             app.output.push_line(OutputLine::System(
-                ox_core::agent::workflow_phases::act_interjection_blocked_message().to_string(),
+                "".to_string(),
             ));
             app.scroll_to_bottom();
             return;

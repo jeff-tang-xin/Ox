@@ -208,7 +208,7 @@ impl TurnMemory {
         include_writes: bool,
     ) {
         let progress =
-            crate::agent::context_injector::build_tool_progress(messages, include_writes);
+            crate::context::context_injector::build_tool_progress(messages, include_writes);
         for line in progress.lines() {
             let line = line.trim();
             if let Some((tool, target, ok)) = parse_progress_line(line) {

@@ -48,6 +48,31 @@ impl SingleFlowPhase {
     }
 }
 
+/// High-level phase buckets for backward compatibility with callers that
+/// only need to distinguish "acting" vs "perceiving" vs "thinking".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowPhase {
+    Act,
+    Perceive,
+    Think,
+}
+
+/// Map canonical [`SingleFlowPhase`] → [`WorkflowPhase`].
+pub fn get_phase(engine: &WorkflowEngine) -> WorkflowPhase {
+    match get(engine) {
+        SingleFlowPhase::Implement => WorkflowPhase::Act,
+        SingleFlowPhase::Complete => WorkflowPhase::Think,
+        SingleFlowPhase::Receive | SingleFlowPhase::Review | SingleFlowPhase::AwaitUser => {
+            WorkflowPhase::Perceive
+        }
+    }
+}
+
+/// Convenience: is the engine currently in the implementation phase?
+pub fn is_implementation_phase(engine: &WorkflowEngine) -> bool {
+    matches!(get(engine), SingleFlowPhase::Implement)
+}
+
 /// Events that may change phase — the only legal entry points.
 #[derive(Debug, Clone)]
 pub enum PhaseEvent {
@@ -139,12 +164,12 @@ pub fn is_scope_gate_active(engine: &WorkflowEngine) -> bool {
     if crate::agent::workflow_session::is_feedback_discuss(engine) {
         return false;
     }
-    if super::business_gate::is_pending_scope(engine) {
+    if super::gate::business_gate::is_pending_scope(engine) {
         return true;
     }
     matches!(get(engine), SingleFlowPhase::AwaitUser)
         && has_findings(engine)
-        && !super::business_gate::scope_implementation_unlocked(engine)
+        && !super::gate::business_gate::scope_implementation_unlocked(engine)
 }
 
 /// Per-iteration directive while [`is_scope_gate_active`].
@@ -394,11 +419,6 @@ fn enter_implement(engine: &WorkflowEngine, user_text: &str) {
     if engine.is_workflow_complete() {
         engine.reset_step_for_fix_reopen();
     }
-    crate::agent::workflow_session::enter_implementation_phase(engine);
-    crate::agent::workflow_phases::set_phase(
-        engine,
-        crate::agent::workflow_phases::WorkflowPhase::Act,
-    );
     engine.sync_plan_from_findings();
     if !user_text.trim().is_empty() {
         crate::agent::workflow_guidance::append(engine, user_text);
@@ -425,7 +445,7 @@ fn can_enter_implement(engine: &WorkflowEngine, user_text: &str) -> bool {
     }
     // 🚨 Do NOT transition to Implement if business gate is still waiting for scope confirm.
     // User may type "修复/处理/改" during discussion — that's feedback, not a confirmation.
-    if crate::agent::business_gate::is_pending_scope(engine) {
+    if crate::agent::gate::business_gate::is_pending_scope(engine) {
         return false;
     }
     if !task_intent::looks_like_greenfield_impl(t)
@@ -459,7 +479,7 @@ pub fn can_reopen_for_fix(engine: &WorkflowEngine, user_text: &str) -> bool {
     if crate::agent::workflow_session::looks_like_new_task(t) {
         return false;
     }
-    if crate::agent::business_gate::is_pending_scope(engine) {
+    if crate::agent::gate::business_gate::is_pending_scope(engine) {
         return false;
     }
     let greenfield = task_intent::looks_like_greenfield_impl(t);

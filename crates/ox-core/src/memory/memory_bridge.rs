@@ -6,7 +6,7 @@ pub const DURABLE_MEMORY_TAG: &str = "[DURABLE_MEMORY]";
 
 /// Build durable context for the current turn (guidance only — [WORKSPACE] holds task state).
 pub fn format_durable_memory_block(engine: &WorkflowEngine) -> String {
-    if crate::agent::context_slim::is_slim_phase(engine) {
+    if crate::context::context_slim::is_slim_phase(engine) {
         return String::new();
     }
     if engine.is_workflow_complete() && !crate::agent::phase::fix_impl_session(engine) {

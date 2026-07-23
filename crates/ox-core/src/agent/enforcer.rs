@@ -484,8 +484,8 @@ impl RuleEnforcer {
                     if tc.name == "code_search"
                         && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                     {
-                        let search_query = args.get("query").and_then(|q| q.as_str()).unwrap_or("");
-                        // code_search was called with the file name or path as query
+                        let search_query = args.get("pattern").and_then(|q| q.as_str()).unwrap_or("");
+                        // code_search was called with the file name or path as pattern
                         if search_query.contains(&target_basename)
                             || search_query.contains(&target_path)
                             || target_path.contains(search_query)
@@ -504,12 +504,12 @@ impl RuleEnforcer {
             Err(format!(
                 "🛑 RULE VIOLATION (impact-analysis): You are editing `{path}` but haven't checked for callers or dependents!\n\n\
                  Before modifying an existing source file, you must check what depends on it:\n\
-                 1. Call `code_search(query=\"{name}\")` to find all references and callers\n\
+                 1. Call `code_search(pattern=\"{name}\")` to find all references and callers\n\
                  2. Review the impact\n\
                  3. Then proceed with the edit\n\n\
                  This prevents breaking changes. The system requires impact analysis before editing existing source files.\n\n\
                  📝 Example:\n\
-                 code_search(query=\"{name}\")\n\
+                 code_search(pattern=\"{name}\")\n\
                  ... review results ...\n\
                  edit_file(path=\"{path}\")",
                 path = target_path,

@@ -12,9 +12,9 @@ use crate::safety::TrustManager;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 
 use super::AgentToUiEvent;
-use super::business_gate;
+use super::gate::business_gate;
 use super::engine::WorkflowEngine;
-use super::safety_gate;
+use super::gate::safety_gate;
 use super::tool_result_envelope::{EnvelopeStatus, ToolResultEnvelope};
 use super::ui_event;
 use super::unified_action::{self, ActionGate, TOOL_NAME, UnifiedActionRequest, UnifiedRoute};
@@ -338,7 +338,14 @@ pub async fn handle_complete_and_check(
 ) -> UnifiedHandleOutcome {
     let req = match unified_action::parse_request(&tc.arguments) {
         Ok(r) => r,
-        Err(e) => return result_err(e),
+        Err(e) => {
+            let valid = unified_action::UNIFIED_ACTIONS_LIST;
+            return result_err(format!(
+                "参数错误: {e}\n\n发送格式: complete_and_check({{\"action\":\"…\",\"params\":{{…}}}})\n\
+                 合法 action: {valid}\n\
+                 示例: file_read→{{path:\"x\"}} find_symbol→{{name:\"Foo\"}} edit_file→{{path:\"x\",old_string:\"…\",new_string:\"…\"}} finish→{{content:\"…\"}}"
+            ));
+        }
     };
 
     match unified_action::route(&req) {
@@ -373,7 +380,13 @@ pub async fn handle_complete_and_check(
             .await
         }
         UnifiedRoute::Recall => handle_recall(&req, tool_ctx).await,
-        UnifiedRoute::Unknown => result_err(format!("unknown action: {}", req.action)),
+        UnifiedRoute::Unknown => {
+            let valid = unified_action::UNIFIED_ACTIONS_LIST;
+            result_err(format!(
+                "未知 action `{}`。合法值: {}\n\n请从上方列表选择正确的 action。",
+                req.action, valid
+            ))
+        }
     }
 }
 
@@ -426,7 +439,7 @@ async fn handle_recall(
 
     // Offloader ref retrieval (file-based node_id).
     let offloader =
-        crate::agent::context_offloader::ContextOffloader::new(&tool_ctx.working_dir, "session");
+        crate::context::context_offloader::ContextOffloader::new(&tool_ctx.working_dir, "session");
     match offloader.retrieve_full_content(&node_id) {
         Some(content) => UnifiedHandleOutcome::Result {
             content,
@@ -501,7 +514,7 @@ where
                             f.issue.chars().take(100).collect::<String>(),
                             f.severity.label()
                         );
-                        crate::agent::blackboard::add_fact(&engine, &fact);
+                        crate::memory::blackboard::add_fact(&engine, &fact);
                         facts.push(fact);
                     }
                     // (Historical batch summary via `_last_session_summary`
@@ -611,21 +624,9 @@ async fn handle_finish(
             && let Ok(engine) = wf.try_lock()
         {
             for f in &ss.key_facts {
-                crate::agent::blackboard::add_fact(&engine, &f.fact);
+                crate::memory::blackboard::add_fact(&engine, &f.fact);
             }
         }
-    }
-
-    // ── Onboarding shortcut: no gate, no findings — just end the turn. ──
-    if crate::agent::onboarding::is_onboarding_turn(messages) {
-        if let Some(wf) = workflow_engine
-            && let Ok(mut engine) = wf.try_lock()
-        {
-            let _ = engine.complete_workflow();
-        }
-        return UnifiedHandleOutcome::TurnDone {
-            summary: (!content.is_empty()).then(|| content.clone()),
-        };
     }
 
     // Show free-text (analysis / answer / summary) in chat.
@@ -831,7 +832,11 @@ async fn handle_delegate(
     let inner_name = match unified_action::action_to_tool_name(&req.action) {
         Some(n) => n,
         None => {
-            return result_err(format!("unknown delegate action: {}", req.action));
+            let valid = unified_action::UNIFIED_ACTIONS_LIST;
+            return result_err(format!(
+                "未知 delegate action `{}`。合法值: {}\n\n请从上方列表选择正确的 action。",
+                req.action, valid
+            ));
         }
     };
 
@@ -844,11 +849,11 @@ async fn handle_delegate(
         if let Err(e) = engine.validate_tool_call(inner_name, &req.params) {
             return result_err(e);
         }
-        if let Err(e) = crate::agent::read_guard::check(inner_name, &req.params, &engine) {
+        if let Err(e) = crate::agent::gate::read_guard::check(inner_name, &req.params, &engine) {
             if inner_name == "file_read"
                 && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
                 && let Some(cached) =
-                    crate::agent::read_guard::cached_file_read_response(&engine, path)
+                    crate::agent::gate::read_guard::cached_file_read_response(&engine, path)
             {
                 return result_ok_envelope(
                     json!({
@@ -906,7 +911,7 @@ async fn handle_delegate(
         let scope_unlocked = workflow_engine
             .as_ref()
             .and_then(|wf| wf.try_lock().ok())
-            .map(|e| crate::agent::business_gate::scope_implementation_unlocked(&e))
+            .map(|e| crate::agent::gate::business_gate::scope_implementation_unlocked(&e))
             .unwrap_or(false);
 
         let confirm = if scope_unlocked {
@@ -1000,7 +1005,7 @@ async fn handle_delegate(
         if inner_name == "edit_file"
             && let Some(wf) = workflow_engine
             && let Ok(engine) = wf.try_lock()
-            && crate::agent::workflow_session::is_implementation_phase(&engine)
+            && crate::agent::phase::is_implementation_phase(&engine)
             && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
         {
             let hint = if engine.impl_file_already_read(path) {
@@ -1084,12 +1089,12 @@ fn apply_delegate_success_effects(
                 .get("offset")
                 .and_then(|o| o.as_u64())
                 .unwrap_or(0) as u32;
-            crate::agent::read_guard::record_file_read(engine, path);
+            crate::agent::gate::read_guard::record_file_read(engine, path);
             crate::agent::tool_digest::record_read(engine, path, &result.content, offset, None);
             // Digest wrapping removed — LLM needs full file content.
         }
     } else if matches!(inner_name, "find_symbol" | "code_search") {
-        crate::agent::read_guard::record_symbol_query(engine, inner_name, &req.params);
+        crate::agent::gate::read_guard::record_symbol_query(engine, inner_name, &req.params);
     } else if inner_name == "code_graph" {
         // Record impact analysis so workspace.rs knows not to re-suggest it.
         if req.params.get("op").and_then(|o| o.as_str()) == Some("impact")
@@ -1161,7 +1166,7 @@ fn apply_delegate_success_effects(
     }
 
     if inner_name == "file_read"
-        && crate::agent::workflow_session::is_implementation_phase(engine)
+        && crate::agent::phase::is_implementation_phase(engine)
         && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
     {
         engine.record_impl_file_read(path, &params_str);
@@ -1179,7 +1184,7 @@ fn apply_delegate_success_effects(
             deferred.push(msg);
         }
         if inner_name == "shell_exec"
-            && crate::agent::workflow_session::is_implementation_phase(engine)
+            && crate::agent::phase::is_implementation_phase(engine)
             && let Some(cmd) = req.params.get("command").and_then(|c| c.as_str())
         {
             let succeeded = !result.is_error;
@@ -1204,7 +1209,7 @@ fn apply_delegate_success_effects(
             }
         }
         if matches!(inner_name, "edit_file" | "file_write" | "delete_range")
-            && crate::agent::workflow_session::is_implementation_phase(engine)
+            && crate::agent::phase::is_implementation_phase(engine)
             && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
         {
             engine.record_impl_file_edited(path);

@@ -73,44 +73,39 @@ pub fn handle_reasoning_chunk(app: &mut App, text: &str) {
 
 /// Handle a single ToolStart event.
 pub fn handle_tool_start(app: &mut App, name: &str, detail: &Option<String>) {
-    // Suppress verbose ToolStart for complete_and_check delegates —
-    // the ToolResult already includes action info in compact format.
-    if name.starts_with("complete_and_check:") {
-        app.output.note_tool_activity(name);
-        return;
-    }
     app.output.note_tool_activity(name);
-    if detail.is_some() {
-        let mut updated = false;
-        for line in app.output.lines.iter_mut().rev() {
-            if let OutputLine::Tool {
-                name: n,
-                detail: d_ref,
-            } = line
-            {
-                if *n == name {
-                    *d_ref = detail.clone();
-                    updated = true;
-                    break;
+    let (display_name, display_detail) = if name.starts_with("complete_and_check:") {
+        let action = name.replace("complete_and_check:", "");
+        let clean_detail = detail
+            .as_ref()
+            .and_then(|d| {
+                let v: serde_json::Value = serde_json::from_str(d).ok()?;
+                let params = v.get("params")?;
+                let op = params.get("op").and_then(|o| o.as_str()).unwrap_or("");
+                let path = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let mut parts = Vec::new();
+                if !op.is_empty() {
+                    parts.push(format!("op={}", op));
                 }
-            }
-        }
-        if !updated {
-            app.output.push_line(OutputLine::Tool {
-                name: name.to_string(),
-                detail: detail.clone(),
+                if !path.is_empty() {
+                    parts.push(format!("path={}", path));
+                }
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(", "))
+                }
             });
-        }
-        app.output.invalidate_cache();
+        (action, clean_detail)
     } else {
-        app.output.push_line(OutputLine::Tool {
-            name: name.to_string(),
-            detail: None,
-        });
-    }
-    if !app.user_scrolled {
-        app.scroll_to_bottom();
-    }
+        (name.to_string(), detail.clone())
+    };
+    app.output.push_line(OutputLine::Tool {
+        name: display_name,
+        detail: display_detail,
+    });
+    app.output.invalidate_cache();
+    app.scroll_to_bottom();
     app.dirty = true;
 }
 
@@ -151,6 +146,7 @@ pub fn handle_tool_result(
     if !app.user_scrolled {
         app.scroll_to_bottom();
     }
+    app.user_scrolled = false;
     app.dirty = true;
 }
 
@@ -168,9 +164,7 @@ pub fn handle_tool_progress(
         format!("[{}] {}", tool_name, message)
     };
     app.output.push_tool_log(tool_call_id, progress_display);
-    if !app.user_scrolled {
-        app.scroll_to_bottom();
-    }
+    app.scroll_to_bottom();
     app.dirty = true;
 }
 

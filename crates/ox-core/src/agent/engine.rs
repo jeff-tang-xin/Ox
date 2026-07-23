@@ -1,3 +1,7 @@
+pub mod exploration;
+pub mod impl_tracking;
+pub mod validation;
+
 use crate::agent::intervention::InterventionRequest;
 use crate::agent::session::SessionState;
 use crate::agent::workflow::{Workflow, WorkflowStep};
@@ -138,7 +142,7 @@ impl WorkflowEngine {
             return false;
         }
         if self.is_single_step() {
-            return crate::agent::business_gate::scope_implementation_unlocked(self);
+            return crate::agent::gate::business_gate::scope_implementation_unlocked(self);
         }
         self.current_step()
             .map(|s| s.allow_code_modification)
@@ -151,82 +155,12 @@ impl WorkflowEngine {
             .is_some_and(|w| w.id == crate::agent::workflow::DEFAULT_WORKFLOW_ID)
     }
 
-    fn is_code_modifying_tool(tool_name: &str) -> bool {
-        matches!(tool_name, "file_write" | "edit_file" | "delete_range")
-    }
-
     fn validate_single_step_tool(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Result<(), String> {
-        // Business gate: only block write/edit/shell tools, not read-only tools.
-        // LLM must be able to file_read during scope discussion.
-        if crate::agent::business_gate::is_pending_scope(self)
-            && Self::is_code_modifying_tool(tool_name)
-        {
-            return Err(
-                "⏸️ 业务流程门禁 — 等待用户确认 findings 范围（c /confirm）；讨论请直接输入文字。"
-                    .to_string(),
-            );
-        }
-        // NOTE: phase==Complete is intentionally NOT a hard block. `finish` is the
-        // LLM's explicit end and yields the turn back to the user; gates/tools must
-        // never forbid future actions. The next user round resets the workflow.
-
-        if !self.allows_code_modification() && Self::is_code_modifying_tool(tool_name) {
-            return Err(format!(
-                "🔒 只读阶段 — 动手前先 finish(finding_json=[...]) 提交计划，用户 c 确认后解锁。禁止 {tool_name}。"
-            ));
-        }
-
-        if crate::agent::phase::get(self) == crate::agent::phase::SingleFlowPhase::Implement {
-            if matches!(tool_name, "file_search" | "file_list") {
-                return Err(format!(
-                    "实施阶段禁止 {tool_name} — 用 find_symbol/file_read 定位。"
-                ));
-            }
-            // Impact gate: require code_graph impact analysis before reading/editing
-            // finding-related files, so the LLM understands the blast radius.
-            if matches!(tool_name, "file_read" | "edit_file")
-                && let Some(path) = args.get("path").and_then(|v| v.as_str())
-                && !path.trim().is_empty()
-            {
-                let target_val = serde_json::Value::String(path.to_string());
-                if let Some(idx) =
-                    crate::agent::findings::finding_index_for_target(self, &target_val)
-                    && !self.impl_impact_done(idx)
-                {
-                    return Err(format!(
-                        "📊 影响范围门禁 — 编辑 `{path}` 前请先评估改动影响。\n\
-                                     先调用 complete_and_check(action=\"code_graph\", \
-                                     params={{\"op\":\"impact\",\"target\":\"{symbol}\",\"direction\":\"downstream\"}}) \
-                                     查看调用链影响范围。",
-                        symbol = path
-                            .rsplit('/')
-                            .next_back()
-                            .unwrap_or(path)
-                            .rsplit('\\')
-                            .next_back()
-                            .unwrap_or(path)
-                            .rsplit('.')
-                            .next()
-                            .unwrap_or(path)
-                    ));
-                }
-            }
-        }
-
-        crate::agent::read_guard::check(tool_name, args, self)?;
-
-        if tool_name == "file_read"
-            && let Some(path) = args.get("path").and_then(|v| v.as_str())
-        {
-            let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
-            self.validate_impl_file_read(path, offset)?;
-        }
-
-        Ok(())
+        validation::validate_single_step_tool(self, tool_name, args)
     }
 
     pub fn set_task_intent(&self, intent: crate::agent::task_intent::TaskIntent) {
@@ -256,7 +190,7 @@ impl WorkflowEngine {
     pub fn clear_turn_provenance(&self) {
         self.set_variable("_explored_paths", "[]".to_string());
         self.set_variable("_exploration_snapshot", "[]".to_string());
-        crate::agent::read_guard::clear(self);
+        crate::agent::gate::read_guard::clear(self);
     }
 
     pub fn reset_step_for_fix_reopen(&self) {
@@ -365,7 +299,6 @@ impl WorkflowEngine {
             if session.current_step_index >= workflow.total_steps() {
                 Ok(false)
             } else {
-                crate::agent::workflow_phases::sync_phase(self);
                 Ok(true)
             }
         } else {
@@ -375,9 +308,6 @@ impl WorkflowEngine {
 
     /// Check if workflow is complete
     pub fn is_workflow_complete(&self) -> bool {
-        if crate::agent::workflow_session::is_parked(self) {
-            return false;
-        }
         if let Some(workflow) = &self.current_workflow {
             if let Ok(session) = self.session_state.try_lock() {
                 session.current_step_index >= workflow.total_steps()
@@ -455,7 +385,6 @@ impl WorkflowEngine {
             session.set_variable("_execute_handoff", "");
             crate::agent::workflow_session::clear_session_flags(self);
             crate::agent::perception::clear(self);
-            crate::agent::workflow_phases::clear_phase(self);
             // FIX: Clear findings store to prevent context pollution across rounds
             crate::agent::findings::clear(self);
             // Clear impl file read counters so new turns don't inherit old limits
@@ -521,14 +450,11 @@ impl WorkflowEngine {
         if self.is_single_step() && self.is_workflow_active() && !self.is_workflow_complete() {
             return true;
         }
-        if crate::agent::workflow_session::is_parked(self) {
-            return true;
-        }
         if !self.is_workflow_active() || self.is_workflow_complete() {
             return false;
         }
-        if crate::agent::workflow_phases::get_phase(self)
-            == crate::agent::workflow_phases::WorkflowPhase::Act
+        if crate::agent::phase::get_phase(self)
+            == crate::agent::phase::WorkflowPhase::Act
         {
             return false;
         }
@@ -552,16 +478,14 @@ impl WorkflowEngine {
     }
 
     pub fn is_workflow_parked(&self) -> bool {
-        crate::agent::workflow_session::is_parked(self)
+        false
     }
 
     pub fn park_workflow_awaiting_user(&mut self) -> Result<(), String> {
         Ok(())
     }
 
-    pub fn unpark_workflow(&self) {
-        crate::agent::workflow_session::unpark(self);
-    }
+    pub fn unpark_workflow(&self) {}
 
     pub fn adopt_execute_interjection(&self, user_text: &str) {
         crate::agent::phase::on_user_message(self, user_text);
@@ -569,60 +493,15 @@ impl WorkflowEngine {
 
     /// Build plan tracker from parked review report; reset per-file read ledger.
     pub fn bootstrap_implementation_plan(&self) {
-        crate::agent::workflow_phases::set_phase(
-            self,
-            crate::agent::workflow_phases::WorkflowPhase::Act,
-        );
-
-        if let Some(findings) = crate::agent::perception::load(self) {
-            let tracker = crate::agent::perception::to_plan_tracker(&findings);
-            tracing::info!(
-                "[IMPL] Loaded {} steps from frozen findings",
-                tracker.steps.len()
-            );
-            self.set_variable(
-                "_plan_tracker",
-                crate::agent::plan_tracker::tracker_to_json(&tracker),
-            );
-            self.clear_impl_files_read();
-            return;
-        }
-
-        let report = self
-            .get_execute_review_report()
-            .or_else(|| self.get_variable("_step3_output"));
-        let Some(report) = report.filter(|s| !s.trim().is_empty()) else {
-            return;
-        };
-        if let Some(tracker) = crate::agent::plan_tracker::load_from_review_report(&report) {
-            tracing::info!(
-                "[IMPL] Loaded {} implementation steps from review report",
-                tracker.steps.len()
-            );
-            self.set_variable(
-                "_plan_tracker",
-                crate::agent::plan_tracker::tracker_to_json(&tracker),
-            );
-            self.clear_impl_files_read();
-        }
+        impl_tracking::bootstrap_implementation_plan(self)
     }
 
     pub fn bootstrap_implementation_plan_from_findings(&self) {
-        if let Some(store) = crate::agent::findings::load_or_migrate(self) {
-            let only_scoped = !store.active_indices.is_empty();
-            let tracker = store.to_plan_tracker(only_scoped);
-            self.set_variable(
-                "_plan_tracker",
-                crate::agent::plan_tracker::tracker_to_json(&tracker),
-            );
-            self.clear_impl_files_read();
-            return;
-        }
-        self.bootstrap_implementation_plan();
+        impl_tracking::bootstrap_implementation_plan_from_findings(self)
     }
 
     pub fn sync_plan_from_findings(&self) {
-        self.bootstrap_implementation_plan_from_findings();
+        impl_tracking::sync_plan_from_findings(self)
     }
 
     /// Re-open workflow after premature ## Done or verify failure.
@@ -644,177 +523,86 @@ impl WorkflowEngine {
     }
 
     pub fn has_file_read_snapshot(&self, path: &str) -> bool {
-        crate::agent::exploration_snapshot::find_file_read_entry(
-            &self.get_exploration_entries(),
-            path,
-        )
-        .is_some()
+        exploration::has_file_read_snapshot(self, path)
     }
 
     pub fn shell_looks_like_file_read(cmd: &str) -> bool {
-        let lower = cmd.to_lowercase();
-        [
-            "cat ",
-            "type ",
-            "head ",
-            "tail ",
-            "more ",
-            "less ",
-            "get-content",
-        ]
-        .iter()
-        .any(|p| lower.contains(p))
+        exploration::shell_looks_like_file_read(cmd)
     }
-
-    const IMPL_READ_KEY: &str = "_impl_files_read";
 
     pub fn clear_impl_files_read(&self) {
-        self.set_variable(Self::IMPL_READ_KEY, "[]".to_string());
+        impl_tracking::clear_impl_files_read(self)
     }
-
-    const REVIEW_HANDOFF_KEY: &str = "_review_handoff_files";
 
     /// Capture files explored during review BEFORE `enter_implement` clears the
     /// turn memory, so the Implement phase knows they were already read and does
     /// not re-explore them from scratch (fixes review→implement context loss).
     pub fn snapshot_review_handoff(&self) {
-        let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for p in self.get_explored_path_set() {
-            if !p.trim().is_empty() {
-                files.insert(p);
-            }
-        }
-        // Findings files are the highest-signal set — always carry them over.
-        if let Some(store) = crate::agent::findings::load_or_migrate(self) {
-            for f in &store.findings {
-                if !f.file.trim().is_empty() {
-                    files.insert(f.file.clone());
-                }
-            }
-        }
-        let files: Vec<String> = files.into_iter().collect();
-        if files.is_empty() {
-            return;
-        }
-        if let Ok(json) = serde_json::to_string(&files) {
-            self.set_variable(Self::REVIEW_HANDOFF_KEY, json);
-        }
+        impl_tracking::snapshot_review_handoff(self)
     }
 
     /// Files carried over from the review phase (already read, content in context).
     pub fn review_handoff_files(&self) -> Vec<String> {
-        self.get_variable(Self::REVIEW_HANDOFF_KEY)
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        impl_tracking::review_handoff_files(self)
     }
 
     pub fn clear_review_handoff(&self) {
-        self.set_variable(Self::REVIEW_HANDOFF_KEY, String::new());
+        impl_tracking::clear_review_handoff(self)
     }
 
     #[allow(dead_code)]
     fn impl_files_read_set(&self) -> std::collections::HashSet<String> {
-        self.get_variable(Self::IMPL_READ_KEY)
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        impl_tracking::impl_files_read_set(self)
     }
 
     pub fn impl_file_already_read(&self, path: &str) -> bool {
-        let norm = crate::agent::plan_tracker::normalize_path(path);
-        self.impl_file_read_count(&norm) > 0
+        impl_tracking::impl_file_already_read(self, path)
     }
-
-    const IMPL_EDITED_KEY: &str = "_impl_files_edited";
 
     pub fn record_impl_file_edited(&self, path: &str) {
-        let norm = crate::agent::plan_tracker::normalize_path(path);
-        let mut list: Vec<String> = self
-            .get_variable(Self::IMPL_EDITED_KEY)
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        if list
-            .iter()
-            .any(|p| crate::agent::plan_tracker::normalize_path(p) == norm)
-        {
-            return;
-        }
-        list.push(path.to_string());
-        if let Ok(json) = serde_json::to_string(&list) {
-            self.set_variable(Self::IMPL_EDITED_KEY, json);
-        }
+        impl_tracking::record_impl_file_edited(self, path)
     }
-
-    const IMPL_IMPACT_KEY: &str = "_impl_impact_done";
 
     /// True when code_graph impact analysis has been recorded for this finding.
     pub fn impl_impact_done(&self, finding_index: u32) -> bool {
-        let list: Vec<u32> = self
-            .get_variable(Self::IMPL_IMPACT_KEY)
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        list.contains(&finding_index)
+        impl_tracking::impl_impact_done(self, finding_index)
     }
 
     /// Mark a finding as having had code_graph impact analysis.
     pub fn record_impl_impact(&self, finding_index: u32) {
-        let mut list: Vec<u32> = self
-            .get_variable(Self::IMPL_IMPACT_KEY)
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        if !list.contains(&finding_index) {
-            list.push(finding_index);
-            if let Ok(json) = serde_json::to_string(&list) {
-                self.set_variable(Self::IMPL_IMPACT_KEY, json);
-            }
-        }
+        impl_tracking::record_impl_impact(self, finding_index)
     }
 
     /// Clear all impact-analysis tracking (called on workflow reset / new round).
     pub fn clear_impl_impact(&self) {
-        self.set_variable(Self::IMPL_IMPACT_KEY, "[]".to_string());
+        impl_tracking::clear_impl_impact(self)
     }
-
-    const CODE_GRAPH_QUERIED_KEY: &str = "_code_graph_queried";
 
     /// True when code_graph has been queried in this round (unblocks find_symbol).
     pub fn impl_code_graph_queried(&self) -> bool {
-        self.get_variable(Self::CODE_GRAPH_QUERIED_KEY).as_deref() == Some("1")
+        impl_tracking::impl_code_graph_queried(self)
     }
 
     /// Mark that code_graph was queried.
     pub fn record_code_graph_queried(&self) {
-        self.set_variable(Self::CODE_GRAPH_QUERIED_KEY, "1".to_string());
+        impl_tracking::record_code_graph_queried(self)
     }
 
     pub fn clear_code_graph_queried(&self) {
-        self.set_variable(Self::CODE_GRAPH_QUERIED_KEY, String::new());
+        impl_tracking::clear_code_graph_queried(self)
     }
 
     /// Implementation phase: allow all reads. Compaction handles context bloat.
     pub fn validate_impl_file_read(&self, _path: &str, _offset: u64) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Count how many times a file has been read this implementation round.
-    fn impl_file_read_count(&self, norm_path: &str) -> usize {
-        let key = &format!("{}:{}", Self::IMPL_READ_KEY, norm_path);
-        self.get_variable(key)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
+        validation::validate_impl_file_read(self, _path, _offset)
     }
 
     pub fn record_impl_file_read(&self, path: &str, _arguments: &str) {
-        let norm = crate::agent::plan_tracker::normalize_path(path);
-        let key = format!("{}:{}", Self::IMPL_READ_KEY, norm);
-        let count = self
-            .get_variable(&key)
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        self.set_variable(&key, (count + 1).to_string());
+        impl_tracking::record_impl_file_read(self, path, _arguments)
     }
 
     pub fn impl_edit_nudge_after_read(&self, _path: &str, _preview: &str) -> Option<String> {
-        None
+        validation::impl_edit_nudge_after_read(self, _path, _preview)
     }
 
     pub fn should_skip_execute_confirmation(&self, _from_step: usize, _target_step: usize) -> bool {
@@ -827,7 +615,7 @@ impl WorkflowEngine {
     }
 
     pub fn looks_like_workflow_continuation(user_text: &str) -> bool {
-        crate::agent::workflow_session::looks_like_workflow_continuation(user_text)
+        crate::agent::workflow_session::looks_like_fix_continuation(user_text)
     }
 
     pub fn looks_like_new_task(user_text: &str) -> bool {
@@ -835,11 +623,11 @@ impl WorkflowEngine {
     }
 
     pub fn allows_midflight_interjection(&self) -> bool {
-        crate::agent::workflow_phases::allows_midflight_interjection(self)
+        true
     }
 
-    pub fn accepts_user_round_input(&self, user_text: &str) -> bool {
-        crate::agent::workflow_phases::accepts_user_round_input(self, user_text)
+    pub fn accepts_user_round_input(&self, _user_text: &str) -> bool {
+        true
     }
 
     /// Get system prompt for current step (with {PREVIOUS_OUTPUT} template substitution)
@@ -914,23 +702,10 @@ impl WorkflowEngine {
                     prompt = prompt.replace("{ROUTING_HINT}", &hint);
                 }
                 if prompt.contains("{WORKFLOW_PHASE}") {
-                    prompt = prompt.replace(
-                        "{WORKFLOW_PHASE}",
-                        crate::agent::workflow_phases::phase_prompt_addon(self),
-                    );
-                } else {
-                    let phase_addon = crate::agent::workflow_phases::phase_prompt_addon(self);
-                    if !phase_addon.is_empty() {
-                        prompt.push_str("\n\n");
-                        prompt.push_str(phase_addon);
-                    }
+                    prompt = prompt.replace("{WORKFLOW_PHASE}", "");
                 }
                 if prompt.contains("{FINDINGS_SCHEMA}") {
-                    let schema = if self.is_perceive_execute() {
-                        crate::agent::workflow_phases::FINDINGS_JSON_SCHEMA
-                    } else {
-                        ""
-                    };
+                    let schema = "";
                     prompt = prompt.replace("{FINDINGS_SCHEMA}", schema);
                 }
                 Some(prompt)
@@ -983,7 +758,6 @@ impl WorkflowEngine {
             self.validate_impl_file_read(path, offset)?;
         }
 
-        crate::agent::workflow_phases::validate_act_tool(self, tool_name)?;
         crate::agent::workflow_session::validate_feedback_discuss_tool(self, tool_name)?;
 
         // Check if code modification is allowed (step + exploring read-only override)
@@ -1259,7 +1033,7 @@ impl WorkflowEngine {
         };
         Some(format!(
             "{}\n✅ {label}\n{summary}",
-            crate::agent::context_injector::STEP_MEMORY_TAG
+            crate::context::context_injector::STEP_MEMORY_TAG
         ))
     }
 
@@ -1337,12 +1111,12 @@ impl WorkflowEngine {
 
     /// Execute step in read-only perceive mode — disabled in single-step model.
     pub fn is_perceive_execute(&self) -> bool {
-        false
+        impl_tracking::is_perceive_execute(self)
     }
 
     /// Whether Execute output should park — disabled in single-step model.
     pub fn should_park_execute_output(&self, _text: &str) -> bool {
-        false
+        impl_tracking::should_park_execute_output(self, _text)
     }
 
     /// Run gatekeeper pipeline when the model signals ## Done.
@@ -1350,8 +1124,8 @@ impl WorkflowEngine {
         &self,
         text: &str,
         had_code_changes: bool,
-    ) -> crate::agent::gatekeeper::GateReport {
-        crate::agent::gatekeeper::standard_pipeline().run(&crate::agent::gatekeeper::GateCtx {
+    ) -> crate::agent::gate::GateReport {
+        crate::agent::gate::standard_pipeline().run(&crate::agent::gate::GateCtx {
             engine: self,
             assistant_text: text,
             touched_files: &[],
@@ -1366,24 +1140,16 @@ impl WorkflowEngine {
         }
         matches!(
             self.run_done_gates(text, false),
-            crate::agent::gatekeeper::GateReport::Pass
+            crate::agent::gate::GateReport::Pass
         )
     }
 
     pub fn mark_execute_report_delivered(&self) {
-        self.set_variable("_execute_report_delivered", "1".to_string());
+        impl_tracking::mark_execute_report_delivered(self)
     }
 
     pub fn execute_report_already_delivered(&self) -> bool {
-        if crate::agent::workflow_session::is_implementation_phase(self) {
-            return false;
-        }
-        if self.get_variable("_execute_report_delivered").as_deref() == Some("1") {
-            return true;
-        }
-        // Prior review in _step3_output — only block re-explore while still in read-only phase.
-        self.get_variable("_step3_output")
-            .is_some_and(|s| Self::looks_like_review_report(&s))
+        impl_tracking::execute_report_already_delivered(self)
     }
 
     /// Block file_read/code_search after a review report (read-only execute phase only).
@@ -1392,18 +1158,11 @@ impl WorkflowEngine {
         tool_calls: &[ToolCall],
         assistant_text: &str,
     ) -> bool {
-        if !tool_calls.is_empty() && Self::looks_like_review_report(assistant_text) {
-            self.mark_execute_report_delivered();
-        }
-        if crate::agent::workflow_session::is_implementation_phase(self) {
-            return false;
-        }
-        (self.execute_report_already_delivered() || self.should_park_execute_output(assistant_text))
-            && Self::tool_calls_are_reexplore_only(tool_calls)
+        impl_tracking::should_block_execute_reexplore(self, tool_calls, assistant_text)
     }
 
     pub fn clear_execute_report_delivered(&self) {
-        self.set_variable("_execute_report_delivered", String::new());
+        impl_tracking::clear_execute_report_delivered(self)
     }
 
     /// Cache lookup for Execute-step read tools (snapshot + explored paths).
@@ -1413,59 +1172,28 @@ impl WorkflowEngine {
         tool: &str,
         arguments: &str,
     ) -> Option<String> {
-        let target = crate::agent::exploration_snapshot::target_from_tool_args(tool, arguments);
-        if tool == "file_read"
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments)
-            && let Some(path) = v.get("path").and_then(|p| p.as_str())
-        {
-            let entries = self.get_exploration_entries();
-            if crate::agent::exploration_snapshot::find_file_read_entry(&entries, path).is_some()
-                || self.is_path_explored("file_read", path)
-            {
-                return Some(crate::agent::exploration_snapshot::resolve_file_read_cache(
-                    working_dir,
-                    &entries,
-                    path,
-                    arguments,
-                ));
-            }
-        }
-        if let Some(hit) = self.lookup_exploration_cache(working_dir, tool, &target) {
-            return Some(hit);
-        }
-        if matches!(tool, "code_search" | "find_symbol" | "file_search")
-            && self.is_path_explored(tool, &target)
-        {
-            return self.lookup_exploration_cache(working_dir, tool, &target);
-        }
-        None
+        exploration::lookup_execute_exploration_cache(self, working_dir, tool, arguments)
     }
 
     pub fn tool_calls_are_reexplore_only(tool_calls: &[ToolCall]) -> bool {
-        !tool_calls.is_empty()
-            && tool_calls.iter().all(|tc| {
-                matches!(
-                    tc.name.as_str(),
-                    "file_read" | "file_list" | "code_search" | "find_symbol" | "file_search"
-                )
-            })
+        exploration::tool_calls_are_reexplore_only(tool_calls)
     }
 
-    pub fn save_turn_memory(&self, tm: &crate::agent::turn_memory::TurnMemory) {
+    pub fn save_turn_memory(&self, tm: &crate::memory::turn_memory::TurnMemory) {
         self.set_variable(
             "_turn_memory",
-            crate::agent::turn_memory::turn_memory_to_json(tm),
+            crate::memory::turn_memory::turn_memory_to_json(tm),
         );
     }
 
-    pub fn load_turn_memory(&self) -> Option<crate::agent::turn_memory::TurnMemory> {
+    pub fn load_turn_memory(&self) -> Option<crate::memory::turn_memory::TurnMemory> {
         self.get_variable("_turn_memory")
-            .and_then(|s| crate::agent::turn_memory::turn_memory_from_json(&s))
+            .and_then(|s| crate::memory::turn_memory::turn_memory_from_json(&s))
     }
 
     /// Combined durable context for turn start injection.
     pub fn durable_memory_block(&self) -> String {
-        crate::agent::memory_bridge::format_durable_memory_block(self)
+        crate::memory::memory_bridge::format_durable_memory_block(self)
     }
 
     /// Retrieve the LLM output from the previous step
@@ -1473,23 +1201,12 @@ impl WorkflowEngine {
         self.get_variable("_prev_output")
     }
 
-    fn get_explored_path_set(&self) -> std::collections::HashSet<String> {
-        self.get_variable("_explored_paths")
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-
     pub fn get_execute_review_report(&self) -> Option<String> {
-        self.get_variable("_step3_output")
-            .filter(|s| !s.trim().is_empty())
-            .filter(|s| Self::looks_like_review_report(s))
+        impl_tracking::get_execute_review_report(self)
     }
 
     pub fn execute_review_report_block(&self, max_chars: usize) -> Option<String> {
-        self.get_execute_review_report().map(|report| {
-            let snippet: String = report.chars().take(max_chars).collect();
-            format!("【审查报告 — park 前输出，用户在此基础上跟进】\n{snippet}")
-        })
+        impl_tracking::execute_review_report_block(self, max_chars)
     }
 
     pub fn get_all_step_outputs_summary(&self) -> String {
@@ -1530,29 +1247,17 @@ impl WorkflowEngine {
 
     /// Normalize a directory path for exploration deduplication.
     pub fn normalize_explore_path(path: &str) -> String {
-        let p = path.trim().trim_matches(|c| c == '/' || c == '\\');
-        if p.is_empty() {
-            ".".to_string()
-        } else {
-            p.to_lowercase()
-        }
+        exploration::normalize_explore_path(path)
     }
 
     /// Record that a directory was already listed/read during Plan exploration.
     pub fn record_explored_path(&self, tool: &str, path: &str) {
-        let key = format!("{}:{}", tool, Self::normalize_explore_path(path));
-        let mut paths = self.get_explored_path_set();
-        if paths.insert(key)
-            && let Ok(json) = serde_json::to_string(&paths)
-        {
-            self.set_variable("_explored_paths", json);
-        }
+        exploration::record_explored_path(self, tool, path)
     }
 
     /// Check whether this tool+path was already explored in the current workflow.
     pub fn is_path_explored(&self, tool: &str, path: &str) -> bool {
-        let key = format!("{}:{}", tool, Self::normalize_explore_path(path));
-        self.get_explored_path_set().contains(&key)
+        exploration::is_path_explored(self, tool, path)
     }
 
     /// Record a tool result into the Plan-step exploration snapshot.
@@ -1563,34 +1268,12 @@ impl WorkflowEngine {
         target: &str,
         raw_result: &str,
     ) {
-        if !crate::agent::exploration_snapshot::is_snapshot_tool(tool) {
-            return;
-        }
-        let content = crate::agent::exploration_snapshot::extract_data_content(raw_result);
-        let mut entries = self.get_exploration_entries();
-        crate::agent::exploration_snapshot::merge_entry(
-            &mut entries,
-            working_dir,
-            tool,
-            target,
-            &content,
-        );
-        self.set_variable(
-            "_exploration_snapshot",
-            crate::agent::exploration_snapshot::entries_to_json(&entries),
-        );
+        exploration::record_exploration_result(self, working_dir, tool, target, raw_result)
     }
 
     /// Formatted exploration snapshot for Review / Execute steps.
     pub fn exploration_snapshot_summary(&self) -> String {
-        let entries = self.get_exploration_entries();
-        crate::agent::exploration_snapshot::format_summary(&entries, 24_000)
-    }
-
-    fn get_exploration_entries(&self) -> Vec<crate::agent::exploration_snapshot::ExplorationEntry> {
-        self.get_variable("_exploration_snapshot")
-            .map(|s| crate::agent::exploration_snapshot::entries_from_json(&s))
-            .unwrap_or_default()
+        exploration::exploration_snapshot_summary(self)
     }
 
     /// Return cached exploration preview when the same tool+path was already run.
@@ -1600,36 +1283,7 @@ impl WorkflowEngine {
         tool: &str,
         target: &str,
     ) -> Option<String> {
-        if tool == "file_read" {
-            let path = crate::agent::exploration_snapshot::file_path_from_target(target);
-            let entries = self.get_exploration_entries();
-            if crate::agent::exploration_snapshot::find_file_read_entry(&entries, path).is_some() {
-                let args = serde_json::json!({ "path": path }).to_string();
-                return Some(crate::agent::exploration_snapshot::resolve_file_read_cache(
-                    working_dir,
-                    &entries,
-                    path,
-                    &args,
-                ));
-            }
-        }
-
-        let norm = crate::agent::plan_tracker::normalize_path(target);
-        self.get_exploration_entries()
-            .into_iter()
-            .find(|e| {
-                e.tool == tool && crate::agent::plan_tracker::normalize_path(&e.target) == norm
-            })
-            .map(|e| {
-                let mut out = format!(
-                    "✅ 【缓存】已探索过 `{target}`（勿重复 {tool}）\n\n{}",
-                    e.content
-                );
-                if let Some(ref rp) = e.ref_path {
-                    out.push_str(&format!("\n\n完整快照: `{rp}`"));
-                }
-                out
-            })
+        exploration::lookup_exploration_cache(self, working_dir, tool, target)
     }
 
     /// Snapshot task + step outputs for skill reflection before workflow reset.

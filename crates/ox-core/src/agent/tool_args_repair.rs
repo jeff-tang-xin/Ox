@@ -120,7 +120,7 @@ pub fn normalize_delegate_params(action: &str, params: &mut Value) {
     };
 
     match action {
-        "find_symbol" if !obj.contains_key("name") => {
+        "find_symbol" | "read_symbol" if !obj.contains_key("name") => {
             for alias in ["symbol", "query", "pattern", "class", "type"] {
                 if let Some(v) = obj.get(alias).cloned() {
                     obj.insert("name".into(), v);
@@ -149,10 +149,29 @@ pub fn normalize_delegate_params(action: &str, params: &mut Value) {
             }
         }
         "code_search" => {
-            if !obj.contains_key("query")
-                && let Some(v) = obj.get("pattern").or(obj.get("q")).cloned()
+            if !obj.contains_key("pattern")
+                && let Some(v) = obj.get("query").or(obj.get("q")).cloned()
             {
-                obj.insert("query".into(), v);
+                obj.insert("pattern".into(), v);
+            }
+        }
+        "code_graph" => {
+            if !obj.contains_key("op")
+                && let Some(v) = obj.get("action").or(obj.get("operation")).cloned()
+            {
+                obj.insert("op".into(), v);
+            }
+        }
+        "delete_range" => {
+            if !obj.contains_key("start_anchor")
+                && let Some(v) = obj.get("start_line").or(obj.get("start")).cloned()
+            {
+                obj.insert("start_anchor".into(), v);
+            }
+            if !obj.contains_key("end_anchor")
+                && let Some(v) = obj.get("end_line").or(obj.get("end")).cloned()
+            {
+                obj.insert("end_anchor".into(), v);
             }
         }
         "shell_exec" => {
@@ -170,7 +189,6 @@ pub fn normalize_delegate_params(action: &str, params: &mut Value) {
             }
         }
         "finish" | "deliver" | "report" | "done" | "complete" => {
-            // Normalize free-text aliases → content.
             if !obj.contains_key("content")
                 && let Some(v) = obj
                     .get("text")
@@ -181,7 +199,6 @@ pub fn normalize_delegate_params(action: &str, params: &mut Value) {
             {
                 obj.insert("content".into(), v);
             }
-            // Normalize review-item aliases → finding_json.
             if !obj.contains_key("finding_json")
                 && let Some(v) = obj.get("findings").or(obj.get("finding")).cloned()
             {
@@ -417,5 +434,30 @@ mod tests {
         let text = r#"Let me read: {"action":"file_read","params":{"path":"x.rs"}}"#;
         let out = repair_unified_arguments(text).unwrap();
         assert!(out.contains("file_read"));
+    }
+
+    #[test]
+    fn repairs_read_symbol_name_alias() {
+        let raw = r#"{"action":"read_symbol","params":{"symbol":"Foo"}}"#;
+        let out = repair_unified_arguments(raw).unwrap();
+        let req: UnifiedActionRequest = serde_json::from_str(&out).unwrap();
+        assert_eq!(req.params["name"], "Foo");
+    }
+
+    #[test]
+    fn repairs_code_graph_op_alias() {
+        let raw = r#"{"action":"code_graph","params":{"action":"query","pattern":"main"}}"#;
+        let out = repair_unified_arguments(raw).unwrap();
+        let req: UnifiedActionRequest = serde_json::from_str(&out).unwrap();
+        assert_eq!(req.params["op"], "query");
+    }
+
+    #[test]
+    fn repairs_delete_range_anchor_aliases() {
+        let raw = r#"{"action":"delete_range","params":{"path":"x.rs","start_line":10,"end_line":20}}"#;
+        let out = repair_unified_arguments(raw).unwrap();
+        let req: UnifiedActionRequest = serde_json::from_str(&out).unwrap();
+        assert_eq!(req.params["start_anchor"], 10);
+        assert_eq!(req.params["end_anchor"], 20);
     }
 }

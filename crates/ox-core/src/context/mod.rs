@@ -1,4 +1,8 @@
+pub mod assembler;
 pub mod compressed_store;
+pub mod context_injector;
+pub mod context_offloader;
+pub mod context_slim;
 mod effort;
 pub mod refinement;
 pub mod skill_prompts;
@@ -917,7 +921,7 @@ mod tests {
         let cb = ContextBuilder::default();
         let b = cb.budgets(128_000);
         // Sum of ratios is 0.99 (1% for user input), so total allocated < context_window.
-        let sum = b.system_prompt + b.memory + b.history + b.reply_reserve;
+        let sum = b.system_prompt + b.history + b.reply_reserve;
         assert!(sum <= 128_000);
         assert!(sum > 120_000); // At least 94% allocated.
     }
@@ -931,7 +935,7 @@ mod tests {
             Message::user("how are you"),
             Message::assistant("I'm good"),
         ];
-        let result = cb.build("You are helpful.", "", &history, 128_000);
+        let result = cb.build("You are helpful.", &history, 128_000);
         // Should have system + all 4 history messages (they're tiny).
         assert_eq!(result.len(), 5);
     }
@@ -940,8 +944,7 @@ mod tests {
     fn build_truncates_old_history_when_budget_exceeded() {
         let cb = ContextBuilder {
             system_prompt_ratio: 0.02,
-            memory_ratio: 0.02,
-            history_ratio: 0.01, // Very tight budget.
+            history_ratio: 0.03,
             reply_reserve_ratio: 0.95,
         };
         // Create many messages to exceed the tiny budget.
@@ -954,7 +957,7 @@ mod tests {
                 "Response {i} with additional content"
             )));
         }
-        let result = cb.build("System", "", &history, 128_000);
+        let result = cb.build("System", &history, 128_000);
         // Should have fewer than all 200 history messages.
         assert!(result.len() < 201);
         // But should have at least system + a few recent messages.

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::engine::WorkflowEngine;
+use crate::agent::engine::WorkflowEngine;
 
 const ROUND_MEMORY_KEY: &str = "_round_memory_log";
 

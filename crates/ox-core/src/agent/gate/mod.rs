@@ -1,4 +1,4 @@
-//! Gatekeeper — simplified single-step agent model.
+//! Gate system — validation, safety, and guard primitives.
 //!
 //! Replaces the multi-step workflow state machine (Intent→Plan→Review→Execute
 //! plus Perceive/Think/Act phases and park/discuss/impl/scope flags) with:
@@ -13,6 +13,12 @@
 
 pub mod gate;
 pub mod gates;
+pub mod business_gate;
+pub mod safety_gate;
+pub mod read_guard;
+pub mod repeat_guard;
+pub mod explore_reflect;
+pub mod idle_narrative;
 
 pub use gate::{
     Gate, GateCtx, GateOutcome, GateReport, GateRunner, current_failures, reset_failures,

@@ -11,8 +11,8 @@ use crate::message::Message;
 use crate::safety::TrustManager;
 use crate::tools::SafetyLevel;
 
-use super::engine::WorkflowEngine;
-use super::ui_event;
+use super::super::engine::WorkflowEngine;
+use super::super::ui_event;
 
 pub use ui_event::ConfirmationDecision as SafetyDecision;
 
@@ -83,12 +83,12 @@ pub async fn await_decision(
     tool_call_id: &str,
     workflow_engine: &Option<Arc<Mutex<WorkflowEngine>>>,
     messages: &mut Vec<Message>,
-    ui_tx: &mpsc::UnboundedSender<super::AgentToUiEvent>,
+    ui_tx: &mpsc::UnboundedSender<super::super::AgentToUiEvent>,
     push_interjection: impl Fn(
         &Option<Arc<Mutex<WorkflowEngine>>>,
         &mut Vec<Message>,
         &str,
-        &mpsc::UnboundedSender<super::AgentToUiEvent>,
+        &mpsc::UnboundedSender<super::super::AgentToUiEvent>,
     ),
 ) -> Result<SafetyDecision, SafetyGateCancelled> {
     let timeout = tokio::time::sleep(std::time::Duration::from_secs(300));
@@ -138,8 +138,8 @@ pub async fn await_decision(
     }
 }
 
-pub fn emit_request(ui_tx: &mpsc::UnboundedSender<super::AgentToUiEvent>, req: &SafetyGateRequest) {
-    let _ = ui_tx.send(super::AgentToUiEvent::ToolConfirmationRequest {
+pub fn emit_request(ui_tx: &mpsc::UnboundedSender<super::super::AgentToUiEvent>, req: &SafetyGateRequest) {
+    let _ = ui_tx.send(super::super::AgentToUiEvent::ToolConfirmationRequest {
         tool_call_id: req.tool_call_id.clone(),
         tool_name: req.tool_name.clone(),
         args_summary: req.args_summary.clone(),

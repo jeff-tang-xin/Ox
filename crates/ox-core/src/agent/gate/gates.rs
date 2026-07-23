@@ -182,7 +182,7 @@ impl Gate for CitationGate {
         if store.findings.is_empty() {
             return GateOutcome::Pass;
         }
-        let read = crate::agent::read_guard::provenance_paths(ctx.engine);
+        let read = crate::agent::gate::read_guard::provenance_paths(ctx.engine);
         let mut unread = Vec::new();
         for f in &store.findings {
             if f.file.trim().is_empty() {
@@ -218,7 +218,7 @@ impl Gate for ProvenanceGate {
         if ctx.had_code_changes {
             return GateOutcome::Pass;
         }
-        let read = crate::agent::read_guard::provenance_paths(ctx.engine);
+        let read = crate::agent::gate::read_guard::provenance_paths(ctx.engine);
         if read.is_empty() {
             return GateOutcome::Pass;
         }

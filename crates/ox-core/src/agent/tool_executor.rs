@@ -68,7 +68,7 @@ pub fn extract_tool_detail(tool_name: &str, arguments: &str) -> Option<String> {
             .and_then(|p| p.as_str())
             .map(|s| s.to_string()),
         "find_symbol" => args.as_ref().map(|v| {
-            let query = v.get("query").and_then(|q| q.as_str()).unwrap_or("?");
+            let query = v.get("name").or_else(|| v.get("query")).and_then(|q| q.as_str()).unwrap_or("?");
             let kind = v
                 .get("kind")
                 .and_then(|k| k.as_str())
@@ -153,7 +153,8 @@ pub fn build_json_parse_error(tool_name: &str, parse_err: &str) -> String {
         }
         "shell_exec" => "{\"command\": \"ls -la\", \"timeout_ms\": 5000}",
         "file_search" => "{\"pattern\": \"*.rs\", \"path\": \"src/\"}",
-        "code_search" => "{\"query\": \"fn main\", \"path\": \"src/\"}",
+        "code_search" => "{\"pattern\": \"fn main\", \"path\": \"src/\"}",
+        "code_graph" => "{\"op\": \"impact\", \"target\": \"funcName\", \"direction\": \"upstream\"}",
         _ => "{ /* check tool documentation */ }",
     };
 

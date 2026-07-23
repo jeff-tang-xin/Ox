@@ -1,7 +1,7 @@
 //! Prevent redundant file reads and shell-as-read after file_read.
 
-use super::engine::WorkflowEngine;
-use super::plan_tracker;
+use super::super::engine::WorkflowEngine;
+use super::super::plan_tracker;
 
 const TURN_FILES_READ_KEY: &str = "_turn_files_read";
 const TURN_SYMBOLS_QUERIED_KEY: &str = "_turn_symbols_queried";
@@ -63,13 +63,14 @@ pub fn check(
                 if offset > 0 {
                     return Ok(());
                 }
-                if crate::agent::workflow_session::is_implementation_phase(engine)
+                if crate::agent::phase::is_implementation_phase(engine)
                     && !engine.impl_file_already_read(path)
                 {
                     return Ok(());
                 }
-                // Allow re-read but log — LLM may need fresh context after compaction
-                tracing::info!("[READ_GUARD] allow re-read: file_read:{}", path);
+                return Err(format!(
+                    "⛔ 禁止重复读取 `{path}` — 该文件本轮已读过。请基于已有内容继续，或用 offset 读取未读部分。"
+                ));
             }
         }
         "shell_exec" => {
@@ -102,8 +103,9 @@ pub fn check(
             if let Some(query) = symbol_query_key(tool_name, args)
                 && symbol_already_queried(engine, &query)
             {
-                // Don't block — just warn. LLM may have new context that makes retry useful.
-                tracing::info!("[READ_GUARD] allow retry: {}:{}", tool_name, query);
+                return Err(format!(
+                    "⛔ 禁止重复 {tool_name}({query}) — 该查询本轮已执行过。请基于已有结果继续推进，不要重复探索。"
+                ));
             }
         }
         _ => {}
@@ -176,15 +178,15 @@ fn symbol_already_queried(engine: &WorkflowEngine, query: &str) -> bool {
 fn symbol_query_key(tool_name: &str, args: &serde_json::Value) -> Option<String> {
     let raw = match tool_name {
         "find_symbol" => args
-            .get("query")
+            .get("name")
+            .or_else(|| args.get("query"))
             .or_else(|| args.get("symbol"))
-            .or_else(|| args.get("name"))
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
         "code_search" => args
-            .get("query")
-            .or_else(|| args.get("pattern"))
+            .get("pattern")
+            .or_else(|| args.get("query"))
             .and_then(|v| v.as_str())
             .map(|s| s.chars().take(120).collect::<String>())
             .filter(|s: &String| !s.is_empty()),
@@ -270,12 +272,11 @@ mod tests {
     }
 
     #[test]
-    fn allows_duplicate_file_read_retry() {
+    fn blocks_duplicate_file_read() {
         let e = engine();
         record_file_read(&e, "src/a.rs");
         let args = serde_json::json!({"path": "src/a.rs"});
-        // Now allowed — LLM may need fresh context after compaction
-        assert!(check("file_read", &args, &e).is_ok());
+        assert!(check("file_read", &args, &e).is_err());
     }
 
     #[test]
@@ -311,17 +312,16 @@ mod tests {
                 active_indices: vec![1],
             },
         );
-        let args = serde_json::json!({"query": "doHandle"});
+        let args = serde_json::json!({"pattern": "doHandle"});
         assert!(check("code_search", &args, &e).is_err());
     }
 
     #[test]
-    fn allows_duplicate_find_symbol_retry() {
+    fn blocks_duplicate_find_symbol() {
         let e = engine();
-        let args = serde_json::json!({"query": "MaintainDeliveryRequest"});
+        let args = serde_json::json!({"name": "MaintainDeliveryRequest"});
         record_symbol_query(&e, "find_symbol", &args);
-        // Now allowed — LLM may have new context that justifies retry
-        assert!(check("find_symbol", &args, &e).is_ok());
+        assert!(check("find_symbol", &args, &e).is_err());
     }
 
     #[test]
@@ -343,6 +343,7 @@ mod tests {
             phase::PHASE_STATE_KEY,
             SingleFlowPhase::Implement.as_str().to_string(),
         );
+        // First re-read in implement phase is allowed (fresh context after compaction)
         assert!(
             check(
                 "file_read",
@@ -352,14 +353,14 @@ mod tests {
             .is_ok()
         );
         e.record_impl_file_read("src/Foo.java", "{}");
-        // Allow re-read — LLM may need fresh context after compaction
+        // Second re-read is blocked — already consumed the fresh-read allowance
         assert!(
             check(
                 "file_read",
                 &serde_json::json!({"path": "src/Foo.java"}),
                 &e
             )
-            .is_ok()
+            .is_err()
         );
     }
 }

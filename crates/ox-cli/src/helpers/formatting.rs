@@ -106,6 +106,16 @@ pub fn summarize_tool_result(name: &str, output: &str) -> String {
                 format!("`{match_count} matches`")
             }
         }
+        "code_graph" => {
+            if output.contains("Error") || output.contains("错误") {
+                let first_line = output.lines().next().unwrap_or("Error");
+                let msg: String = first_line.chars().take(100).collect();
+                format!("`❌ {msg}`")
+            } else {
+                let line_count = output.lines().count();
+                format!("`✅ code_graph: {line_count} lines`")
+            }
+        }
         "shell_exec" => {
             if let Some(line) = output.lines().find(|l| l.starts_with("[exit code:")) {
                 format!("`{line}`")

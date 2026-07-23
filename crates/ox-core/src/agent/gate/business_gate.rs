@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::message::Message;
 
-use super::engine::WorkflowEngine;
-use super::findings;
-use super::ui_event::{self, BusinessGateKind};
+use super::super::engine::WorkflowEngine;
+use super::super::findings;
+use super::super::ui_event::{self, BusinessGateKind};
 
 pub const PENDING_SCOPE_KEY: &str = "_business_gate_pending_scope";
 pub const SCOPE_ACK_KEY: &str = "_business_gate_scope_ack";
@@ -41,7 +41,7 @@ pub fn ack_findings_scope(engine: &WorkflowEngine) {
     }
     engine.set_variable(PENDING_SCOPE_KEY, String::new());
     engine.set_variable(SCOPE_ACK_KEY, "1".to_string());
-    super::phase::on_scope_selected(engine);
+    super::super::phase::on_scope_selected(engine);
 }
 
 pub fn is_pending_scope(engine: &WorkflowEngine) -> bool {
@@ -59,7 +59,7 @@ pub fn is_pending_scope(engine: &WorkflowEngine) -> bool {
 
 pub fn scope_implementation_unlocked(engine: &WorkflowEngine) -> bool {
     engine.get_variable(SCOPE_ACK_KEY).as_deref() == Some("1")
-        || super::phase::get(engine) == super::phase::SingleFlowPhase::Implement
+        || super::super::phase::get(engine) == super::super::phase::SingleFlowPhase::Implement
 }
 
 pub fn clear(engine: &WorkflowEngine) {
@@ -74,12 +74,12 @@ pub async fn await_findings_scope_gate(
     cancel_token: &CancellationToken,
     workflow_engine: &Option<Arc<Mutex<WorkflowEngine>>>,
     messages: &mut Vec<Message>,
-    ui_tx: &mpsc::UnboundedSender<super::AgentToUiEvent>,
+    ui_tx: &mpsc::UnboundedSender<super::super::AgentToUiEvent>,
     push_interjection: impl Fn(
         &Option<Arc<Mutex<WorkflowEngine>>>,
         &mut Vec<Message>,
         &str,
-        &mpsc::UnboundedSender<super::AgentToUiEvent>,
+        &mpsc::UnboundedSender<super::super::AgentToUiEvent>,
     ),
 ) -> BusinessGateResume {
     // If user already pre-confirmed (typed "c" before gate opened), skip wait.
@@ -93,7 +93,7 @@ pub async fn await_findings_scope_gate(
         return BusinessGateResume::Acknowledged;
     }
 
-    let _ = ui_tx.send(super::AgentToUiEvent::Status(
+    let _ = ui_tx.send(super::super::AgentToUiEvent::Status(
         "⏸ 业务流程门禁：等待确认 findings 范围 — 面板选 finding 后 c /confirm；可输入讨论"
             .to_string(),
     ));
@@ -175,14 +175,14 @@ pub async fn await_findings_scope_gate(
                 if is_retry {
                     // Already retried once, now really cancel
                     tracing::warn!("[BUSINESS_GATE] 超时（{}秒），自动取消", INITIAL_TIMEOUT_SECS + RETRY_TIMEOUT_SECS);
-                    let _ = ui_tx.send(super::AgentToUiEvent::Status(
-                        "⏸ 等待确认超时（10分钟），自动取消。\n��重新发起任务或输入新需求。".to_string(),
+                    let _ = ui_tx.send(super::super::AgentToUiEvent::Status(
+                        "⏸ 等待确认超时（10分钟），自动取消。\n请重新发起任务或输入新需求。".to_string(),
                     ));
                     return BusinessGateResume::Cancelled;
                 } else {
                     // First timeout: notify user and allow retry
                     is_retry = true;
-                    let _ = ui_tx.send(super::AgentToUiEvent::Status(
+                    let _ = ui_tx.send(super::super::AgentToUiEvent::Status(
                         "⏸ 等待确认超时（5分钟），继续等待还是取消？\n输入 c 确认，或输入任意内容讨论。".to_string(),
                     ));
                     // Continue loop for retry period
@@ -199,16 +199,16 @@ pub async fn await_deliver_gate(
     cancel_token: &CancellationToken,
     workflow_engine: &Option<Arc<Mutex<WorkflowEngine>>>,
     messages: &mut Vec<Message>,
-    ui_tx: &mpsc::UnboundedSender<super::AgentToUiEvent>,
+    ui_tx: &mpsc::UnboundedSender<super::super::AgentToUiEvent>,
     push_interjection: impl Fn(
         &Option<Arc<Mutex<WorkflowEngine>>>,
         &mut Vec<Message>,
         &str,
-        &mpsc::UnboundedSender<super::AgentToUiEvent>,
+        &mpsc::UnboundedSender<super::super::AgentToUiEvent>,
     ),
     kind: &str,
 ) -> BusinessGateResume {
-    let _ = ui_tx.send(super::AgentToUiEvent::Status(format!(
+    let _ = ui_tx.send(super::super::AgentToUiEvent::Status(format!(
         "⏸ 交付门禁 ({kind})：c /confirm 确认 · 输入讨论"
     )));
 

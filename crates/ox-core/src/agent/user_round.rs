@@ -119,7 +119,6 @@ pub fn format_interrupt_boundary_message(task: &str) -> String {
         "{INTERRUPT_BOUNDARY_TAG}\n\
          ⏹️ **用户中断（INTERRUPTED — HISTORICAL / 未完成）**\n\
          任务: {}\n\
-         ⚠️ 此轮**未正常完成**，不触发 Skill 反思。\n\
          - 继续同一任务：直接说明跟进内容\n\
          - 换新任务：用「新任务」或 /new",
         task.chars().take(1500).collect::<String>()
@@ -388,19 +387,6 @@ pub fn format_user_round_block(engine: &WorkflowEngine) -> String {
              {}\n\
              ⚠️ 只执行以上内容；对话历史与其它记忆中的任务均属 HISTORICAL，勿继续执行。",
             current.chars().take(2000).collect::<String>()
-        ));
-    }
-
-    // Recent cross-round history now comes from the ReAct log (single source of
-    // truth), fetched into `_react_timeline` each turn. Older, archived history
-    // lives in the pinned [MEMORY_GRAPH] block. The former `_round_history`
-    // textual recap was retired.
-    if let Some(timeline) = engine.get_variable("_react_timeline")
-        && !timeline.trim().is_empty()
-    {
-        parts.push(format!(
-            "## 📚 近期 ReAct（HISTORICAL — 只读参考，禁止重复执行）\n{}",
-            timeline.chars().take(3000).collect::<String>()
         ));
     }
 

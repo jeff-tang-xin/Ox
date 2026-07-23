@@ -64,6 +64,7 @@ impl MemoryStore {
                 outcome TEXT NOT NULL DEFAULT '',
                 decision TEXT NOT NULL DEFAULT '',
                 assistant_text TEXT NOT NULL DEFAULT '',
+                reasoning TEXT NOT NULL DEFAULT '',
                 tool_result TEXT NOT NULL DEFAULT '',
                 impacted INTEGER NOT NULL DEFAULT 0,
                 graph_id INTEGER
@@ -96,6 +97,10 @@ impl MemoryStore {
         );
         let _ = conn.execute(
             "ALTER TABLE react_log ADD COLUMN tool_result TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE react_log ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''",
             [],
         );
         // Memory-graph tiering columns (L1/L2/L3 + downgrade). Idempotent.
@@ -428,11 +433,14 @@ impl MemoryStore {
         Ok(out)
     }
 
-    /// Record a single ReAct tool call to the log (with timestamp).
-    /// Each tool execution → one row storing the full ReAct triple so it can be
-    /// replayed as `[user(task_desc @ created_at), assistant(assistant_text),
-    /// tool_result]`. `decision` keeps the short in-turn rationale; `assistant_text`
-    /// is the fuller assistant message; `tool_result` is the (truncated) output.
+    /// Record a single ReAct step to the log (with timestamp).
+    /// Each tool execution → one row storing the full ReAct tuple so it can be
+    /// replayed as `[user(task_desc @ created_at), assistant(reasoning → visible),
+    /// tool_call(tool+target), tool_result]`.
+    /// - `decision`: short in-turn rationale (why this tool was chosen)
+    /// - `assistant_text`: visible assistant reply (striped of think blocks)
+    /// - `reasoning`: raw thinking/reasoning content (for replay when visible text alone is insufficient)
+    /// - `tool_result`: truncated tool output
     #[allow(clippy::too_many_arguments)]
     pub fn record_react(
         &self,
@@ -443,17 +451,18 @@ impl MemoryStore {
         outcome: &str,
         decision: &str,
         assistant_text: &str,
+        reasoning: &str,
         tool_result: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        // Cap large fields so a single huge tool result can't bloat the DB.
-        let assistant_text: String = assistant_text.chars().take(2000).collect();
-        let tool_result: String = tool_result.chars().take(4000).collect();
+        let assistant_text: String = assistant_text.chars().take(4000).collect();
+        let reasoning: String = reasoning.chars().take(4000).collect();
+        let tool_result: String = tool_result.chars().take(6000).collect();
         conn.execute(
             "INSERT INTO react_log
-                (session_id, task_desc, tool, target, outcome, decision, assistant_text, tool_result)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![session_id, task_desc, tool, target, outcome, decision, assistant_text, tool_result],
+                (session_id, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![session_id, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result],
         )?;
         Ok(())
     }
@@ -502,6 +511,85 @@ impl MemoryStore {
                     "    → {}\n",
                     decision.chars().take(100).collect::<String>()
                 ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Get the full ReAct mainline (oldest first) for context injection.
+    /// This is the **primary memory source** for the LLM — it includes
+    /// the complete tool execution trace with assistant reasoning and results.
+    /// Returns formatted text grouped by time, with summaries of each step.
+    pub fn get_react_mainline(&self, session_id: &str, limit: usize) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT created_at, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result
+             FROM react_log
+             WHERE impacted = 0 AND session_id = ?1
+             ORDER BY created_at ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+
+        let mut out = String::new();
+        let mut prev_date = String::new();
+        let mut prev_task = String::new();
+        for row in rows {
+            let (ts, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result) = row?;
+            let date: String = ts.chars().take(16).collect();
+            let target_short: String = target.chars().take(80).collect();
+
+            if date != prev_date {
+                if !out.is_empty() {
+                    out.push_str("\n");
+                }
+                out.push_str(&format!("── {} ──\n", date));
+                prev_date = date;
+            }
+
+            if task_desc != prev_task {
+                out.push_str(&format!("📋 Task: {}\n", task_desc.chars().take(200).collect::<String>()));
+                prev_task = task_desc;
+            }
+
+            let icon = if outcome == "ok" || outcome.starts_with("ok") { "✅" } else { "⚠️" };
+            out.push_str(&format!("  {} [{}] {}\n", icon, tool, target_short));
+
+            if !decision.is_empty() {
+                out.push_str(&format!("    💭 Decision: {}\n", decision.chars().take(200).collect::<String>()));
+            }
+
+            if !reasoning.is_empty() {
+                let r: String = reasoning.chars().take(300).collect();
+                if !r.is_empty() {
+                    out.push_str(&format!("    🧠 Reasoning: {}\n", r));
+                }
+            }
+
+            if !assistant_text.is_empty() {
+                let a: String = assistant_text.chars().take(300).collect();
+                if !a.is_empty() {
+                    out.push_str(&format!("    💬 Assistant: {}\n", a));
+                }
+            }
+
+            if !tool_result.is_empty() {
+                let r: String = tool_result.chars().take(500).collect();
+                if !r.is_empty() {
+                    out.push_str(&format!("    📄 Result: {}\n", r));
+                }
             }
         }
         Ok(out)
@@ -911,6 +999,7 @@ mod tests {
                     "file_read",
                     &format!("f{i}.rs"),
                     "ok",
+                    "",
                     "",
                     "",
                     "",

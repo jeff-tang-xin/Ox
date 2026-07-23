@@ -27,7 +27,7 @@ pub fn minimal_durable_addon(engine: &WorkflowEngine) -> String {
     } else {
         format!(
             "{}\n\n{}",
-            super::memory_bridge::DURABLE_MEMORY_TAG,
+            crate::memory::memory_bridge::DURABLE_MEMORY_TAG,
             guidance
         )
     }
@@ -505,7 +505,7 @@ fn phase_notes_for_mode_unified(_mode: WorkspaceMode) -> String {
 }
 
 fn build_files_read(engine: &WorkflowEngine) -> Vec<ReadSlot> {
-    let mut slots: Vec<ReadSlot> = crate::agent::read_guard::paths_read(engine)
+    let mut slots: Vec<ReadSlot> = crate::agent::gate::read_guard::paths_read(engine)
         .into_iter()
         .map(|path| ReadSlot {
             path,

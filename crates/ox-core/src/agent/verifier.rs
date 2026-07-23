@@ -10,7 +10,7 @@ pub fn after_edit_note(
     file_path: &str,
     tool_output: &str,
 ) -> Option<String> {
-    if !crate::agent::workflow_session::is_implementation_phase(engine) {
+    if !crate::agent::phase::is_implementation_phase(engine) {
         return None;
     }
     let diff_snippet = extract_diff_snippet(tool_output);

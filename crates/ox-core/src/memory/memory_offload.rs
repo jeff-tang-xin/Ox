@@ -221,21 +221,46 @@ fn cleanup_only(messages: &mut Vec<Message>) {
 /// compact placeholder so freed budget is realized, keeping tool-call pairs
 /// consistent afterwards. `count` is advisory (for the notice text).
 fn placeholder_old_react(messages: &mut Vec<Message>, count: usize) {
-    // Find the first user message index — never touch the current-round anchor
-    // or the leading system prompt; only collapse the middle tool churn.
     let first_user = messages
         .iter()
         .position(|m| matches!(m, Message::User { .. }))
         .unwrap_or(0);
 
-    // Collapse tool results before the *last* third of the conversation.
     let cut = messages
         .len()
         .saturating_sub(messages.len() / 3)
         .max(first_user + 1);
 
     let mut replaced = 0usize;
+    let mut compressed = 0usize;
+
     for msg in messages.iter_mut().take(cut).skip(first_user) {
+        // 1. Compress large Assistant messages (not just ToolResults)
+        if let Message::Assistant { content, tool_calls, .. } = msg {
+            if !content.is_empty() && content.len() > 500 {
+                // Truncate long assistant text to first 300 chars
+                if content.len() > 300 {
+                    let boundary = content
+                        .char_indices()
+                        .take_while(|(i, _)| *i < 300)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(300);
+                    *content = format!("{}... (truncated, full text in ReAct log)", &content[..boundary]);
+                    compressed += 1;
+                }
+            }
+            // Also compress tool_calls arguments that are large
+            for tc in tool_calls.iter_mut() {
+                if tc.arguments.len() > 800 {
+                    tc.arguments = tc.arguments.chars().take(800).collect::<String>()
+                        + "...(truncated)";
+                    compressed += 1;
+                }
+            }
+        }
+
+        // 2. Replace old ToolResults with compact placeholders
         if let Message::ToolResult { content, .. } = msg {
             if !content.starts_with("（已归纳") {
                 *content = "（已归纳到记忆图谱，recall #<编号> 可重放）".to_string();
@@ -243,11 +268,11 @@ fn placeholder_old_react(messages: &mut Vec<Message>, count: usize) {
             }
         }
     }
-    // Drop tool_calls whose results we just collapsed? No — keep pairs intact;
-    // the placeholder still satisfies the tool_call↔result contract. Then run
-    // correctness cleanup to drop anything now orphaned.
+
     cleanup_only(messages);
-    tracing::info!("[OFFLOAD] Placeholdered {replaced} old ReAct results (archived ~{count} rows)");
+    tracing::info!(
+        "[OFFLOAD] Placeholdered {replaced} old ReAct results + compressed {compressed} large messages (archived ~{count} rows)"
+    );
 }
 
 /// Public entry to the last-resort tail-trim, for the agent loop's bounded
@@ -265,12 +290,33 @@ fn hard_trim(messages: &mut Vec<Message>) {
         cleanup_only(messages);
         return;
     }
+
     let system = messages.first().cloned();
     let anchor_user = messages
         .iter()
         .find(|m| matches!(m, Message::User { .. }))
         .cloned();
+
+    // Keep the last 30 messages, but also try to preserve intermediate
+    // User messages and key Assistant messages (those with ## Plan/Done)
     let tail_start = messages.len().saturating_sub(KEEP_TAIL);
+    let mut preserved_mid: Vec<Message> = Vec::new();
+
+    for msg in messages.iter().skip(1).take(tail_start - 1) {
+        let keep = match msg {
+            Message::User { .. } => true,
+            Message::Assistant { content, tool_calls, .. } => {
+                content.contains("## Plan")
+                    || content.contains("## Done")
+                    || (!tool_calls.is_empty() && content.is_empty())
+            }
+            _ => false,
+        };
+        if keep {
+            preserved_mid.push(msg.clone());
+        }
+    }
+
     let tail: Vec<Message> = messages[tail_start..].to_vec();
 
     let mut out = Vec::new();
@@ -282,6 +328,13 @@ fn hard_trim(messages: &mut Vec<Message>) {
     ));
     if let Some(u) = anchor_user {
         out.push(u);
+    }
+    // Insert preserved mid-section messages before tail
+    if !preserved_mid.is_empty() {
+        out.push(Message::system(
+            "[PRESERVED_KEY_POINTS]\n保留的关键中间消息：",
+        ));
+        out.extend(preserved_mid.into_iter().take(15)); // Cap at 15 to avoid bloat
     }
     out.extend(tail);
     crate::context::sanitize_tool_pairs(&mut out);

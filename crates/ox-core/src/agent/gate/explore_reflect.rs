@@ -708,7 +708,7 @@ mod tests {
         let mut reflected = false;
         let mut total = 0;
         let reads = names(&["file_read"]);
-        // Two low-gain turns build the streak.
+        // Two低-gain turns build the streak.
         evaluate(
             &mut streak,
             &mut reflected,

@@ -140,6 +140,7 @@ pub fn action_to_tool_name(action: &str) -> Option<&'static str> {
         "code_search" => Some("code_search"),
         "delete_range" => Some("delete_range"),
         "find_symbol" => Some("find_symbol"),
+        "read_symbol" => Some("read_symbol"),
         "load_skill" => Some("load_skill"),
         "shell_exec" => Some("shell_exec"),
         "project_detect" => Some("project_detect"),
@@ -243,12 +244,12 @@ pub fn tool_schema_with_actions(actions: &[&str]) -> ToolSchema {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "动作类型",
+                    "description": "动作类型，必须是合法 action 清单中的一个值",
                     "enum": actions
                 },
                 "params": {
                     "type": "object",
-                    "description": "动作参数。file_read:{path}; find_symbol:{name}; edit_file:{path,old_string,new_string}; code_graph:{op,...}(代码图谱: op=query/context/impact/detect_changes/api_impact/cypher/rename… 改前查影响面); finish:{content?, finding_json?}。finish 时：有 finding_json(需用户审核的plan/bug/改动)→门禁确认；无→结束等用户。禁止 symbol/key 代替 name/node_id。"
+                    "description": "动作参数对象，格式: {\"action\":\"xxx\",\"params\":{...}}。\n\n读取类(无需确认):\n- file_read: {path, offset?, limit?}\n- file_list: {path}\n- file_search: {pattern, path?, file_pattern?}\n- code_search: {pattern, path?, file_pattern?, case_insensitive?}\n- find_symbol: {name, kind?, file_pattern?}\n- read_symbol: {name, kind?, context_lines?}\n- git_status/git_diff/project_detect/web_fetch/load_skill: 各自参数\n\n代码图谱(GitNexus):\n- code_graph: {op, ...} — op=query|context|impact|detect_changes|api_impact|route_map|tool_map|shape_check|cypher|rename\n  impact: {op:\"impact\", target:\"funcName\", direction:\"upstream\"}\n  context: {op:\"context\", name:\"TypeName\"}\n  多 repo 时需加 repo 参数\n\n写入类(需门禁确认):\n- edit_file: {path, old_string, new_string}\n- file_write: {path, content}\n- delete_range: {path, start_anchor, end_anchor}\n- shell_exec: {command}\n\n结束:\n- finish: {content?} — 结束本轮\n- finish: {finding_json:[...]} — 提交审核\n\n❌ 禁止 CLI 语法(--flag) | 禁止空 params | 禁止 XML 格式",
                 }
             },
             "required": ["action", "params"]
@@ -326,7 +327,7 @@ fn unified_route_spec(engine: &WorkflowEngine) -> UnifiedRouteSpec {
             "本轮已收尾 — 等用户新输入；如需继续可只读探索或 finish。",
         ),
         SingleFlowPhase::AwaitUser => {
-            if super::business_gate::scope_implementation_unlocked(engine) {
+            if super::gate::business_gate::scope_implementation_unlocked(engine) {
                 (
                     vec!["code_graph", "file_read", "edit_file", "shell_exec"],
                     vec![
@@ -515,9 +516,9 @@ pub fn build_unified_route(engine: &WorkflowEngine) -> String {
 /// Compact route block embedded inside `[WORKSPACE]` (unified mode — no separate injection).
 pub fn build_unified_route_compact(engine: &WorkflowEngine) -> String {
     let spec = unified_route_spec(engine);
-    let lock = if super::business_gate::scope_implementation_unlocked(engine) {
+    let lock = if super::gate::business_gate::scope_implementation_unlocked(engine) {
         "🔓 写权限已解锁 — edit/write/shell 自动执行（硬安全例外仍拦截）"
-    } else if super::business_gate::is_pending_scope(engine) {
+    } else if super::gate::business_gate::is_pending_scope(engine) {
         "⏸ 等待用户 c 确认 — 禁止一切 action"
     } else {
         "🔒 只读 — 动手前先 finish(finding_json=[...]) 提交计划，用户 c 确认后解锁"
