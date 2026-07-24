@@ -8,8 +8,7 @@ use unicode_width::UnicodeWidthStr;
 use super::app::{App, ParkFollowUpTag};
 use super::input_pane::InputPane;
 use super::output_pane::{
-    CHAT_THINK_HEIGHT_RATIO, OutputLine, SESSION_WIDTH_MAX, SESSION_WIDTH_MIN,
-    SESSION_WIDTH_PERCENT, THINK_PANE_SLIM_HEIGHT, ThinkPaneMode,
+    CHAT_THINK_HEIGHT_RATIO, OutputLine, THINK_PANE_SLIM_HEIGHT, ThinkPaneMode,
 };
 use crate::helpers::formatting::short_display_path;
 
@@ -213,31 +212,19 @@ fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     frame.render_widget(Clear, area);
 
-    let has_sidebar_content = !app.sessions.is_empty() || !app.plan_items.is_empty();
-    // Session column: smallest width slice.
-    let sidebar_w = if has_sidebar_content {
-        let pct = area.width.saturating_mul(SESSION_WIDTH_PERCENT) / 100;
-        pct.clamp(SESSION_WIDTH_MIN, SESSION_WIDTH_MAX)
-    } else {
-        0
-    };
-
-    let row_chunks =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(sidebar_w)]).split(area);
-
     let tick = app.spinner_frame;
     let think_mode = app.output.think_pane_mode(app.agent_running);
 
     match think_mode {
         ThinkPaneMode::Hidden => {
-            render_chat(frame, app, row_chunks[0]);
+            render_chat(frame, app, area);
         }
         ThinkPaneMode::Slim => {
             let col_chunks = Layout::vertical([
                 Constraint::Min(1),
                 Constraint::Length(THINK_PANE_SLIM_HEIGHT),
             ])
-            .split(row_chunks[0]);
+            .split(area);
             render_chat(frame, app, col_chunks[0]);
             render_think_pane(frame, app, col_chunks[1], tick, think_mode);
         }
@@ -247,14 +234,10 @@ fn render_main(frame: &mut Frame, app: &mut App, area: Rect) {
                 Constraint::Ratio(chat_ratio, chat_ratio + think_ratio),
                 Constraint::Ratio(think_ratio, chat_ratio + think_ratio),
             ])
-            .split(row_chunks[0]);
+            .split(area);
             render_chat(frame, app, col_chunks[0]);
             render_think_pane(frame, app, col_chunks[1], tick, think_mode);
         }
-    }
-
-    if sidebar_w > 0 {
-        render_sidebar(frame, app, row_chunks[1]);
     }
 }
 
@@ -432,7 +415,6 @@ fn render_single_line(
 ) -> Vec<Line<'static>> {
     match ol {
         OutputLine::User(s) => {
-            // User messages with distinct background
             vec![Line::from(vec![
                 Span::styled(
                     " ▸ ".to_string(),
@@ -456,27 +438,32 @@ fn render_single_line(
             }
         }
         OutputLine::Tool { name, detail } => {
-            // Tool calls with action-specific icons
             let icon = match name.as_str() {
-                "file_read" => " 📖 ",
-                "file_write" | "edit_file" | "delete_range" => " ✏️ ",
-                "find_symbol" | "code_search" | "file_search" => " 🔎 ",
-                "shell_exec" => " 💻 ",
-                "code_graph" => " 🕸 ",
-                "finish" | "complete_and_check" => " ✅ ",
-                _ => " ⚙ ",
+                "file_read" => "📖",
+                "file_write" | "edit_file" | "delete_range" => "✏️",
+                "find_symbol" | "code_search" | "file_search" => "🔎",
+                "shell_exec" => "💻",
+                "code_graph" => "🕸",
+                "web_fetch" => "🌐",
+                "recall" => "🧠",
+                "load_skill" => "📦",
+                _ => "⚙",
             };
             let mut spans = vec![
-                Span::styled(icon, Style::default().fg(TOOL_COLOR)),
+                Span::styled(
+                    format!(" {icon} "),
+                    Style::default().fg(TOOL_COLOR).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(
                     name.clone(),
                     Style::default().fg(TOOL_COLOR).add_modifier(Modifier::BOLD),
                 ),
             ];
             if let Some(cmd) = detail {
-                let short = cmd.chars().take(80).collect::<String>();
+                let short: String = cmd.chars().take(100).collect();
+                spans.push(Span::styled("  ".to_string(), Style::default()));
                 spans.push(Span::styled(
-                    format!(" {}", short),
+                    short,
                     Style::default().fg(TEXT_DIM),
                 ));
             }
@@ -488,26 +475,37 @@ fn render_single_line(
             summary,
             is_error,
         } => {
-            let (icon, color) = if *is_error {
-                (" ✗", TOOL_ERR)
+            if *is_error {
+                let short: String = summary.chars().take(120).collect();
+                vec![Line::from(vec![
+                    Span::styled(
+                        " ✗ ".to_string(),
+                        Style::default()
+                            .fg(TOOL_ERR)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(short, Style::default().fg(TOOL_ERR)),
+                ])]
             } else {
-                (" ✓", TOOL_OK)
-            };
-            let short: String = summary.chars().take(120).collect();
-            vec![Line::from(vec![
-                Span::styled(icon, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                Span::styled(short, Style::default().fg(color)),
-            ])]
+                let short: String = summary.chars().take(140).collect();
+                vec![Line::from(vec![
+                    Span::styled(
+                        " ✓ ".to_string(),
+                        Style::default()
+                            .fg(TOOL_OK)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(short, Style::default().fg(TOOL_OK)),
+                ])]
+            }
         }
         OutputLine::System(s) => {
-            // System messages with subtle indicator
             vec![Line::from(vec![
                 Span::styled(" ● ".to_string(), Style::default().fg(SYS_COLOR)),
                 Span::styled(s.clone(), Style::default().fg(TEXT_DIM)),
             ])]
         }
         OutputLine::Error(s) => {
-            // Error messages with prominent styling
             vec![Line::from(vec![
                 Span::styled(
                     " ✗ ".to_string(),
@@ -553,7 +551,6 @@ fn render_single_line(
             if s.is_empty() {
                 return vec![Line::from("")];
             }
-            // Apply color to tool-prefixed output lines (──, ✓, ✗)
             let first = s.lines().next().unwrap_or("").trim();
             if first.starts_with('✓') || first.starts_with("── DATA") {
                 let rendered = md_renderer.render_lines(s, width);
@@ -578,9 +575,8 @@ fn render_single_line(
             message,
             timestamp: _,
         } => {
-            // Tool execution logs in small dim font below tool card
             vec![Line::from(vec![
-                Span::styled("   └─ ", Style::default().fg(TEXT_DIM)),
+                Span::styled("   └─ ".to_string(), Style::default().fg(TEXT_DIM)),
                 Span::styled(
                     message.clone(),
                     Style::default().fg(TEXT_DIM).add_modifier(Modifier::DIM),
@@ -590,161 +586,9 @@ fn render_single_line(
     }
 }
 
-fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    frame.render_widget(Clear, area);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // ── Tasks Section ──
-    if !app.plan_items.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " Tasks ".to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for item in &app.plan_items {
-            let (icon, style) = match item.status {
-                super::app::PlanItemStatus::Done => ("✅", Style::default().fg(TOOL_OK)),
-                super::app::PlanItemStatus::Pending => ("⏳", Style::default().fg(Color::Yellow)),
-                super::app::PlanItemStatus::Cancelled => ("❌", Style::default().fg(TEXT_DIM)),
-            };
-            let display: String = item
-                .file
-                .chars()
-                .take(area.width.saturating_sub(6) as usize)
-                .collect();
-            lines.push(Line::from(Span::styled(
-                format!(" {icon} {display}"),
-                style,
-            )));
-        }
-        lines.push(Line::from("")); // separator
-    }
-
-    // ── Sessions Section ──
-    if !app.sessions.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " Sessions ".to_string(),
-            Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
-        )));
-        for entry in &app.sessions {
-            let style = if entry.is_active {
-                Style::default().fg(USER_COLOR).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(TEXT_DIM)
-            };
-            let icon = if entry.is_active { "▸" } else { " " };
-            let display_short: String = entry
-                .display_name()
-                .chars()
-                .take(area.width as usize - 4)
-                .collect();
-            lines.push(Line::from(Span::styled(
-                format!(" {icon} {display_short}"),
-                style,
-            )));
-        }
-    }
-
-    if lines.is_empty() {
-        return;
-    }
-
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(BG));
-
-    let para = Paragraph::new(lines)
-        .block(block)
-        .style(Style::default().bg(BG));
-    frame.render_widget(para, area);
-}
-
-#[allow(dead_code)]
-fn render_findings_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(panel) = &app.findings_panel else {
-        return;
-    };
-    if area.width < 10 || area.height < 2 {
-        return;
-    }
-    frame.render_widget(Clear, area);
-
-    let inner_w = area.width.saturating_sub(4) as usize;
-    let issue_budget = inner_w.saturating_sub(28).max(24);
-
-    let mut lines: Vec<Line> = Vec::new();
-    if !panel.summary.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("摘要 ", Style::default().fg(TEXT_DIM)),
-            Span::styled(
-                truncate_display(&panel.summary, inner_w.saturating_sub(6)),
-                Style::default().fg(TEXT),
-            ),
-        ]));
-    }
-    lines.push(Line::from(Span::styled(
-        "1-9 范围 · c 确认 · d 讨论 · n 新任务",
-        Style::default().fg(TEXT_DIM),
-    )));
-    for row in &panel.rows {
-        let mark = if row.in_scope { "☑" } else { "☐" };
-        let status_icon = match row.status {
-            ox_core::agent::findings::FindingStatus::Done => "✅",
-            ox_core::agent::findings::FindingStatus::InProgress
-            | ox_core::agent::findings::FindingStatus::AwaitingVerify => "🔄",
-            ox_core::agent::findings::FindingStatus::Skipped
-            | ox_core::agent::findings::FindingStatus::WontFix => "⏭",
-            ox_core::agent::findings::FindingStatus::Disputed => "⚠️",
-            _ => "📌",
-        };
-        let loc = if row.file.is_empty() {
-            truncate_display(&row.symbol, 32)
-        } else {
-            truncate_display(&short_display_path(&row.file, 36), 36)
-        };
-        let sev = truncate_display(&row.severity, 8);
-        let issue = truncate_display(&row.issue, issue_budget);
-        lines.push(Line::from(vec![
-            Span::styled(format!("{mark} "), Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format!("#{} ", row.index),
-                Style::default()
-                    .fg(TEXT_BRIGHT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("[{sev}] "), Style::default().fg(HEADING_FG)),
-            Span::styled(format!("{status_icon} "), Style::default().fg(TEXT_DIM)),
-            Span::styled(format!("{loc} "), Style::default().fg(TEXT_DIM)),
-            Span::styled(issue, Style::default().fg(TEXT)),
-        ]));
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
-        .style(Style::default().bg(BG))
-        .title(" Findings — 选择修复范围 ")
-        .title_style(
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        );
-    frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64) {
     frame.render_widget(Clear, area);
 
-    // When indexing or agent running, show progress status prominently
     let (status_style, status_bg) = if app.indexing {
         (
             Style::default().fg(TEXT_BRIGHT).bg(Color::Rgb(80, 60, 0)),
@@ -754,8 +598,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         (Style::default().fg(TEXT_BRIGHT).bg(BLUE), BLUE)
     };
 
-    // Left side: Model and working directory (essential info)
-    let dir_short = short_display_path(&app.working_dir, 28);
+    let dir_short = short_display_path(&app.working_dir, 36);
     let mut left_parts: Vec<Span> = vec![
         Span::styled(
             format!(" {} ", app.model_name),
@@ -765,9 +608,8 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         Span::styled(format!(" {dir_short} "), status_style),
     ];
 
-    // Show app.status (indexing progress, thinking, etc.)
     if !app.status.is_empty() {
-        let available = (area.width as usize).saturating_sub(80);
+        let available = (area.width as usize).saturating_sub(100);
         let status_text = if app.status.chars().count() > available && available > 10 {
             format!(
                 "{}…",
@@ -779,8 +621,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         } else {
             app.status.clone()
         };
-        // Pad with spaces to ensure old text is fully overwritten on re-render
-        let padded = format!(" {:<width$} ", status_text, width = available.min(80));
+        let padded = format!(" {:<width$} ", status_text, width = available.min(120));
         left_parts.push(Span::styled(" │ ", status_style));
         left_parts.push(Span::styled(
             padded,
@@ -788,7 +629,6 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, _tick_count: u64)
         ));
     }
 
-    // Right side: phase + message count and cost (compact format)
     let running_indicator = if app.agent_running { "⏳ " } else { "" };
     let phase_part = if app.workflow_phase_line.is_empty() {
         String::new()

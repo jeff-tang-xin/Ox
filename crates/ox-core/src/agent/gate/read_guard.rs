@@ -60,16 +60,20 @@ pub fn check(
             }
             let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0);
             if path_already_read(engine, path) {
+                // Allow re-reads when:
+                // 1. Reading a different portion (offset > 0)
+                // 2. First re-read for verification (in any phase)
+                // 3. Implementation phase: allow one fresh read after review
                 if offset > 0 {
                     return Ok(());
                 }
-                if crate::agent::phase::is_implementation_phase(engine)
-                    && !engine.impl_file_already_read(path)
-                {
+                // Track re-reads to allow first one but block subsequent ones
+                if !engine.impl_file_already_read(path) {
+                    engine.record_impl_file_read(path, "");
                     return Ok(());
                 }
                 return Err(format!(
-                    "⛔ 禁止重复读取 `{path}` — 该文件本轮已读过。请基于已有内容继续，或用 offset 读取未读部分。"
+                    "该文件已读过 2 次以上，建议基于已有内容推进。如需重读请加 offset。"
                 ));
             }
         }
@@ -91,20 +95,14 @@ pub fn check(
             }
         }
         "find_symbol" | "code_search" | "file_search" => {
-            if matches!(tool_name, "code_search" | "file_search" | "file_list")
-                && engine.execute_report_already_delivered()
-                && crate::agent::phase::get(engine)
-                    != crate::agent::phase::SingleFlowPhase::Implement
-            {
-                return Err(format!(
-                    "审查报告已提交 — 禁止 {tool_name}；进入实施后可用 find_symbol。"
-                ));
-            }
+            // Simplified: only block truly duplicate queries within the same turn.
+            // Phase-based gating (execute_report_already_delivered) is removed
+            // to allow simple tasks to proceed without artificial barriers.
             if let Some(query) = symbol_query_key(tool_name, args)
                 && symbol_already_queried(engine, &query)
             {
                 return Err(format!(
-                    "⛔ 禁止重复 {tool_name}({query}) — 该查询本轮已执行过。请基于已有结果继续推进，不要重复探索。"
+                    "⛔ 禁止重复 {tool_name}({query}) — 该查询本轮已执行过。"
                 ));
             }
         }
@@ -272,11 +270,15 @@ mod tests {
     }
 
     #[test]
-    fn blocks_duplicate_file_read() {
+    fn allows_first_reread_then_blocks_duplicate() {
         let e = engine();
         record_file_read(&e, "src/a.rs");
+        // First re-read is allowed (for verification)
         let args = serde_json::json!({"path": "src/a.rs"});
-        assert!(check("file_read", &args, &e).is_err());
+        assert!(check("file_read", &args, &e).is_ok());
+        // Second re-read is blocked
+        let args2 = serde_json::json!({"path": "src/a.rs"});
+        assert!(check("file_read", &args2, &e).is_err());
     }
 
     #[test]
@@ -288,32 +290,14 @@ mod tests {
     }
 
     #[test]
-    fn blocks_code_search_after_review_report() {
-        use crate::agent::findings::{self, Finding, FindingStatus, FindingsStore, Severity};
+    fn allows_code_search_after_review_report() {
+        // Simplified: phase-based search restrictions removed.
+        // Only truly duplicate queries are blocked.
         let e = engine();
         e.mark_execute_report_delivered();
-        findings::save(
-            &e,
-            &FindingsStore {
-                summary: "1 issue".into(),
-                findings: vec![Finding {
-                    index: 1,
-                    severity: Severity::High,
-                    file: "a.java".into(),
-                    symbol: String::new(),
-                    issue: "i".into(),
-                    recommendation: String::new(),
-                    fix_plan: String::new(),
-                    status: FindingStatus::Open,
-                    user_notes: vec![],
-                    dispute: None,
-                    impl_log: vec![],
-                }],
-                active_indices: vec![1],
-            },
-        );
         let args = serde_json::json!({"pattern": "doHandle"});
-        assert!(check("code_search", &args, &e).is_err());
+        // First search is allowed even after review report
+        assert!(check("code_search", &args, &e).is_ok());
     }
 
     #[test]

@@ -455,9 +455,11 @@ impl MemoryStore {
         tool_result: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let assistant_text: String = assistant_text.chars().take(4000).collect();
-        let reasoning: String = reasoning.chars().take(4000).collect();
-        let tool_result: String = tool_result.chars().take(6000).collect();
+        // Store full content without truncation — SQLite TEXT has no length limit.
+        // Only apply a very large safety net to prevent extreme cases.
+        let assistant_text: String = assistant_text.chars().take(50000).collect();
+        let reasoning: String = reasoning.chars().take(50000).collect();
+        let tool_result: String = tool_result.chars().take(100000).collect();
         conn.execute(
             "INSERT INTO react_log
                 (session_id, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result)
@@ -543,13 +545,28 @@ impl MemoryStore {
             ))
         })?;
 
+        // Collect all rows first to enable tiered truncation
+        let all_rows: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+        let total_count = all_rows.len();
+        
         let mut out = String::new();
         let mut prev_date = String::new();
         let mut prev_task = String::new();
-        for row in rows {
-            let (ts, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result) = row?;
+        
+        for (idx, row) in all_rows.iter().enumerate() {
+            let (ts, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result) = row;
             let date: String = ts.chars().take(16).collect();
             let target_short: String = target.chars().take(80).collect();
+
+            // Tiered truncation: recent records get full content
+            // Last 5 records: full limits; earlier records: moderate limits
+            let is_recent = idx >= total_count.saturating_sub(5);
+            
+            let (decision_limit, reasoning_limit, assistant_limit, result_limit) = if is_recent {
+                (500usize, 2000usize, 1000usize, 3000usize)  // Recent: full content
+            } else {
+                (300usize, 800usize, 500usize, 1500usize)    // Older: moderate limits
+            };
 
             if date != prev_date {
                 if !out.is_empty() {
@@ -559,36 +576,45 @@ impl MemoryStore {
                 prev_date = date;
             }
 
-            if task_desc != prev_task {
-                out.push_str(&format!("📋 Task: {}\n", task_desc.chars().take(200).collect::<String>()));
-                prev_task = task_desc;
+            if task_desc.as_str() != prev_task.as_str() {
+                out.push_str(&format!("📋 Task: {}\n", task_desc.chars().take(500).collect::<String>()));
+                prev_task = task_desc.clone();
             }
 
             let icon = if outcome == "ok" || outcome.starts_with("ok") { "✅" } else { "⚠️" };
             out.push_str(&format!("  {} [{}] {}\n", icon, tool, target_short));
 
-            if !decision.is_empty() {
-                out.push_str(&format!("    💭 Decision: {}\n", decision.chars().take(200).collect::<String>()));
+            let d: String = decision.chars().take(decision_limit).collect();
+            if !d.is_empty() {
+                out.push_str(&format!("    💭 Decision: {}\n", d));
             }
 
-            if !reasoning.is_empty() {
-                let r: String = reasoning.chars().take(300).collect();
-                if !r.is_empty() {
-                    out.push_str(&format!("    🧠 Reasoning: {}\n", r));
-                }
+            let r: String = reasoning.chars().take(reasoning_limit).collect();
+            if !r.is_empty() {
+                out.push_str(&format!("    🧠 Reasoning: {}\n", r));
             }
 
-            if !assistant_text.is_empty() {
-                let a: String = assistant_text.chars().take(300).collect();
-                if !a.is_empty() {
-                    out.push_str(&format!("    💬 Assistant: {}\n", a));
-                }
+            let a: String = assistant_text.chars().take(assistant_limit).collect();
+            if !a.is_empty() {
+                out.push_str(&format!("    💬 Assistant: {}\n", a));
             }
 
-            if !tool_result.is_empty() {
-                let r: String = tool_result.chars().take(500).collect();
-                if !r.is_empty() {
-                    out.push_str(&format!("    📄 Result: {}\n", r));
+            let tr: String = tool_result.chars().take(result_limit).collect();
+            if !tr.is_empty() {
+                out.push_str(&format!("    📄 Result: {}\n", tr));
+            }
+
+            // If ALL detail fields are empty, show a compact placeholder
+            if d.is_empty() && r.is_empty() && a.is_empty() && tr.is_empty() {
+                out.push_str("    (无详细记录 — 仅工具执行)\n");
+            }
+            
+            // Add truncation indicator for recent records
+            if is_recent {
+                let orig_len = decision.len() + reasoning.len() + assistant_text.len() + tool_result.len();
+                let shown_len = d.len() + r.len() + a.len() + tr.len();
+                if orig_len > shown_len {
+                    out.push_str("    ... (已截断，完整内容已存储)\n");
                 }
             }
         }

@@ -14,15 +14,20 @@ use crate::memory::turn_memory::TurnMemory;
 /// [USER_ROUND]          ← Current user task (top, always visible)
 /// [TURN_CONTEXT]        ← Iteration, phase, budget gauge, plan recap
 /// ── Edit Dedup ──      ← Files edited this turn (prevents duplicate edits)
-/// 🔄 ReAct Mainline     ← FULL cross-turn action history (LLM's backbone memory)
+/// 🔄 ReAct Log         ← FULL cross-turn action history (LLM's backbone memory)
 ///                         includes: task, decision, reasoning, assistant text, tool result
+///                         ordered by time (oldest first → newest last)
 /// ── Workspace State ── ← Intent, findings, implementation progress
 /// ```
 ///
 /// # Design
 ///
-/// - **ReAct backbone**: `react_log` is the primary memory. Every tool call
-///   is recorded with full context (reasoning, decision, result).
+/// - **ReAct Log = single source of truth**: Every LLM action (thinking,
+///   text output, tool call, tool result) is recorded in `react_log`.
+///   The LLM reads this log to know what it did last round.
+/// - **No stop-signal dependency**: The loop does NOT rely on detecting
+///   text markers like `## Done` or `总结` to know when to stop.
+///   Instead, LLM naturally stops when it outputs plain text without tool calls.
 /// - **TurnMemory = dedup**: Used only for edit tracking + in-turn prevention.
 ///   NOT an independent memory source.
 /// - **Single injection**: One `assemble()` call replaces all scattered
@@ -89,13 +94,13 @@ impl ContextAssembler {
         // 2c. Edit dedup (from TurnMemory — unique info, not in react_log)
         block.push_str(&crate::agent::mod_builders::build_edit_dedup_block(turn_memory));
 
-        // 2d. 🔄 ReAct Mainline — the LLM's backbone memory (replaces old Timeline)
-        // This is the key upgrade: full ReAct history with reasoning + results.
+        // 2d. 🔄 ReAct Log — the LLM's backbone memory (single source of truth)
+        // Every LLM action is recorded here, from oldest to newest.
         if let Some(ms) = memory_store {
             let mainline_limit = if in_impl_phase { 50 } else { 30 };
             if let Ok(mainline) = ms.get_react_mainline(session_id, mainline_limit) {
                 if !mainline.trim().is_empty() {
-                    block.push_str("🔄 ReAct Mainline (Full Action History):\n");
+                    block.push_str("📜 历史行动轨迹 (ReAct Log, 由远及近):\n");
                     block.push_str(&mainline);
                     block.push('\n');
                 }

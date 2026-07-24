@@ -268,8 +268,18 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
         || engine.get_variable(ROUND_FINALIZED_KEY).as_deref() == Some("1")
     {
         if engine.reopen_execute_for_fixes(user_message) {
-            engine.clear_turn_provenance();
-            engine.set_variable("_current_user_request", user_message.to_string());
+            // 🔴 DO NOT clear turn provenance — this is fix mode,
+            // keep file-read records to prevent re-exploration.
+            // Preserve original task + append fix instruction.
+            let prev = engine.get_variable("_current_user_request")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| user_message.to_string());
+            let combined = if prev == user_message {
+                prev.clone()
+            } else {
+                format!("{prev} → {user_message}")
+            };
+            engine.set_variable("_current_user_request", combined);
             return false;
         }
         if let Some(prev) = engine.get_variable("_current_user_request")

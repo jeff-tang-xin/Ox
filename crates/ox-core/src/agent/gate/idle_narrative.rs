@@ -60,21 +60,17 @@ pub enum IdleAction {
 }
 
 /// True when assistant text is acknowledgment / planning prose without substance.
+/// Any substantive text (≥ 80 chars, or containing JSON, or containing code blocks)
+/// is considered a valid output — the ReAct Log will capture it.
 pub fn is_idle_narrative(content: &str) -> bool {
     let t = content.trim();
     if t.is_empty() {
         return true;
     }
-    if WorkflowEngine::looks_like_review_report(t) {
-        return false;
-    }
-    if WorkflowEngine::text_signals_done(t) {
-        return false;
-    }
     if crate::agent::engine::extract_json_block(t).is_some() {
         return false;
     }
-    // Long prose is substantive reasoning — not "空转" just because it says "让我先读".
+    // Long prose is substantive reasoning — not "空转".
     const SUBSTANTIVE_CHARS: usize = 280;
     if t.chars().count() >= SUBSTANTIVE_CHARS {
         return false;
@@ -136,16 +132,14 @@ pub fn is_idle_narrative(content: &str) -> bool {
 }
 
 /// Whether text satisfies the current workflow step output requirement.
+/// With the new ReAct-Log-driven design, any non-idle text is a valid deliverable.
 pub fn is_step_deliverable(ctx: &IdleContext<'_>, content: &str) -> bool {
     let t = content.trim();
     if t.is_empty() {
         return false;
     }
     if ctx.engine.is_some_and(|e| e.is_single_step()) {
-        return WorkflowEngine::text_signals_done(t)
-            || WorkflowEngine::looks_like_review_report(t)
-            || crate::agent::perception::extract_from_text(t).is_some()
-            || (!is_idle_narrative(t) && t.chars().count() >= 80);
+        return !is_idle_narrative(t) || crate::agent::engine::extract_json_block(t).is_some();
     }
     !is_idle_narrative(t)
 }

@@ -95,10 +95,6 @@ pub const THINK_PANE_SLIM_HEIGHT: u16 = 3;
 pub const THINKING_DOCK_LINES: usize = 2;
 /// Main column height split — chat largest, think medium.
 pub const CHAT_THINK_HEIGHT_RATIO: (u32, u32) = (7, 3);
-/// Session sidebar width — smallest slice of main row (~12%).
-pub const SESSION_WIDTH_PERCENT: u16 = 12;
-pub const SESSION_WIDTH_MIN: u16 = 12;
-pub const SESSION_WIDTH_MAX: u16 = 20;
 
 /// How much vertical space the think pane should take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

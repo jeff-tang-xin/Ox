@@ -202,7 +202,6 @@ pub struct App {
     pub trusted_all: bool,
     pub header_info: Vec<String>,
     pub sessions: Vec<SessionEntry>,
-    pub sidebar_width: u16,
     /// Track last spinner frame to avoid unnecessary renders
     pub last_spinner_frame: u64,
 
@@ -313,7 +312,6 @@ impl App {
             trusted_all: false,
             header_info: Vec::new(),
             sessions: Vec::new(),
-            sidebar_width: 22,
             last_spinner_frame: 0,
 
             // Implicit feedback system initialization

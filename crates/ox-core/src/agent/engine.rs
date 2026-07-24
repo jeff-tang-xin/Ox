@@ -1082,6 +1082,41 @@ impl WorkflowEngine {
         false
     }
 
+    /// Detect if LLM's plain text response signals task completion.
+    /// Unlike text_signals_done (which checks for explicit markers like ## Done),
+    /// this checks for more general completion patterns in the response.
+    pub fn text_signals_completion(text: &str) -> bool {
+        let t = text.trim();
+        if t.chars().count() < 50 {
+            return false;
+        }
+        
+        // Check for completion-related keywords at the beginning or end
+        let lower = t.to_lowercase();
+        let completion_markers = [
+            "总结", "结论", "综上", "最后", "总的来说",
+            "summary", "conclusion", "to sum up", "in conclusion",
+            "task completed", "已完成", "搞定", "没问题",
+        ];
+        
+        for marker in &completion_markers {
+            if lower.contains(marker) {
+                return true;
+            }
+        }
+        
+        // Check if the last line indicates completion
+        if let Some(last) = t.lines().map(str::trim).rfind(|l| !l.is_empty()) {
+            let last_lower = last.to_lowercase();
+            if last_lower.contains("已完成") || last_lower.contains("搞定") || 
+               last_lower.contains("没问题") || last_lower.contains("完成了") {
+                return true;
+            }
+        }
+        
+        false
+    }
+
     /// Structured code-review report without explicit ## Done (exploring execute).
     pub fn looks_like_review_report(text: &str) -> bool {
         let t = text.trim();

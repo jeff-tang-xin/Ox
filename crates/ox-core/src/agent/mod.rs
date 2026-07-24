@@ -202,6 +202,70 @@ fn digest_reasoning(text: &str, max_chars: usize) -> String {
     format!("{head}\n…(中间省略)…\n{tail}")
 }
 
+/// Build reasoning fallback for react_log recording.
+/// In tool mode the LLM often produces no <think> tags, so we synthesise
+/// a plausible "why" from the tool call arguments or the visible text.
+/// This ensures react_log always carries a meaningful reasoning field
+/// so subsequent turns can reconstruct the decision chain.
+pub fn build_reasoning_fallback(
+    reasoning_content: &str,
+    tool_name: &str,
+    tool_arguments: &str,
+    full_text: &str,
+    unified_tool_mode: bool,
+) -> String {
+    if !reasoning_content.trim().is_empty() {
+        return reasoning_content.to_string();
+    }
+
+    // Try to extract a meaningful intent from tool arguments
+    if !tool_name.is_empty() && !tool_arguments.is_empty() {
+        if unified_tool_mode && tool_name == crate::agent::unified_action::TOOL_NAME {
+            if let Ok(req) = crate::agent::unified_action::parse_request(tool_arguments) {
+                let action = req.action;
+                let target = req
+                    .params
+                    .get("path")
+                    .or_else(|| req.params.get("name"))
+                    .or_else(|| req.params.get("target"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.chars().take(80).collect::<String>())
+                    .unwrap_or_else(|| "?".to_string());
+                let args_preview: String = tool_arguments.chars().take(120).collect();
+                return format!(
+                    "(意图推断) LLM 决定执行 `{action}` 操作，目标: {target}，参数: {args_preview}"
+                );
+            }
+        } else {
+            let target_json: Option<serde_json::Value> = serde_json::from_str(tool_arguments).ok();
+            let target: String = target_json
+                .as_ref()
+                .and_then(|v| v.get("path").or_else(|| v.get("name")).or_else(|| v.get("params")))
+                .map(|x| {
+                    if let Some(s) = x.as_str() {
+                        s.chars().take(80).collect()
+                    } else {
+                        x.to_string().chars().take(80).collect()
+                    }
+                })
+                .unwrap_or_else(|| "?".to_string());
+            let args_preview: String = tool_arguments.chars().take(120).collect();
+            return format!(
+                "(意图推断) LLM 调用 `{tool_name}`，目标: {target}，参数: {args_preview}"
+            );
+        }
+    }
+
+    // If no tool, try to extract from full text
+    let visible = crate::agent::think_stream::visible_only(full_text);
+    if !visible.trim().is_empty() {
+        let preview: String = visible.chars().take(150).collect();
+        return format!("(文本推断) LLM 输出文本: {preview}");
+    }
+
+    "(本轮无显式思考过程，仅工具调用)".to_string()
+}
+
 /// Deliver a user interjection into the live message list (workflow-aware).
 fn push_interjection_message(
     workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
@@ -868,18 +932,12 @@ pub async fn run_agent_turn(
         tracing::debug!("{}", "=".repeat(80));
 
         let mut llm_opts = crate::llm::StreamOptions::default();
-        if unified_tool_mode && !schemas.is_empty() {
-            // Unified mode always exposes exactly ONE tool (`complete_and_check`).
-            // We force it by NAME rather than the generic "required": glm-5.1 (via
-            // the aigw gateway) does NOT honor "required" — it writes the intended
-            // action into reasoning and returns no tool_call, stalling the loop.
-            // The named form `{"type":"function","function":{"name":...}}` is the
-            // stronger contract. (Some GPT-compatible endpoints reject the named
-            // form with `Missing required parameter: 'tool_choice.name'`; if this
-            // endpoint does, fall back to ToolChoice::Required.)
-            llm_opts.tool_choice = Some(crate::llm::ToolChoice::Function(
-                crate::agent::unified_action::TOOL_NAME.to_string(),
-            ));
+        if !schemas.is_empty() {
+            // Use tool_choice: auto — LLM can choose to call tools or output
+            // plain text. When no tool_calls are returned, it means the LLM
+            // has reached a conclusion and is ending the turn. This replaces
+            // the old "finish" action with natural LLM behavior.
+            llm_opts.tool_choice = Some(crate::llm::ToolChoice::Auto);
             llm_opts.parallel_tool_calls = Some(true);
         }
         let cancel_clone = cancel_token.clone();
@@ -1241,311 +1299,68 @@ pub async fn run_agent_turn(
             }
         }
 
-        // If no tool calls, the turn is complete.
         if tool_calls.is_empty() {
-            if unified_tool_mode {
-                // We force `complete_and_check` on every step (tool_choice=Function),
-                // so a response with NO tool call is the model NOT complying — it
-                // returned prose only. There is no legitimate "plain-text step": the
-                // Thought must ride in the content field ALONGSIDE the call, and the
-                // only way to end the turn is an explicit `finish`. This branch is
-                // anomaly recovery: preserve whatever reasoning the model wrote (so it
-                // isn't lost), then make it emit a proper call. Cap so a persistently
-                // non-complying model can't burn the whole turn.
-                let visible = crate::agent::think_stream::visible_only(&full_text);
-                if !visible.trim().is_empty() {
-                    content_only_streak += 1;
-                    let msg = Message::Assistant {
-                        content: visible.clone(),
-                        tool_calls: Vec::new(),
-                        reasoning_content: None,
-                    };
-                    new_messages.push(msg.clone());
-                    messages.push(msg);
+            let visible = crate::agent::think_stream::visible_only(&full_text);
+            let reasoning = crate::agent::think_stream::visible_only(&reasoning_content);
 
-                    const CONTENT_ONLY_HARD_CAP: u32 = 8;
-                    if content_only_streak >= CONTENT_ONLY_HARD_CAP {
-                        let _ = ui_tx.send(AgentToUiEvent::Status(
-                            "⏹️ 多次未发出 complete_and_check — 结束本轮，等用户输入".to_string(),
-                        ));
-                        persist_turn_memory(&workflow_engine, &turn_memory);
-                        emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                        return;
-                    }
-
-                    messages.push(Message::system(
-                        "⚠️ 你这步没有调用 complete_and_check（本系统每步都必须通过它行动）。\
-                         把上面的思考作为依据，立即发出一个 complete_and_check 调用：\
-                         继续就用 file_read/find_symbol/edit_file… 行动；确已完成就 finish(params.content=…) 收尾。",
-                    ));
-                    persist_turn_memory(&workflow_engine, &turn_memory);
-                    iteration += 1;
-                    continue;
-                }
-                // Empty visible output. If the model produced ONLY reasoning
-                // (content all inside <think>), we must NOT silently drop it:
-                // doing so leaves the message history unchanged, so the next LLM
-                // call sees identical input and regenerates the identical thought
-                // — a reasoning-only infinite loop. Persist a digest of the
-                // reasoning into the visible history so context advances, and
-                // count it toward the hard cap so the loop can terminate.
-                let reasoning_digest = crate::agent::think_stream::visible_only(&reasoning_content);
-                let reasoning_digest = if reasoning_digest.is_empty() {
-                    reasoning_content.trim().to_string()
-                } else {
-                    reasoning_digest
-                };
-                if !reasoning_digest.is_empty() {
-                    content_only_streak += 1;
-                    // Keep head + tail: the conclusion (what to do next) usually
-                    // lives at the END of the reasoning, so prioritize the tail.
-                    let digest = digest_reasoning(&reasoning_digest, 1400);
-                    let msg = Message::Assistant {
-                        content: format!("(内部思考摘要)\n{digest}"),
-                        tool_calls: Vec::new(),
-                        reasoning_content: None,
-                    };
-                    new_messages.push(msg.clone());
-                    messages.push(msg);
-
-                    const CONTENT_ONLY_HARD_CAP: u32 = 8;
-                    if content_only_streak >= CONTENT_ONLY_HARD_CAP {
-                        let _ = ui_tx.send(AgentToUiEvent::Status(
-                            "⏹️ 多次只思考未发出动作 — 结束本轮，等用户输入".to_string(),
-                        ));
-                        persist_turn_memory(&workflow_engine, &turn_memory);
-                        emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                        return;
-                    }
-
-                    messages.push(Message::system(
-                        "⚠️ 你上一步只输出了思考，没有发出 complete_and_check。\
-                         不要重复同样的思考。基于上面的思考摘要，立即发出一个具体动作：\
-                         file_read 一个**还没读过**的文件 / edit_file / finish 收尾。",
-                    ));
-                    persist_turn_memory(&workflow_engine, &turn_memory);
-                    iteration += 1;
-                    continue;
-                }
-                // Truly empty response (no visible, no reasoning) — nudge to act.
-                content_only_streak += 1;
-                const EMPTY_HARD_CAP: u32 = 8;
-                if content_only_streak >= EMPTY_HARD_CAP {
-                    let _ = ui_tx.send(AgentToUiEvent::Status(
-                        "⏹️ 多次空响应 — 结束本轮，等用户输入".to_string(),
-                    ));
-                    persist_turn_memory(&workflow_engine, &turn_memory);
-                    emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                    return;
-                }
-                messages.push(Message::system(
-                    "【ALL-TOOLING】请勿空输出。必须调用 complete_and_check（行动 或 finish 收尾）。",
-                ));
-                persist_turn_memory(&workflow_engine, &turn_memory);
-                iteration += 1;
-                continue;
-            }
-            // Cross-step idle detection — break prose↔gate loops before stacking messages.
-            if let Some(ref engine_arc) = workflow_engine
-                && let Ok(engine) = engine_arc.try_lock()
-                && engine.is_workflow_active()
-                && pre_llm_step_idx <= 3
+            // Record to react_log: LLM's plain-text output (thinking + text).
+            // This becomes the backbone memory for subsequent rounds.
             {
-                let ctx = crate::agent::gate::idle_narrative::IdleContext {
-                    step_idx: pre_llm_step_idx,
-                    engine: Some(&*engine),
-                };
-                let visible_for_idle = crate::agent::think_stream::visible_only(&full_text);
-                if !crate::agent::gate::idle_narrative::is_step_deliverable(&ctx, &visible_for_idle)
-                    && crate::agent::gate::idle_narrative::is_idle_narrative(&visible_for_idle)
-                {
-                    match crate::agent::gate::idle_narrative::handle_empty_response(
-                        &ctx,
-                        &visible_for_idle,
-                        &mut idle_streak,
-                        false,
-                        Some(last_stream_completion_tokens),
-                        unified_tool_mode,
-                    ) {
-                        crate::agent::gate::idle_narrative::IdleAction::EndTurn { user_status } => {
-                            tracing::warn!(
-                                "[IDLE] step {} streak {} — ending turn",
-                                pre_llm_step_idx,
-                                idle_streak
-                            );
-                            let _ = ui_tx.send(AgentToUiEvent::Status(user_status));
-                            persist_turn_memory(&workflow_engine, &turn_memory);
-                            drop(engine);
-                            emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                            return;
-                        }
-                        crate::agent::gate::idle_narrative::IdleAction::Continue { directive } => {
-                            let msg = Message::Assistant {
-                                content: crate::agent::think_stream::visible_only(&full_text),
-                                tool_calls: Vec::new(),
-                                reasoning_content: None,
-                            };
-                            crate::agent::gate::idle_narrative::upsert_idle_assistant(
-                                &mut messages,
-                                &msg,
-                            );
-                            crate::agent::gate::idle_narrative::upsert_idle_assistant(
-                                &mut new_messages,
-                                &msg,
-                            );
-                            if let Some(d) = directive {
-                                crate::agent::gate::idle_narrative::upsert_idle_hint(&mut messages, &d);
-                            }
-                            persist_turn_memory(&workflow_engine, &turn_memory);
-                            drop(engine);
-                            iteration += 1;
-                            continue;
-                        }
-                    }
+                if let Some(ref ms) = tool_ctx.memory_store {
+                    let session_id = workflow_engine
+                        .as_ref()
+                        .and_then(|wf| wf.try_lock().ok())
+                        .map(|e| e.session_id())
+                        .unwrap_or_else(|| "default".to_string());
+                    let task_desc = workflow_engine
+                        .as_ref()
+                        .and_then(|wf| wf.try_lock().ok())
+                        .and_then(|e| e.get_variable("_current_user_request"))
+                        .unwrap_or_else(|| user_task.clone().unwrap_or_default());
+
+                    let assistant_text = if visible.trim().is_empty() {
+                        reasoning.clone()
+                    } else {
+                        visible.clone()
+                    };
+
+                    let decision = if !reasoning.is_empty() {
+                        reasoning.chars().take(200).collect()
+                    } else {
+                        "LLM 输出文本".to_string()
+                    };
+
+                    let _ = ms.record_react(
+                        &session_id,
+                        &task_desc,
+                        "(llm_text)",
+                        "",
+                        "ok",
+                        &decision,
+                        &assistant_text,
+                        &reasoning_content,
+                        "LLM 纯文本输出，本轮结束",
+                    );
                 }
             }
 
-            // Single-step model: always show the assistant's text to the user
-            // (perception filter strips machine-only findings JSON when present).
-            let content_for_session = execute_user_display(
-                &workflow_engine,
-                pre_llm_step_idx,
-                &crate::agent::think_stream::visible_only(&full_text),
-            );
-
-            let msg = Message::Assistant {
-                content: content_for_session.clone(),
-                tool_calls: Vec::new(),
-                reasoning_content: None,
-            };
-            let workflow_active = workflow_engine.as_ref().is_some_and(|wf| {
-                wf.try_lock()
-                    .map(|e| e.is_workflow_active())
-                    .unwrap_or(false)
-            });
-            if crate::agent::engine::WorkflowEngine::looks_like_review_report(&content_for_session)
-            {
-                upsert_review_report_assistant(&mut messages, &msg);
-                upsert_review_report_assistant(&mut new_messages, &msg);
-                if let Some(ref engine_arc) = workflow_engine
-                    && let Ok(engine) = engine_arc.try_lock()
-                    && engine.is_single_step()
-                {
-                    let phase = crate::agent::phase::get(&engine);
-                    if matches!(
-                        phase,
-                        crate::agent::phase::SingleFlowPhase::Receive
-                            | crate::agent::phase::SingleFlowPhase::Review
-                    ) {
-                        let result = crate::agent::phase::transition(
-                            &engine,
-                            crate::agent::phase::PhaseEvent::ReviewReportDelivered,
-                        );
-                        notify_workspace_state_if_changed(&ui_tx, &engine, &result);
-                    }
-                }
-            } else if workflow_active
-                && crate::agent::gate::idle_narrative::is_idle_narrative(&content_for_session)
-            {
-                crate::agent::gate::idle_narrative::upsert_idle_assistant(&mut messages, &msg);
-                crate::agent::gate::idle_narrative::upsert_idle_assistant(&mut new_messages, &msg);
+            let msg_content = if visible.trim().is_empty() {
+                reasoning_content.clone()
             } else {
-                new_messages.push(msg.clone());
-                messages.push(msg);
-            }
+                visible.clone()
+            };
+            let msg = Message::Assistant {
+                content: msg_content.clone(),
+                tool_calls: Vec::new(),
+                reasoning_content: Some(reasoning_content.clone()),
+            };
+            new_messages.push(msg.clone());
+            messages.push(msg);
 
-            // ── Implement: block re-emitting review findings instead of editing ──
-            if let Some(ref engine_arc) = workflow_engine
-                && let Ok(engine) = engine_arc.try_lock()
-                && crate::agent::phase::get(&engine)
-                    == crate::agent::phase::SingleFlowPhase::Implement
-                && !crate::agent::engine::WorkflowEngine::text_signals_done(&full_text)
-                && (crate::agent::engine::WorkflowEngine::looks_like_review_report(&full_text)
-                    || crate::agent::perception::extract_from_text(&full_text).is_some())
-            {
-                messages.push(Message::system(
-                    "【实施轮】禁止重新输出 findings / 审查报告。\
-                             读 [TURN_CONTEXT]「下一步」，直接 file_read → edit_file。",
-                ));
-                persist_turn_memory(&workflow_engine, &turn_memory);
-                iteration += 1;
-                continue;
-            }
-
-            // ── ## Done → gatekeeper pipeline (single-step model) ──
-            if crate::agent::engine::WorkflowEngine::text_signals_done(&full_text)
-                && let Some(ref engine_arc) = workflow_engine
-            {
-                let mut engine = engine_arc.lock().await;
-                if engine.is_workflow_active() && !engine.is_workflow_complete() {
-                    let had_code = turn_memory.had_code_changes();
-                    match engine.run_done_gates(&full_text, had_code) {
-                        crate::agent::gate::GateReport::Pass => {
-                            engine.set_previous_output(&full_text);
-                            let had_receipt =
-                                crate::agent::completion::extract_from_text(&full_text).is_some();
-                            if let Some(receipt) =
-                                crate::agent::completion::extract_from_text(&full_text)
-                                && let Some(mut store) =
-                                    crate::agent::findings::load_or_migrate(&engine)
-                            {
-                                crate::agent::completion::apply_receipt(&mut store, &receipt);
-                                crate::agent::findings::save(&engine, &store);
-                            }
-                            let result = crate::agent::phase::transition(
-                                &engine,
-                                crate::agent::phase::PhaseEvent::DoneGatePassed {
-                                    had_completion_receipt: had_receipt,
-                                },
-                            );
-                            notify_workspace_state_if_changed(&ui_tx, &engine, &result);
-                            if result.phase == crate::agent::phase::SingleFlowPhase::Complete {
-                                let _ = engine.complete_workflow();
-                                emit_workflow_completed(
-                                    &ui_tx,
-                                    user_task.as_ref(),
-                                    &engine,
-                                    &full_text,
-                                );
-                                let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
-                            } else if result.phase
-                                == crate::agent::phase::SingleFlowPhase::AwaitUser
-                            {
-                                let _ = ui_tx.send(AgentToUiEvent::Status(
-                                    "✅ 审查完成 — 门禁暂停，待用户在面板确认范围（c /confirm）"
-                                        .to_string(),
-                                ));
-                            } else {
-                                let _ = ui_tx.send(AgentToUiEvent::Status("✅ 完成".to_string()));
-                            }
-                            drop(engine);
-                            emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                            return;
-                        }
-                        crate::agent::gate::GateReport::Fail { gate, feedback } => {
-                            let recovery = gate_recovery_hint(&gate);
-                            messages.push(Message::system(format!(
-                                "【门禁·{gate}】{feedback}\n\n\
-                                     👉 **恢复：** 按 [TURN_CONTEXT]「下一步」执行；{recovery}"
-                            )));
-                            persist_turn_memory(&workflow_engine, &turn_memory);
-                            drop(engine);
-                            iteration += 1;
-                            continue;
-                        }
-                        crate::agent::gate::GateReport::NeedsUser { gate, prompt } => {
-                            let status = format!("【门禁·{gate}】{prompt}");
-                            let _ = ui_tx.send(AgentToUiEvent::Status(status.clone()));
-                            messages.push(Message::system(&status));
-                            persist_turn_memory(&workflow_engine, &turn_memory);
-                            drop(engine);
-                            emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                            return;
-                        }
-                    }
-                }
-            }
-
+            let _ = ui_tx.send(AgentToUiEvent::Status(
+                "✅ LLM 输出完成，本轮结束".to_string(),
+            ));
+            persist_turn_memory(&workflow_engine, &turn_memory);
             emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
             return;
         }
@@ -1891,6 +1706,99 @@ pub async fn run_agent_turn(
         // record_turn removed — KnowledgeEngine disabled at runtime
         let _ = l0_content;
 
+        // ── 🔴 UNIFIED RECORD: Capture LLM's decision BEFORE tool execution ──
+        // This is the "front-door interception" point: every LLM response
+        // gets recorded to react_log immediately, regardless of what happens
+        // to the tools (success/failure/cancellation). This ensures the LLM's
+        // reasoning and intent are never lost.
+        {
+            if let Some(ref ms) = tool_ctx.memory_store {
+                let session_id = workflow_engine
+                    .as_ref()
+                    .and_then(|wf| wf.try_lock().ok())
+                    .map(|e| e.session_id())
+                    .unwrap_or_else(|| "default".to_string());
+                let task_desc = workflow_engine
+                    .as_ref()
+                    .and_then(|wf| wf.try_lock().ok())
+                    .and_then(|e| e.get_variable("_current_user_request"))
+                    .unwrap_or_else(|| user_task.clone().unwrap_or_default());
+
+                let first_tool = tool_calls.first();
+                let (tool_name, tool_target) = if let Some(tc) = first_tool {
+                    if unified_tool_mode
+                        && tc.name == crate::agent::unified_action::TOOL_NAME
+                    {
+                        crate::agent::unified_action::parse_request(&tc.arguments)
+                            .ok()
+                            .map(|req| {
+                                let target = req.params.get("path")
+                                    .or_else(|| req.params.get("name"))
+                                    .or_else(|| req.params.get("target"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default();
+                                (req.action, target)
+                            })
+                            .unwrap_or_else(|| (tc.name.clone(), String::new()))
+                    } else {
+                        let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                        let target: String = target_json
+                            .as_ref()
+                            .and_then(|v| v.get("path").or_else(|| v.get("name")))
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        (tc.name.clone(), target)
+                    }
+                } else {
+                    ("(no tool)".to_string(), String::new())
+                };
+
+                // Build reasoning fallback using unified helper
+                let reasoning_fallback = build_reasoning_fallback(
+                    &reasoning_content,
+                    tool_name.as_str(),
+                    first_tool.map(|tc| tc.arguments.as_str()).unwrap_or(""),
+                    &full_text,
+                    unified_tool_mode,
+                );
+
+                // Build assistant_text: prefer visible text, else reasoning summary
+                let assistant_text = {
+                    let raw = crate::agent::think_stream::visible_only(&full_text);
+                    if raw.trim().is_empty() {
+                        if !reasoning_content.trim().is_empty() {
+                            format!("(思考摘要) {}", reasoning_content)
+                        } else {
+                            "(本轮仅工具调用，无可见文本)".into()
+                        }
+                    } else {
+                        raw
+                    }
+                };
+
+                // Store full decision without truncation
+                let decision = turn_memory
+                    .decisions
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| format!("LLM 选择执行: {}", actions_summary));
+
+                let _ = ms.record_react(
+                    &session_id,
+                    &task_desc,
+                    &tool_name,
+                    &tool_target,
+                    "llm_decision",
+                    &decision,
+                    &assistant_text,
+                    &reasoning_fallback,
+                    &format!("(待执行) {} 个工具调用", tool_calls.len()),
+                );
+            }
+        }
+
         // ── Context Offloader: created once and reused across all tools in this iteration ──
         let mut offloader = crate::context::context_offloader::ContextOffloader::new(
             &tool_ctx.working_dir,
@@ -2115,13 +2023,31 @@ pub async fn run_agent_turn(
                                     .map(|e| e.session_id())
                                     .unwrap_or_else(|| "default".to_string());
                                 let react_task = user_task.clone().unwrap_or_default();
+                                // Store full decision without truncation
                                 let decision = turn_memory
                                     .decisions
                                     .last()
-                                    .map(|d| d.chars().take(200).collect::<String>())
-                                    .unwrap_or_default();
-                                let assistant_text =
-                                    crate::agent::think_stream::visible_only(&full_text);
+                                    .cloned()
+                                    .unwrap_or_else(|| "本轮仅工具调用".into());
+                                let assistant_text = {
+                                    let raw = crate::agent::think_stream::visible_only(&full_text);
+                                    if raw.trim().is_empty() {
+                                        if !reasoning_content.trim().is_empty() {
+                                            format!("(思考摘要) {}", reasoning_content)
+                                        } else {
+                                            "(本轮仅工具调用，无可见文本)".into()
+                                        }
+                                    } else {
+                                        raw
+                                    }
+                                };
+                                let reasoning_fallback = build_reasoning_fallback(
+                                    &reasoning_content,
+                                    &meta.inner_tool,
+                                    &meta.inner_args,
+                                    &full_text,
+                                    unified_tool_mode,
+                                );
                                 let outcome = if is_error { "error" } else { "ok" };
                                 let _ = ms.record_react(
                                     &session_id,
@@ -2131,12 +2057,68 @@ pub async fn run_agent_turn(
                                     outcome,
                                     &decision,
                                     &assistant_text,
-                                    &reasoning_content,
+                                    &reasoning_fallback,
                                     &meta.live_output,
                                 );
                             }
                         } else {
                             turn_memory.record_tool(&tc.name, &tc.arguments, is_error);
+                            // Also record tool execution result to react_log
+                            if let Some(ref ms) = tool_ctx.memory_store {
+                                let session_id = workflow_engine
+                                    .as_ref()
+                                    .and_then(|wf| wf.try_lock().ok())
+                                    .map(|e| e.session_id())
+                                    .unwrap_or_else(|| "default".to_string());
+                                let task_desc = workflow_engine
+                                    .as_ref()
+                                    .and_then(|wf| wf.try_lock().ok())
+                                    .and_then(|e| e.get_variable("_current_user_request"))
+                                    .unwrap_or_default();
+                                let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                                let target = target_json
+                                    .as_ref()
+                                    .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                                    .and_then(|x| x.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default();
+                                // Store full decision without truncation
+                                let decision = turn_memory
+                                    .decisions
+                                    .last()
+                                    .cloned()
+                                    .unwrap_or_else(|| "本轮仅工具调用".into());
+                                let assistant_text = {
+                                    let raw = crate::agent::think_stream::visible_only(&full_text);
+                                    if raw.trim().is_empty() {
+                                        if !reasoning_content.trim().is_empty() {
+                                            format!("(思考摘要) {}", reasoning_content)
+                                        } else {
+                                            "(本轮仅工具调用，无可见文本)".into()
+                                        }
+                                    } else {
+                                        raw
+                                    }
+                                };
+                                let reasoning_fallback = build_reasoning_fallback(
+                                    &reasoning_content,
+                                    &tc.name,
+                                    &tc.arguments,
+                                    &full_text,
+                                    unified_tool_mode,
+                                );
+                                let _ = ms.record_react(
+                                    &session_id,
+                                    &task_desc,
+                                    &tc.name,
+                                    &target,
+                                    if is_error { "error" } else { "ok" },
+                                    &decision,
+                                    &assistant_text,
+                                    &reasoning_fallback,
+                                    &content,
+                                );
+                            }
                         }
                         let _ = ui_tx.send(AgentToUiEvent::ToolResult {
                             name: tc.name.clone(),
@@ -2145,6 +2127,7 @@ pub async fn run_agent_turn(
                         });
                     }
                     crate::agent::unified_handler::UnifiedHandleOutcome::TurnDone { summary } => {
+                        let finish_content_text = summary.clone().unwrap_or_default();
                         // Persist the agent's final free-text summary so it lives
                         // in the session transcript (it was previously only
                         // previewed in the UI via DeliverPreview and lost on
@@ -2167,6 +2150,58 @@ pub async fn run_agent_turn(
                                     _ => new_messages.push(Message::assistant(summary)),
                                 }
                             }
+                        }
+                        // ── Persist the finish action to react_log (cross-round memory) ──
+                        // LLM's final summary + reasoning + finish content must be
+                        // written to react_log so subsequent sessions can recall
+                        // what this round concluded.
+                        if let Some(ref ms) = tool_ctx.memory_store {
+                            let session_id = workflow_engine
+                                .as_ref()
+                                .and_then(|wf| wf.try_lock().ok())
+                                .map(|e| e.session_id())
+                                .unwrap_or_else(|| "default".to_string());
+                            let task_desc = workflow_engine
+                                .as_ref()
+                                .and_then(|wf| wf.try_lock().ok())
+                                .and_then(|e| e.get_variable("_current_user_request"))
+                                .unwrap_or_default();
+                            // Store full decision without truncation
+                            let decision = turn_memory
+                                .decisions
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| "finish: round completed".into());
+                            let assistant_text = {
+                                let raw = crate::agent::think_stream::visible_only(&full_text);
+                                if raw.trim().is_empty() {
+                                    if !reasoning_content.trim().is_empty() {
+                                        format!("(思考摘要) {}", reasoning_content)
+                                    } else {
+                                        "(本轮仅工具调用，无可见文本)".into()
+                                    }
+                                } else {
+                                    raw
+                                }
+                            };
+                            let reasoning_fallback = build_reasoning_fallback(
+                                &reasoning_content,
+                                tc.name.as_str(),
+                                &tc.arguments,
+                                &full_text,
+                                unified_tool_mode,
+                            );
+                            let _ = ms.record_react(
+                                &session_id,
+                                &task_desc,
+                                tc.name.as_str(),
+                                finish_content_text.as_str(),
+                                "ok",
+                                &decision,
+                                &assistant_text,
+                                &reasoning_fallback,
+                                &finish_content_text,
+                            );
                         }
                         if let Some(wf) = &workflow_engine
                             && let Ok(engine) = wf.try_lock()
@@ -2233,6 +2268,52 @@ pub async fn run_agent_turn(
                 new_messages.push(result_msg.clone());
                 messages.push(result_msg);
                 turn_memory.record_tool(&tc.name, &tc.arguments, false);
+                // Record infinite loop detection to react_log
+                if let Some(ref ms) = tool_ctx.memory_store {
+                    let session_id = workflow_engine
+                        .as_ref()
+                        .and_then(|wf| wf.try_lock().ok())
+                        .map(|e| e.session_id())
+                        .unwrap_or_else(|| "default".to_string());
+                    let task_desc = workflow_engine
+                        .as_ref()
+                        .and_then(|wf| wf.try_lock().ok())
+                        .and_then(|e| e.get_variable("_current_user_request"))
+                        .unwrap_or_default();
+                    let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                    let target = target_json
+                        .as_ref()
+                        .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    let reasoning_fallback = build_reasoning_fallback(
+                        &reasoning_content,
+                        &tc.name,
+                        &tc.arguments,
+                        &full_text,
+                        unified_tool_mode,
+                    );
+                    let assistant_text = {
+                        let raw = crate::agent::think_stream::visible_only(&full_text);
+                        if raw.trim().is_empty() {
+                            "(LLM 陷入循环，被系统阻止)".into()
+                        } else {
+                            raw
+                        }
+                    };
+                    let _ = ms.record_react(
+                        &session_id,
+                        &task_desc,
+                        &tc.name,
+                        &target,
+                        "blocked",
+                        &format!("🚨 检测到无限循环: {} 已调用 {} 次，强制阻止", loop_key, call_count),
+                        &assistant_text,
+                        &reasoning_fallback,
+                        &error_msg,
+                    );
+                }
                 let _ = ui_tx.send(AgentToUiEvent::ToolResult {
                     name: tc.name.clone(),
                     output: error_msg,
@@ -2615,6 +2696,52 @@ pub async fn run_agent_turn(
                         };
                         new_messages.push(result_msg.clone());
                         messages.push(result_msg);
+                        // Record user denial to react_log
+                        if let Some(ref ms) = tool_ctx.memory_store {
+                            let session_id = workflow_engine
+                                .as_ref()
+                                .and_then(|wf| wf.try_lock().ok())
+                                .map(|e| e.session_id())
+                                .unwrap_or_else(|| "default".to_string());
+                            let task_desc = workflow_engine
+                                .as_ref()
+                                .and_then(|wf| wf.try_lock().ok())
+                                .and_then(|e| e.get_variable("_current_user_request"))
+                                .unwrap_or_default();
+                            let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                            let target = target_json
+                                .as_ref()
+                                .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_default();
+                            let reasoning_fallback = build_reasoning_fallback(
+                                &reasoning_content,
+                                &tc.name,
+                                &tc.arguments,
+                                &full_text,
+                                unified_tool_mode,
+                            );
+                            let assistant_text = {
+                                let raw = crate::agent::think_stream::visible_only(&full_text);
+                                if raw.trim().is_empty() {
+                                    "(用户拒绝了此工具执行)".into()
+                                } else {
+                                    raw
+                                }
+                            };
+                            let _ = ms.record_react(
+                                &session_id,
+                                &task_desc,
+                                &tc.name,
+                                &target,
+                                "denied",
+                                &format!("👤 用户拒绝执行: {}", tc.name),
+                                &assistant_text,
+                                &reasoning_fallback,
+                                &error_msg,
+                            );
+                        }
                         let _ = ui_tx.send(AgentToUiEvent::ToolResult {
                             name: tc.name.clone(),
                             output: error_msg,
@@ -2903,6 +3030,33 @@ pub async fn run_agent_turn(
                 is_error: result.is_error,
             });
 
+            // Record decision BEFORE react_log (so react_log reflects current tool, not previous)
+            {
+                let dec_target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                let dec_target: String = dec_target_json
+                    .as_ref()
+                    .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let observation: String =
+                    crate::agent::exploration_snapshot::extract_data_content(&result.content)
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                        .chars()
+                        .take(260)
+                        .collect();
+                let status = if result.is_error { "失败" } else { "成功" };
+                turn_memory.record_decision(format!(
+                    "你刚才执行 {}({}) {status}; 观察到: {}; 后续避免重复同一查询",
+                    tc.name, dec_target, observation
+                ));
+            }
+
             // Record to SQLite react_log for cross-round memory
             if let Some(ref ms) = tool_ctx.memory_store {
                 let session_id = workflow_engine
@@ -2915,25 +3069,40 @@ pub async fn run_agent_turn(
                     .and_then(|wf| wf.try_lock().ok())
                     .and_then(|e| e.get_variable("_current_user_request"))
                     .unwrap_or_default();
-                let target = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("params")
-                            .or_else(|| v.get("path"))
-                            .or_else(|| v.get("name"))
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_string())
-                    })
+                let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                let target = target_json
+                    .as_ref()
+                    .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
                     .unwrap_or_default();
                 let outcome = if result.is_error { "error" } else { "ok" };
-                // Attach the latest in-turn decision so the summarizer has "why".
+                // Store full decision without truncation
                 let decision = turn_memory
                     .decisions
                     .last()
-                    .map(|d| d.chars().take(200).collect::<String>())
-                    .unwrap_or_default();
+                    .cloned()
+                    .unwrap_or_else(|| "本轮仅工具调用".into());
                 // ReAct tuple: assistant visible text + reasoning + tool result.
-                let assistant_text = crate::agent::think_stream::visible_only(&full_text);
+                let assistant_text = {
+                    let raw = crate::agent::think_stream::visible_only(&full_text);
+                    if raw.trim().is_empty() {
+                        if !reasoning_content.trim().is_empty() {
+                            format!("(思考摘要) {}", reasoning_content)
+                        } else {
+                            "(本轮仅工具调用，无可见文本)".into()
+                        }
+                    } else {
+                        raw
+                    }
+                };
+                let reasoning_fallback = build_reasoning_fallback(
+                    &reasoning_content,
+                    &tc.name,
+                    &tc.arguments,
+                    &full_text,
+                    unified_tool_mode,
+                );
                 let _ = ms.record_react(
                     &session_id,
                     &task,
@@ -2942,7 +3111,7 @@ pub async fn run_agent_turn(
                     outcome,
                     &decision,
                     &assistant_text,
-                    &reasoning_content,
+                    &reasoning_fallback,
                     &result.content,
                 );
             }
