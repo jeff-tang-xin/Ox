@@ -2826,72 +2826,9 @@ pub async fn run_agent_turn(
             messages.push(Message::system(&canvas_ctx));
         }
 
-        // 🚨 Done reminder + AST recovery + verify hints
+        // 🚨 AST recovery + verify hints + Done reminder
         if !tool_calls.is_empty() {
-            let has_write = tool_calls.iter().any(|tc| {
-                matches!(
-                    tc.name.as_str(),
-                    "file_write" | "edit_file" | "delete_range"
-                )
-            });
-            let has_ast =
-                post_edit_verification::tool_batch_has_ast_issues(&new_messages, &tool_calls);
-
-            post_edit_verification::check_ast_and_recover(
-                &mut messages,
-                &new_messages,
-                &tool_calls,
-            );
-
-            let execute_coding = workflow_engine.as_ref().is_some_and(|wf| {
-                wf.try_lock()
-                    .map(|e| e.is_task_step() && !e.is_perceive_execute())
-                    .unwrap_or(false)
-            });
-            if execute_coding {
-                let project_root = tool_ctx
-                    .runtime
-                    .project_root
-                    .clone()
-                    .unwrap_or_else(|| tool_ctx.working_dir.clone());
-                if let Some(ref engine_arc) = workflow_engine
-                    && let Ok(engine) = engine_arc.try_lock()
-                {
-                    post_edit_verification::track_edits_and_verify_plan(
-                        &engine,
-                        &project_root,
-                        &tool_calls,
-                        &new_messages,
-                        true,
-                    );
-                    if !has_ast
-                        && let Some(hint) = post_edit_verification::verify_hint_message(&engine)
-                    {
-                        messages.push(Message::system(&hint));
-                    }
-                }
-            }
-
-            if has_write && !has_ast {
-                let verify_blocking = workflow_engine.as_ref().and_then(|wf| {
-                    wf.try_lock()
-                        .ok()
-                        .and_then(|e| post_edit_verification::check_execute_done_gate(&e))
-                });
-                let ast_pending = workflow_engine.as_ref().and_then(|wf| {
-                    wf.try_lock()
-                        .ok()
-                        .and_then(|e| e.get_variable("_ast_pending"))
-                        .filter(|s| !s.is_empty())
-                });
-                if verify_blocking.is_none() && ast_pending.is_none() {
-                    messages.push(Message::system(if unified_tool_mode {
-                        "Files were modified. Run verify via shell_exec if needed, then complete_and_check(action=finish, params={summary:\"...\"}). 3 lines max in summary."
-                    } else {
-                        "Files were modified. Run project verify if not done yet, then output ## Done with what changed and verify result. 3 lines max."
-                    }));
-                }
-            }
+            run_post_edit_checks(&tool_calls, &mut messages, &new_messages, &workflow_engine, &tool_ctx, unified_tool_mode);
 
             // 🔄 Auto-fix: if build/test failed, inject error for self-repair
             // Also pass gitnexus for impact analysis when available
@@ -3829,6 +3766,71 @@ fn prune_orphaned_tool_calls(messages: &mut [&mut Vec<Message>]) {
         }
         if let Some(pos) = msgs.iter().rposition(|m| matches!(m, Message::Assistant { content, tool_calls, .. } if content.is_empty() && tool_calls.is_empty())) {
             msgs.remove(pos);
+        }
+    }
+}
+
+/// Run post-edit verification checks: AST recovery, edit tracking, verify hints,
+/// and Done reminder injection. Mutates `messages` with deferred system notes.
+#[allow(clippy::too_many_arguments)]
+fn run_post_edit_checks(
+    tool_calls: &[ToolCall],
+    messages: &mut Vec<Message>,
+    new_messages: &[Message],
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    tool_ctx: &ToolContext,
+    unified_tool_mode: bool,
+) {
+    let has_write = tool_calls.iter().any(|tc| {
+        matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range")
+    });
+    let has_ast =
+        post_edit_verification::tool_batch_has_ast_issues(new_messages, tool_calls);
+    post_edit_verification::check_ast_and_recover(messages, new_messages, tool_calls);
+
+    let execute_coding = workflow_engine.as_ref().is_some_and(|wf| {
+        wf.try_lock()
+            .map(|e| e.is_task_step() && !e.is_perceive_execute())
+            .unwrap_or(false)
+    });
+    if execute_coding {
+        let project_root = tool_ctx
+            .runtime
+            .project_root
+            .clone()
+            .unwrap_or_else(|| tool_ctx.working_dir.clone());
+        if let Some(engine_arc) = workflow_engine
+            && let Ok(engine) = engine_arc.try_lock()
+        {
+            post_edit_verification::track_edits_and_verify_plan(
+                &engine, &project_root, tool_calls, new_messages, true,
+            );
+            if !has_ast
+                && let Some(hint) = post_edit_verification::verify_hint_message(&engine)
+            {
+                messages.push(Message::system(&hint));
+            }
+        }
+    }
+
+    if has_write && !has_ast {
+        let verify_blocking = workflow_engine.as_ref().and_then(|wf| {
+            wf.try_lock()
+                .ok()
+                .and_then(|e| post_edit_verification::check_execute_done_gate(&e))
+        });
+        let ast_pending = workflow_engine.as_ref().and_then(|wf| {
+            wf.try_lock()
+                .ok()
+                .and_then(|e| e.get_variable("_ast_pending"))
+                .filter(|s| !s.is_empty())
+        });
+        if verify_blocking.is_none() && ast_pending.is_none() {
+            messages.push(Message::system(if unified_tool_mode {
+                "Files were modified. Run verify via shell_exec if needed, then complete_and_check(action=finish, params={summary:\"...\"}). 3 lines max in summary."
+            } else {
+                "Files were modified. Run project verify if not done yet, then output ## Done with what changed and verify result. 3 lines max."
+            }));
         }
     }
 }
