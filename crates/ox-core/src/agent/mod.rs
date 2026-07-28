@@ -682,12 +682,11 @@ pub async fn run_agent_turn(
     }
 
     let mut iteration = 0u32;
-    let mut explore_streak = 0u32;
-    let mut explore_reflected = false;
-    // Cumulative exploration hard ceiling — persisted across turns via engine
-    // variable so multi-turn exploration budgets accumulate. Only a real
-    // edit/finish (handled inside evaluate()) resets it to 0.
-    let mut total_explore = workflow_engine
+    // ── P5.1: TurnBudget consolidates explore/impl streak counters ──
+    // Previously 6 loose locals; now grouped in a typed struct.
+    // `total_explore` is persisted across turns via engine counter `_total_explore`;
+    // only a real edit/finish (handled inside evaluate()) resets it to 0.
+    let total_explore_init = workflow_engine
         .as_ref()
         .and_then(|wf| wf.try_lock().ok())
         .map(|e| {
@@ -702,9 +701,8 @@ pub async fn run_agent_turn(
             }
         })
         .unwrap_or(0);
-    // Implementation-phase reflection (consecutive no-edit turns once the plan is confirmed).
-    let mut impl_streak = 0u32;
-    let mut impl_reflected = false;
+    let mut budget =
+        crate::agent::turn_state::TurnBudget::with_total_explore(total_explore_init);
     let mut repeat_guard = repeat_guard::RepeatGuard::new();
     let mut unified_parse_error_streak = 0u32;
     let mut findings_deliver_error_streak = 0u32;
@@ -834,9 +832,9 @@ pub async fn run_agent_turn(
                 .and_then(|wf| wf.try_lock().ok())
                 .map(|e| e.session_id().to_string())
                 .unwrap_or_default(),
-            explore_streak,
-            total_explore,
-            impl_streak,
+            budget.explore_streak,
+            budget.total_explore,
+            budget.impl_streak,
             slim_in_impl_phase,
         );
 
@@ -1018,11 +1016,7 @@ pub async fn run_agent_turn(
             unified_tool_mode,
             &workflow_engine,
             user_task.as_deref().unwrap_or(""),
-            &mut explore_streak,
-            &mut explore_reflected,
-            &mut total_explore,
-            &mut impl_streak,
-            &mut impl_reflected,
+            &mut budget,
             &ui_tx,
         ) {
             let reasoning_only = Message::Assistant {
@@ -3252,11 +3246,7 @@ pub(crate) fn evaluate_reflection(
     unified_tool_mode: bool,
     workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
     user_task: &str,
-    explore_streak: &mut u32,
-    explore_reflected: &mut bool,
-    total_explore: &mut u32,
-    impl_streak: &mut u32,
-    impl_reflected: &mut bool,
+    budget: &mut crate::agent::turn_state::TurnBudget,
     ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
 ) -> Option<String> {
     // Resolve each tool call to its inner tool name (unified mode parses
@@ -3336,8 +3326,8 @@ pub(crate) fn evaluate_reflection(
     // Implementation phase -> impl guard; otherwise the exploration guard.
     let action = if in_impl_phase {
         explore_reflect::evaluate_impl(
-            impl_streak,
-            impl_reflected,
+            &mut budget.impl_streak,
+            &mut budget.impl_reflected,
             &turn_tool_names,
             had_finish,
             user_task,
@@ -3349,9 +3339,9 @@ pub(crate) fn evaluate_reflection(
             .map(|e| explore_reflect::ConvergeMode::from_intent(e.get_task_intent()))
             .unwrap_or(explore_reflect::ConvergeMode::SubmitPlan);
         let action = explore_reflect::evaluate(
-            explore_streak,
-            explore_reflected,
-            total_explore,
+            &mut budget.explore_streak,
+            &mut budget.explore_reflected,
+            &mut budget.total_explore,
             &turn_tool_names,
             had_finish,
             made_discovery,
@@ -3361,7 +3351,7 @@ pub(crate) fn evaluate_reflection(
         if let Some(wf) = workflow_engine
             && let Ok(engine) = wf.try_lock()
         {
-            engine.set_counter("_total_explore", *total_explore);
+            engine.set_counter("_total_explore", budget.total_explore);
         }
         action
     };
@@ -3375,7 +3365,8 @@ pub(crate) fn evaluate_reflection(
                 "🪞 探索反思检查点 - 提示模型盘点已知信息后动手。"
             };
             tracing::info!(
-                "[REFLECT] Pre-exec reflect (impl_phase={in_impl_phase}, explore_streak={explore_streak}, impl_streak={impl_streak}) - skipping this tool batch"
+                "[REFLECT] Pre-exec reflect (impl_phase={in_impl_phase}, explore_streak={}, impl_streak={}) - skipping this tool batch",
+                budget.explore_streak, budget.impl_streak
             );
             let _ = ui_tx.send(AgentToUiEvent::Status(label.to_string()));
             Some(prompt)
@@ -3389,8 +3380,8 @@ pub(crate) fn evaluate_reflection(
             let _ = ui_tx.send(AgentToUiEvent::Status(
                 "⏸️ 探索预算耗尽 - c 继续 · 其他结束".to_string(),
             ));
-            *explore_streak = 0;
-            *total_explore = 0;
+            budget.explore_streak = 0;
+            budget.total_explore = 0;
             Some(gate_msg)
         }
     }
@@ -3999,7 +3990,6 @@ fn build_arg_parse_error(name: &str, parse_err: &serde_json::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Message;
 
     fn make_tc(id: &str, name: &str, args: &str) -> ToolCall {
         ToolCall {

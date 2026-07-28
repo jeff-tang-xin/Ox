@@ -17,9 +17,12 @@
 //! 2. Its transitions are pure functions -- `on_explore` and `on_edit_or_finish`
 //!    mutate counters with no I/O, so they are trivially testable.
 //!
-//! This module is intentionally not yet wired into the agent loop; that is a
-//! later, separately-verified step. Landing the scaffold plus tests first keeps
-//! each change small and green.
+//! Wired into `run_agent_turn` as the `budget` local (P5.1), replacing 6
+//! previously loose locals (`explore_streak`, `explore_reflected`,
+//! `total_explore`, `impl_streak`, `impl_reflected`, and `content_only_streak`).
+//! `iteration` remains a separate local because it is too pervasive to rename.
+//! `RepeatGuard` and `tools_used_this_turn` stay separate because they are not
+//! plain counters.
 
 use crate::agent::gate::explore_reflect::ConvergeMode;
 
@@ -45,8 +48,6 @@ pub enum TurnPhase {
 pub struct TurnBudget {
     /// Total tool-call iterations this turn.
     pub iteration: u32,
-    /// Consecutive turns producing prose only (no tool call).
-    pub content_only_streak: u32,
     /// Consecutive read-only exploration tool calls (resets on edit/finish).
     pub explore_streak: u32,
     /// Cumulative exploration count -- the hard-ceiling counter. Persisted

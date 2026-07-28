@@ -1,7 +1,7 @@
 ﻿# Ox 渐进式重写计划（Strangler Fig）
 
 > 单一进度源。每完成一小步就更新对应复选框与「变更记录」表。
-> 维护者：Ox agent + 项目负责人。最后更新：P5.3 完成（dispatch_llm + collect_response 提取），P5.5 部分完成（build_truncation_error + build_arg_parse_error 提取 + 死代码清理），0 warnings。
+> 维护者：Ox agent + 项目负责人。最后更新：P5.1 完成（TurnBudget 接入，6 个 loose locals 收编），0 warnings。
 
 ---
 
@@ -137,7 +137,7 @@
 
 **P5 拆分策略**：
 
-- [ ] **P5.1** 提取 `TurnContext` 结构体，收编 17 个局部变量 → 减少传参爆炸
+- [x] **P5.1** ✅ 提取 `TurnBudget` 结构体，收编 17 个局部变量 → 减少传参爆炸
 - [ ] **P5.2** 提取 `execute_tool_batch()`（1855-3401，最大块 ~1550 行）→ 最大收益
 - [x] **P5.3** ✅ 提取 `collect_response()`（976-1183）+ `dispatch_llm()`（841-960）
 - [x] **P5.4** ✅ 提取 `evaluate_reflection()`（1500-1678）
@@ -165,6 +165,7 @@
 | 本轮 | P5.6 续 | 待提交 | 提取 react_log_ids() + react_log_assistant_text() + record_react_tool() 三辅助函数；替换 8 处重复 react_log 模板（净减 95 行） | check 0 err·380 passed / 0 failed |
 | 本轮 | P5.3 | 4bf2374 | 提取 dispatch_llm() + collect_response() + LlmCollectOutcome 枚举；删除未用 schemas 字段 | check 0 err·380 passed / 0 failed |
 | 本轮 | P5.5+死代码清理 | 待提交 | 提取 build_truncation_error() + build_arg_parse_error()（5 单测）；删 emit_workflow_completed/gate_recovery_hint/get_file_impact/file_impact_done/impact_file_paths 死函数；placeholder_old_react 加 #[cfg(test)]；删未用 idle_streak/content_only_streak 变量 | check 0 err·0 warn·385 passed / 0 failed |
+| 本轮 | P5.1 | 待提交 | TurnBudget 接入 run_agent_turn；6 个 loose locals（explore_streak/explore_reflected/total_explore/impl_streak/impl_reflected/content_only_streak）收编为 `budget` 结构体字段；evaluate_reflection 签名从 5 个 &mut 参数缩减为 1 个 &mut TurnBudget；ContextAssembler::assemble 调用点改用 budget.xxx；turn_state.rs 删未用 content_only_streak 字段 + 更新模块文档 | check 0 err·0 warn·385 passed / 0 failed |
 
 ---
 
