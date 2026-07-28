@@ -179,6 +179,7 @@
 | 本轮 | P5.2 step 13 | b45681b | post_success_updates() 138L; &mut deferred/tools_used | check 0 err / 385 pass |
 | 本轮 | P5.2 step 14 | 95dea36 | check_repeated_failure_handoff() 40L; bool return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 15 | bfaaac9 | check_repeat_guard() 21L; bool return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 16 | cba9e34 | check_unified_parse_error() 53L; UnifiedParseOutcome enum | check 0 err / 385 pass |
 | 本轮 | P5.2 step 4 | b2710db | check_file_write_missing_path() 34L; bool return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 5 | acdb25d | lookup_tool_or_error() 29L; Option<&dyn Tool> return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 6 | f74b8a9 | parse_tool_args() 41L; Result<Value,()> return | check 0 err / 385 pass |
