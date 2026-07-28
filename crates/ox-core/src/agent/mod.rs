@@ -1521,34 +1521,16 @@ pub async fn run_agent_turn(
                 detail: tool_detail,
             });
 
-            tracing::info!("[AGENT] About to get tool object for: {}", tc.name);
-            let tool = match tool_registry.get(&tc.name) {
-                Some(t) => {
-                    tracing::info!("[AGENT] Tool object retrieved for: {}", tc.name);
-                    t
-                }
-                None => {
-                    let tool_names: Vec<String> = tool_registry
-                        .names()
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
-                    let error_msg = tool_executor::build_unknown_tool_error(&tc.name, &tool_names);
-                    tracing::warn!("Unknown tool requested: '{}'", tc.name);
-
-                    let result_msg = Message::ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: error_msg.clone(),
-                    };
-                    new_messages.push(result_msg.clone());
-                    messages.push(result_msg);
-                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                        name: tc.name.clone(),
-                        output: error_msg,
-                        is_error: true,
-                    });
-                    continue;
-                }
+            // Tool registry lookup (extracted to lookup_tool_or_error)
+            let tool = match lookup_tool_or_error(
+                tc,
+                &tool_registry,
+                &mut messages,
+                &mut new_messages,
+                &ui_tx,
+            ) {
+                Some(t) => t,
+                None => continue,
             };
 
             // ── Safety check before execution ──
@@ -3552,6 +3534,46 @@ fn check_file_write_missing_path(
         is_error: true,
     });
     true
+}
+
+// ── Tool registry lookup extraction ───────────────────────────────────────────
+/// Look up a tool from the registry. Returns `Some(tool)` if found, or `None`
+/// if the tool name is unknown (error already pushed to messages/ui_tx).
+fn lookup_tool_or_error<'a>(
+    tc: &ToolCall,
+    tool_registry: &'a crate::tools::ToolRegistry,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> Option<&'a dyn crate::tools::Tool> {
+    tracing::info!("[AGENT] About to get tool object for: {}", tc.name);
+    match tool_registry.get(&tc.name) {
+        Some(t) => {
+            tracing::info!("[AGENT] Tool object retrieved for: {}", tc.name);
+            Some(t)
+        }
+        None => {
+            let tool_names: Vec<String> = tool_registry
+                .names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let error_msg = tool_executor::build_unknown_tool_error(&tc.name, &tool_names);
+            tracing::warn!("Unknown tool requested: '{}'", tc.name);
+            let result_msg = Message::ToolResult {
+                tool_call_id: tc.id.clone(),
+                content: error_msg.clone(),
+            };
+            new_messages.push(result_msg.clone());
+            messages.push(result_msg);
+            let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                name: tc.name.clone(),
+                output: error_msg,
+                is_error: true,
+            });
+            None
+        }
+    }
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
