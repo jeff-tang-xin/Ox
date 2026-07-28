@@ -575,7 +575,8 @@ impl WorkflowEngine {
 
     /// Clear all impact-analysis tracking (called on workflow reset / new round).
     pub fn clear_impl_impact(&self) {
-        impl_tracking::clear_impl_impact(self)
+        impl_tracking::clear_impl_impact(self);
+        impl_tracking::clear_file_impact(self);
     }
 
     /// True when code_graph has been queried in this round (unblocks find_symbol).

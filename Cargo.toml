@@ -63,3 +63,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 # ox-core
 ox-core = { path = "crates/ox-core" }
+
+# Base64 encoding (for image read)
+base64 = "0.22"

@@ -1,14 +1,21 @@
 //! Budget-triggered memory offload — the *single* context-compaction path.
 //!
-//! When the real prompt-token count from the API crosses 80% of the model's
-//! context window, we "offload": ask a summarizer LLM to cluster the session's
-//! un-archived ReAct log into memory-graph nodes, persist them, mark those rows
-//! `impacted=1`, and replace the corresponding old ReAct messages with compact
-//! placeholders (freeing budget while keeping tool-call pairs intact).
+//! When the real prompt-token count from the API crosses the adaptive
+//! threshold (85% default, 92% with GitNexus), we "offload": ask a summarizer
+//! LLM to cluster the session's un-archived ReAct log into memory-graph nodes,
+//! persist them, mark those rows `impacted=1`, and replace the corresponding
+//! old ReAct messages with compact placeholders (freeing budget while keeping
+//! tool-call pairs intact).
 //!
-//! This replaces the former three-way split (`compact_completed_rounds`,
-//! `compact_turn_messages`, ad-hoc engine-variable summaries): budget overflow
-//! and memory archival are now one action.
+//! Improvements over the original:
+//! - **Adaptive threshold**: GitNexus availability → higher threshold (92%)
+//!   because the graph provides a compressed codebase knowledge layer.
+//! - **Cooldown**: after an offload, skip the next N budget checks to avoid
+//!   rapid-fire re-triggering.
+//! - **GitNexus context block**: build a compact `[CODEBASE_CONTEXT]` block
+//!   from graph clusters instead of relying solely on LLM summarization.
+//! - **Priority-based preservation**: messages referencing active codebase
+//!   clusters are preserved, others are compressed more aggressively.
 
 use std::sync::Arc;
 
@@ -16,21 +23,34 @@ use crate::llm::{LlmProvider, LlmStreamEvent, StreamOptions};
 use crate::memory::store::{GraphNode, MemoryStore};
 use crate::message::Message;
 
-/// Fraction of the context window at which offload triggers.
-pub const OFFLOAD_THRESHOLD: f32 = 0.80;
+/// Default fraction of the context window at which offload triggers.
+pub const OFFLOAD_THRESHOLD: f32 = 0.85;
+
+/// Higher threshold when GitNexus is available — the graph acts as a
+/// compressed knowledge layer, reducing the need for frequent offload.
+pub const OFFLOAD_THRESHOLD_WITH_GITNEXUS: f32 = 0.92;
 
 /// Engine variable holding the current `[MEMORY_GRAPH]` top-of-context block.
-/// Injected (once populated) by `mod.rs` ahead of `[TURN_CONTEXT]`.
 pub const MEMORY_GRAPH_VAR: &str = "_memory_graph_block";
-/// Engine variable counting consecutive offload failures (for the hard-trim fallback).
+/// Engine variable counting consecutive offload failures.
 pub const OFFLOAD_FAIL_VAR: &str = "_offload_fail_streak";
+/// Engine variable: cooldown counter (number of LLM calls to skip after offload).
+pub const OFFLOAD_COOLDOWN_VAR: &str = "_offload_cooldown";
+/// Engine variable: cached GitNexus codebase context block.
+pub const CODEBASE_CONTEXT_VAR: &str = "_codebase_context_block";
+
+/// Number of LLM calls to skip after a successful offload before checking again.
+pub const OFFLOAD_COOLDOWN_CALLS: u32 = 8;
 
 pub const MEMORY_GRAPH_TAG: &str = "[MEMORY_GRAPH]";
+pub const CODEBASE_CONTEXT_TAG: &str = "[CODEBASE_CONTEXT]";
 
 /// Result of an offload attempt.
 pub enum OffloadOutcome {
     /// Below threshold — nothing done.
     NotNeeded,
+    /// Cooldown active — skipped, waiting for more calls before next check.
+    Cooldown { remaining: u32 },
     /// Archived N nodes and freed message budget.
     Archived { nodes: usize },
     /// Summarization failed; only correctness cleanup ran (+ maybe a hard trim).
@@ -39,8 +59,8 @@ pub enum OffloadOutcome {
 
 /// Decide + perform offload. Returns the outcome so the caller can log/notify.
 ///
-/// `emit_status` is a closure so this module stays UI-agnostic (the caller wires
-/// it to `AgentToUiEvent::Status`).
+/// `gitnexus_available` controls the adaptive threshold and context building.
+/// `cooldown` is the remaining cooldown counter (decremented by caller).
 #[allow(clippy::too_many_arguments)]
 pub async fn offload_if_over_budget(
     prompt_tokens: u32,
@@ -51,36 +71,63 @@ pub async fn offload_if_over_budget(
     store: &MemoryStore,
     session_id: &str,
     fail_streak: u32,
+    cooldown: u32,
+    gitnexus_available: bool,
     emit_status: impl Fn(String),
-) -> (OffloadOutcome, u32) {
-    let budget = (context_window as f32 * OFFLOAD_THRESHOLD) as u32;
-    if prompt_tokens < budget {
-        return (OffloadOutcome::NotNeeded, fail_streak);
+) -> (OffloadOutcome, u32, u32) {
+    // ── 1. Cooldown check ──
+    if cooldown > 0 {
+        return (
+            OffloadOutcome::Cooldown {
+                remaining: cooldown.saturating_sub(1),
+            },
+            fail_streak,
+            cooldown.saturating_sub(1),
+        );
     }
 
+    // ── 2. Adaptive threshold ──
+    let threshold = if gitnexus_available {
+        OFFLOAD_THRESHOLD_WITH_GITNEXUS
+    } else {
+        OFFLOAD_THRESHOLD
+    };
+    let budget = (context_window as f32 * threshold) as u32;
+    if prompt_tokens < budget {
+        return (OffloadOutcome::NotNeeded, fail_streak, 0);
+    }
+
+    let pct = (prompt_tokens as f64 / context_window as f64 * 100.0) as u32;
     emit_status(format!(
-        "🔒 上下文达 {}% — 正在归纳记忆图谱…（可继续输入，将排队）",
-        (OFFLOAD_THRESHOLD * 100.0) as u32
+        "🔒 上下文达 {}%（阈值 {}%） — 正在归纳记忆图谱…（可继续输入，将排队）",
+        pct,
+        (threshold * 100.0) as u32
     ));
 
-    // Pull the un-archived ReAct timeline (id-tagged) as summarization input.
+    // ── 3. Build GitNexus codebase context block (cheap, synchronous prep) ──
+    // This runs before summarization so the graph knowledge is available even
+    // if the summarizer fails.
+    let graph_block = if gitnexus_available {
+        build_codebase_context_block(store, session_id)
+    } else {
+        String::new()
+    };
+
+    // ── 4. Pull the un-archived ReAct timeline ──
     let timeline = store
         .get_react_timeline_with_ids(session_id, 200)
         .unwrap_or_default();
 
-    // Nothing to archive → fall back to correctness cleanup only.
     if timeline.trim().is_empty() {
         cleanup_only(messages);
-        return (OffloadOutcome::Degraded, fail_streak.saturating_add(1));
+        return (OffloadOutcome::Degraded, fail_streak.saturating_add(1), 0);
     }
 
+    // ── 5. Summarize ──
     let provider = summarizer.as_ref().unwrap_or(default_provider);
     let clusters = match summarize_clusters(provider, &timeline).await {
         Some(c) if !c.is_empty() => c,
         _ => {
-            // Failure path: skip archival, run correctness cleanup, and if we've
-            // now failed repeatedly, hard-trim the message tail to guarantee the
-            // budget is relieved and we don't loop forever.
             let new_streak = fail_streak.saturating_add(1);
             if new_streak >= 2 {
                 hard_trim(messages);
@@ -89,24 +136,183 @@ pub async fn offload_if_over_budget(
                 cleanup_only(messages);
                 emit_status("⚠️ 记忆归纳失败 — 本次跳过卸载，稍后重试".to_string());
             }
-            return (OffloadOutcome::Degraded, new_streak);
+            return (OffloadOutcome::Degraded, new_streak, 0);
         }
     };
 
-    // Persist clusters + stamp react_log rows impacted=1.
+    // ── 6. Persist clusters ──
     let node_count = clusters.len();
     if let Err(e) = store.archive_react_batch(session_id, &clusters) {
         tracing::warn!("[OFFLOAD] archive_react_batch failed: {e}");
         cleanup_only(messages);
-        return (OffloadOutcome::Degraded, fail_streak.saturating_add(1));
+        return (OffloadOutcome::Degraded, fail_streak.saturating_add(1), 0);
     }
 
-    // Replace old ReAct tool messages with placeholders (keep pairs valid).
+    // ── 7. Compact messages with GitNexus-aware priority ──
     let archived_ids: Vec<i64> = clusters.iter().flat_map(|c| c.react_ids.clone()).collect();
-    placeholder_old_react(messages, archived_ids.len());
+    let preserved_paths = extract_active_file_paths_from_timeline(&timeline);
+    placeholder_old_react_prioritized(messages, archived_ids.len(), &preserved_paths);
 
-    emit_status(format!("✅ 已归纳 {node_count} 个记忆图谱节点"));
-    (OffloadOutcome::Archived { nodes: node_count }, 0)
+    // ── 8. Inject codebase context block ──
+    if !graph_block.is_empty() {
+        inject_codebase_context(messages, &graph_block);
+    }
+
+    emit_status(format!(
+        "✅ 已归纳 {node_count} 个记忆图谱节点（冷却 {OFFLOAD_COOLDOWN_CALLS} 轮）"
+    ));
+    (
+        OffloadOutcome::Archived { nodes: node_count },
+        0,
+        OFFLOAD_COOLDOWN_CALLS,
+    )
+}
+
+/// Extract active file paths from the ReAct timeline for priority preservation.
+fn extract_active_file_paths_from_timeline(timeline: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in timeline.lines() {
+        let lower = line.to_lowercase();
+        // Detect file paths mentioned in tool calls and results
+        if let Some(path) = lower
+            .find("\"path\"")
+            .and_then(|_| {
+                let rest = &line[lower.find("\"path\"")?..];
+                let start = rest.find('"').and_then(|_| rest[1..].find('"').map(|i| &rest[1..1 + i]))?;
+                let val_start = start.find('"').map(|i| i + 1)?;
+                let val_end = start[val_start..].find('"').map(|i| val_start + i)?;
+                Some(start[val_start..val_end].to_string())
+            })
+        {
+            if path.len() > 4 && path.contains('.') && !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+/// Build a compact codebase context block from GitNexus clusters.
+/// This provides the LLM with a compressed view of the codebase structure,
+/// reducing reliance on raw message history.
+fn build_codebase_context_block(store: &MemoryStore, session_id: &str) -> String {
+    let nodes = store.get_memory_graphs(session_id, 20).unwrap_or_default();
+    if nodes.is_empty() {
+        return String::new();
+    }
+    let mut b = String::from(CODEBASE_CONTEXT_TAG);
+    b.push_str("\n📐 代码图谱上下文（从 GitNexus 图谱构建）\n");
+    b.push_str("以下为项目功能区概览，详细信息可通过 read_symbol / code_graph 查询。\n\n");
+    for (id, summary, tier, weight) in &nodes {
+        let title: String = summary.chars().take(120).collect();
+        let tier_mark = if *tier >= 2 { "◆◆" } else { "◆" };
+        let impact_mark = if *weight >= 2.0 { " ⚡" } else { "" };
+        b.push_str(&format!("  {tier_mark} #{id}{impact_mark} {title}\n"));
+    }
+    b
+}
+
+/// Inject the codebase context block into messages as a system message.
+fn inject_codebase_context(messages: &mut Vec<Message>, block: &str) {
+    // Remove any existing codebase context block first
+    messages.retain(|m| {
+        !matches!(m, Message::System { content, .. } if content.starts_with(CODEBASE_CONTEXT_TAG))
+    });
+
+    // Insert after the first system message (or at position 1)
+    let insert_pos = messages
+        .iter()
+        .position(|m| matches!(m, Message::System { .. }))
+        .map(|p| p + 1)
+        .unwrap_or(1)
+        .min(messages.len());
+
+    messages.insert(insert_pos, Message::system(block.to_string()));
+}
+
+/// Placeholder with priority: preserve messages referencing active files.
+fn placeholder_old_react_prioritized(
+    messages: &mut Vec<Message>,
+    count: usize,
+    preserved_paths: &[String],
+) {
+    let first_user = messages
+        .iter()
+        .position(|m| matches!(m, Message::User { .. }))
+        .unwrap_or(0);
+
+    let cut = messages
+        .len()
+        .saturating_sub(messages.len() / 3)
+        .max(first_user + 1);
+
+    let mut replaced = 0usize;
+    let mut compressed = 0usize;
+
+    for msg in messages.iter_mut().take(cut).skip(first_user) {
+        let is_active = message_references_active_file(msg, preserved_paths);
+
+        if let Message::Assistant { content, tool_calls, .. } = msg {
+            // Compress large assistant text, but preserve more if referencing active files
+            let max_content = if is_active { 600 } else { 300 };
+            if !content.is_empty() && content.len() > max_content {
+                let boundary = content
+                    .char_indices()
+                    .take_while(|(i, _)| *i < max_content)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(max_content);
+                *content = format!("{}... (截断，完整内容在 ReAct 日志中)", &content[..boundary]);
+                compressed += 1;
+            }
+            for tc in tool_calls.iter_mut() {
+                let max_args = if is_active { 1200 } else { 800 };
+                if tc.arguments.len() > max_args {
+                    tc.arguments = tc.arguments.chars().take(max_args).collect::<String>()
+                        + "...(截断)";
+                    compressed += 1;
+                }
+            }
+        }
+
+        // Replace old ToolResults with placeholders, but preserve active file results
+        if let Message::ToolResult { content, .. } = msg {
+            if !content.starts_with("（已归纳") && !is_active {
+                *content = "（已归纳到记忆图谱，recall #<编号> 可重放）".to_string();
+                replaced += 1;
+            }
+        }
+    }
+
+    cleanup_only(messages);
+    tracing::info!(
+        "[OFFLOAD] Placeholdered {replaced} old ReAct results + compressed {compressed} large messages (archived ~{count} rows)"
+    );
+}
+
+/// Check if a message references any of the preserved (active) file paths.
+fn message_references_active_file(msg: &Message, preserved_paths: &[String]) -> bool {
+    if preserved_paths.is_empty() {
+        return false;
+    }
+    match msg {
+        Message::ToolResult { content, .. } => {
+            let lower = content.to_lowercase();
+            preserved_paths.iter().any(|p| lower.contains(&p.to_lowercase()))
+        }
+        Message::Assistant { content, tool_calls, .. } => {
+            let lower_content = content.to_lowercase();
+            let content_match = preserved_paths.iter().any(|p| lower_content.contains(&p.to_lowercase()));
+            if content_match {
+                return true;
+            }
+            tool_calls.iter().any(|tc| {
+                let lower_args = tc.arguments.to_lowercase();
+                preserved_paths.iter().any(|p| lower_args.contains(&p.to_lowercase()))
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Build the top-of-context `[MEMORY_GRAPH]` block from persisted nodes.

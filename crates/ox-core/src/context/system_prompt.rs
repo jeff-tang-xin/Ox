@@ -323,7 +323,7 @@ const METHODOLOGY: &str = "\
 fn build_unified_tool_block() -> String {
     "【可用工具】\n\
      ╔══ 读取（Safe · 无副作用）\n\
-     ║ file_read: {path, offset?, limit?} — 读取文件\n\
+     ║ file_read: {path, offset?, limit?} — 读取文件（图片 png/jpg/gif/webp/bmp/svg/... ≤256KB 自动以 Base64 返回）\n\
      ║ file_list: {path} — 列出目录\n\
      ║ file_search: {pattern, path?, file_pattern?} — 文件名搜索\n\
      ║ code_search: {pattern, path?, file_pattern?, case_insensitive?} — 代码内容搜索\n\

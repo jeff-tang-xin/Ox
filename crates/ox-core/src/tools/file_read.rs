@@ -1,13 +1,60 @@
+use base64::Engine;
 use encoding_rs::Encoding;
 use serde_json::{Value, json};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
 
 use super::{SafetyLevel, Tool, ToolContext, ToolOutput};
 
 /// Files smaller than this on disk are read fully; tool results below this stay inline (no ref).
 pub const SMALL_FILE_THRESHOLD: u64 = 512 * 1024;
 pub const INLINE_CONTENT_THRESHOLD: usize = SMALL_FILE_THRESHOLD as usize;
+
+/// Max image size for inline Base64 encoding. Larger images return a note instead.
+pub const IMAGE_MAX_SIZE: u64 = 256 * 1024;
+
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff", "tif", "avif", "heic",
+];
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let lower = e.to_lowercase();
+            IMAGE_EXTENSIONS.contains(&lower.as_str())
+        })
+        .unwrap_or(false)
+}
+
+fn image_mime(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("avif") => "image/avif",
+        Some("tiff") | Some("tif") => "image/tiff",
+        _ => "application/octet-stream",
+    }
+}
+
+fn read_image_as_base64(path: &Path, file_size: u64) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("Cannot read image: {e}"))?;
+    let mime = image_mime(path);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let kb = file_size / 1024;
+    Ok(format!(
+        "🖼️ 图片读取 (type={mime}, size={kb}KB)\n\n\
+         ```\n\
+         data:{mime};base64,{b64}\n\
+         ```"
+    ))
+}
 
 /// Hard character cap on a single file_read tool result. The line-based
 /// `limit` param does NOT bound output size: a minified file (e.g. a bundled
@@ -129,7 +176,8 @@ impl Tool for FileReadTool {
 
     fn description(&self) -> &str {
         "Read file contents with line numbers. Default: 200 lines from offset 0. \
-         Large files are NOT read in full — use offset/limit to paginate (e.g. offset=200, limit=200 for next page)."
+         Large files are NOT read in full — use offset/limit to paginate (e.g. offset=200, limit=200 for next page). \
+         Image files (png/jpg/gif/webp/bmp/svg/...) under 256KB are auto-returned as Base64 data URIs."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -212,6 +260,25 @@ impl Tool for FileReadTool {
             Ok(m) => m.len(),
             Err(e) => return ToolOutput::error(format!("Cannot access file: {e}")),
         };
+
+        // Image detection: auto Base64 for images ≤ IMAGE_MAX_SIZE
+        if is_image_path(&path) {
+            if file_size <= IMAGE_MAX_SIZE {
+                match read_image_as_base64(&path, file_size) {
+                    Ok(output) => return ToolOutput::success(output),
+                    Err(e) => return ToolOutput::error(e),
+                }
+            } else {
+                let mime = image_mime(&path);
+                let kb = file_size / 1024;
+                return ToolOutput::success(format!(
+                    "🖼️ 图片读取 (type={mime}, size={kb}KB)\n\n\
+                     ⚠️ 图片超过 {img_max}KB 限制，无法内嵌 Base64。\n\
+                     💡 请使用外部工具查看，或压缩后重试。",
+                    img_max = IMAGE_MAX_SIZE / 1024,
+                ));
+            }
+        }
 
         let result = if file_size < SMALL_FILE_THRESHOLD && encoding.is_none() {
             read_full_then_slice(&path, offset, limit)

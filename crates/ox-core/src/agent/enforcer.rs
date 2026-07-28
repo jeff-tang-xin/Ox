@@ -406,118 +406,16 @@ impl RuleEnforcer {
 
     /// 检查修改源文件前是否搜索了调用方 (Impact Analysis)
     ///
-    /// 当编辑已存在的源码文件时，确保 LLM 调用了 code_search 来检查依赖/调用方。
-    /// 防止修改函数签名/接口后忘记更新调用处。
+    /// ⚠️ 已改为软警告：不再阻断 edit/write。
+    /// Auto-impact 分析已在 unified_handler 的 handle_delegate 中自动同步执行，
+    /// 结果会注入到 tool output 中。此处仅保留为 legacy 工具路径（非 unified 模式）
+    /// 的可选检查，返回 Ok 放行。
     fn check_impact_before_edit(
-        tc: &ToolCall,
-        messages: &[Message],
-        trivial_threshold: usize,
+        _tc: &ToolCall,
+        _messages: &[Message],
+        _trivial_threshold: usize,
     ) -> Result<(), String> {
-        if !matches!(
-            tc.name.as_str(),
-            "file_write" | "edit_file" | "delete_range"
-        ) {
-            return Ok(());
-        }
-
-        // 只对已存在的源码文件强制
-        let target_path = match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-            Ok(args) => args
-                .get("path")
-                .and_then(|p| p.as_str())
-                .map(|s| s.trim().to_string()),
-            Err(_) => return Ok(()),
-        };
-        let target_path = match target_path {
-            Some(p) if !p.is_empty() => p,
-            _ => return Ok(()),
-        };
-        if !is_source_file(&target_path) {
-            return Ok(());
-        }
-
-        // 🎯 Trivial 编辑白名单：短修改不需要 impact analysis
-        if tc.name == "edit_file"
-            && trivial_threshold > 0
-            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-        {
-            if let Some(old_str) = args.get("old_string").and_then(|v| v.as_str())
-                && old_str.len() <= trivial_threshold
-            {
-                return Ok(());
-            }
-            if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
-                let all_trivial = edits.iter().all(|e| {
-                    e.get("old_string")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.len() <= trivial_threshold)
-                        .unwrap_or(false)
-                });
-                if all_trivial {
-                    return Ok(());
-                }
-            }
-        }
-
-        let target_basename = std::path::Path::new(&target_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        // 🎯 检查最近一次用户消息之后，是否对同一文件执行过 code_search
-        let last_user_idx = messages
-            .iter()
-            .rev()
-            .position(|m| matches!(m, Message::User { .. }))
-            .map(|pos| messages.len() - 1 - pos);
-
-        let search_start = last_user_idx.unwrap_or(0);
-        let recent_messages = if search_start < messages.len() {
-            &messages[search_start..]
-        } else {
-            &[]
-        };
-
-        let has_impact_check = recent_messages.iter().any(|msg| {
-            if let Message::Assistant { tool_calls, .. } = msg {
-                tool_calls.iter().any(|tc| {
-                    if tc.name == "code_search"
-                        && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                    {
-                        let search_query = args.get("pattern").and_then(|q| q.as_str()).unwrap_or("");
-                        // code_search was called with the file name or path as pattern
-                        if search_query.contains(&target_basename)
-                            || search_query.contains(&target_path)
-                            || target_path.contains(search_query)
-                        {
-                            return true;
-                        }
-                    }
-                    false
-                })
-            } else {
-                false
-            }
-        });
-
-        if !has_impact_check {
-            Err(format!(
-                "🛑 RULE VIOLATION (impact-analysis): You are editing `{path}` but haven't checked for callers or dependents!\n\n\
-                 Before modifying an existing source file, you must check what depends on it:\n\
-                 1. Call `code_search(pattern=\"{name}\")` to find all references and callers\n\
-                 2. Review the impact\n\
-                 3. Then proceed with the edit\n\n\
-                 This prevents breaking changes. The system requires impact analysis before editing existing source files.\n\n\
-                 📝 Example:\n\
-                 code_search(pattern=\"{name}\")\n\
-                 ... review results ...\n\
-                 edit_file(path=\"{path}\")",
-                path = target_path,
-                name = target_basename,
-            ))
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 }
 

@@ -681,9 +681,29 @@ pub async fn run_agent_turn(
     let mut content_only_streak = 0u32;
     let mut explore_streak = 0u32;
     let mut explore_reflected = false;
-    // Cumulative exploration hard ceiling — discovery does NOT reset this; only a
-    // real edit/finish does. Backstop against unbounded breadth-first wandering.
-    let mut total_explore = 0u32;
+    // Cumulative exploration hard ceiling — persisted across turns via engine
+    // variable so multi-turn exploration budgets accumulate. Only a real
+    // edit/finish (handled inside evaluate()) resets it to 0.
+    let mut total_explore = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .and_then(|e| {
+            let val = e.get_variable("_total_explore")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let user_req = e.get_variable("_current_user_request")
+                .unwrap_or_default();
+            if crate::agent::workflow_session::looks_like_new_task(&user_req) {
+                e.set_variable("_total_explore", "0".to_string());
+                tracing::info!(
+                    "[EXPLORE_RESET] total_explore reset to 0 (new task detected)"
+                );
+                Some(0u32)
+            } else {
+                Some(val)
+            }
+        })
+        .unwrap_or(0);
     // Implementation-phase reflection (consecutive no-edit turns once the plan is confirmed).
     let mut impl_streak = 0u32;
     let mut impl_reflected = false;
@@ -1180,7 +1200,7 @@ pub async fn run_agent_turn(
         }
 
         // ── Unified budget offload ──
-        // When the API's real prompt-token count crosses 80% of the window,
+        // When the API's real prompt-token count crosses the adaptive threshold,
         // cluster the un-archived ReAct log into memory-graph nodes, persist
         // them, and placeholder the old ReAct messages (one action = archive +
         // compaction). Runs here, after the stream fully ends, so `messages`
@@ -1199,10 +1219,21 @@ pub async fn run_agent_turn(
                 .and_then(|e| e.get_variable(crate::memory::memory_offload::OFFLOAD_FAIL_VAR))
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(0);
+            let cooldown = workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .and_then(|e| e.get_variable(crate::memory::memory_offload::OFFLOAD_COOLDOWN_VAR))
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let gitnexus_available = if let Some(svc) = tool_ctx.gitnexus.as_ref() {
+                svc.is_ready().await
+            } else {
+                false
+            };
             let context_window = active_provider.context_window_size();
             let summarizer = tool_ctx.summarizer.clone();
             let ui_tx_offload = ui_tx.clone();
-            let (outcome, new_streak) = crate::memory::memory_offload::offload_if_over_budget(
+            let (outcome, new_streak, new_cooldown) = crate::memory::memory_offload::offload_if_over_budget(
                 last_prompt_tokens,
                 context_window,
                 &mut messages,
@@ -1211,6 +1242,8 @@ pub async fn run_agent_turn(
                 ms,
                 &session_id,
                 fail_streak,
+                cooldown,
+                gitnexus_available,
                 |s| {
                     let _ = ui_tx_offload.send(AgentToUiEvent::Status(s));
                 },
@@ -1220,6 +1253,7 @@ pub async fn run_agent_turn(
                 && let Ok(engine) = wf.try_lock()
             {
                 engine.set_variable(crate::memory::memory_offload::OFFLOAD_FAIL_VAR, new_streak.to_string());
+                engine.set_variable(crate::memory::memory_offload::OFFLOAD_COOLDOWN_VAR, new_cooldown.to_string());
                 // Refresh the top-of-context graph block after any archival.
                 if matches!(outcome, crate::memory::memory_offload::OffloadOutcome::Archived { .. }) {
                     let block = crate::memory::memory_offload::build_memory_graph_block(ms, &session_id);
@@ -1577,7 +1611,7 @@ pub async fn run_agent_turn(
                     .and_then(|wf| wf.try_lock().ok())
                     .map(|e| explore_reflect::ConvergeMode::from_intent(e.get_task_intent()))
                     .unwrap_or(explore_reflect::ConvergeMode::SubmitPlan);
-                explore_reflect::evaluate(
+                let action = explore_reflect::evaluate(
                     &mut explore_streak,
                     &mut explore_reflected,
                     &mut total_explore,
@@ -1586,7 +1620,13 @@ pub async fn run_agent_turn(
                     made_discovery,
                     user_task_str,
                     converge,
-                )
+                );
+                if let Some(wf) = &workflow_engine
+                    && let Ok(engine) = wf.try_lock()
+                {
+                    engine.set_variable("_total_explore", total_explore.to_string());
+                }
+                action
             };
 
             let reflect_prompt = match action {
@@ -1826,41 +1866,54 @@ pub async fn run_agent_turn(
 
             if unified_tool_mode
                 && tc.name == crate::agent::unified_action::TOOL_NAME
-                && tc.arguments.trim().is_empty()
             {
-                let error_msg = "❌ complete_and_check 参数为空。\n\n\
-                     必须发送合法 JSON，例如：\n\
-                     {\"action\":\"file_read\",\"params\":{\"path\":\"src/main.rs\"}}\n\n\
-                     禁止空 arguments；每轮必须包含 action 与 params。";
-                let result_msg = Message::ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: error_msg.to_string(),
-                };
-                new_messages.push(result_msg.clone());
-                messages.push(result_msg);
-                turn_memory.record_tool(&tc.name, &tc.arguments, true);
-                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                    name: tc.name.clone(),
-                    output: error_msg.to_string(),
-                    is_error: true,
-                });
-                unified_parse_error_streak += 1;
-                if unified_parse_error_streak >= 3 {
-                    messages.push(Message::system(
-                        "⚠️ 已连续 3 次空/无效 complete_and_check 参数。\
-                         必须发送合法 JSON：{\"action\":\"…\",\"params\":{…}}\n\
-                         例如 action=file_read, action=edit_file, action=finish",
-                    ));
+                let args_empty = tc.arguments.trim().is_empty();
+                let args_invalid = !tc.arguments.trim().is_empty()
+                    && serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err();
+                if args_empty || args_invalid {
+                    let reason = if args_empty { "参数为空" } else { "参数不是合法 JSON" };
+                    let error_msg = format!(
+                        "❌ complete_and_check {reason}。\n\n\
+                         必须发送合法 JSON，例如：\n\
+                         {{\"action\":\"file_read\",\"params\":{{\"path\":\"src/main.rs\"}}}}\n\n\
+                         禁止空或非法 arguments；每轮必须包含 action 与 params。"
+                    );
+                    let result_msg = Message::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: error_msg.to_string(),
+                    };
+                    new_messages.push(result_msg.clone());
+                    messages.push(result_msg);
+                    turn_memory.record_tool(&tc.name, &tc.arguments, true);
+                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                        name: tc.name.clone(),
+                        output: error_msg.to_string(),
+                        is_error: true,
+                    });
+                    unified_parse_error_streak += 1;
+                    tracing::warn!(
+                        "[UNIFIED_PARSE_ERROR] streak={} reason={} args_len={} iteration={}",
+                        unified_parse_error_streak,
+                        reason,
+                        tc.arguments.len(),
+                        iteration,
+                    );
+                    if unified_parse_error_streak >= 3 {
+                        messages.push(Message::system(
+                            "⚠️ 已连续 3 次空/无效 complete_and_check 参数。\
+                             必须发送合法 JSON：{\"action\":\"…\",\"params\":{…}}\n\
+                             例如 action=file_read, action=edit_file, action=finish",
+                        ));
+                    }
+                    if unified_parse_error_streak >= 5 {
+                        let _ = ui_tx.send(AgentToUiEvent::Status(
+                            "⏹️ 连续 5 次无效 complete_and_check — 强制结束本轮".to_string(),
+                        ));
+                        emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
+                        return;
+                    }
+                    continue;
                 }
-                if unified_parse_error_streak >= 5 {
-                    // Hard stop — LLM is stuck in an empty-arg loop, force turn end
-                    let _ = ui_tx.send(AgentToUiEvent::Status(
-                        "⏹️ 连续 5 次空 complete_and_check — 强制结束本轮".to_string(),
-                    ));
-                    emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                    return;
-                }
-                continue;
             }
 
             if unified_tool_mode && tc.name == crate::agent::unified_action::TOOL_NAME {

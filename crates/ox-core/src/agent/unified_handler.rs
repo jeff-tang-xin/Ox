@@ -19,50 +19,128 @@ use super::tool_result_envelope::{EnvelopeStatus, ToolResultEnvelope};
 use super::ui_event;
 use super::unified_action::{self, ActionGate, TOOL_NAME, UnifiedActionRequest, UnifiedRoute};
 
-/// Analyze potential impact before edit_file operations using GitNexus.
-/// Returns a summary of affected symbols/functions, or None if unavailable.
-pub async fn analyze_edit_impact(tool_ctx: &Arc<ToolContext>, file_path: &str) -> Option<String> {
+/// Risk level parsed from impact analysis results.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImpactRisk {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl ImpactRisk {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImpactRisk::Low => "LOW",
+            ImpactRisk::Medium => "MEDIUM",
+            ImpactRisk::High => "HIGH",
+            ImpactRisk::Critical => "CRITICAL",
+        }
+    }
+
+    pub fn is_blocking(&self) -> bool {
+        matches!(self, ImpactRisk::High | ImpactRisk::Critical)
+    }
+}
+
+/// Structured result of an auto-impact analysis.
+pub struct ImpactAnalysis {
+    pub risk: ImpactRisk,
+    pub summary: String,
+    pub target: String,
+}
+
+/// Analyze potential impact before edit_file/file_write operations using GitNexus.
+/// Auto-extracts target (symbol name or file basename) and repo from the path.
+/// Returns structured risk + summary, or None if GitNexus is unavailable.
+pub async fn analyze_edit_impact(
+    tool_ctx: &Arc<ToolContext>,
+    file_path: &str,
+) -> Option<ImpactAnalysis> {
     let svc = tool_ctx.gitnexus.as_ref()?;
     if !svc.is_ready().await {
         return None;
     }
 
-    // Extract function/method name from file_path if possible
-    // For simplicity, we analyze the file itself as the target
-    let target = file_path.split('/').next_back()?.split('\\').next_back()?;
+    let target = extract_impact_target(file_path);
     if target.is_empty() {
         return None;
     }
 
-    let mut params = crate::mcp::gitnexus::ImpactParams::new(target, "downstream");
-    params.max_depth = Some(2); // Limit depth for performance
+    let mut params = crate::mcp::gitnexus::ImpactParams::new(&target, "upstream");
+    params.max_depth = Some(2);
+    params.file_path = Some(file_path.to_string());
 
     match svc.impact(&params).await {
         Ok(result) if !result.is_error && !result.text.is_empty() => {
-            // Parse and summarize the impact
-            let summary = summarize_impact(&result.text, target);
-            Some(summary)
+            let risk = parse_risk(&result.text);
+            let summary = summarize_impact(&result.text, &target, &risk);
+            Some(ImpactAnalysis {
+                risk,
+                summary,
+                target,
+            })
         }
         _ => None,
     }
 }
 
-/// Summarize impact results into a concise message.
-fn summarize_impact(impact_text: &str, target: &str) -> String {
+/// Parse risk level from GitNexus impact output text.
+fn parse_risk(text: &str) -> ImpactRisk {
+    let lower = text.to_lowercase();
+    if lower.contains("critical") {
+        ImpactRisk::Critical
+    } else if lower.contains("high") {
+        ImpactRisk::High
+    } else if lower.contains("medium") {
+        ImpactRisk::Medium
+    } else {
+        ImpactRisk::Low
+    }
+}
+
+/// Extract a meaningful impact target from a file path.
+/// Strategy: try symbol-like names from path segments, fall back to basename.
+fn extract_impact_target(file_path: &str) -> String {
+    let normalized = file_path.replace('\\', "/");
+    let basename = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(file_path)
+        .to_string();
+
+    let without_ext = basename
+        .rsplit('.')
+        .next()
+        .unwrap_or(&basename)
+        .to_string();
+
+    if without_ext.is_empty() {
+        return basename;
+    }
+
+    without_ext
+}
+
+/// Summarize impact results into a concise message with risk level.
+fn summarize_impact(impact_text: &str, target: &str, risk: &ImpactRisk) -> String {
     let mut summary = format!("📊 **代码影响分析** (`{}`):\n\n", target);
 
-    // Try to extract key information from the impact result
-    if impact_text.contains("risk") {
-        if impact_text.contains("LOW") {
-            summary.push_str("✅ **风险等级: LOW** - 影响范围较小\n");
-        } else if impact_text.contains("MEDIUM") {
-            summary.push_str("⚠️ **风险等级: MEDIUM** - 有一定影响范围\n");
-        } else if impact_text.contains("HIGH") || impact_text.contains("CRITICAL") {
-            summary.push_str("🔴 **风险等级: HIGH/CRITICAL** - 影响范围较大，请谨慎操作\n");
+    match risk {
+        ImpactRisk::Low => {
+            summary.push_str("✅ **风险等级: LOW** - 影响范围较小，可安全修改\n");
+        }
+        ImpactRisk::Medium => {
+            summary.push_str("⚠️ **风险等级: MEDIUM** - 有一定影响范围，修改后需验证\n");
+        }
+        ImpactRisk::High => {
+            summary.push_str("🔴 **风险等级: HIGH** - 影响范围较大，请谨慎操作\n");
+        }
+        ImpactRisk::Critical => {
+            summary.push_str("🚨 **风险等级: CRITICAL** - 关键路径，修改可能导致大面积故障\n");
         }
     }
 
-    // Add snippet of affected items
     let lines: Vec<&str> = impact_text.lines().take(10).collect();
     if !lines.is_empty() {
         summary.push_str("**可能影响的代码:**\n");
@@ -974,22 +1052,83 @@ async fn handle_delegate(
         }
     }
 
-    // ── Impact analysis before edit operations ──
-    let _impact_warning = String::new();
-    if (inner_name == "edit_file" || inner_name == "file_write" || inner_name == "delete_range")
+    // ── Auto-impact analysis before edit/write/delete ──
+    // Synchronously runs impact analysis and injects the result into the
+    // tool output as a pre-warning. Risk levels are handled as:
+    //   CRITICAL/HIGH → BLOCK: return error, LLM must confirm or redesign
+    //   MEDIUM        → WARN: inject warning, allow edit but record
+    //   LOW           → LOG:  inject silently, no action
+    let auto_impact = if (inner_name == "edit_file" || inner_name == "file_write" || inner_name == "delete_range")
         && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
     {
-        // Run impact analysis asynchronously (non-blocking)
         let ctx_clone = Arc::clone(tool_ctx);
         let path_owned = path.to_string();
-        tokio::spawn(async move {
-            if let Some(impact) = analyze_edit_impact(&ctx_clone, &path_owned).await {
-                tracing::info!("[IMPACT] edit impact analysis: {}", impact);
-                // The impact analysis is logged for reference
-                // Could be sent to UI if needed
+        analyze_edit_impact(&ctx_clone, &path_owned).await
+    } else {
+        None
+    };
+
+    // ── HIGH / CRITICAL risk: block the edit, return structured error ──
+    if let Some(ref impact) = auto_impact
+        && impact.risk.is_blocking()
+    {
+        let risk_label = impact.risk.as_str();
+        let block_msg = format!(
+            "🛑 **IMPACT BLOCKED** — 风险等级 `{}` 阻止了此操作。\n\n\
+             {}
+             \n**影响目标**: `{}`\n\
+             \n**建议**: 该文件位于关键路径，{} 可能导致大面积故障。\n\
+             请改用 `read_symbol` 查看依赖详情，或分拆修改以降低风险。",
+            risk_label,
+            impact.summary,
+            impact.target,
+            match inner_name {
+                "edit_file" => "编辑",
+                "file_write" => "重写",
+                "delete_range" => "删除",
+                _ => "操作",
             }
-        });
+        );
+
+        tracing::warn!(
+            "[DELEGATE] BLOCKED {} — risk={}, target={}",
+            inner_name,
+            risk_label,
+            impact.target
+        );
+
+        if let Some(wf) = workflow_engine {
+            let engine = wf.lock().await;
+            crate::agent::engine::impl_tracking::record_file_impact(
+                &engine,
+                req.params.get("path").and_then(|p| p.as_str()).unwrap_or(""),
+                &format!("BLOCKED({}) — {}", risk_label, impact.summary),
+            );
+        }
+
+        return UnifiedHandleOutcome::Result {
+            content: block_msg,
+            is_error: true,
+            deferred_system: Vec::new(),
+            delegate_meta: None,
+        };
     }
+
+    // ── MEDIUM: record impact for memory, continue with warning ──
+    if let Some(ref impact) = auto_impact
+        && matches!(impact.risk, ImpactRisk::Medium)
+    {
+        if let Some(wf) = workflow_engine {
+            let engine = wf.lock().await;
+            crate::agent::engine::impl_tracking::record_file_impact(
+                &engine,
+                req.params.get("path").and_then(|p| p.as_str()).unwrap_or(""),
+                &format!("WARN(MEDIUM) — {}", impact.summary),
+            );
+        }
+    }
+
+    let auto_impact_note = auto_impact.map(|i| i.summary);
 
     tracing::info!("[DELEGATE] Executing inner tool: {}", inner_name);
     let result = tool.execute(req.params.clone(), tool_ctx).await;
@@ -1033,7 +1172,7 @@ async fn handle_delegate(
     }
 
     let mut output = result.content.clone();
-    let deferred = if let Some(wf) = workflow_engine {
+    let mut deferred = if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
             let (d, out) =
                 apply_delegate_success_effects(&engine, tool_ctx, inner_name, &req, &result);
@@ -1045,6 +1184,20 @@ async fn handle_delegate(
     } else {
         Vec::new()
     };
+
+    // Inject auto-impact analysis into output + deferred system note
+    if let Some(impact_note) = &auto_impact_note {
+        output.push_str(&format!("\n\n── IMPACT ANALYSIS ──\n{impact_note}"));
+        deferred.push(format!("📊 Impact 分析已自动执行：{}", impact_note.lines().next().unwrap_or("")));
+
+        // Record impact status in engine memory for this file
+        if let Some(wf) = workflow_engine
+            && let Ok(engine) = wf.try_lock()
+            && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
+        {
+            crate::agent::engine::impl_tracking::record_file_impact(&engine, path, impact_note);
+        }
+    }
 
     result_ok_envelope(
         json!({

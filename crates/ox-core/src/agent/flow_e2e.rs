@@ -137,6 +137,10 @@ fn edit_blocked_in_review_allowed_in_implement() {
 
     seed_findings(&engine);
     phase::pivot_to_fix_mode(&engine, "/fix");
+    // edit_file requires prior file_read in Implement phase
+    assert!(engine.validate_tool_call("edit_file", &args).is_err());
+    // After reading the file, edit is allowed
+    crate::agent::engine::impl_tracking::record_impl_file_read(&engine, "src/Foo.java", "");
     assert!(engine.validate_tool_call("edit_file", &args).is_ok());
     assert!(engine.allows_code_modification());
 }

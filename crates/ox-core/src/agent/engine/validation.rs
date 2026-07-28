@@ -35,32 +35,32 @@ pub(crate) fn validate_single_step_tool(
                 "实施阶段禁止 {tool_name} — 用 find_symbol/file_read 定位。"
             ));
         }
-        // Impact gate: require code_graph impact analysis before reading/editing
-        // finding-related files, so the LLM understands the blast radius.
-        if matches!(tool_name, "file_read" | "edit_file")
+        // Edit gate: ensure file has been read before editing.
+        // Exception: file_write for a NEW file (file doesn't exist yet) — no need to read first.
+        // Impact analysis runs automatically in unified_handler before edit/write/delete.
+        if matches!(tool_name, "edit_file" | "file_write" | "delete_range")
             && let Some(path) = args.get("path").and_then(|v| v.as_str())
             && !path.trim().is_empty()
+            && !crate::agent::engine::impl_tracking::impl_file_already_read(engine, path)
         {
-            let target_val = serde_json::Value::String(path.to_string());
-            if let Some(idx) =
-                crate::agent::findings::finding_index_for_target(engine, &target_val)
-                && !engine.impl_impact_done(idx)
-            {
+            // For file_write: skip the read gate if the file doesn't exist yet (new file creation).
+            let is_new_file = if tool_name == "file_write" {
+                let p = std::path::Path::new(path);
+                if p.is_absolute() {
+                    !p.exists()
+                } else {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|d| !d.join(p).exists())
+                        .unwrap_or(false)
+                }
+            } else {
+                false
+            };
+            if !is_new_file {
                 return Err(format!(
-                    "📊 影响范围门禁 — 编辑 `{path}` 前请先评估改动影响。\n\
-                                 先调用 complete_and_check(action=\"code_graph\", \
-                                 params={{\"op\":\"impact\",\"target\":\"{symbol}\",\"direction\":\"downstream\"}}) \
-                                 查看调用链影响范围。",
-                    symbol = path
-                        .rsplit('/')
-                        .next_back()
-                        .unwrap_or(path)
-                        .rsplit('\\')
-                        .next_back()
-                        .unwrap_or(path)
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(path)
+                    "📊 编辑门禁 — `{path}` 尚未读取。\n\
+                                 先调用 file_read 读取文件内容再编辑。"
                 ));
             }
         }

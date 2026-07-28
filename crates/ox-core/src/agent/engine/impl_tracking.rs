@@ -3,6 +3,7 @@ use super::WorkflowEngine;
 pub(crate) const IMPL_READ_KEY: &str = "_impl_files_read";
 pub(crate) const IMPL_EDITED_KEY: &str = "_impl_files_edited";
 pub(crate) const IMPL_IMPACT_KEY: &str = "_impl_impact_done";
+pub(crate) const IMPL_IMPACT_FILES_KEY: &str = "_impl_impact_files";
 pub(crate) const CODE_GRAPH_QUERIED_KEY: &str = "_code_graph_queried";
 pub(crate) const REVIEW_HANDOFF_KEY: &str = "_review_handoff_files";
 
@@ -234,4 +235,47 @@ pub(crate) fn execute_review_report_block(
         let snippet: String = report.chars().take(max_chars).collect();
         format!("【审查报告 — park 前输出，用户在此基础上跟进】\n{snippet}")
     })
+}
+
+/// Record impact analysis result for a specific file path.
+/// Stores `{path: normalized} → impact_summary` mapping in engine memory.
+pub(crate) fn record_file_impact(engine: &WorkflowEngine, path: &str, summary: &str) {
+    let norm = crate::agent::plan_tracker::normalize_path(path);
+    let mut map: serde_json::Map<String, serde_json::Value> = engine
+        .get_variable(IMPL_IMPACT_FILES_KEY)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    map.insert(norm, serde_json::Value::String(summary.to_string()));
+    if let Ok(json) = serde_json::to_string(&map) {
+        engine.set_variable(IMPL_IMPACT_FILES_KEY, json);
+    }
+}
+
+/// Get the recorded impact summary for a specific file path.
+pub(crate) fn get_file_impact(engine: &WorkflowEngine, path: &str) -> Option<String> {
+    let norm = crate::agent::plan_tracker::normalize_path(path);
+    let map: serde_json::Map<String, serde_json::Value> = engine
+        .get_variable(IMPL_IMPACT_FILES_KEY)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    map.get(&norm).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Check if impact analysis has been recorded for a specific file.
+pub(crate) fn file_impact_done(engine: &WorkflowEngine, path: &str) -> bool {
+    get_file_impact(engine, path).is_some()
+}
+
+/// Get all file paths that have recorded impact analyses.
+pub(crate) fn impact_file_paths(engine: &WorkflowEngine) -> Vec<String> {
+    let map: serde_json::Map<String, serde_json::Value> = engine
+        .get_variable(IMPL_IMPACT_FILES_KEY)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    map.keys().cloned().collect()
+}
+
+/// Clear all file-level impact tracking.
+pub(crate) fn clear_file_impact(engine: &WorkflowEngine) {
+    engine.set_variable(IMPL_IMPACT_FILES_KEY, "{}".to_string());
 }
