@@ -1397,70 +1397,20 @@ pub async fn run_agent_turn(
             return;
         }
 
-        // Sanitize tool_call arguments: if the LLM response was truncated
-        // (e.g. finish_reason="length"), arguments may be incomplete JSON.
-        // Mark truncated tool calls so we skip execution and return an error
-        // to the LLM, letting it retry.
-        let mut truncated_ids = std::collections::HashSet::new();
-        for tc in &mut tool_calls {
-            if !tc.arguments.trim().is_empty() {
-                match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                    Ok(_) => {} // Valid JSON, no issue
-                    Err(e) => {
-                        // Check if this looks like truncation vs other JSON errors
-                        let is_likely_truncated = is_likely_json_truncation(&tc.arguments, &e);
-
-                        if is_likely_truncated {
-                            tracing::warn!(
-                                "Truncated tool arguments for '{}' (len {}, error: {}), will return error to LLM",
-                                tc.name,
-                                tc.arguments.len(),
-                                e
-                            );
-                            truncated_ids.insert(tc.id.clone());
-                            tc.arguments = "{}".to_string();
-                        } else {
-                            // Not truncation, let it pass through to normal error handling
-                            tracing::debug!(
-                                "Invalid JSON for '{}' but not truncation (error: {}), will handle later",
-                                tc.name,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // ✅ CRITICAL FIX: Filter out truncated tool_calls from the Assistant message.
-        // Truncated tool calls have already been handled (error ToolResult added),
-        // so they should NOT appear in the Assistant message to avoid confusing
-        // the compression logic and causing "tool call result does not follow tool call" errors.
-
-        // 🚨 Also filter out tool calls that exceeded the infinite loop limit
-        let mut exceeded_loop_limit_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut temp_counts: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
-        let mut tool_loop_keys: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        // Classify tool calls: detect truncated arguments and infinite loops.
+        // Extracted into `classify_tool_calls()` for testability -- pure computation,
+        // no side effects beyond resetting truncated arguments to `{}`.
+        let classification = classify_tool_calls(&mut tool_calls, MAX_SAME_TOOL_CALLS);
+        let truncated_ids = classification.truncated_ids;
+        let exceeded_loop_limit_ids = classification.exceeded_loop_limit_ids;
+        let tool_loop_keys = classification.tool_loop_keys;
+        let temp_counts = classification.temp_counts;
 
         let execute_step = workflow_engine
             .as_ref()
-            .and_then(|wf| wf.try_lock().ok())
+                       .and_then(|wf| wf.try_lock().ok())
             .map(|e| e.is_task_step())
             .unwrap_or(false);
-
-        for tc in &tool_calls {
-            let loop_key = tool_loop_key(&tc.name, &tc.arguments);
-            tool_loop_keys.insert(tc.id.clone(), loop_key.clone());
-            let count = temp_counts.entry(loop_key).or_insert(0);
-            *count += 1;
-            let limit = MAX_SAME_TOOL_CALLS;
-            if *count > limit {
-                exceeded_loop_limit_ids.insert(tc.id.clone());
-            }
-        }
 
         // Single-step model: always show the assistant's text to the user
         // (perception filter strips machine-only findings JSON when present).
@@ -1506,179 +1456,36 @@ pub async fn run_agent_turn(
         //
         // When a threshold trips we DISCARD this turn's chosen tool batch,
         // record the reasoning as a tool-call-free assistant message (so no
-        // ToolResult is orphaned), inject the reflection, and loop — forcing the
+        // ToolResult is orphaned), inject the reflection, and loop - forcing the
         // model to re-decide with the reflection in view. A `finish` batch is
         // treated as progress and never skipped.
-        {
-            let turn_tool_names: Vec<String> = tool_calls
-                .iter()
-                .map(|tc| {
-                    if unified_tool_mode {
-                        crate::agent::unified_action::parse_request(&tc.arguments)
-                            .ok()
-                            .and_then(|r| {
-                                crate::agent::unified_action::action_to_tool_name(&r.action)
-                                    .map(|s| s.to_string())
-                            })
-                            .unwrap_or_else(|| tc.name.clone())
-                    } else {
-                        tc.name.clone()
-                    }
-                })
-                .collect();
-            let had_finish = tool_calls.iter().any(|tc| {
-                if unified_tool_mode {
-                    crate::agent::unified_action::parse_request(&tc.arguments)
-                        .ok()
-                        .map(|r| {
-                            matches!(
-                                crate::agent::unified_action::route(&r),
-                                crate::agent::unified_action::UnifiedRoute::Finish
-                            )
-                        })
-                        .unwrap_or(false)
-                } else {
-                    tc.name == "finish"
-                }
-            });
-            let user_task_str = user_task.as_deref().unwrap_or("");
-            let in_impl_phase = workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .map(|e| crate::agent::phase::is_implementation_phase(&e))
-                .unwrap_or(false);
-
-            // 🔍 Information-gain signal: does this turn's read-only batch surface
-            // anything NEW (unread file, further slice, fresh query, structural
-            // listing)? Evaluated against engine state, which already records what
-            // prior turns read. A discovering turn is real progress and resets the
-            // exploration streak — so reading many *different* files in a large
-            // project never trips the budget; only repeated low-gain reads do.
-            let made_discovery = workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .map(|engine| {
-                    tool_calls.iter().any(|tc| {
-                        let (inner_name, inner_args) = if unified_tool_mode {
-                            match crate::agent::unified_action::parse_request(&tc.arguments) {
-                                Ok(r) => (
-                                    crate::agent::unified_action::action_to_tool_name(&r.action)
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| tc.name.clone()),
-                                    r.params,
-                                ),
-                                Err(_) => (
-                                    tc.name.clone(),
-                                    serde_json::from_str(&tc.arguments)
-                                        .unwrap_or(serde_json::json!({})),
-                                ),
-                            }
-                        } else {
-                            (
-                                tc.name.clone(),
-                                serde_json::from_str(&tc.arguments)
-                                    .unwrap_or(serde_json::json!({})),
-                            )
-                        };
-                        crate::agent::gate::read_guard::is_discovery_call(
-                            &engine,
-                            &inner_name,
-                            &inner_args,
-                        )
-                    })
-                })
-                .unwrap_or(true); // No engine → don't penalize.
-
-            // Implementation phase → impl guard (no-edit streak); otherwise the
-            // exploration guard (low-gain read streak). Never both in one turn.
-            let action = if in_impl_phase {
-                explore_reflect::evaluate_impl(
-                    &mut impl_streak,
-                    &mut impl_reflected,
-                    &turn_tool_names,
-                    had_finish,
-                    user_task_str,
-                )
-            } else {
-                // Convergence action depends on task intent: review submits a plan
-                // (writes locked); fix/general edits directly (writes unlocked);
-                // Q&A answers. Default SubmitPlan when no engine — never nudge an
-                // edit unless we can confirm writes are unlocked.
-                let converge = workflow_engine
-                    .as_ref()
-                    .and_then(|wf| wf.try_lock().ok())
-                    .map(|e| explore_reflect::ConvergeMode::from_intent(e.get_task_intent()))
-                    .unwrap_or(explore_reflect::ConvergeMode::SubmitPlan);
-                let action = explore_reflect::evaluate(
-                    &mut explore_streak,
-                    &mut explore_reflected,
-                    &mut total_explore,
-                    &turn_tool_names,
-                    had_finish,
-                    made_discovery,
-                    user_task_str,
-                    converge,
-                );
-                if let Some(wf) = &workflow_engine
-                    && let Ok(engine) = wf.try_lock()
-                {
-                    engine.set_counter("_total_explore", total_explore);
-                }
-                action
+        if let Some(prompt) = evaluate_reflection(
+            &tool_calls,
+            unified_tool_mode,
+            &workflow_engine,
+            user_task.as_deref().unwrap_or(""),
+            &mut explore_streak,
+            &mut explore_reflected,
+            &mut total_explore,
+            &mut impl_streak,
+            &mut impl_reflected,
+            &ui_tx,
+        ) {
+            let reasoning_only = Message::Assistant {
+                content: content_with_reasoning.clone(),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
             };
-
-            let reflect_prompt = match action {
-                explore_reflect::ReflectAction::Continue => None,
-                explore_reflect::ReflectAction::Reflect(prompt) => {
-                    let label = if in_impl_phase {
-                        "🛠️ 实施反思检查点 — 提示模型停止泛读、立即动手。"
-                    } else {
-                        "🪞 探索反思检查点 — 提示模型盘点已知信息后动手。"
-                    };
-                    tracing::info!(
-                        "[REFLECT] Pre-exec reflect (impl_phase={in_impl_phase}, explore_streak={explore_streak}, impl_streak={impl_streak}) — skipping this tool batch"
-                    );
-                    let _ = ui_tx.send(AgentToUiEvent::Status(label.to_string()));
-                    Some(prompt)
-                }
-                explore_reflect::ReflectAction::Stop(handoff) => {
-                    // Exploration hit a stop threshold — either the low-gain streak
-                    // ran past reflection, or the cumulative ceiling tripped. The
-                    // handoff message already states which; keep the c/其他 gate so
-                    // the user can wave it on.
-                    let gate_msg = format!(
-                        "{handoff}\n\n\
-                         **c** 继续探索\n\
-                         **其他** 结束本轮"
-                    );
-                    let _ = ui_tx.send(AgentToUiEvent::Status(
-                        "⏸️ 探索预算耗尽 — c 继续 · 其他结束".to_string(),
-                    ));
-                    explore_streak = 0;
-                    total_explore = 0;
-                    Some(gate_msg)
-                }
-            };
-
-            if let Some(prompt) = reflect_prompt {
-                // Record the reasoning without the (discarded) tool_calls so the
-                // model retains WHY it was about to act, then inject the reflection.
-                let reasoning_only = Message::Assistant {
-                    content: content_with_reasoning.clone(),
-                    tool_calls: Vec::new(),
-                    reasoning_content: None,
-                };
-                new_messages.push(reasoning_only.clone());
-                messages.push(reasoning_only);
-                messages.push(Message::system(&prompt));
-                new_messages.push(Message::system(&prompt));
-                persist_turn_memory(&workflow_engine, &turn_memory);
-                iteration += 1;
-                continue;
-            }
+            new_messages.push(reasoning_only.clone());
+            messages.push(reasoning_only);
+            messages.push(Message::system(&prompt));
+            new_messages.push(Message::system(&prompt));
+            persist_turn_memory(&workflow_engine, &turn_memory);
+            iteration += 1;
+            continue;
         }
 
-        // Keep ALL tool_calls on the assistant message so every ToolResult has a matching id.
+// Keep ALL tool_calls on the assistant message so every ToolResult has a matching id.
         // (Filtering caused orphaned ToolResults → API auto-fix → context amnesia.)
         let assistant_msg = Message::Assistant {
             content: content_with_reasoning,
@@ -3649,6 +3456,93 @@ fn is_likely_json_truncation(json_str: &str, error: &serde_json::Error) -> bool 
     is_eof_error || has_unclosed_structure
 }
 
+/// Result of classifying tool calls for truncation and loop-limit violations.
+///
+/// This is a pure computation over the LLM's tool-call batch -- no side effects,
+/// no I/O. The caller uses the sets to skip execution of bad tool calls and
+/// return error messages to the LLM.
+pub(crate) struct ToolCallClassification {
+    /// Tool-call IDs whose arguments were truncated (incomplete JSON).
+    /// Their `arguments` have been reset to `{}` so they parse cleanly.
+    pub truncated_ids: std::collections::HashSet<String>,
+    /// Tool-call IDs that exceeded the same-tool call limit (`MAX_SAME_TOOL_CALLS`).
+    pub exceeded_loop_limit_ids: std::collections::HashSet<String>,
+    /// Maps tool-call ID -> dedup loop key (used for error messages later).
+    pub tool_loop_keys: std::collections::HashMap<String, String>,
+    /// Maps loop key -> call count (used for error messages later).
+    pub temp_counts: std::collections::HashMap<String, u32>,
+}
+
+/// Classify tool calls for two failure modes:
+///
+/// 1. **Truncation**: when `finish_reason="length"`, arguments may be incomplete
+///    JSON. We detect this heuristically and mark the ID so the caller skips
+///    execution and returns an error to the LLM. The arguments are reset to `{}`
+///    so downstream parsing doesn't choke.
+///
+/// 2. **Infinite loop**: when the same tool (same name + same dedup key) is
+///    called more than `MAX_SAME_TOOL_CALLS` times in one LLM response.
+///
+/// This function mutates `tool_calls` in place (resetting truncated arguments)
+/// and returns the classification sets for the caller to consult during
+/// execution.
+pub(crate) fn classify_tool_calls(
+    tool_calls: &mut [ToolCall],
+    max_same_tool_calls: u32,
+) -> ToolCallClassification {
+    let mut truncated_ids = std::collections::HashSet::new();
+    let mut exceeded_loop_limit_ids = std::collections::HashSet::new();
+    let mut temp_counts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut tool_loop_keys: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    // Phase 1: truncation detection
+    for tc in tool_calls.iter_mut() {
+        if !tc.arguments.trim().is_empty() {
+            match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                Ok(_) => {}
+                Err(e) => {
+                    if is_likely_json_truncation(&tc.arguments, &e) {
+                        tracing::warn!(
+                            "Truncated tool arguments for '{}' (len {}, error: {}), will return error to LLM",
+                            tc.name,
+                            tc.arguments.len(),
+                            e
+                        );
+                        truncated_ids.insert(tc.id.clone());
+                        tc.arguments = "{}".to_string();
+                    } else {
+                        tracing::debug!(
+                            "Invalid JSON for '{}' but not truncation (error: {}), will handle later",
+                            tc.name,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 2: loop-limit detection
+    for tc in tool_calls.iter() {
+        let loop_key = tool_loop_key(&tc.name, &tc.arguments);
+        tool_loop_keys.insert(tc.id.clone(), loop_key.clone());
+        let count = temp_counts.entry(loop_key).or_insert(0);
+        *count += 1;
+        if *count > max_same_tool_calls {
+            exceeded_loop_limit_ids.insert(tc.id.clone());
+        }
+    }
+
+    ToolCallClassification {
+        truncated_ids,
+        exceeded_loop_limit_ids,
+        tool_loop_keys,
+        temp_counts,
+    }
+}
+
 /// Replace the latest review report instead of stacking duplicate full reports.
 fn upsert_review_report_assistant(messages: &mut Vec<Message>, new_msg: &Message) {
     let Message::Assistant {
@@ -3812,3 +3706,264 @@ fn clean_think_tags(text: &str) -> String {
     let result = THINK_PATTERN.replace_all(text, "");
     UNCLOSED_THINK.replace_all(&result, "").to_string()
 }
+
+/// Evaluate whether the pre-execution reflection guard should fire.
+///
+/// This is the **reflect-FIRST guard** -- it runs *before* this turn's tools
+/// execute. Two separate loops are caught:
+///
+/// - **Exploration**: read-after-read without ever acting (threshold in
+///   `explore_reflect::evaluate`).
+/// - **Implementation**: plan confirmed, but drifting into no-edit turns
+///   instead of editing (threshold in `explore_reflect::evaluate_impl`).
+///
+/// When a threshold trips, the caller discards this turn's chosen tool batch,
+/// records the reasoning as a tool-call-free assistant message, and injects the
+/// returned prompt -- forcing the model to re-decide with the reflection in view.
+///
+/// Returns `Some(prompt)` when the reflection should fire, `None` when the
+/// tool batch should proceed to execution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_reflection(
+    tool_calls: &[ToolCall],
+    unified_tool_mode: bool,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    user_task: &str,
+    explore_streak: &mut u32,
+    explore_reflected: &mut bool,
+    total_explore: &mut u32,
+    impl_streak: &mut u32,
+    impl_reflected: &mut bool,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> Option<String> {
+    // Resolve each tool call to its inner tool name (unified mode parses
+    // the action from the complete_and_check wrapper).
+    let turn_tool_names: Vec<String> = tool_calls
+        .iter()
+        .map(|tc| {
+            if unified_tool_mode {
+                crate::agent::unified_action::parse_request(&tc.arguments)
+                    .ok()
+                    .and_then(|r| {
+                        crate::agent::unified_action::action_to_tool_name(&r.action)
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| tc.name.clone())
+            } else {
+                tc.name.clone()
+            }
+        })
+        .collect();
+
+    // Does this batch contain a finish action? A finish batch is treated as
+    // progress and never skipped.
+    let had_finish = tool_calls.iter().any(|tc| {
+        if unified_tool_mode {
+            crate::agent::unified_action::parse_request(&tc.arguments)
+                .ok()
+                .map(|r| {
+                    matches!(
+                        crate::agent::unified_action::route(&r),
+                        crate::agent::unified_action::UnifiedRoute::Finish
+                    )
+                })
+                .unwrap_or(false)
+        } else {
+            tc.name == "finish"
+        }
+    });
+
+    let in_impl_phase = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|e| crate::agent::phase::is_implementation_phase(&e))
+        .unwrap_or(false);
+
+    // Information-gain signal: does this turn's read-only batch surface anything
+    // NEW? A discovering turn is real progress and resets the exploration streak.
+    let made_discovery = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|engine| {
+            tool_calls.iter().any(|tc| {
+                let (inner_name, inner_args) = if unified_tool_mode {
+                    match crate::agent::unified_action::parse_request(&tc.arguments) {
+                        Ok(r) => (
+                            crate::agent::unified_action::action_to_tool_name(&r.action)
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| tc.name.clone()),
+                            r.params,
+                        ),
+                        Err(_) => (
+                            tc.name.clone(),
+                            serde_json::from_str(&tc.arguments)
+                                .unwrap_or(serde_json::json!({})),
+                        ),
+                    }
+                } else {
+                    (
+                        tc.name.clone(),
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({})),
+                    )
+                };
+                crate::agent::gate::read_guard::is_discovery_call(
+                    &engine,
+                    &inner_name,
+                    &inner_args,
+                )
+            })
+        })
+        .unwrap_or(true);
+
+    // Implementation phase -> impl guard; otherwise the exploration guard.
+    let action = if in_impl_phase {
+        explore_reflect::evaluate_impl(
+            impl_streak,
+            impl_reflected,
+            &turn_tool_names,
+            had_finish,
+            user_task,
+        )
+    } else {
+        let converge = workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .map(|e| explore_reflect::ConvergeMode::from_intent(e.get_task_intent()))
+            .unwrap_or(explore_reflect::ConvergeMode::SubmitPlan);
+        let action = explore_reflect::evaluate(
+            explore_streak,
+            explore_reflected,
+            total_explore,
+            &turn_tool_names,
+            had_finish,
+            made_discovery,
+            user_task,
+            converge,
+        );
+        if let Some(wf) = workflow_engine
+            && let Ok(engine) = wf.try_lock()
+        {
+            engine.set_counter("_total_explore", *total_explore);
+        }
+        action
+    };
+
+    match action {
+        explore_reflect::ReflectAction::Continue => None,
+        explore_reflect::ReflectAction::Reflect(prompt) => {
+            let label = if in_impl_phase {
+                "🛠️ 实施反思检查点 - 提示模型停止泛读、立即动手。"
+            } else {
+                "🪞 探索反思检查点 - 提示模型盘点已知信息后动手。"
+            };
+            tracing::info!(
+                "[REFLECT] Pre-exec reflect (impl_phase={in_impl_phase}, explore_streak={explore_streak}, impl_streak={impl_streak}) - skipping this tool batch"
+            );
+            let _ = ui_tx.send(AgentToUiEvent::Status(label.to_string()));
+            Some(prompt)
+        }
+        explore_reflect::ReflectAction::Stop(handoff) => {
+            let gate_msg = format!(
+                "{handoff}\n\n\
+                 **c** 继续探索\n\
+                 **其他** 结束本轮"
+            );
+            let _ = ui_tx.send(AgentToUiEvent::Status(
+                "⏸️ 探索预算耗尽 - c 继续 · 其他结束".to_string(),
+            ));
+            *explore_streak = 0;
+            *total_explore = 0;
+            Some(gate_msg)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Message;
+
+    fn make_tc(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: args.to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_valid_json_no_truncation() {
+        let mut tcs = vec![
+            make_tc("a", "file_read", r#"{"path":"src/main.rs"}"#),
+            make_tc("b", "edit_file", r#"{"path":"x","old_string":"a","new_string":"b"}"#),
+        ];
+        let cls = classify_tool_calls(&mut tcs, 5);
+        assert!(cls.truncated_ids.is_empty());
+        assert!(cls.exceeded_loop_limit_ids.is_empty());
+        assert_eq!(cls.temp_counts.len(), 2); // two distinct keys
+    }
+
+    #[test]
+    fn classify_truncated_args_detected_and_reset() {
+        let mut tcs = vec![
+            // Incomplete JSON: missing closing brace
+            make_tc("t1", "file_write", r#"{"path":"out.txt","content":"hello"#),
+        ];
+        let cls = classify_tool_calls(&mut tcs, 5);
+        assert!(cls.truncated_ids.contains("t1"));
+        // Arguments should be reset to {}
+        assert_eq!(tcs[0].arguments, "{}");
+    }
+
+    #[test]
+    fn classify_invalid_but_not_truncated_passes_through() {
+        let mut tcs = vec![
+            // Valid JSON shape but not truncated -- trailing comma (not truncation)
+            make_tc("x1", "shell_exec", r#"{"command":"ls",}"#),
+        ];
+        let cls = classify_tool_calls(&mut tcs, 5);
+        assert!(cls.truncated_ids.is_empty());
+        // Arguments NOT reset (left as-is for normal error handling)
+        assert_eq!(tcs[0].arguments, r#"{"command":"ls",}"#);
+    }
+
+    #[test]
+    fn classify_loop_limit_exceeded() {
+        let mut tcs = vec![
+            make_tc("c1", "file_read", r#"{"path":"a"}"#),
+            make_tc("c2", "file_read", r#"{"path":"a"}"#),
+            make_tc("c3", "file_read", r#"{"path":"a"}"#),
+        ];
+        // Limit = 2: 3rd call exceeds
+        let cls = classify_tool_calls(&mut tcs, 2);
+        assert!(cls.exceeded_loop_limit_ids.contains("c3"));
+        assert!(!cls.exceeded_loop_limit_ids.contains("c1"));
+        assert!(!cls.exceeded_loop_limit_ids.contains("c2"));
+        // Same dedup key for all three
+        assert_eq!(cls.temp_counts.len(), 1);
+        assert_eq!(cls.temp_counts.values().next().copied().unwrap_or(0), 3);
+    }
+
+    #[test]
+    fn classify_different_paths_no_loop() {
+        let mut tcs = vec![
+            make_tc("d1", "file_read", r#"{"path":"a.rs"}"#),
+            make_tc("d2", "file_read", r#"{"path":"b.rs"}"#),
+            make_tc("d3", "file_read", r#"{"path":"c.rs"}"#),
+        ];
+        let cls = classify_tool_calls(&mut tcs, 2);
+        assert!(cls.exceeded_loop_limit_ids.is_empty());
+        // Three distinct keys
+        assert_eq!(cls.temp_counts.len(), 3);
+    }
+
+    #[test]
+    fn classify_empty_args_not_truncated() {
+        let mut tcs = vec![make_tc("e1", "file_list", "")];
+        let cls = classify_tool_calls(&mut tcs, 5);
+        assert!(cls.truncated_ids.is_empty());
+        // Empty args still get a loop key
+        assert_eq!(cls.tool_loop_keys.len(), 1);
+    }
+}
+
