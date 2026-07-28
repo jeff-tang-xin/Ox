@@ -1,7 +1,7 @@
 ﻿# Ox 渐进式重写计划（Strangler Fig）
 
 > 单一进度源。每完成一小步就更新对应复选框与「变更记录」表。
-> 维护者：Ox agent + 项目负责人。最后更新：P5.3 完成（repair_and_extract + run_memory_offload + handle_empty_tool_calls + build_content_with_reasoning），P5.2/P5.5 待续。
+> 维护者：Ox agent + 项目负责人。最后更新：P5.5 完成（prune_orphaned_tool_calls + run_post_edit_checks），P5.2/P5.3 stream extraction 待续。
 
 ---
 
