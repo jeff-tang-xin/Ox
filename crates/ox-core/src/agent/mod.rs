@@ -1770,26 +1770,19 @@ pub async fn run_agent_turn(
             tracing::warn!("Failed to clean up old refs: {}", e);
         }
 
-        // 🔁 Repeated-output guard: catch the degenerate loop where the model
-        // emits near-identical reasoning turn after turn without progressing.
-        match repeat_guard.observe(&crate::agent::think_stream::visible_only(&full_text)) {
-            repeat_guard::RepeatAction::Continue => {}
-            repeat_guard::RepeatAction::Nudge(nudge) => {
-                let _ = ui_tx.send(AgentToUiEvent::Status(
-                    "🔁 检测到重复思考 — 提示模型发出具体动作。".to_string(),
-                ));
-                messages.push(Message::system(&nudge));
-            }
-            repeat_guard::RepeatAction::Stop(handoff) => {
-                let _ = ui_tx.send(AgentToUiEvent::Status(
-                    "🛑 连续重复思考无法推进 — 暂停本轮，等待你的指示。".to_string(),
-                ));
-                messages.push(Message::system(&handoff));
-                new_messages.push(Message::system(&handoff));
-                persist_turn_memory(&workflow_engine, &turn_memory);
-                emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                return;
-            }
+        // Repeat guard (extracted to check_repeat_guard)
+        if check_repeat_guard(
+            &mut repeat_guard,
+            &full_text,
+            &mut messages,
+            &mut new_messages,
+            &mut turn_memory,
+            &workflow_engine,
+            &ui_tx,
+            turn_id,
+            &total_usage,
+        ) {
+            return;
         }
 
         // Loop back to call LLM again with tool results.
@@ -3768,6 +3761,42 @@ fn check_repeated_failure_handoff(
     } else {
         false
     }
+}
+
+// ── Repeat guard extraction ───────────────────────────────────────────────────
+/// Check for degenerate repeated-output loops. Returns `true` if the turn
+/// should be aborted (Stop), `false` to continue.
+fn check_repeat_guard(
+    repeat_guard: &mut crate::agent::repeat_guard::RepeatGuard,
+    full_text: &str,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    turn_id: u64,
+    total_usage: &crate::message::TokenUsage,
+) -> bool {
+    match repeat_guard.observe(&crate::agent::think_stream::visible_only(full_text)) {
+        repeat_guard::RepeatAction::Continue => {}
+        repeat_guard::RepeatAction::Nudge(nudge) => {
+            let _ = ui_tx.send(AgentToUiEvent::Status(
+                "🔁 检测到重复思考 - 提示模型发出具体动作。".to_string(),
+            ));
+            messages.push(Message::system(&nudge));
+        }
+        repeat_guard::RepeatAction::Stop(handoff) => {
+            let _ = ui_tx.send(AgentToUiEvent::Status(
+                "🛑 连续重复思考无法推进 - 暂停本轮，等待你的指示。".to_string(),
+            ));
+            messages.push(Message::system(&handoff));
+            new_messages.push(Message::system(&handoff));
+            persist_turn_memory(workflow_engine, turn_memory);
+            emit_turn_done(ui_tx, turn_id, new_messages.clone(), total_usage.clone());
+            return true;
+        }
+    }
+    false
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
