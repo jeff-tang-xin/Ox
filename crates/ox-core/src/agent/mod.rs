@@ -633,76 +633,14 @@ pub async fn run_agent_turn(
         crate::agent::gate::read_guard::clear_symbol_queries(&engine);
     }
 
-    // 🎯 Anchor to the **current turn user input** (not session history)
-    let user_task: Option<String> = workflow_engine
-        .as_ref()
-        .and_then(|wf| wf.try_lock().ok())
-        .and_then(|e| user_round::get_turn_user_input(&e))
-        .or_else(|| {
-            workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .and_then(|e| e.get_variable("_current_user_request"))
-                .filter(|s| !s.trim().is_empty())
-        })
-        .or_else(|| {
-            messages.iter().rev().find_map(|m| {
-                if let Message::User { content } = m {
-                    Some(content.clone())
-                } else {
-                    None
-                }
-            })
-        });
+    // Result: user task resolved via workflow engine -> _current_user_request -> last User message
+    let user_task = resolve_user_task(&workflow_engine, &messages);
 
-    let mut turn_memory =
-        crate::memory::turn_memory::TurnMemory::new(user_task.as_deref().unwrap_or(""));
-    if let Some(wf) = &workflow_engine {
-        // FIX: Add warning when lock acquisition fails
-        if let Ok(engine) = wf.try_lock() {
-            crate::agent::gate::reset_failures(&engine);
-            post_edit_verification::reset_verify_failures(&engine);
-            if let Some(saved) = engine.load_turn_memory() {
-                turn_memory.merge_from(saved);
-            }
-            // Intent is set at user-round boundary; do not re-classify each LLM iteration.
-            let block = engine.user_round_memory_block();
-            if !block.is_empty() {
-                user_round::inject_user_round(&mut messages, &block);
-            }
-            let block = engine.durable_memory_block();
-            if !block.is_empty() {
-                crate::memory::memory_bridge::inject_durable_memory(&mut messages, &block);
-            }
-        } else {
-            tracing::warn!(
-                "[run_agent_turn] Failed to acquire workflow_engine lock for memory injection"
-            );
-        }
-    }
+    let mut turn_memory = init_turn_memory(&workflow_engine, &mut messages, user_task.as_deref());
 
     let mut iteration = 0u32;
-    // ── P5.1: TurnBudget consolidates explore/impl streak counters ──
-    // Previously 6 loose locals; now grouped in a typed struct.
-    // `total_explore` is persisted across turns via engine counter `_total_explore`;
-    // only a real edit/finish (handled inside evaluate()) resets it to 0.
-    let total_explore_init = workflow_engine
-        .as_ref()
-        .and_then(|wf| wf.try_lock().ok())
-        .map(|e| {
-            let val = e.get_counter("_total_explore");
-            let user_req = e.get_variable("_current_user_request").unwrap_or_default();
-            if crate::agent::workflow_session::looks_like_new_task(&user_req) {
-                e.set_counter("_total_explore", 0);
-                tracing::info!("[EXPLORE_RESET] total_explore reset to 0 (new task detected)");
-                0u32
-            } else {
-                val
-            }
-        })
-        .unwrap_or(0);
     let mut budget =
-        crate::agent::turn_state::TurnBudget::with_total_explore(total_explore_init);
+        crate::agent::turn_state::TurnBudget::with_total_explore(init_total_explore(&workflow_engine));
     let mut repeat_guard = repeat_guard::RepeatGuard::new();
     let mut unified_parse_error_streak = 0u32;
     let mut findings_deliver_error_streak = 0u32;
@@ -1317,6 +1255,95 @@ pub async fn run_agent_turn(
     // Loop exited via break (cancellation or user declined to continue).
     emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
 }
+/// Resolve the user task from three fallback sources (in priority order):
+/// 1. `user_round::get_turn_user_input` (explicit turn-scoped input)
+/// 2. `_current_user_request` workflow variable
+/// 3. Last `Message::User` in the conversation
+///
+/// Returns `None` if all sources are empty.
+fn resolve_user_task(
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &[Message],
+) -> Option<String> {
+    workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .and_then(|e| user_round::get_turn_user_input(&e))
+        .or_else(|| {
+            workflow_engine
+                .as_ref()
+                .and_then(|wf| wf.try_lock().ok())
+                .and_then(|e| e.get_variable("_current_user_request"))
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| {
+            messages.iter().rev().find_map(|m| {
+                if let Message::User { content } = m {
+                    Some(content.clone())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+/// Initialize TurnMemory and inject saved state + memory blocks into messages.
+///
+/// Side effects: mutates `messages` by injecting user_round and durable memory blocks.
+/// Also resets gate failures and verify failures for the new turn.
+fn init_turn_memory(
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &mut Vec<Message>,
+    user_task: Option<&str>,
+) -> crate::memory::turn_memory::TurnMemory {
+    let mut turn_memory =
+        crate::memory::turn_memory::TurnMemory::new(user_task.unwrap_or(""));
+    if let Some(wf) = workflow_engine {
+        if let Ok(engine) = wf.try_lock() {
+            crate::agent::gate::reset_failures(&engine);
+            post_edit_verification::reset_verify_failures(&engine);
+            if let Some(saved) = engine.load_turn_memory() {
+                turn_memory.merge_from(saved);
+            }
+            let block = engine.user_round_memory_block();
+            if !block.is_empty() {
+                user_round::inject_user_round(messages, &block);
+            }
+            let block = engine.durable_memory_block();
+            if !block.is_empty() {
+                crate::memory::memory_bridge::inject_durable_memory(messages, &block);
+            }
+        } else {
+            tracing::warn!(
+                "[run_agent_turn] Failed to acquire workflow_engine lock for memory injection"
+            );
+        }
+    }
+    turn_memory
+}
+
+/// Load `total_explore` counter from the workflow engine, resetting to 0
+/// if a new task is detected.
+fn init_total_explore(
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+) -> u32 {
+    workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|e| {
+            let val = e.get_counter("_total_explore");
+            let user_req = e.get_variable("_current_user_request").unwrap_or_default();
+            if crate::agent::workflow_session::looks_like_new_task(&user_req) {
+                e.set_counter("_total_explore", 0);
+                tracing::info!("[EXPLORE_RESET] total_explore reset to 0 (new task detected)");
+                0u32
+            } else {
+                val
+            }
+        })
+        .unwrap_or(0)
+}
+
 
 // ─── P5.3: Extracted from run_agent_turn ───
 
