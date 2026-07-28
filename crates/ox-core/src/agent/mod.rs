@@ -661,11 +661,6 @@ pub async fn run_agent_turn(
             break;
         }
 
-        // No automatic per-turn iteration cap: the ReAct loop runs until the agent
-        // calls finish (LLM-driven termination) or the user stops it (N / Ctrl+C).
-        // The only remaining auto-stops are genuine safety nets: same-tool loop
-        // detection, the per-call 120s timeout, and empty-arg streak guards.
-
         let _ = ui_tx.send(AgentToUiEvent::Status(if iteration == 0 {
             "🧠 Thinking...".to_string()
         } else {
@@ -681,22 +676,6 @@ pub async fn run_agent_turn(
             push_interjection_message,
         );
 
-
-
-        turn_memory.bump_iteration();
-        persist_turn_memory(&workflow_engine, &turn_memory);
-
-        // In-turn message growth is handled by the unified offload path: after
-        // each LLM call, real prompt-token count is checked against the 80%
-        // window budget and, if exceeded, the ReAct log is archived + old tool
-        // messages placeholdered (crate::memory::memory_offload::offload_if_over_budget). The
-        // former iteration-count-based compact_turn_messages was retired.
-
-        // NOTE: fold_review_exploration removed — it replaced tool results with
-        // placeholders pointing to [WORKSPACE]/STEP_MEMORY blocks that no longer
-        // exist in the context, causing the LLM to see no actual code content.
-        // File contents must stay visible so the LLM can edit them.
-
         // Prepare context for LLM call (extracted to prepare_llm_context)
         prepare_llm_context(
             &mut messages,
@@ -710,8 +689,6 @@ pub async fn run_agent_turn(
             budget.total_explore,
             budget.impl_streak,
         );
-
-
 
         // Single-step model: always show assistant output to the user.
         let pre_llm_step_idx = workflow_engine
@@ -801,8 +778,6 @@ pub async fn run_agent_turn(
             ReviewFindingsOutcome::Continue => continue,
             ReviewFindingsOutcome::Proceed => {}
         }
-
-
 
         if tool_calls.is_empty() {
             if handle_empty_tool_calls(
@@ -896,8 +871,6 @@ pub async fn run_agent_turn(
             unified_tool_mode,
         )
         .await;
-
-
 
         // ── Context Offloader: created once and reused across all tools in this iteration ──
         let mut offloader = crate::context::context_offloader::ContextOffloader::new(
