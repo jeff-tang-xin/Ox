@@ -1681,51 +1681,15 @@ pub async fn run_agent_turn(
             // Record read/symbol queries to workflow engine (extracted to record_read_queries)
             record_read_queries(tc, &result, &workflow_engine);
 
-            // Snapshot tool results for Plan / Execute step iteration memory
-            if !result.is_error
-                && let Some(ref engine_arc) = workflow_engine
-                && let Ok(engine) = engine_arc.try_lock()
-            {
-                let step = engine.get_current_step_index();
-                if crate::agent::exploration_snapshot::should_snapshot_for_step(step, &tc.name) {
-                    let target = crate::agent::exploration_snapshot::target_from_tool_args(
-                        &tc.name,
-                        &tc.arguments,
-                    );
-                    engine.record_exploration_result(
-                        &tool_ctx.working_dir,
-                        &tc.name,
-                        &target,
-                        &result_content,
-                    );
-                }
-            }
-
-            turn_memory.record_tool_with_result(
-                &tc.name,
-                &tc.arguments,
-                !result.is_error,
-                Some(&result_content),
+            // Snapshot + record tool result to turn memory (extracted to snapshot_and_record_turn)
+            snapshot_and_record_turn(
+                tc,
+                &result,
+                &result_content,
+                &tool_ctx.working_dir,
+                &workflow_engine,
+                &mut turn_memory,
             );
-            let target =
-                crate::agent::exploration_snapshot::target_from_tool_args(&tc.name, &tc.arguments);
-            let observation: String =
-                crate::agent::exploration_snapshot::extract_data_content(&result_content)
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-                    .chars()
-                    .take(260)
-                    .collect();
-            let status = if result.is_error { "失败" } else { "成功" };
-            turn_memory.record_decision(format!(
-                "你刚才执行 {}({}) {status}; 观察到: {}; 后续避免重复同一查询",
-                tc.name, target, observation
-            ));
-            persist_turn_memory(&workflow_engine, &turn_memory);
 
             if tc.name == "shell_exec"
                 && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
@@ -3675,6 +3639,64 @@ fn record_read_queries(
     {
         crate::agent::gate::read_guard::record_symbol_query(&engine, &tc.name, &args);
     }
+}
+
+// ── Snapshot + turn memory recording extraction ────────────────────────────────
+/// Snapshot exploration results to the workflow engine and record the tool
+/// result + decision to turn memory, then persist.
+fn snapshot_and_record_turn(
+    tc: &ToolCall,
+    result: &crate::tools::ToolOutput,
+    result_content: &str,
+    working_dir: &std::path::Path,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+) {
+    // Snapshot tool results for Plan / Execute step iteration memory
+    if !result.is_error
+        && let Some(engine_arc) = workflow_engine
+        && let Ok(engine) = engine_arc.try_lock()
+    {
+        let step = engine.get_current_step_index();
+        if crate::agent::exploration_snapshot::should_snapshot_for_step(step, &tc.name) {
+            let target = crate::agent::exploration_snapshot::target_from_tool_args(
+                &tc.name,
+                &tc.arguments,
+            );
+            engine.record_exploration_result(
+                working_dir,
+                &tc.name,
+                &target,
+                result_content,
+            );
+        }
+    }
+
+    turn_memory.record_tool_with_result(
+        &tc.name,
+        &tc.arguments,
+        !result.is_error,
+        Some(result_content),
+    );
+    let target =
+        crate::agent::exploration_snapshot::target_from_tool_args(&tc.name, &tc.arguments);
+    let observation: String =
+        crate::agent::exploration_snapshot::extract_data_content(result_content)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ")
+            .chars()
+            .take(260)
+            .collect();
+    let status = if result.is_error { "失败" } else { "成功" };
+    turn_memory.record_decision(format!(
+        "你刚才执行 {}({}) {status}; 观察到: {}; 后续避免重复同一查询",
+        tc.name, target, observation
+    ));
+    persist_turn_memory(workflow_engine, turn_memory);
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
