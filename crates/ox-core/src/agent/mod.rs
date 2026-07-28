@@ -1678,35 +1678,8 @@ pub async fn run_agent_turn(
                 offloaded.to_context_message()
             );
 
-            if tc.name == "file_read"
-                && !result.is_error
-                && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-            {
-                if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
-                    let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as u32;
-                    if let Some(ref engine_arc) = workflow_engine
-                        && let Ok(engine) = engine_arc.try_lock()
-                    {
-                        crate::agent::gate::read_guard::record_file_read(&engine, path);
-                        crate::agent::tool_digest::record_read(
-                            &engine,
-                            path,
-                            &result.content,
-                            offset,
-                            None,
-                        );
-                        // Digest wrapping removed — LLM needs full file content.
-                        // Compaction at iteration 3 handles context bloat.
-                    }
-                }
-            } else if matches!(tc.name.as_str(), "find_symbol" | "code_search")
-                && !result.is_error
-                && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                && let Some(ref engine_arc) = workflow_engine
-                && let Ok(engine) = engine_arc.try_lock()
-            {
-                crate::agent::gate::read_guard::record_symbol_query(&engine, &tc.name, &args);
-            }
+            // Record read/symbol queries to workflow engine (extracted to record_read_queries)
+            record_read_queries(tc, &result, &workflow_engine);
 
             // Snapshot tool results for Plan / Execute step iteration memory
             if !result.is_error
@@ -3665,6 +3638,43 @@ fn offload_and_record(
     }
 
     offloaded
+}
+
+// ── Read query recording extraction ───────────────────────────────────────────
+/// Record file_read and find_symbol/code_search results to the workflow engine
+/// for gate/digest tracking.
+fn record_read_queries(
+    tc: &ToolCall,
+    result: &crate::tools::ToolOutput,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+) {
+    if tc.name == "file_read"
+        && !result.is_error
+        && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+    {
+        if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
+            let offset = args.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as u32;
+            if let Some(engine_arc) = workflow_engine
+                && let Ok(engine) = engine_arc.try_lock()
+            {
+                crate::agent::gate::read_guard::record_file_read(&engine, path);
+                crate::agent::tool_digest::record_read(
+                    &engine,
+                    path,
+                    &result.content,
+                    offset,
+                    None,
+                );
+            }
+        }
+    } else if matches!(tc.name.as_str(), "find_symbol" | "code_search")
+        && !result.is_error
+        && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        && let Some(engine_arc) = workflow_engine
+        && let Ok(engine) = engine_arc.try_lock()
+    {
+        crate::agent::gate::read_guard::record_symbol_query(&engine, &tc.name, &args);
+    }
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
