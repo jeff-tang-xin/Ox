@@ -33,6 +33,7 @@ pub mod tool_executor; // 🆕 Tool detail display + error formatting
 pub mod tool_graph; // Phase-aware [TOOL_ROUTE] injection
 pub mod tool_result;
 pub mod tool_result_envelope;
+pub mod turn_state; // Typed per-turn budget (P1 rewrite scaffold)
 pub mod ui_event;
 pub mod unified_action;
 pub mod unified_handler;
@@ -687,20 +688,18 @@ pub async fn run_agent_turn(
     let mut total_explore = workflow_engine
         .as_ref()
         .and_then(|wf| wf.try_lock().ok())
-        .and_then(|e| {
-            let val = e.get_variable("_total_explore")
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
+        .map(|e| {
+            let val = e.get_counter("_total_explore");
             let user_req = e.get_variable("_current_user_request")
                 .unwrap_or_default();
             if crate::agent::workflow_session::looks_like_new_task(&user_req) {
-                e.set_variable("_total_explore", "0".to_string());
+                e.set_counter("_total_explore", 0);
                 tracing::info!(
                     "[EXPLORE_RESET] total_explore reset to 0 (new task detected)"
                 );
-                Some(0u32)
+                0u32
             } else {
-                Some(val)
+                val
             }
         })
         .unwrap_or(0);
@@ -1624,7 +1623,7 @@ pub async fn run_agent_turn(
                 if let Some(wf) = &workflow_engine
                     && let Ok(engine) = wf.try_lock()
                 {
-                    engine.set_variable("_total_explore", total_explore.to_string());
+                    engine.set_counter("_total_explore", total_explore);
                 }
                 action
             };

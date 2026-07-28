@@ -102,21 +102,16 @@ impl GateRunner {
 
 /// Increment and return the cumulative gate-failure counter for this turn.
 fn bump_failure(engine: &WorkflowEngine) -> u32 {
-    let next = current_failures(engine) + 1;
-    engine.set_variable(GATE_FAILURE_KEY, next.to_string());
-    next
+    engine.bump_counter(GATE_FAILURE_KEY)
 }
 
 pub fn current_failures(engine: &WorkflowEngine) -> u32 {
-    engine
-        .get_variable(GATE_FAILURE_KEY)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+    engine.get_counter(GATE_FAILURE_KEY)
 }
 
 /// Clear the counter (call at the start of every fresh user turn).
 pub fn reset_failures(engine: &WorkflowEngine) {
-    engine.set_variable(GATE_FAILURE_KEY, String::new());
+    engine.set_counter(GATE_FAILURE_KEY, 0);
 }
 
 #[cfg(test)]

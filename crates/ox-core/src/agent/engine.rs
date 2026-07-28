@@ -886,6 +886,29 @@ impl WorkflowEngine {
         }
     }
 
+    /// Read a session variable as an integer counter.
+    ///
+    /// Typed accessor over the string-based variable store: returns 0 when the
+    /// key is absent or unparsable, so callers never repeat the
+    /// `get_variable(..).and_then(|s| s.parse().ok()).unwrap_or(0)` dance.
+    pub fn get_counter(&self, key: &str) -> u32 {
+        self.get_variable(key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Set an integer counter variable.
+    pub fn set_counter(&self, key: &str, value: u32) {
+        self.set_variable(key, value.to_string());
+    }
+
+    /// Increment a counter by 1 and return the new value.
+    pub fn bump_counter(&self, key: &str) -> u32 {
+        let next = self.get_counter(key) + 1;
+        self.set_counter(key, next);
+        next
+    }
+
     /// Store the LLM output from the previous step (used as {PREVIOUS_OUTPUT} in next step's prompt)
     pub fn set_previous_output(&self, output: &str) {
         self.set_variable("_prev_output", output.to_string());
