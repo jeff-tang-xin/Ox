@@ -1010,49 +1010,20 @@ pub async fn run_agent_turn(
             &mut turn_memory,
         );
 
-        // Build actions_summary for fallback decision text in react_log below.
-        let actions_summary = tool_calls
-            .iter()
-            .map(|tc| {
-                if unified_tool_mode && tc.name == crate::agent::unified_action::TOOL_NAME {
-                    crate::agent::unified_action::parse_request(&tc.arguments)
-                        .map(|req| req.action)
-                        .unwrap_or_else(|_| tc.name.clone())
-                } else {
-                    tc.name.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        // ── 🔴 UNIFIED RECORD: Capture LLM's decision BEFORE tool execution ──
-        if let Some(ref ms) = tool_ctx.memory_store {
-            let (session_id, task_desc) =
-                react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-            let first_tool = tool_calls.first();
-            let (tool_name, tool_target) = first_tool
-                .map(|tc| extract_tool_name_and_target(tc, unified_tool_mode))
-                .unwrap_or(("(no tool)".to_string(), String::new()));
-            let decision = turn_memory
-                .decisions
-                .last()
-                .cloned()
-                .unwrap_or_else(|| format!("LLM 选择执行: {}", actions_summary));
-            let _ = record_react_tool(
-                ms.as_ref(),
-                &session_id,
-                &task_desc,
-                &tool_name,
-                &tool_target,
-                "llm_decision",
-                &decision,
-                &full_text,
-                &reasoning_content,
-                unified_tool_mode,
-                first_tool.map(|tc| tc.arguments.as_str()).unwrap_or(""),
-                &format!("(待执行) {} 个工具调用", tool_calls.len()),
-            )
-            .await;
-        }
+        // Record LLM decision to react_log (extracted to record_llm_decision)
+        record_llm_decision(
+            &tool_calls,
+            &tool_ctx,
+            &workflow_engine,
+            &user_task,
+            &turn_memory,
+            &full_text,
+            &reasoning_content,
+            unified_tool_mode,
+        )
+        .await;
+
+
 
         // ── Context Offloader: created once and reused across all tools in this iteration ──
         let mut offloader = crate::context::context_offloader::ContextOffloader::new(
@@ -3997,6 +3968,62 @@ fn prepare_llm_context(
     crate::agent::think_stream::prepare_messages_for_llm(messages);
 
     slim_in_impl_phase
+}
+
+/// Record the LLM's decision BEFORE tool execution to the SQLite react_log.
+/// This captures the tool batch intent (not yet executed) for cross-round memory.
+#[allow(clippy::too_many_arguments)]
+async fn record_llm_decision(
+    tool_calls: &[ToolCall],
+    tool_ctx: &Arc<ToolContext>,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    user_task: &Option<String>,
+    turn_memory: &crate::memory::turn_memory::TurnMemory,
+    full_text: &str,
+    reasoning_content: &str,
+    unified_tool_mode: bool,
+) {
+    let actions_summary = tool_calls
+        .iter()
+        .map(|tc| {
+            if unified_tool_mode && tc.name == crate::agent::unified_action::TOOL_NAME {
+                crate::agent::unified_action::parse_request(&tc.arguments)
+                    .map(|req| req.action)
+                    .unwrap_or_else(|_| tc.name.clone())
+            } else {
+                tc.name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(ref ms) = tool_ctx.memory_store {
+        let (session_id, task_desc) =
+            react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
+        let first_tool = tool_calls.first();
+        let (tool_name, tool_target) = first_tool
+            .map(|tc| extract_tool_name_and_target(tc, unified_tool_mode))
+            .unwrap_or(("(no tool)".to_string(), String::new()));
+        let decision = turn_memory
+            .decisions
+            .last()
+            .cloned()
+            .unwrap_or_else(|| format!("LLM 选择执行: {}", actions_summary));
+        let _ = record_react_tool(
+            ms.as_ref(),
+            &session_id,
+            &task_desc,
+            &tool_name,
+            &tool_target,
+            "llm_decision",
+            &decision,
+            full_text,
+            reasoning_content,
+            unified_tool_mode,
+            first_tool.map(|tc| tc.arguments.as_str()).unwrap_or(""),
+            &format!("(待执行) {} 个工具调用", tool_calls.len()),
+        )
+        .await;
+    }
 }
 
 /// Record a legacy (non-unified) tool execution to the SQLite react_log.
