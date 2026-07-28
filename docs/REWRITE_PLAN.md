@@ -20,7 +20,7 @@
 | 阶段 | 目标 | 消除的旧债 | 状态 |
 |------|------|-----------|------|
 | **P1** | 类型化 Turn 状态机骨架 | 十几个散落 streak + `_total_explore` 字符串反模式 | 🟡 进行中（P1.1/P1.6 ✅） |
-| **P2** | 统一门禁管线（前置拦截也走 `Gate` trait） | enforcer / read_guard / `validate_tool_call` 三处重叠 | ⬜ 未开始 |
+| **P2** | 统一门禁管线（前置拦截也走 `Gate` trait） | enforcer / read_guard / `validate_tool_call` 三处重叠 | 🟨 P2a 完成(双调bug修复) / P2b 未开始 |
 | **P3** | 原生 function calling，删 `complete_and_check` 壳 | `unified_action` / `unified_handler` / `tool_args_repair` 大半 | ⬜ 未开始 |
 | **P4** | 统一上下文预算账本 | `memory_offload` 散落魔数（85%/92%/冷却） | ⬜ 未开始 |
 | **P5** | 拆 `run_agent_turn` god function（3855 行） | mod.rs 巨型命令式循环 → 每状态一 handler | ⬜ 未开始 |
@@ -62,12 +62,29 @@
 
 **现状**：已有 `gate/gate.rs` 的 `Gate` trait + `GateRunner`，但只跑在 `## Done` 之后（后置校验）；前置拦截散在 `enforcer.rs`(22KB) / `gate/read_guard.rs` / `engine.rs::validate_tool_call`。
 
-- [ ] P2.1 定义前置 `PreGate` trait（或复用 `Gate`，输入改为 `ToolCall + TurnCtx`）
-- [ ] P2.2 `ReadBeforeEdit` / `PathScope` / `ImpactAnalysis` / `TrustLevel` 各实现为独立 gate
-- [ ] P2.3 组装 `pre_pipeline()`，返回 `Allow | Warn | Block | NeedConfirm`
-- [ ] P2.4 `enforcer` / `read_guard` / `validate_tool_call` 逐个改为委托新管线（保留旧入口签名，内部转发）
-- [ ] P2.5 单测覆盖每个 gate 的 allow/block 分支
-- [ ] P2.6 `cargo test -p ox-core` 通过
+#### P2a — 修复双调 bug（✅ 完成，使用期间发现）
+
+分析三处重叠时实测发现：`read_guard::check` 是**有状态**门禁（file_read 首次重读时 `record_impl_file_read` 写状态），却在两条执行路径里各被调用两次 —
+- **mod.rs 主循环**：2512 直接调 + 2548 `validate_tool_call`→validation.rs 间接调
+- **unified_handler**：930 直接调 + 927 `validate_tool_call` 间接调
+
+后果：首次重读在第一次调用消耗掉「允许一次重读」额度，第二次调用即误判「已读 2 次以上」而拦截。改造者本轮重读 `turn_state.rs` 时亲历此误拦。
+
+- [x] P2a.1 从 `validate_single_step_tool`（validation.rs:69）移除 `read_guard::check`，补注释说明唯一调用点
+- [x] P2a.2 两条路径各保留紧邻 cached-response 回填的唯一直接调用
+- [x] P2a.3 新增回归单测 `single_step_validation_does_not_consume_reread_budget`
+- [x] P2a.4 `cargo test -p ox-core --lib` → 381 passed / 0 failed
+
+#### P2b — 统一前置门禁管线（⬜ 未开始，大 scope）
+
+- [ ] P2b.1 定义前置 `PreGate` trait（或复用 `Gate`，输入改为 `ToolCall + TurnCtx`）
+- [ ] P2b.2 `ReadBeforeEdit` / `PathScope` / `ImpactAnalysis` / `TrustLevel` 各实现为独立 gate
+- [ ] P2b.3 组装 `pre_pipeline()`，返回 `Allow | Warn | Block | NeedConfirm`
+- [ ] P2b.4 `enforcer` / `read_guard` / `validate_tool_call` 逐个改为委托新管线（保留旧入口签名，内部转发）
+- [ ] P2b.5 单测覆盖每个 gate 的 allow/block 分支
+- [ ] P2b.6 `cargo test -p ox-core` 通过
+
+**风险登记**：`enforcer::RuleEnforcer::validate`（mod.rs:2639）在单步模式下因 `skip_plan_rules` 恒真而是**死代码**，仅 legacy 多步路径触达。删除需先确认多步路径依赖，属 P2b scope，本次未动。
 
 **验收标准**：「能否执行工具」的判断只有一处事实源；旧三入口沦为薄委托。
 
@@ -111,9 +128,10 @@
 | 日期 | 阶段/子任务 | commit | 说明 | check/test |
 |------|------------|--------|------|-----------|
 | —    | —          | —      | 计划文档建立 | — |
-| 本次 | P1.1+P1.6  | 待提交 | engine.rs 新增类型化计数器 API；gate.rs 三函数迁移；消除 gate 反模式 | check 0 err。60 gate 测|
-| 本次 | P1.2+P1.3+P1.7 | 待提交 | 新建 turn_state.rs（TurnPhase/TurnBudget，上限委托 ConvergeMode）+ 挂模块 + 6 单测 | 7 passed / 0 failed |
-| 本次 | P1.4+P1.5 ✅P1 完成 | 待提交 | mod.rs 两处 `_total_explore` 字符串反模式迁移为 get_counter/set_counter；parse/to_string 在 agent 模块内清零 | check 0 err，380 passed / 0 failed |
+| 本次 | P1.1+P1.6  | c933890 | engine.rs 新增类型化计数器 API；gate.rs 三函数迁移；消除 gate 反模式 | check 0 err。60 gate 测|
+| 本次 | P1.2+P1.3+P1.7 | c933890 | 新建 turn_state.rs（TurnPhase/TurnBudget，上限委托 ConvergeMode）+ 挂模块 + 6 单测 | 7 passed / 0 failed |
+| 本次 | P1.4+P1.5 ✅P1 完成 | c933890 | mod.rs 两处 `_total_explore` 字符串反模式迁移为 get_counter/set_counter；parse/to_string 在 agent 模块内清零 | check 0 err，380 passed / 0 failed |
+| 本次 | P2a 双调bug修复 | 待提交 | 实测发现 read_guard::check 在单步+unified 两路径各被调用两次（有状态门禁），误拦首次重读；从 validation.rs 移除重复调用 + 回归单测 | check 0 err，381 passed / 0 failed |
 
 ---
 
