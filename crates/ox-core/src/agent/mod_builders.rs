@@ -27,15 +27,11 @@ pub fn build_task_anchor_block(
     } else {
         ""
     };
-    b.push_str(&format!("[TURN_CONTEXT]\n"));
+    b.push_str("[TURN_CONTEXT]\n");
     // Task anchor with clear boundary
     b.push_str(&format!("🎯 **当前任务**: {task}{ellipsis}\n"));
-    b.push_str(&format!(
-        "📌 **完成标准**: 能回答用户的问题 / 修复用户指出的问题\n"
-    ));
-    b.push_str(&format!(
-        "🚧 **任务边界**: 仅探索与上述任务直接相关的代码，偏离时立即收敛\n"
-    ));
+    b.push_str("📌 **完成标准**: 能回答用户的问题 / 修复用户指出的问题\n");
+    b.push_str("🚧 **任务边界**: 仅探索与上述任务直接相关的代码，偏离时立即收敛\n");
 
     if let Some(wf) = workflow_engine
         && let Ok(engine) = wf.try_lock()

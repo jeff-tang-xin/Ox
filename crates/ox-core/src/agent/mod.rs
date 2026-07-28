@@ -779,8 +779,8 @@ pub async fn run_agent_turn(
             ReviewFindingsOutcome::Proceed => {}
         }
 
-        if tool_calls.is_empty() {
-            if handle_empty_tool_calls(
+        if tool_calls.is_empty()
+            && handle_empty_tool_calls(
                 &full_text,
                 &reasoning_content,
                 &tool_ctx,
@@ -797,7 +797,6 @@ pub async fn run_agent_turn(
             {
                 return;
             }
-        }
 
         // Classify tool calls: detect truncated arguments and infinite loops.
         // Extracted into `classify_tool_calls()` for testability -- pure computation,
@@ -1579,11 +1578,10 @@ async fn collect_response(
                 }
                 let visible_piece = visible_delta.unwrap_or_default();
                 let clean_visible = strip_tool_call_xml(&visible_piece);
-                if clean_visible.len() < visible_piece.len() {
-                    if let Some(action) = extract_action_from_xml(&visible_piece) {
+                if clean_visible.len() < visible_piece.len()
+                    && let Some(action) = extract_action_from_xml(&visible_piece) {
                         let _ = ui_tx.send(AgentToUiEvent::Status(format!("🔄 {} ...", action)));
                     }
-                }
                 if let Some(ref mut filter) = findings_stream {
                     if let Some(visible) = filter.push(&clean_visible)
                         && !visible.is_empty()
@@ -2243,11 +2241,11 @@ async fn check_safety_gate(
         && let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
         && let Some(cmd) = args_val.get("command").and_then(|v| v.as_str())
     {
-        blacklist_warning = safety_gate::shell_blacklist_warning(&trust_manager, cmd);
+        blacklist_warning = safety_gate::shell_blacklist_warning(trust_manager, cmd);
     }
 
     let should_confirm = safety_gate::needs_confirmation(
-        &trust_manager,
+        trust_manager,
         &tc.name,
         safety_level,
         path_outside,
@@ -2294,7 +2292,7 @@ async fn check_safety_gate(
         safety_level,
         high_risk_warning,
     );
-    safety_gate::emit_request(&ui_tx, &req);
+    safety_gate::emit_request(ui_tx, &req);
 
     let decision = match safety_gate::await_decision(
         ui_rx,
@@ -2379,7 +2377,7 @@ async fn check_safety_gate(
         }
         ui_event::ConfirmationDecision::TrustAlways => {
             tracing::info!("[AGENT] User trusted all tools");
-            safety_gate::apply_trust_all(&trust_manager);
+            safety_gate::apply_trust_all(trust_manager);
             SafetyGateOutcome::Allow
         }
         ui_event::ConfirmationDecision::Allow => {
@@ -3930,8 +3928,8 @@ fn drain_interjections_pre_llm(
                     || trimmed.starts_with("/fix")
                     || trimmed.contains("确认")
                     || trimmed.contains("开始实施");
-                if is_confirm {
-                    if let Some(wf) = workflow_engine
+                if is_confirm
+                    && let Some(wf) = workflow_engine
                         && let Ok(engine) = wf.try_lock()
                     {
                         engine.set_variable(
@@ -3939,7 +3937,6 @@ fn drain_interjections_pre_llm(
                             "1".to_string(),
                         );
                     }
-                }
                 push_interjection_message(workflow_engine, messages, &text, ui_tx);
             }
             ui_event::UiToAgentEvent::ScopeConfirmed

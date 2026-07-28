@@ -375,7 +375,7 @@ impl MemoryStore {
 
             let mut score = 0.0f64;
 
-            if file_bases.iter().any(|b| base == *b) {
+            if file_bases.contains(&base) {
                 score += 3.0;
             } else if file_bases
                 .iter()
@@ -580,7 +580,7 @@ impl MemoryStore {
 
             if date != prev_date {
                 if !out.is_empty() {
-                    out.push_str("\n");
+                    out.push('\n');
                 }
                 out.push_str(&format!("── {} ──\n", date));
                 prev_date = date;

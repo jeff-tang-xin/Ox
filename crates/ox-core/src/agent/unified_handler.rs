@@ -1118,8 +1118,7 @@ async fn handle_delegate(
     // ── MEDIUM: record impact for memory, continue with warning ──
     if let Some(ref impact) = auto_impact
         && matches!(impact.risk, ImpactRisk::Medium)
-    {
-        if let Some(wf) = workflow_engine {
+        && let Some(wf) = workflow_engine {
             let engine = wf.lock().await;
             crate::agent::engine::impl_tracking::record_file_impact(
                 &engine,
@@ -1130,7 +1129,6 @@ async fn handle_delegate(
                 &format!("WARN(MEDIUM) — {}", impact.summary),
             );
         }
-    }
 
     let auto_impact_note = auto_impact.map(|i| i.summary);
 
