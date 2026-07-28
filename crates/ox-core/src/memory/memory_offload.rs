@@ -443,6 +443,7 @@ fn cleanup_only(messages: &mut Vec<Message>) {
 /// Replace the earliest ToolResult / tool-carrying Assistant messages with a
 /// compact placeholder so freed budget is realized, keeping tool-call pairs
 /// consistent afterwards. `count` is advisory (for the notice text).
+#[cfg(test)]
 fn placeholder_old_react(messages: &mut Vec<Message>, count: usize) {
     let first_user = messages
         .iter()

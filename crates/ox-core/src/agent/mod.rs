@@ -682,8 +682,6 @@ pub async fn run_agent_turn(
     }
 
     let mut iteration = 0u32;
-    let mut idle_streak = 0u32;
-    let mut content_only_streak = 0u32;
     let mut explore_streak = 0u32;
     let mut explore_reflected = false;
     // Cumulative exploration hard ceiling — persisted across turns via engine
@@ -943,7 +941,6 @@ pub async fn run_agent_turn(
                 business_gate::BusinessGateResume::Acknowledged => {
                     refresh_turn_memory_for_implement(&workflow_engine, &mut turn_memory);
                     tools_used_this_turn.clear();
-                    idle_streak = 0;
                     persist_turn_memory(&workflow_engine, &turn_memory);
                     iteration += 1;
                     continue;
@@ -1581,107 +1578,12 @@ pub async fn run_agent_turn(
 
             // Skip truncated tool calls — return error so LLM can retry.
             if truncated_ids.contains(&tc.id) {
-                // Special handling for different tools
-                let is_file_write = tc.name == "file_write";
-                let is_edit_file = tc.name == "edit_file";
-                let content_length = tc.arguments.len();
-
-                let error_msg = if is_file_write && content_length > 10000 {
-                    // Likely large file write that was truncated
-                    format!(
-                        "❌ Content Too Large - Arguments Truncated:\n\
-                         The 'content' parameter appears to be too large ({:.1} KB).\n\
-                         This usually happens when trying to write a large file in one call.\n\n\
-                         💡 Solutions (choose one):\n\n\
-                         1️⃣ Retry the request:\n\
-                            The system will automatically handle large files (>1 MB) using chunked writes.\n\
-                            Just resend the complete content without worrying about size.\n\n\
-                         2️⃣ Split into multiple operations:\n\
-                            - Write first part: {{\"path\": \"file.txt\", \"content\": \"part1...\"}}\n\
-                            - Use edit_file to append/modify remaining parts\n\n\
-                         3️⃣ Use edit_file for modifications:\n\
-                            If modifying existing file, use search/replace instead of rewriting entire file\n\n\
-                         📝 Note: Files >1 MB are automatically written in 512 KB chunks",
-                        content_length as f64 / 1024.0
-                    )
-                } else if is_edit_file && content_length > 500 {
-                    // Likely edit_file with long search/replace that was truncated
-                    // Try to extract partial info for better error message
-                    let partial_info = if let Ok(args_val) =
-                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                    {
-                        let path = args_val
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("<not specified>");
-                        let has_search = args_val.get("search").is_some();
-                        let has_replace = args_val.get("replace").is_some();
-                        format!(
-                            "\n\n📋 Partial arguments received:\n\
-                             • path: {}\n\
-                             • search: {}\n\
-                             • replace: {}",
-                            path,
-                            if has_search {
-                                "✅ present (may be truncated)"
-                            } else {
-                                "❌ missing"
-                            },
-                            if has_replace {
-                                "✅ present (may be truncated)"
-                            } else {
-                                "❌ missing"
-                            }
-                        )
-                    } else {
-                        "".to_string()
-                    };
-
-                    format!(
-                        "❌ Arguments Truncated - edit_file parameters incomplete:\n\
-                         Your search/replace content was too long and got truncated ({:.1} KB).\n\
-                         This usually happens when including too many lines of code context.\n\n\
-                         💡 How to fix:\n\
-                         1️⃣ Use SHORTER search strings:\n\
-                            - Include only 2-3 unique lines that uniquely identify the code\n\
-                            - Use distinctive identifiers (method names, variable names)\n\
-                            - Example: {{\"search\": \"fn process_order() {{\n    let order = validate();\"}}\n\n\
-                         2️⃣ Use file_read first:\n\
-                            - Read the file to see exact line numbers\n\
-                            - Copy the EXACT text including whitespace\n\
-                            - Use line numbers to ensure you have unique context\n\n\
-                         3️⃣ Break into multiple patches:\n\
-                            - Instead of one large patch, make 2-3 smaller edit_file calls\n\
-                            - Each patch should change <50% of the file\n\
-                            - Or use file_write to rewrite the entire file\n{}\n\n\
-                         📝 Example of good search string (2-3 lines):\n\
-                         {{\"path\": \"src/main.rs\", \"search\": \"fn calculate() {{\n    let result = a + b;\", \"replace\": \"fn calculate() {{\n    let result = a * b;\"}}",
-                        content_length as f64 / 1024.0,
-                        partial_info
-                    )
-                } else {
-                    // General truncation error
-                    format!(
-                        "❌ JSON Truncation Error for tool '{}':\n\
-                         Arguments were truncated (incomplete JSON). This usually happens when:\n\
-                         • The response exceeded the token limit\n\
-                         • The content was cut off during transmission\n\n\
-                         💡 How to fix:\n\
-                         • Retry with a shorter or more concise request\n\
-                         • Break large operations into smaller steps\n\
-                         • Ensure complete JSON syntax with all brackets/braces closed\n\n\
-                         📝 Example of complete JSON:\n\
-                         {{\"path\": \"output.txt\", \"content\": \"Hello World\"}}\n\n\
-                         Please retry with complete arguments.",
-                        tc.name
-                    )
-                };
-
+                let error_msg = build_truncation_error(&tc.name, &tc.arguments);
                 tracing::warn!(
                     "Tool '{}' (id={}) had truncated arguments ({} bytes). Sending error to LLM.",
                     tc.name,
                     tc.id,
-                    content_length
+                    tc.arguments.len()
                 );
 
                 let result_msg = Message::ToolResult {
@@ -1988,35 +1890,7 @@ pub async fn run_agent_turn(
                     Ok(v) => v,
                     Err(parse_err) => {
                         // Provide helpful guidance with examples
-                        let example = match tc.name.as_str() {
-                            "file_read" => "{\"path\": \"src/main.rs\", \"limit\": 100}",
-                            "file_write" => {
-                                "{\"path\": \"output.txt\", \"content\": \"Hello World\"}"
-                            }
-                            "edit_file" => {
-                                "{\"path\": \"src/lib.rs\", \"old_string\": \"...\", \"new_string\": \"...\"}"
-                            }
-                            "shell_exec" => "{\"command\": \"ls -la\", \"timeout_ms\": 5000}",
-                            "file_search" => "{\"pattern\": \"*.rs\", \"path\": \"src/\"}",
-                            "code_search" => "{\"pattern\": \"fn main\", \"path\": \"src/\"}",
-                            "code_graph" => {
-                                "{\"op\": \"impact\", \"target\": \"funcName\", \"direction\": \"upstream\"}"
-                            }
-                            _ => "{ /* check tool documentation */ }",
-                        };
-
-                        let error_msg = format!(
-                            "❌ JSON Parse Error for tool '{}':\n{}\n\n\
-                             💡 How to fix:\n\
-                             • Ensure valid JSON syntax (no trailing commas)\n\
-                             • Quote all keys and string values with double quotes\n\
-                             • Escape special characters in strings\n\
-                             • Check for missing brackets or braces\n\n\
-                             📝 Correct format example:\n\
-                             {}\n\n\
-                             Please retry with corrected arguments.",
-                            tc.name, parse_err, example
-                        );
+                        let error_msg = build_arg_parse_error(&tc.name, &parse_err);
 
                         tracing::warn!(
                             "Tool argument parse error for '{}': {} | Raw: {}",
@@ -2697,10 +2571,6 @@ pub async fn run_agent_turn(
         // Loop back to call LLM again with tool results.
         persist_turn_memory(&workflow_engine, &turn_memory);
         iteration += 1;
-        if !tool_calls.is_empty() {
-            idle_streak = 0;
-            content_only_streak = 0;
-        }
     }
 
     persist_turn_memory(&workflow_engine, &turn_memory);
@@ -3277,38 +3147,6 @@ fn execute_user_display(
         crate::agent::perception::format_for_user_display(text)
     } else {
         text.to_string()
-    }
-}
-
-/// Emit WorkflowCompleted so the CLI can trigger auto-reflection.
-fn emit_workflow_completed(
-    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    user_task: Option<&String>,
-    engine: &crate::agent::engine::WorkflowEngine,
-    fallback_summary: &str,
-) {
-    let task_description = user_task
-        .cloned()
-        .unwrap_or_else(|| "Unknown task".to_string());
-    let summary = engine.get_all_step_outputs_summary();
-    let execution_summary = if summary == "（无上一步输出）" {
-        fallback_summary.chars().take(1000).collect()
-    } else {
-        summary
-    };
-    let _ = ui_tx.send(AgentToUiEvent::WorkflowCompleted {
-        task_description,
-        execution_summary,
-    });
-}
-
-fn gate_recovery_hint(gate: &str) -> &'static str {
-    match gate {
-        "verify" | "syntax" => "运行验证命令或修正语法后再 ## Done。",
-        "citation" | "provenance" => "先 file_read 相关文件再断言。",
-        "plan" => "补全 ## Plan 勾选或调整 findings。",
-        "scope" => "只处理 in-scope findings。",
-        _ => "避免重复探索，聚焦当前任务。",
     }
 }
 
@@ -4033,6 +3871,131 @@ fn run_post_edit_checks(
     }
 }
 
+/// Build a contextual error message for tool arguments that were truncated
+/// (incomplete JSON). Produces tool-specific guidance for file_write and
+/// edit_file, or a generic message for other tools.
+fn build_truncation_error(name: &str, arguments: &str) -> String {
+    let is_file_write = name == "file_write";
+    let is_edit_file = name == "edit_file";
+    let content_length = arguments.len();
+
+    if is_file_write && content_length > 10000 {
+        format!(
+            "❌ Content Too Large - Arguments Truncated:\n\
+             The 'content' parameter appears to be too large ({:.1} KB).\n\
+             This usually happens when trying to write a large file in one call.\n\n\
+             💡 Solutions (choose one):\n\n\
+             1️⃣ Retry the request:\n\
+                The system will automatically handle large files (>1 MB) using chunked writes.\n\
+                Just resend the complete content without worrying about size.\n\n\
+             2️⃣ Split into multiple operations:\n\
+                - Write first part: {{\"path\": \"file.txt\", \"content\": \"part1...\"}}\n\
+                - Use edit_file to append/modify remaining parts\n\n\
+             3️⃣ Use edit_file for modifications:\n\
+                If modifying existing file, use search/replace instead of rewriting entire file\n\n\
+             📝 Note: Files >1 MB are automatically written in 512 KB chunks",
+            content_length as f64 / 1024.0
+        )
+    } else if is_edit_file && content_length > 500 {
+        let partial_info =
+            if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(arguments) {
+                let path = args_val
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<not specified>");
+                let has_search = args_val.get("search").is_some();
+                let has_replace = args_val.get("replace").is_some();
+                format!(
+                    "\n\n📋 Partial arguments received:\n\
+                 • path: {}\n\
+                 • search: {}\n\
+                 • replace: {}",
+                    path,
+                    if has_search {
+                        "✅ present (may be truncated)"
+                    } else {
+                        "❌ missing"
+                    },
+                    if has_replace {
+                        "✅ present (may be truncated)"
+                    } else {
+                        "❌ missing"
+                    }
+                )
+            } else {
+                "".to_string()
+            };
+
+        format!(
+            "❌ Arguments Truncated - edit_file parameters incomplete:\n\
+             Your search/replace content was too long and got truncated ({:.1} KB).\n\
+             This usually happens when including too many lines of code context.\n\n\
+             💡 How to fix:\n\
+             1️⃣ Use SHORTER search strings:\n\
+                - Include only 2-3 unique lines that uniquely identify the code\n\
+                - Use distinctive identifiers (method names, variable names)\n\
+                - Example: {{\"search\": \"fn process_order() {{\n    let order = validate();\"}}\n\n\
+             2️⃣ Use file_read first:\n\
+                - Read the file to see exact line numbers\n\
+                - Copy the EXACT text including whitespace\n\
+                - Use line numbers to ensure you have unique context\n\n\
+             3️⃣ Break into multiple patches:\n\
+                - Instead of one large patch, make 2-3 smaller edit_file calls\n\
+                - Each patch should change <50% of the file\n\
+                - Or use file_write to rewrite the entire file\n{}\n\n\
+             📝 Example of good search string (2-3 lines):\n\
+             {{\"path\": \"src/main.rs\", \"search\": \"fn calculate() {{\n    let result = a + b;\", \"replace\": \"fn calculate() {{\n    let result = a * b;\"}}",
+            content_length as f64 / 1024.0,
+            partial_info
+        )
+    } else {
+        format!(
+            "❌ JSON Truncation Error for tool '{}':\n\
+             Arguments were truncated (incomplete JSON). This usually happens when:\n\
+             • The response exceeded the token limit\n\
+             • The content was cut off during transmission\n\n\
+             💡 How to fix:\n\
+             • Retry with a shorter or more concise request\n\
+             • Break large operations into smaller steps\n\
+             • Ensure complete JSON syntax with all brackets/braces closed\n\n\
+             📝 Example of complete JSON:\n\
+             {{\"path\": \"output.txt\", \"content\": \"Hello World\"}}\n\n\
+             Please retry with complete arguments.",
+            name
+        )
+    }
+}
+
+/// Build a contextual error message for tool arguments that failed JSON parsing.
+fn build_arg_parse_error(name: &str, parse_err: &serde_json::Error) -> String {
+    let example = match name {
+        "file_read" => "{\"path\": \"src/main.rs\", \"limit\": 100}",
+        "file_write" => "{\"path\": \"output.txt\", \"content\": \"Hello World\"}",
+        "edit_file" => {
+            "{\"path\": \"src/lib.rs\", \"old_string\": \"...\", \"new_string\": \"...\"}"
+        }
+        "shell_exec" => "{\"command\": \"ls -la\", \"timeout_ms\": 5000}",
+        "file_search" => "{\"pattern\": \"*.rs\", \"path\": \"src/\"}",
+        "code_search" => "{\"pattern\": \"fn main\", \"path\": \"src/\"}",
+        "code_graph" => {
+            "{\"op\": \"impact\", \"target\": \"funcName\", \"direction\": \"upstream\"}"
+        }
+        _ => "{ /* check tool documentation */ }",
+    };
+    format!(
+        "❌ JSON Parse Error for tool '{}':\n{}\n\n\
+         💡 How to fix:\n\
+         • Ensure valid JSON syntax (no trailing commas)\n\
+         • Quote all keys and string values with double quotes\n\
+         • Escape special characters in strings\n\
+         • Check for missing brackets or braces\n\n\
+         📝 Correct format example:\n\
+         {}\n\n\
+         Please retry with corrected arguments.",
+        name, parse_err, example
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4123,5 +4086,48 @@ mod tests {
         assert!(cls.truncated_ids.is_empty());
         // Empty args still get a loop key
         assert_eq!(cls.tool_loop_keys.len(), 1);
+    }
+
+    #[test]
+    fn truncation_error_file_write_large() {
+        let args = "x".repeat(11000);
+        let msg = build_truncation_error("file_write", &args);
+        assert!(msg.contains("Content Too Large"));
+    }
+
+    #[test]
+    fn truncation_error_edit_file_long() {
+        let args = "x".repeat(600);
+        let msg = build_truncation_error("edit_file", &args);
+        assert!(msg.contains("Arguments Truncated"));
+        assert!(msg.contains("edit_file"));
+    }
+
+    #[test]
+    fn truncation_error_generic() {
+        let args = "{partial";
+        let msg = build_truncation_error("code_search", &args);
+        assert!(msg.contains("JSON Truncation Error"));
+        assert!(msg.contains("code_search"));
+    }
+
+    #[test]
+    fn arg_parse_error_known_tool() {
+        let args = "{bad json}";
+        let err = serde_json::from_str::<serde_json::Value>(args).unwrap_err();
+        let msg = build_arg_parse_error("file_read", &err);
+        assert!(msg.contains("JSON Parse Error"));
+        assert!(msg.contains("file_read"));
+        assert!(msg.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn arg_parse_error_unknown_tool() {
+        let args = "{bad json}";
+        let err = serde_json::from_str::<serde_json::Value>(args).unwrap_err();
+        let msg = build_arg_parse_error("my_custom_tool", &err);
+        assert!(msg.contains("JSON Parse Error"));
+        assert!(msg.contains("my_custom_tool"));
+        assert!(msg.contains("check tool documentation"));
     }
 }

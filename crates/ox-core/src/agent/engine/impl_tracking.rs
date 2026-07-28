@@ -248,32 +248,6 @@ pub(crate) fn record_file_impact(engine: &WorkflowEngine, path: &str, summary: &
     }
 }
 
-/// Get the recorded impact summary for a specific file path.
-pub(crate) fn get_file_impact(engine: &WorkflowEngine, path: &str) -> Option<String> {
-    let norm = crate::agent::plan_tracker::normalize_path(path);
-    let map: serde_json::Map<String, serde_json::Value> = engine
-        .get_variable(IMPL_IMPACT_FILES_KEY)
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    map.get(&norm)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-/// Check if impact analysis has been recorded for a specific file.
-pub(crate) fn file_impact_done(engine: &WorkflowEngine, path: &str) -> bool {
-    get_file_impact(engine, path).is_some()
-}
-
-/// Get all file paths that have recorded impact analyses.
-pub(crate) fn impact_file_paths(engine: &WorkflowEngine) -> Vec<String> {
-    let map: serde_json::Map<String, serde_json::Value> = engine
-        .get_variable(IMPL_IMPACT_FILES_KEY)
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    map.keys().cloned().collect()
-}
-
 /// Clear all file-level impact tracking.
 pub(crate) fn clear_file_impact(engine: &WorkflowEngine) {
     engine.set_variable(IMPL_IMPACT_FILES_KEY, "{}".to_string());

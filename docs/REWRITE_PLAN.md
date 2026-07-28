@@ -1,7 +1,7 @@
 ﻿# Ox 渐进式重写计划（Strangler Fig）
 
 > 单一进度源。每完成一小步就更新对应复选框与「变更记录」表。
-> 维护者：Ox agent + 项目负责人。最后更新：P5.5 完成（prune_orphaned_tool_calls + run_post_edit_checks），P5.2/P5.3 stream extraction 待续。
+> 维护者：Ox agent + 项目负责人。最后更新：P5.3 完成（dispatch_llm + collect_response 提取），P5.5 部分完成（build_truncation_error + build_arg_parse_error 提取 + 死代码清理），0 warnings。
 
 ---
 
@@ -139,9 +139,9 @@
 
 - [ ] **P5.1** 提取 `TurnContext` 结构体，收编 17 个局部变量 → 减少传参爆炸
 - [ ] **P5.2** 提取 `execute_tool_batch()`（1855-3401，最大块 ~1550 行）→ 最大收益
-- [ ] **P5.3** 提取 `collect_response()`（976-1183）+ `dispatch_llm()`（841-960）
+- [x] **P5.3** ✅ 提取 `collect_response()`（976-1183）+ `dispatch_llm()`（841-960）
 - [x] **P5.4** ✅ 提取 `evaluate_reflection()`（1500-1678）
-- [ ] **P5.5** 提取 `loop_head()` + `loop_tail()` + `post_edit_checks()`
+- [ ] **P5.5** 提取 `loop_head()` + `loop_tail()` + `post_edit_checks()`（✅ post_edit_checks 已提取；✅ loop_tail 部分完成：提取 `build_truncation_error()` + `build_arg_parse_error()` 消除两个大内联 error-msg 块）
 - [x] **P5.6** ✅ 提取 `handle_idle()` + `capture_review_findings()` + `filter_tool_calls()`
 - [ ] **P5.7** `run_agent_turn` 从 3814 行降到数百行，主循环变成 `transition(state, event)` 调度
 - [ ] **P5.8** 全量回归
@@ -163,6 +163,8 @@
 | 本轮 | P2b 删死代码 | 61df638 | 删 enforcer.rs(557行)+config/rules.rs(72行)+enforcement_rules 字段+TOML 模板；依赖分析确认全 36 处 register/activate 均用 DEFAULT_WORKFLOW_ID，enforcer 零活跃引用 | check 0 err·374 passed / 0 failed |
 | 本轮 | P5.1+P5.4+P5.6 | b173ccd | 提取 classify_tool_calls()（6 单测）+ evaluate_reflection() + TurnContext 结构体；mod.rs 净减 227 行 | check 0 err·380 passed / 0 failed |
 | 本轮 | P5.6 续 | 待提交 | 提取 react_log_ids() + react_log_assistant_text() + record_react_tool() 三辅助函数；替换 8 处重复 react_log 模板（净减 95 行） | check 0 err·380 passed / 0 failed |
+| 本轮 | P5.3 | 4bf2374 | 提取 dispatch_llm() + collect_response() + LlmCollectOutcome 枚举；删除未用 schemas 字段 | check 0 err·380 passed / 0 failed |
+| 本轮 | P5.5+死代码清理 | 待提交 | 提取 build_truncation_error() + build_arg_parse_error()（5 单测）；删 emit_workflow_completed/gate_recovery_hint/get_file_impact/file_impact_done/impact_file_paths 死函数；placeholder_old_react 加 #[cfg(test)]；删未用 idle_streak/content_only_streak 变量 | check 0 err·0 warn·385 passed / 0 failed |
 
 ---
 
