@@ -1602,64 +1602,14 @@ pub async fn run_agent_turn(
                 continue;
             }
 
-            // Send toolProgress event to indicate execution starting
-            let progress_msg = match tc.name.as_str() {
-                "file_write" => "Starting file write...",
-                "file_read" => "Reading file...",
-                "shell_exec" => "Executing command...",
-                "code_search" => "Searching code...",
-                "edit_file" => "Editing file...",
-                "delete_range" => "Deleting range...",
-                "find_symbol" => "Finding symbols...",
-                _ => "Executing...",
-            };
-            let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
-                tool_call_id: tc.id.clone(),
-                tool_name: tc.name.clone(),
-                message: progress_msg.to_string(),
-                progress_percent: Some(0),
-            });
-
-            tracing::info!("[AGENT] About to execute tool: {} (id: {})", tc.name, tc.id);
-            // Create a tool context with progress callback for real-time updates
-            let ui_tx_clone = ui_tx.clone();
-            let _tool_call_id_clone = tc.id.clone();
-            let _tool_name_clone = tc.name.clone();
-            let tool_ctx_with_progress =
-                Arc::new(crate::tools::ToolContext::with_progress_callback(
-                    tool_ctx.runtime.clone(),
-                    tool_ctx.working_dir.clone(),
-                    tool_ctx.config.clone(),
-                    tc.id.clone(),
-                    move |progress: crate::tools::ToolProgress| {
-                        let _ = ui_tx_clone.send(AgentToUiEvent::ToolProgress {
-                            tool_call_id: progress.tool_call_id,
-                            tool_name: progress.tool_name,
-                            message: progress.message,
-                            progress_percent: progress.progress_percent,
-                        });
-                    },
-                ));
-
-            tracing::info!("[AGENT] Executing tool.execute() for: {}", tc.name);
-            let mut result = tool.execute(args.clone(), &tool_ctx_with_progress).await;
-            // Retry once for transient failures on write/network tools
-            if result.is_error
-                && matches!(tc.name.as_str(), "file_write" | "shell_exec" | "web_fetch")
-            {
-                tracing::warn!(
-                    "[AGENT] Tool {} failed, retrying once: {}",
-                    tc.name,
-                    result.content
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                result = tool.execute(args.clone(), &tool_ctx_with_progress).await;
-            }
-            tracing::info!(
-                "[AGENT] Tool execution completed: {}, is_error: {}",
-                tc.name,
-                result.is_error
-            );
+            // Execute tool with retry (extracted to execute_tool_with_retry)
+            let result = execute_tool_with_retry(
+                tc,
+                &args,
+                tool,
+                &tool_ctx,
+                &ui_tx,
+            ).await;
             // ── Full tool I/O logging for debugging ──
             let args_preview: String =
                 serde_json::to_string_pretty(&args).unwrap_or_else(|_| format!("{:?}", args));
@@ -3591,6 +3541,77 @@ fn parse_tool_args(
             Err(())
         }
     }
+}
+
+// ── Tool execution + retry extraction ──────────────────────────────────────────
+/// Send a progress event, build the progress-callback context, execute the tool,
+/// and retry once on transient failures (file_write/shell_exec/web_fetch).
+async fn execute_tool_with_retry(
+    tc: &ToolCall,
+    args: &serde_json::Value,
+    tool: &dyn crate::tools::Tool,
+    tool_ctx: &crate::tools::ToolContext,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> crate::tools::ToolOutput {
+    // Send toolProgress event to indicate execution starting
+    let progress_msg = match tc.name.as_str() {
+        "file_write" => "Starting file write...",
+        "file_read" => "Reading file...",
+        "shell_exec" => "Executing command...",
+        "code_search" => "Searching code...",
+        "edit_file" => "Editing file...",
+        "delete_range" => "Deleting range...",
+        "find_symbol" => "Finding symbols...",
+        _ => "Executing...",
+    };
+    let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
+        tool_call_id: tc.id.clone(),
+        tool_name: tc.name.clone(),
+        message: progress_msg.to_string(),
+        progress_percent: Some(0),
+    });
+
+    tracing::info!("[AGENT] About to execute tool: {} (id: {})", tc.name, tc.id);
+    // Create a tool context with progress callback for real-time updates
+    let ui_tx_clone = ui_tx.clone();
+    let _tool_call_id_clone = tc.id.clone();
+    let _tool_name_clone = tc.name.clone();
+    let tool_ctx_with_progress =
+        Arc::new(crate::tools::ToolContext::with_progress_callback(
+            tool_ctx.runtime.clone(),
+            tool_ctx.working_dir.clone(),
+            tool_ctx.config.clone(),
+            tc.id.clone(),
+            move |progress: crate::tools::ToolProgress| {
+                let _ = ui_tx_clone.send(AgentToUiEvent::ToolProgress {
+                    tool_call_id: progress.tool_call_id,
+                    tool_name: progress.tool_name,
+                    message: progress.message,
+                    progress_percent: progress.progress_percent,
+                });
+            },
+        ));
+
+    tracing::info!("[AGENT] Executing tool.execute() for: {}", tc.name);
+    let mut result = tool.execute(args.clone(), &tool_ctx_with_progress).await;
+    // Retry once for transient failures on write/network tools
+    if result.is_error
+        && matches!(tc.name.as_str(), "file_write" | "shell_exec" | "web_fetch")
+    {
+        tracing::warn!(
+            "[AGENT] Tool {} failed, retrying once: {}",
+            tc.name,
+            result.content
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        result = tool.execute(args.clone(), &tool_ctx_with_progress).await;
+    }
+    tracing::info!(
+        "[AGENT] Tool execution completed: {}, is_error: {}",
+        tc.name,
+        result.is_error
+    );
+    result
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
