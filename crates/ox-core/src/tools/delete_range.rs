@@ -168,9 +168,9 @@ impl Tool for DeleteRangeTool {
                     let hint_start = start_idx.saturating_sub(2);
                     let hint_end = (start_idx + 15).min(n);
                     let mut hint = String::new();
-                    for i in hint_start..hint_end {
+                    for (i, line) in lines.iter().enumerate().take(hint_end).skip(hint_start) {
                         let marker = if i == start_idx { "→ " } else { "  " };
-                        hint.push_str(&format!("{}Line {}: {}\n", marker, i + 1, lines[i]));
+                        hint.push_str(&format!("{}Line {}: {}\n", marker, i + 1, line));
                     }
                     return Err(format!(
                         "❌ end_anchor not found in {}.\n\n\
@@ -209,12 +209,8 @@ impl Tool for DeleteRangeTool {
 
             let deleted_lines = del_end - del_start;
             let mut out: Vec<String> = Vec::new();
-            for i in 0..del_start {
-                out.push(lines[i].to_string());
-            }
-            for i in del_end..n {
-                out.push(lines[i].to_string());
-            }
+            out.extend(lines[..del_start].iter().map(|l| l.to_string()));
+            out.extend(lines[del_end..].iter().map(|l| l.to_string()));
             let new_content = out.join("\n");
 
             match std::fs::write(&path, &new_content) {

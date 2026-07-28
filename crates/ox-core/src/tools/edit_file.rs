@@ -469,15 +469,11 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
                 let rl: Vec<&str> = current.lines().collect();
                 let new_lines: Vec<&str> = new.lines().collect();
                 let mut out: Vec<String> = Vec::new();
-                for i in 0..start {
-                    out.push(rl[i].to_string());
-                }
+                out.extend(rl[..start].iter().map(|l| l.to_string()));
                 for nl in &new_lines {
                     out.push(nl.to_string());
                 }
-                for i in end..rl.len() {
-                    out.push(rl[i].to_string());
-                }
+                out.extend(rl[end..].iter().map(|l| l.to_string()));
                 current = out.join("\n");
             }
             tracing::info!("[EDIT_FILE] Trimmed replace_all: applied replacements");
@@ -486,15 +482,11 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
             // Single replacement: replace lines best_start..best_end with new
             let new_lines: Vec<&str> = new.lines().collect();
             let mut out: Vec<String> = Vec::new();
-            for i in 0..best_start {
-                out.push(file_lines[i].to_string());
-            }
+            out.extend(file_lines[..best_start].iter().map(|l| l.to_string()));
             for nl in &new_lines {
                 out.push(nl.to_string());
             }
-            for i in best_end..n_file {
-                out.push(file_lines[i].to_string());
-            }
+            out.extend(file_lines[best_end..n_file].iter().map(|l| l.to_string()));
             tracing::info!(
                 "[EDIT_FILE] Trimmed match at lines {}-{} (score: {}/{}), applied replacement",
                 best_start + 1,
@@ -714,13 +706,9 @@ fn fuzzy_relative_indent_match(
             let replace_abs = from_relative_indent(&replace_rel, &lines, start);
 
             let mut result: Vec<String> = Vec::new();
-            for i in 0..start {
-                result.push(lines[i].to_string());
-            }
+            result.extend(lines[..start].iter().map(|l| l.to_string()));
             result.extend(replace_abs);
-            for i in end..lines.len() {
-                result.push(lines[i].to_string());
-            }
+            result.extend(lines[end..].iter().map(|l| l.to_string()));
             current = result.join("\n");
         }
 
@@ -733,15 +721,11 @@ fn fuzzy_relative_indent_match(
         let replace_abs = from_relative_indent(&replace_rel, &file_lines, best_start);
 
         let mut result: Vec<String> = Vec::new();
-        for i in 0..best_start {
-            result.push(file_lines[i].to_string());
-        }
+        result.extend(file_lines[..best_start].iter().map(|l| l.to_string()));
         if !replace_lines.is_empty() {
             result.extend(replace_abs);
         }
-        for i in best_end..n_file {
-            result.push(file_lines[i].to_string());
-        }
+        result.extend(file_lines[best_end..n_file].iter().map(|l| l.to_string()));
 
         tracing::info!(
             "[EDIT_FILE] Fuzzy match at lines {}-{} (score: {}/{}), applied replacement",

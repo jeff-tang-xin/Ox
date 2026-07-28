@@ -302,9 +302,7 @@ impl ContextBuilder {
         // 3. Fill history from newest to oldest within budget.
         let history_count = history.len().saturating_sub(start_idx);
         if history_count <= 8 {
-            for i in start_idx..history.len() {
-                result.push(history[i].clone());
-            }
+            result.extend(history[start_idx..].iter().cloned());
             sanitize_tool_pairs(&mut result);
             deduplicate_file_reads(&mut result);
             filter_noisy_messages(&mut result);
