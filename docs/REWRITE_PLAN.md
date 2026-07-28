@@ -1,7 +1,7 @@
-﻿# Ox 渐进式重写计划（Strangler Fig）
+# Ox 渐进式重写计划（Strangler Fig）
 
 > 单一进度源。每完成一小步就更新对应复选框与「变更记录」表。
-> Last update: P5 complete (P5.1-P5.8), run_agent_turn 3814->579 lines (-85%), 0 warnings.
+> 维护者：Ox agent + 项目负责人。最后更新：P5 全部完成（P5.1-P5.8），run_agent_turn 3814→579 行（-85%），0 warnings。
 
 ---
 
@@ -21,9 +21,9 @@
 |------|------|-----------|------|
 | **P1** | 类型化 Turn 状态机骨架 | 十几个散落 streak + `_total_explore` 字符串反模式 | ✅ 完成 |
 | **P2** | 统一门禁管线（前置拦截也走 `Gate` trait） | enforcer / read_guard / `validate_tool_call` 三处重叠 | ✅ 完成（P2a 双调修复 + P2b 删死代码） |
-| **P3** | 原生 function calling，删 `complete_and_check` 壳 | `unified_action` / `unified_handler` / `tool_args_repair` 大半 | 🔄 暂缓（依赖 P5 先拆开 god function 才好改） |
+| **P3** | 原生 function calling，删 `complete_and_check` 壳 | `unified_action` / `unified_handler` / `tool_args_repair` 大半 | ⏸️ 暂缓（依赖 P5 先拆开 god function 才好改） |
 | **P4** | 统一上下文预算账本 | `memory_offload` 散落魔数（85%/92%/冷却） | ⬜ 未开始 |
-| **P5** | 拆 run_agent_turn god function | mod.rs -> handlers | Done (579L, -85%) |
+| **P5** | 拆 `run_agent_turn` god function（3814 行） | mod.rs 巨型命令式循环 → 每状态一 handler | ✅ 完成（579 行，-85%） |
 
 图例：⬜未开始 · 🔄进行中 · ✅完成 · ⏸️暂缓
 
@@ -33,7 +33,7 @@
 
 ## 2. 阶段明细与进度
 
-### P1 — 类型化 Turn 状态机骨架 ✅
+### P1 - 类型化 Turn 状态机骨架 ✅
 
 **产出物**：`crates/ox-core/src/agent/turn_state.rs`（新增）
 
@@ -43,7 +43,7 @@
 - [x] P1.4 `mod.rs:688` 用 `engine.get_counter("_total_explore")` 替换字符串 parse 加载逻辑；new-task 重置改 `set_counter(..,0)` ✅
 - [x] P1.5 `mod.rs:1626` 回写改用 `engine.set_counter("_total_explore", total_explore)` ✅
 - [x] P1.6 `gate/gate.rs` 的 `bump_failure/current_failures/reset_failures` 改用新计数器 API ✅
-- [x] P1.7 单元测试：new` 新任务归零 / `on_explore` 累加 / `on_edit_or_finish` 重置 / `explore_exhausted` 边界（4 个用例均通过） ✅
+- [x] P1.7 单元测试：`new` 新任务归零 / `on_explore` 累加 / `on_edit_or_finish` 重置 / `explore_exhausted` 边界（4 个用例均通过） ✅
 - [x] P1.8 `cargo test -p ox-core turn_state` 通过（8 passed / 0 failed） ✅
 
 **验收标准**：`parse::<u32>` 字符串状态反模式在 mod.rs + gate.rs 内清扫干净；行为与迁移前一致。
@@ -58,11 +58,11 @@
 
 ---
 
-### P2 — 统一门禁管线 ✅
+### P2 - 统一门禁管线 ✅
 
 **现状**：已有 `gate/gate.rs` 的 `Gate` trait + `GateRunner`，但只跑在 `## Done` 之后（后置校验）；前置拦截散在 `enforcer.rs`(22KB) / `gate/read_guard.rs` / `engine.rs::validate_tool_call`。
 
-#### P2a — 修复双调 bug（✅ 完成于使用期间发现）
+#### P2a - 修复双调 bug（✅ 完成于使用期间发现）
 
 分析三处重叠时实测发现：`read_guard::check` 是**有状态**门禁（file_read 首次重读时 `record_impl_file_read` 写状态），却在两条执行路径里各自调用两次——
 - **mod.rs 主循环**：2512 直接调 + 2548 `validate_tool_call`→validation.rs 间接调
@@ -75,7 +75,7 @@
 - [x] P2a.3 新增回归单测 `single_step_validation_does_not_consume_reread_budget`
 - [x] P2a.4 `cargo test -p ox-core --lib` → 381 passed / 0 failed
 
-#### P2b — 删除 enforcer 死代码 + EnforcementRules 孤儿配置（✅ 完成）
+#### P2b - 删除 enforcer 死代码 + EnforcementRules 孤儿配置（✅ 完成）
 
 依赖分析确认：`RuleEnforcer::validate` 唯一调用点（mod.rs:2639）被 `skip_plan_rules`（单步模式）短路；所有 36 处 register/activate 均用 `DEFAULT_WORKFLOW_ID`（单步），多步 pipeline 无活跃入口。`EnforcementRules` 仅被 enforcer 消费，CLI 层零引用。
 
@@ -89,7 +89,7 @@
 **验收标准**：死代码清零；enforcement_rules 孤儿消除；编译测试全绿。
 ---
 
-### P3 — 原生 function calling ⏸️
+### P3 - 原生 function calling ⏸️
 
 > **暂缓说明**：P3 原定在 P5 之前，但 `unified_tool_mode` 分支在 `run_agent_turn` 3814 行里有 60+ 处 if/else 分叉。在这个巨型函数里改 P3 = 在刀尖上走钢丝。改为 **P5 先拆开结构**，P3 再在已拆分的 handler 里逐个迁移。
 
@@ -103,7 +103,7 @@
 
 ---
 
-### P4 — 统一上下文预算账本 ⬜
+### P4 - 统一上下文预算账本 ⬜
 
 - [ ] P4.1 定义 `ContextBudget { max, used }` 单一计量入口
 - [ ] P4.2 卸载/压缩触发改为纯函数 `should_offload(budget, policy) -> Decision`
@@ -113,38 +113,38 @@
 
 ---
 
-### P5 — 拆 god function 🔄
+### P5 - 拆 god function ✅
 
-**当前 god function 结构**（`run_agent_turn`，3814 行，600→3613）：
+**当前 god function 结构**（`run_agent_turn`，原 3814 行）→ **拆后 579 行（-85%）**
 
-| 行号区间 | 职责 | 拆出目标 |
-|---------|------|---------|
-| 600-717 | 函数签名 + 局部变量初始化（17 个 streak/flag/budget） | → `TurnContext` 结构体 |
-| 719-840 | ReAct 循环入口：cancellation、interjection drain、memory sync、context assembly | → `loop_head()` |
-| 841-960 | LLM stream 发起（provider 选择、schema 过滤、tool_choice） | → `dispatch_llm()` |
-| 976-1183 | LLM stream 收集（text/reasoning/tool_calls + timeout/error handling） | → `collect_response()` |
-| 1200-1261 | budget offload（prompt token → archive → placeholder） | → `offload_if_needed()` |
-| 1263-1290 | args repair（XML→JSON、GLM `<tool_call>` 提取） | → `repair_tool_args()` |
-| 1292-1331 | legacy review-findings 捕获 + business gate await | → `capture_review_findings()` |
-| 1334-1398 | 空输出收尾（idle narrative → TurnDone） | → `handle_idle()` |
-| 1400-1463 | truncation/loop-limit 过滤 | → `filter_tool_calls()` |
-| 1500-1678 | reflect-first guard（explore/impl streak 评估 → 可能 continue） | → `evaluate_reflection()` |
-| 1747-1838 | ReAct 记录（pre-execution decision → SQLite） | → `record_decision()` |
-| 1855-3401 | **工具执行循环**（unified handler / legacy tool / safety gate / impact / react log / post-hooks） | → `execute_tool_batch()` |
-| 3407-3455 | post-fix：orphan tool_call 清理 | → `cleanup_orphans()` |
-| 3456-3572 | Done reminder + AST recovery + verify hints + repeated-failure handoff | → `post_edit_checks()` |
-| 3574-3604 | offloader cleanup + repeat guard + loop tail | → `loop_tail()` |
+| 行号区间 | 职责 | 拆出目标 | 状态 |
+|---------|------|---------|------|
+| 600-717 | 函数签名 + 局部变量初始化（17 个 streak/flag/budget） | → `TurnBudget` 结构体 + `resolve_user_task()` + `init_turn_memory()` + `init_total_explore()` | ✅ |
+| 719-840 | ReAct 循环入口：cancellation、interjection drain、memory sync、context assembly | → `drain_interjections_pre_llm()` + `prepare_llm_context()` | ✅ |
+| 841-960 | LLM stream 发起 | → `dispatch_llm()` | ✅ |
+| 976-1183 | LLM stream 收集 | → `collect_response()` + `LlmCollectOutcome` | ✅ |
+| 1200-1261 | budget offload | → `offload_and_record()` | ✅ |
+| 1263-1290 | args repair | → `repair_and_extract_tool_calls()` | ✅ |
+| 1292-1331 | review-findings 捕获 + business gate | → `handle_review_findings()` + `ReviewFindingsOutcome` | ✅ |
+| 1334-1398 | 空输出收尾 | → `handle_empty_tool_calls()` | ✅ |
+| 1400-1463 | truncation/loop-limit 过滤 | → `check_loop_and_truncation_guards()` | ✅ |
+| 1500-1678 | reflect-first guard | → `evaluate_reflection()` + `check_reflection_skip()` | ✅ |
+| 1747-1838 | ReAct 记录 | → `record_react_log()` + `record_llm_decision()` | ✅ |
+| 1855-3401 | 工具执行循环 | → `check_safety_gate()` + `check_file_write_missing_path()` + `lookup_tool_or_error()` + `parse_tool_args()` + `execute_tool_with_retry()` + `handle_unified_tool_call()` + `post_tool_log_and_sanitize()` + `record_read_queries()` + `snapshot_and_record_turn()` + `post_verify_and_hint()` + `post_success_updates()` + `check_repeated_failure_handoff()` + `check_repeat_guard()` + `check_unified_parse_error()` | ✅ |
+| 3407-3455 | post-fix orphan 清理 | → `post_batch_processing()` 内 | ✅ |
+| 3456-3572 | Done reminder + AST recovery + verify hints | → `post_batch_processing()` 内 | ✅ |
+| 3574-3604 | offloader cleanup + repeat guard + loop tail | → `post_batch_processing()` 内 | ✅ |
 
 **P5 拆分策略**：
 
-- [x] **P5.1** ✅ 提取 `TurnBudget` 结构体，收编 17 个局部变量 → 减少传参爆炸
-- [x] **P5.2** COMPLETE: 24 extraction steps, ~1280 lines extracted from tool exec loop
-- [x] **P5.3** ✅ 提取 `collect_response()`（976-1183）+ `dispatch_llm()`（841-960）
-- [x] **P5.4** ✅ 提取 `evaluate_reflection()`（1500-1678）
-- [x] **P5.5** ✅ 提取 loop_head() + loop_tail() + post_edit_checks() + setup helpers (resolve_user_task, init_turn_memory, init_total_explore)
-- [x] **P5.6** ✅ 提取 `handle_idle()` + `capture_review_findings()` + `filter_tool_calls()`
+- [x] **P5.1** ✅ 提取 `TurnBudget` 结构体，收编 6 个散落局部变量 → 减少传参爆炸
+- [x] **P5.2** ✅ 24 个提取步骤，~1280 行从工具执行循环中抽出为独立 handler
+- [x] **P5.3** ✅ 提取 `collect_response()` + `dispatch_llm()` + `LlmCollectOutcome` 枚举
+- [x] **P5.4** ✅ 提取 `evaluate_reflection()`（5 个 `&mut` 参数 → 1 个 `&mut TurnBudget`）
+- [x] **P5.5** ✅ 提取 `resolve_user_task()` + `init_turn_memory()` + `init_total_explore()` + `post_batch_processing()` + 清理过期注释/空行
+- [x] **P5.6** ✅ 提取 `handle_empty_tool_calls()` + `handle_review_findings()` + `filter_tool_calls()` + `classify_tool_calls()` + `check_reflection_skip()`
 - [x] **P5.7** ✅ `run_agent_turn` 从 3814 行降到 579 行（-85%），主循环变成线性 handler 调用序列
-- [x] **P5.8** ✅ 全量回归：cargo check (workspace) 0 err/0 warn; cargo test -p ox-core --lib 385 passed/0 failed; cargo build -p ox-cli 0 err/0 warn
+- [x] **P5.8** ✅ 全量回归：cargo check (workspace) 0 err/0 warn；cargo test -p ox-core --lib 385 passed/0 failed；cargo build -p ox-cli 0 err/0 warn
 
 **依赖**：P1 的 `TurnPhase` 枚举已就绪 ✅
 
@@ -154,22 +154,22 @@
 
 | 日期 | 阶段/子任务 | commit | 说明 | check/test |
 |------|------------|--------|------|-----------|
-| —    | —          | —      | 计划文档建立 | —|
+| -    | -          | -      | 计划文档建立 | -|
 | 本轮 | P1.1+P1.6  | c933890 | engine.rs 新增类型化计数器 API；gate.rs 三函数迁移；消除 gate 反模式 | check 0 err·0 gate 测|
 | 本轮 | P1.2+P1.3+P1.7 | c933890 | 新建 turn_state.rs（TurnPhase/TurnBudget，上限委托 ConvergeMode）；挂模块 + 6 单测 | 7 passed / 0 failed |
 | 本轮 | P1.4+P1.5 ✅P1 完成 | c933890 | mod.rs 两处 `_total_explore` 字符串反模式迁移为 get_counter/set_counter；parse/to_string 在 agent 模块内清扫 | check 0 err·380 passed / 0 failed |
 | 本轮 | P2a 双调bug修复 | 2ca6d85 | 实测发现 read_guard::check 在单步 unified 两路径各自被调用两次（有状态门禁），误判首次重读；从 validation.rs 移除重复调用 + 回归单测 | check 0 err·381 passed / 0 failed |
-| 本轮 | P2b 删死代码 | 待提交 | 删 enforcer.rs(557行)+config/rules.rs(72行)+enforcement_rules 字段+TOML 模板；依赖分析确认全 36 处 register/activate 均用 DEFAULT_WORKFLOW_ID，enforcer 零活跃引用 | check 0 err·374 passed / 0 failed |
 | 本轮 | P2b 删死代码 | 61df638 | 删 enforcer.rs(557行)+config/rules.rs(72行)+enforcement_rules 字段+TOML 模板；依赖分析确认全 36 处 register/activate 均用 DEFAULT_WORKFLOW_ID，enforcer 零活跃引用 | check 0 err·374 passed / 0 failed |
 | 本轮 | P5.1+P5.4+P5.6 | b173ccd | 提取 classify_tool_calls()（6 单测）+ evaluate_reflection() + TurnContext 结构体；mod.rs 净减 227 行 | check 0 err·380 passed / 0 failed |
-| 本轮 | P5.6 续 | 待提交 | 提取 react_log_ids() + react_log_assistant_text() + record_react_tool() 三辅助函数；替换 8 处重复 react_log 模板（净减 95 行） | check 0 err·380 passed / 0 failed |
 | 本轮 | P5.3 | 4bf2374 | 提取 dispatch_llm() + collect_response() + LlmCollectOutcome 枚举；删除未用 schemas 字段 | check 0 err·380 passed / 0 failed |
-| 本轮 | P5.5+死代码清理 | 待提交 | 提取 build_truncation_error() + build_arg_parse_error()（5 单测）；删 emit_workflow_completed/gate_recovery_hint/get_file_impact/file_impact_done/impact_file_paths 死函数；placeholder_old_react 加 #[cfg(test)]；删未用 idle_streak/content_only_streak 变量 | check 0 err·0 warn·385 passed / 0 failed |
-| 本轮 | P5.1 | 待提交 | TurnBudget 接入 run_agent_turn；6 个 loose locals（explore_streak/explore_reflected/total_explore/impl_streak/impl_reflected/content_only_streak）收编为 `budget` 结构体字段；evaluate_reflection 签名从 5 个 &mut 参数缩减为 1 个 &mut TurnBudget；ContextAssembler::assemble 调用点改用 budget.xxx；turn_state.rs 删未用 content_only_streak 字段 + 更新模块文档 | check 0 err·0 warn·385 passed / 0 failed |
+| 本轮 | P5.5+死代码清理 | 9bfb03d | 提取 build_truncation_error() + build_arg_parse_error()（5 单测）；删 emit_workflow_completed/gate_recovery_hint/get_file_impact/file_impact_done/impact_file_paths 死函数；placeholder_old_react 加 #[cfg(test)]；删未用 idle_streak/content_only_streak 变量 | check 0 err·0 warn·385 passed / 0 failed |
+| 本轮 | P5.1 TurnBudget 接入 | 3f74608 | TurnBudget 接入 run_agent_turn；6 个 loose locals 收编为 `budget` 结构体字段；evaluate_reflection 签名从 5 个 &mut 参数缩减为 1 个 &mut TurnBudget；ContextAssembler::assemble 调用点改用 budget.xxx；turn_state.rs 删未用 content_only_streak 字段 | check 0 err·0 warn·385 passed / 0 failed |
 | 本轮 | P5.2 step 1 | b94070c | check_safety_gate() 163L; SafetyGateOutcome{Allow,Skip,TurnDone} | check 0 err / 385 pass |
 | 本轮 | P5.2 step 2 | 1e3533c | check_loop_and_truncation_guards() 118L; bool return; react_log recording | check 0 err / 385 pass |
 | 本轮 | P5.2 step 3 | 5a7adbb | check_workflow_validation() 72L; 3 skip paths (cached read, read_guard, workflow validate) | check 0 err / 385 pass |
-
+| 本轮 | P5.2 step 4 | b2710db | check_file_write_missing_path() 34L; bool return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 5 | acdb25d | lookup_tool_or_error() 29L; Option<&dyn Tool> return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 6 | f74b8a9 | parse_tool_args() 41L; Result<Value,()> return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 7 | 63a82e2 | execute_tool_with_retry() 53L; ToolOutput return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 8 | 6d023ec | post_tool_log_and_sanitize() 55L; (String, Option<ToolContext>) return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 9 | 86fd08c | offload_and_record() 64L; OffloadedResult return | check 0 err / 385 pass |
@@ -180,13 +180,6 @@
 | 本轮 | P5.2 step 14 | 95dea36 | check_repeated_failure_handoff() 40L; bool return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 15 | bfaaac9 | check_repeat_guard() 21L; bool return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 16 | cba9e34 | check_unified_parse_error() 53L; UnifiedParseOutcome enum | check 0 err / 385 pass |
-| 本轮 | P5.2 step 4 | b2710db | check_file_write_missing_path() 34L; bool return | check 0 err / 385 pass |
-| 本轮 | P5.2 step 5 | acdb25d | lookup_tool_or_error() 29L; Option<&dyn Tool> return | check 0 err / 385 pass |
-| 本轮 | P5.2 step 6 | f74b8a9 | parse_tool_args() 41L; Result<Value,()> return | check 0 err / 385 pass |
----
-
-## 4. 风险登记
-
 | 本轮 | P5.2 step 17 | 1b76f35 | handle_unified_tool_call() ~300L; UnifiedDispatchOutcome enum | check 0 err / 385 pass |
 | 本轮 | P5.2 step 18 | 239e13c | record_react_log() 36L; async | check 0 err / 385 pass |
 | 本轮 | P5.2 step 19 | 06efbb7 | prepare_llm_context() 56L; returns slim_in_impl_phase | check 0 err / 385 pass |
@@ -195,9 +188,14 @@
 | 本轮 | P5.2 step 22 | 98dc3a5 | check_reflection_skip() 33L; bool return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 23 | d48b231 | drain_interjections_pre_llm() 39L; fn pointer | check 0 err / 385 pass |
 | 本轮 | P5.2 step 24 | acacb78 | drain_interjections_pre_tool() 20L; fn pointer | check 0 err / 385 pass |
-| 本轮 | P5.5 | 85842ef | resolve_user_task() 21L + init_turn_memory() 25L + init_total_explore() 17L; run_agent_turn 718->653L | check 0 err / 385 pass |
+| 本轮 | P5.5 | 85842ef | resolve_user_task() 21L + init_turn_memory() 25L + init_total_explore() 17L; run_agent_turn 718→653L | check 0 err / 385 pass |
 | 本轮 | P5.5 | 8266446 | post_batch_processing() 65L; bool return for 2 `return` paths | check 0 err / 385 pass |
-| 本轮 | P5.5 | 5b7cae8 | cleanup stale comments + extra blank lines; 606->579L | check 0 err / 385 pass |
+| 本轮 | P5.5 | 5b7cae8 | cleanup stale comments + extra blank lines; 606→579L | check 0 err / 385 pass |
+
+---
+
+## 4. 风险登记
+
 | 风险 | 阶段 | 缓解 |
 |------|------|------|
 | 阈值迁移引入行为漂移 | P1/P4 | 迁移前逐一读取现值写入常量并注释来源 |
@@ -212,5 +210,6 @@
 
 - 已否决「一次性全量推倒重写」—改为绞杀者模式渐进替换。
 - **P1 ✅** + **P2 ✅** 均已完成。P2b 原计划的 PreGate trait 抽象取消（enforcer 删除后事实源已从三处缩减到两处，无需再造大抽象）。
-- **P3 ⏸️ 暂缓**：`unified_tool_mode` 分支在 mod.rs 里有 60+ 处，在 god function 里改风险极高。改为 P5 先拆开结构。
-- **当前进行 P5**：从 `TurnContext` 结构体提取开始，逐步把 `run_agent_turn` 3814 行拆成数个 handler 函数。
+- **P3 ⏸️ 暂缓**：`unified_tool_mode` 分支在 mod.rs 里有 60+ 处，在 god function 里改风险极高。P5 已完成拆分，可在已拆分的 handler 里逐个迁移。
+- **P4 ⬜ 未开始**：统一上下文预算账本，待 P3 完成后启动。
+- **P5 ✅ 完成**：`run_agent_turn` 从 3814 行拆到 579 行（-85%），提取 30+ 个独立 handler 函数和 7 个 outcome 枚举。全量回归 385 tests passed / 0 warnings。
