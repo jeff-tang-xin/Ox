@@ -1751,44 +1751,16 @@ pub async fn run_agent_turn(
                 tool_ctx.gitnexus.as_ref(),
             );
 
-            // 🛑 Repeated-failure hand-off: if the same verify has failed N times
-            // in a row, stop auto-retrying and give control back to the user
-            // instead of spinning. Mirrors the `## Done` gatekeeper stop path.
-            let repeated_failure = workflow_engine.as_ref().and_then(|wf| {
-                wf.try_lock().ok().and_then(|e| {
-                    if post_edit_verification::should_stop_on_repeated_failure(&e) {
-                        let streak = post_edit_verification::verify_fail_streak(&e);
-                        let cmd = e
-                            .get_variable(post_edit_verification::VERIFY_CMD_KEY)
-                            .unwrap_or_default();
-                        Some((streak, cmd))
-                    } else {
-                        None
-                    }
-                })
-            });
-            if let Some((streak, cmd)) = repeated_failure {
-                let cmd_line = if cmd.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n验证命令: `{cmd}`")
-                };
-                let handoff = format!(
-                    "## Failed\n已连续 {streak} 次验证未通过，停止自动重试，交给你判断。{cmd_line}\n\
-                     请查看上面最近的报错：可能是改法方向不对、缺少依赖，或需要你补充信息。"
-                );
-                let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                    "🛑 连续 {streak} 次验证失败 — 暂停本轮，等待你的指示。"
-                )));
-                messages.push(Message::system(&handoff));
-                new_messages.push(Message::system(&handoff));
-                if let Some(wf) = &workflow_engine
-                    && let Ok(engine) = wf.try_lock()
-                {
-                    post_edit_verification::reset_verify_failures(&engine);
-                }
-                persist_turn_memory(&workflow_engine, &turn_memory);
-                emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
+            // Repeated-failure hand-off (extracted to check_repeated_failure_handoff)
+            if check_repeated_failure_handoff(
+                &workflow_engine,
+                &mut messages,
+                &mut new_messages,
+                &mut turn_memory,
+                &ui_tx,
+                turn_id,
+                &total_usage,
+            ) {
                 return;
             }
         }
@@ -3741,7 +3713,61 @@ fn post_success_updates(
                 "✅ 文件已写入。如果所有需要的文件都已完成，输出 `## Done` 结束。".to_string()
             });
         }
-    } // verify-after-edit
+} // verify-after-edit
+}
+
+// ── Repeated-failure hand-off extraction ───────────────────────────────────────
+/// Check if the same verify has failed N times in a row. If so, stop
+/// auto-retrying, emit a hand-off message, and return `true` (TurnDone).
+/// Returns `false` to continue normally.
+fn check_repeated_failure_handoff(
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    turn_id: u64,
+    total_usage: &crate::message::TokenUsage,
+) -> bool {
+    let repeated_failure = workflow_engine.as_ref().and_then(|wf| {
+        wf.try_lock().ok().and_then(|e| {
+            if post_edit_verification::should_stop_on_repeated_failure(&e) {
+                let streak = post_edit_verification::verify_fail_streak(&e);
+                let cmd = e
+                    .get_variable(post_edit_verification::VERIFY_CMD_KEY)
+                    .unwrap_or_default();
+                Some((streak, cmd))
+            } else {
+                None
+            }
+        })
+    });
+    if let Some((streak, cmd)) = repeated_failure {
+        let cmd_line = if cmd.is_empty() {
+            String::new()
+        } else {
+            format!("\n验证命令: `{cmd}`")
+        };
+        let handoff = format!(
+            "## Failed\n已连续 {streak} 次验证未通过，停止自动重试，交给你判断。{cmd_line}\n\
+             请查看上面最近的报错：可能是改法方向不对、缺少依赖，或需要你补充信息。"
+        );
+        let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+            "🛑 连续 {streak} 次验证失败 - 暂停本轮，等待你的指示。"
+        )));
+        messages.push(Message::system(&handoff));
+        new_messages.push(Message::system(&handoff));
+        if let Some(wf) = workflow_engine
+            && let Ok(engine) = wf.try_lock()
+        {
+            post_edit_verification::reset_verify_failures(&engine);
+        }
+        persist_turn_memory(workflow_engine, turn_memory);
+        emit_turn_done(ui_tx, turn_id, new_messages.clone(), total_usage.clone());
+        true
+    } else {
+        false
+    }
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
