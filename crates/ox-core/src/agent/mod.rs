@@ -1345,64 +1345,18 @@ pub async fn run_agent_turn(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        // 🧠 Record this turn as L0 WorkingMemory with the LLM's raw response
-        let user_text = user_task.as_deref().unwrap_or("");
-        let assistant_preview: String = full_text.chars().take(400).collect();
-        let assistant_truncated = if assistant_preview.len() < full_text.len() {
-            "..."
-        } else {
-            ""
-        };
-        let l0_content = format!(
-            "User: {}\n\nAssistant: {}{}",
-            user_text.chars().take(300).collect::<String>(),
-            assistant_preview,
-            assistant_truncated
-        );
-        // record_turn removed — KnowledgeEngine disabled at runtime
-        let _ = l0_content;
-
         // ── 🔴 UNIFIED RECORD: Capture LLM's decision BEFORE tool execution ──
         if let Some(ref ms) = tool_ctx.memory_store {
             let (session_id, task_desc) = react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-
             let first_tool = tool_calls.first();
-            let (tool_name, tool_target) = if let Some(tc) = first_tool {
-                if unified_tool_mode
-                    && tc.name == crate::agent::unified_action::TOOL_NAME
-                {
-                    crate::agent::unified_action::parse_request(&tc.arguments)
-                        .ok()
-                        .map(|req| {
-                            let target = req.params.get("path")
-                                .or_else(|| req.params.get("name"))
-                                .or_else(|| req.params.get("target"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                                .unwrap_or_default();
-                            (req.action, target)
-                        })
-                        .unwrap_or_else(|| (tc.name.clone(), String::new()))
-                } else {
-                    let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
-                    let target: String = target_json
-                        .as_ref()
-                        .and_then(|v| v.get("path").or_else(|| v.get("name")))
-                        .and_then(|x| x.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-                    (tc.name.clone(), target)
-                }
-            } else {
-                ("(no tool)".to_string(), String::new())
-            };
-
+            let (tool_name, tool_target) = first_tool
+                .map(|tc| extract_tool_name_and_target(tc, unified_tool_mode))
+                .unwrap_or(("(no tool)".to_string(), String::new()));
             let decision = turn_memory
                 .decisions
                 .last()
                 .cloned()
                 .unwrap_or_else(|| format!("LLM 选择执行: {}", actions_summary));
-
             let _ = record_react_tool(
                 ms.as_ref(),
                 &session_id,
@@ -3850,6 +3804,34 @@ fn record_turn_decision(
         turn_memory.record_decision(format!(
             "你刚才选择动作: {actions_summary}; 当时的可见依据: {visible_summary}"
         ));
+    }
+}
+
+/// Extract a human-readable (name, target) pair from a tool call for react_log.
+/// Handles both unified-mode and native tool calls.
+fn extract_tool_name_and_target(tc: &ToolCall, unified_tool_mode: bool) -> (String, String) {
+    if unified_tool_mode && tc.name == crate::agent::unified_action::TOOL_NAME {
+        crate::agent::unified_action::parse_request(&tc.arguments)
+            .ok()
+            .map(|req| {
+                let target = req.params.get("path")
+                    .or_else(|| req.params.get("name"))
+                    .or_else(|| req.params.get("target"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                (req.action, target)
+            })
+            .unwrap_or_else(|| (tc.name.clone(), String::new()))
+    } else {
+        let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+        let target = target_json
+            .as_ref()
+            .and_then(|v| v.get("path").or_else(|| v.get("name")))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        (tc.name.clone(), target)
     }
 }
 
