@@ -1,7 +1,7 @@
 ﻿# Ox 渐进式重写计划（Strangler Fig）
 
 > 单一进度源。每完成一小步就更新对应复选框与「变更记录」表。
-> 维护者：Ox agent + 项目负责人。最后更新：P5.1+P5.4+P5.6 完成，P5.2 进行中。
+> 维护者：Ox agent + 项目负责人。最后更新：P5 react_log 去重完成，P5.2/P5.3/P5.5 待续。
 
 ---
 
@@ -162,6 +162,7 @@
 | 本轮 | P2b 删死代码 | 待提交 | 删 enforcer.rs(557行)+config/rules.rs(72行)+enforcement_rules 字段+TOML 模板；依赖分析确认全 36 处 register/activate 均用 DEFAULT_WORKFLOW_ID，enforcer 零活跃引用 | check 0 err·374 passed / 0 failed |
 | 本轮 | P2b 删死代码 | 61df638 | 删 enforcer.rs(557行)+config/rules.rs(72行)+enforcement_rules 字段+TOML 模板；依赖分析确认全 36 处 register/activate 均用 DEFAULT_WORKFLOW_ID，enforcer 零活跃引用 | check 0 err·374 passed / 0 failed |
 | 本轮 | P5.1+P5.4+P5.6 | b173ccd | 提取 classify_tool_calls()（6 单测）+ evaluate_reflection() + TurnContext 结构体；mod.rs 净减 227 行 | check 0 err·380 passed / 0 failed |
+| 本轮 | P5.6 续 | 待提交 | 提取 react_log_ids() + react_log_assistant_text() + record_react_tool() 三辅助函数；替换 8 处重复 react_log 模板（净减 95 行） | check 0 err·380 passed / 0 failed |
 
 ---
 
