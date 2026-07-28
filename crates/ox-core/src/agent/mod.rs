@@ -941,36 +941,19 @@ pub async fn run_agent_turn(
 
         // Fold reasoning digest into content so it survives into next turn.
         let content_with_reasoning = build_content_with_reasoning(&display, &reasoning_content);
-        // 🪞 Reflect-FIRST guard (fires BEFORE this turn's tools execute).
-        //
-        // Two separate loops we catch here:
-        //  • Exploration: read-after-read without ever acting (threshold 10).
-        //  • Implementation: plan confirmed, but drifting into no-edit turns
-        //    instead of editing (threshold 3, implementation phase only).
-        //
-        // When a threshold trips we DISCARD this turn's chosen tool batch,
-        // record the reasoning as a tool-call-free assistant message (so no
-        // ToolResult is orphaned), inject the reflection, and loop - forcing the
-        // model to re-decide with the reflection in view. A `finish` batch is
-        // treated as progress and never skipped.
-        if let Some(prompt) = evaluate_reflection(
+        // 🪞 Reflect-FIRST guard (extracted to check_reflection_skip)
+        if check_reflection_skip(
             &tool_calls,
             unified_tool_mode,
             &workflow_engine,
             user_task.as_deref().unwrap_or(""),
             &mut budget,
             &ui_tx,
+            &content_with_reasoning,
+            &mut messages,
+            &mut new_messages,
+            &mut turn_memory,
         ) {
-            let reasoning_only = Message::Assistant {
-                content: content_with_reasoning.clone(),
-                tool_calls: Vec::new(),
-                reasoning_content: None,
-            };
-            new_messages.push(reasoning_only.clone());
-            messages.push(reasoning_only);
-            messages.push(Message::system(&prompt));
-            new_messages.push(Message::system(&prompt));
-            persist_turn_memory(&workflow_engine, &turn_memory);
             iteration += 1;
             continue;
         }
@@ -3879,6 +3862,48 @@ async fn record_react_tool(
         &reasoning_fallback,
         live_output,
     );
+}
+
+/// Check if reflection should fire, and if so, inject reflection prompt
+/// and return `true` (caller should continue the loop).
+///
+/// When a reflection threshold trips, this DISCARDS the current tool batch,
+/// records the reasoning as a tool-call-free assistant message, and injects
+/// the reflection prompt.
+#[allow(clippy::too_many_arguments)]
+fn check_reflection_skip(
+    tool_calls: &[ToolCall],
+    unified_tool_mode: bool,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    user_task: &str,
+    budget: &mut crate::agent::turn_state::TurnBudget,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    content_with_reasoning: &str,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+) -> bool {
+    let Some(prompt) = evaluate_reflection(
+        tool_calls,
+        unified_tool_mode,
+        workflow_engine,
+        user_task,
+        budget,
+        ui_tx,
+    ) else {
+        return false;
+    };
+    let reasoning_only = Message::Assistant {
+        content: content_with_reasoning.to_string(),
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+    };
+    new_messages.push(reasoning_only.clone());
+    messages.push(reasoning_only);
+    messages.push(Message::system(&prompt));
+    new_messages.push(Message::system(&prompt));
+    persist_turn_memory(workflow_engine, turn_memory);
+    true
 }
 
 /// Outcome of `handle_review_findings`.
