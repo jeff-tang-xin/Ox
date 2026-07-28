@@ -143,8 +143,8 @@
 - [x] **P5.4** ✅ 提取 `evaluate_reflection()`（1500-1678）
 - [x] **P5.5** ✅ 提取 loop_head() + loop_tail() + post_edit_checks() + setup helpers (resolve_user_task, init_turn_memory, init_total_explore)
 - [x] **P5.6** ✅ 提取 `handle_idle()` + `capture_review_findings()` + `filter_tool_calls()`
-- [ ] **P5.7** `run_agent_turn` 从 3814 行降到数百行，主循环变成 `transition(state, event)` 调度
-- [ ] **P5.8** 全量回归
+- [x] **P5.7** ✅ `run_agent_turn` 从 3814 行降到 579 行（-85%），主循环变成线性 handler 调用序列
+- [x] **P5.8** ✅ 全量回归：cargo check (workspace) 0 err/0 warn; cargo test -p ox-core --lib 385 passed/0 failed; cargo build -p ox-cli 0 err/0 warn
 
 **依赖**：P1 的 `TurnPhase` 枚举已就绪 ✅
 
@@ -196,6 +196,8 @@
 | 本轮 | P5.2 step 23 | d48b231 | drain_interjections_pre_llm() 39L; fn pointer | check 0 err / 385 pass |
 | 本轮 | P5.2 step 24 | acacb78 | drain_interjections_pre_tool() 20L; fn pointer | check 0 err / 385 pass |
 | 本轮 | P5.5 | 85842ef | resolve_user_task() 21L + init_turn_memory() 25L + init_total_explore() 17L; run_agent_turn 718->653L | check 0 err / 385 pass |
+| 本轮 | P5.5 | 8266446 | post_batch_processing() 65L; bool return for 2 `return` paths | check 0 err / 385 pass |
+| 本轮 | P5.5 | 5b7cae8 | cleanup stale comments + extra blank lines; 606->579L | check 0 err / 385 pass |
 | 风险 | 阶段 | 缓解 |
 |------|------|------|
 | 阈值迁移引入行为漂移 | P1/P4 | 迁移前逐一读取现值写入常量并注释来源 |
