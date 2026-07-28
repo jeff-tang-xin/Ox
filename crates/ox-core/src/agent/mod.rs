@@ -1120,58 +1120,22 @@ pub async fn run_agent_turn(
                 break;
             }
 
-            if unified_tool_mode && tc.name == crate::agent::unified_action::TOOL_NAME {
-                let args_empty = tc.arguments.trim().is_empty();
-                let args_invalid = !tc.arguments.trim().is_empty()
-                    && serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err();
-                if args_empty || args_invalid {
-                    let reason = if args_empty {
-                        "参数为空"
-                    } else {
-                        "参数不是合法 JSON"
-                    };
-                    let error_msg = format!(
-                        "❌ complete_and_check {reason}。\n\n\
-                         必须发送合法 JSON，例如：\n\
-                         {{\"action\":\"file_read\",\"params\":{{\"path\":\"src/main.rs\"}}}}\n\n\
-                         禁止空或非法 arguments；每轮必须包含 action 与 params。"
-                    );
-                    let result_msg = Message::ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: error_msg.to_string(),
-                    };
-                    new_messages.push(result_msg.clone());
-                    messages.push(result_msg);
-                    turn_memory.record_tool(&tc.name, &tc.arguments, true);
-                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                        name: tc.name.clone(),
-                        output: error_msg.to_string(),
-                        is_error: true,
-                    });
-                    unified_parse_error_streak += 1;
-                    tracing::warn!(
-                        "[UNIFIED_PARSE_ERROR] streak={} reason={} args_len={} iteration={}",
-                        unified_parse_error_streak,
-                        reason,
-                        tc.arguments.len(),
-                        iteration,
-                    );
-                    if unified_parse_error_streak >= 3 {
-                        messages.push(Message::system(
-                            "⚠️ 已连续 3 次空/无效 complete_and_check 参数。\
-                             必须发送合法 JSON：{\"action\":\"…\",\"params\":{…}}\n\
-                             例如 action=file_read, action=edit_file, action=finish",
-                        ));
-                    }
-                    if unified_parse_error_streak >= 5 {
-                        let _ = ui_tx.send(AgentToUiEvent::Status(
-                            "⏹️ 连续 5 次无效 complete_and_check — 强制结束本轮".to_string(),
-                        ));
-                        emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                        return;
-                    }
-                    continue;
-                }
+            // Unified parse error check (extracted to check_unified_parse_error)
+            match check_unified_parse_error(
+                tc,
+                unified_tool_mode,
+                &mut messages,
+                &mut new_messages,
+                &mut turn_memory,
+                &mut unified_parse_error_streak,
+                &ui_tx,
+                turn_id,
+                &total_usage,
+                iteration,
+            ) {
+                UnifiedParseOutcome::Skip => continue,
+                UnifiedParseOutcome::TurnDone => return,
+                UnifiedParseOutcome::Proceed => {}
             }
 
             if unified_tool_mode && tc.name == crate::agent::unified_action::TOOL_NAME {
@@ -3797,6 +3761,90 @@ fn check_repeat_guard(
         }
     }
     false
+}
+
+// ── Unified parse error extraction ────────────────────────────────────────────
+
+/// Outcome of `check_unified_parse_error`.
+enum UnifiedParseOutcome {
+    /// Args are valid; proceed with unified handler.
+    Proceed,
+    /// Args invalid; error pushed, skip this tool.
+    Skip,
+    /// 5th consecutive parse error; TurnDone emitted, caller should return.
+    TurnDone,
+}
+
+/// Check for empty/invalid `complete_and_check` arguments when in unified tool mode.
+/// Returns `Proceed` if args are valid, `Skip` if invalid (error pushed),
+/// or `TurnDone` if 5 consecutive errors (turn aborted).
+fn check_unified_parse_error(
+    tc: &ToolCall,
+    unified_tool_mode: bool,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    unified_parse_error_streak: &mut u32,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    turn_id: u64,
+    total_usage: &crate::message::TokenUsage,
+    iteration: u32,
+) -> UnifiedParseOutcome {
+    if !unified_tool_mode || tc.name != crate::agent::unified_action::TOOL_NAME {
+        return UnifiedParseOutcome::Proceed;
+    }
+    let args_empty = tc.arguments.trim().is_empty();
+    let args_invalid = !tc.arguments.trim().is_empty()
+        && serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err();
+    if !args_empty && !args_invalid {
+        return UnifiedParseOutcome::Proceed;
+    }
+    let reason = if args_empty {
+        "参数为空"
+    } else {
+        "参数不是合法 JSON"
+    };
+    let error_msg = format!(
+        "❌ complete_and_check {reason}。\n\n\
+         必须发送合法 JSON，例如：\n\
+         {{\"action\":\"file_read\",\"params\":{{\"path\":\"src/main.rs\"}}}}\n\n\
+         禁止空或非法 arguments；每轮必须包含 action 与 params。"
+    );
+    let result_msg = Message::ToolResult {
+        tool_call_id: tc.id.clone(),
+        content: error_msg.to_string(),
+    };
+    new_messages.push(result_msg.clone());
+    messages.push(result_msg);
+    turn_memory.record_tool(&tc.name, &tc.arguments, true);
+    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+        name: tc.name.clone(),
+        output: error_msg.to_string(),
+        is_error: true,
+    });
+    *unified_parse_error_streak += 1;
+    tracing::warn!(
+        "[UNIFIED_PARSE_ERROR] streak={} reason={} args_len={} iteration={}",
+        *unified_parse_error_streak,
+        reason,
+        tc.arguments.len(),
+        iteration,
+    );
+    if *unified_parse_error_streak >= 3 {
+        messages.push(Message::system(
+            "⚠️ 已连续 3 次空/无效 complete_and_check 参数。\
+             必须发送合法 JSON：{\"action\":\"…\",\"params\":{…}}\n\
+             例如 action=file_read, action=edit_file, action=finish",
+        ));
+    }
+    if *unified_parse_error_streak >= 5 {
+        let _ = ui_tx.send(AgentToUiEvent::Status(
+            "⏹️ 连续 5 次无效 complete_and_check - 强制结束本轮".to_string(),
+        ));
+        emit_turn_done(ui_tx, turn_id, new_messages.clone(), total_usage.clone());
+        return UnifiedParseOutcome::TurnDone;
+    }
+    UnifiedParseOutcome::Skip
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
