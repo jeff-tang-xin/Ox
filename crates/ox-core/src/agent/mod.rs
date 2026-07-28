@@ -1610,61 +1610,17 @@ pub async fn run_agent_turn(
                 &tool_ctx,
                 &ui_tx,
             ).await;
-            // ── Full tool I/O logging for debugging ──
-            let args_preview: String =
-                serde_json::to_string_pretty(&args).unwrap_or_else(|_| format!("{:?}", args));
-            let result_preview: String = if result.content.len() > 8000 {
-                let head: String = result.content.chars().take(8000).collect();
-                format!(
-                    "{head}... (truncated, total {} chars)",
-                    result.content.len()
-                )
-            } else {
-                result.content.clone()
-            };
-            tracing::info!(
-                "[TOOL_IO] {} | args={} | error={} | output={}",
-                tc.name,
-                args_preview,
-                result.is_error,
-                result_preview
+            // Log + sanitize + update working dir (extracted to post_tool_log_and_sanitize)
+            let (sanitized_content, new_tool_ctx) = post_tool_log_and_sanitize(
+                tc,
+                &args,
+                &result,
+                &tool_ctx,
+                &ui_tx,
             );
-
-            // record_tool_live_update removed — KnowledgeEngine disabled at runtime
-            let _ = (&workflow_engine, &user_task, &tc.arguments);
-
-            // Send completion progress event only if tool executed successfully
-            if !result.is_error {
-                let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    message: "Completed".to_string(),
-                    progress_percent: Some(100),
-                });
+            if let Some(ctx) = new_tool_ctx {
+                tool_ctx = Arc::new(ctx);
             }
-
-            // If the tool changed working directory, update tool_ctx and notify UI.
-            if let Some(new_dir) = result.new_working_dir.clone() {
-                tool_ctx = Arc::new(ToolContext::new(
-                    tool_ctx.runtime.clone(),
-                    new_dir.clone(),
-                    tool_ctx.config.clone(),
-                ));
-                let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
-            }
-
-            // 🛡️ Untrusted tool output: injection scan + data banner
-            let sanitized_content = if matches!(
-                tc.name.as_str(),
-                "web_fetch" | "file_read" | "shell_exec" | "git_diff" | "code_search"
-            ) && !result.is_error
-            {
-                crate::agent::tool_result::wrap_for_llm(&tc.name, &result.content, false)
-            } else if result.is_error {
-                crate::agent::tool_result::wrap_for_llm(&tc.name, &result.content, true)
-            } else {
-                result.content.clone()
-            };
 
             // ── Context Offloading: only offload shell_exec (build logs can be huge) ──
             // file_read results are essential context — never offload
@@ -3612,6 +3568,77 @@ async fn execute_tool_with_retry(
         result.is_error
     );
     result
+}
+
+// ── Tool I/O logging + sanitization extraction ─────────────────────────────────
+/// Log tool I/O, send completion progress, update working dir if changed,
+/// and sanitize untrusted tool output.
+/// Returns `(sanitized_content, Option<ToolContext>)` where the second element
+/// is a new ToolContext if the tool changed the working directory.
+fn post_tool_log_and_sanitize(
+    tc: &ToolCall,
+    args: &serde_json::Value,
+    result: &crate::tools::ToolOutput,
+    tool_ctx: &crate::tools::ToolContext,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> (String, Option<crate::tools::ToolContext>) {
+    // ── Full tool I/O logging for debugging ──
+    let args_preview: String =
+        serde_json::to_string_pretty(args).unwrap_or_else(|_| format!("{:?}", args));
+    let result_preview: String = if result.content.len() > 8000 {
+        let head: String = result.content.chars().take(8000).collect();
+        format!(
+            "{head}... (truncated, total {} chars)",
+            result.content.len()
+        )
+    } else {
+        result.content.clone()
+    };
+    tracing::info!(
+        "[TOOL_IO] {} | args={} | error={} | output={}",
+        tc.name,
+        args_preview,
+        result.is_error,
+        result_preview
+    );
+
+    // Send completion progress event only if tool executed successfully
+    if !result.is_error {
+        let _ = ui_tx.send(AgentToUiEvent::ToolProgress {
+            tool_call_id: tc.id.clone(),
+            tool_name: tc.name.clone(),
+            message: "Completed".to_string(),
+            progress_percent: Some(100),
+        });
+    }
+
+    // If the tool changed working directory, update tool_ctx and notify UI.
+    let new_ctx = if let Some(new_dir) = result.new_working_dir.clone() {
+        let ctx = crate::tools::ToolContext::new(
+            tool_ctx.runtime.clone(),
+            new_dir.clone(),
+            tool_ctx.config.clone(),
+        );
+        let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
+        Some(ctx)
+    } else {
+        None
+    };
+
+    // 🛡️ Untrusted tool output: injection scan + data banner
+    let sanitized_content = if matches!(
+        tc.name.as_str(),
+        "web_fetch" | "file_read" | "shell_exec" | "git_diff" | "code_search"
+    ) && !result.is_error
+    {
+        crate::agent::tool_result::wrap_for_llm(&tc.name, &result.content, false)
+    } else if result.is_error {
+        crate::agent::tool_result::wrap_for_llm(&tc.name, &result.content, true)
+    } else {
+        result.content.clone()
+    };
+
+    (sanitized_content, new_ctx)
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
