@@ -1499,77 +1499,17 @@ pub async fn run_agent_turn(
             }
             let _ = ui_tx.send(AgentToUiEvent::Status(format!("Running tool: {}", tc.name)));
 
-            // ── Workflow validation before execution ──
-            if let Some(ref engine_arc) = workflow_engine {
-                let engine = engine_arc.lock().await;
-
-                // Parse tool arguments for validation
-                let args_value = if !tc.arguments.trim().is_empty() {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                        .unwrap_or(serde_json::json!({}))
-                } else {
-                    serde_json::json!({})
-                };
-
-                // Read guard: duplicate file_read / shell-as-read
-                if let Err(e) =
-                    crate::agent::gate::read_guard::check(&tc.name, &args_value, &engine)
-                {
-                    if tc.name == "file_read"
-                        && let Some(path) = args_value.get("path").and_then(|p| p.as_str())
-                        && let Some(cached) =
-                            crate::agent::gate::read_guard::cached_file_read_response(&engine, path)
-                    {
-                        let result_msg = Message::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: cached.clone(),
-                        };
-                        new_messages.push(result_msg.clone());
-                        messages.push(result_msg);
-                        turn_memory.record_tool(&tc.name, &tc.arguments, true);
-                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                            name: tc.name.clone(),
-                            output: cached,
-                            is_error: false,
-                        });
-                        continue;
-                    }
-                    let result_msg = Message::ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: format!("❌ {e}"),
-                    };
-                    new_messages.push(result_msg.clone());
-                    messages.push(result_msg);
-                    turn_memory.record_tool(&tc.name, &tc.arguments, false);
-                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                        name: tc.name.clone(),
-                        output: e.clone(),
-                        is_error: true,
-                    });
-                    continue;
-                }
-
-                // Validate tool call against current workflow step
-                if let Err(e) = engine.validate_tool_call(&tc.name, &args_value) {
-                    tracing::warn!("Workflow validation failed for tool '{}': {}", tc.name, e);
-                    let directive = if unified_tool_mode {
-                        "\n\n💡 该 action 当前不可用。请改用 [WORKSPACE] 允许的 action，或 finish。"
-                    } else {
-                        "\n\n💡 该工具当前不可用。请改用其它工具，或完成时输出 ## Done。"
-                    };
-                    let result_msg = Message::ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: format!("❌ {}\n{}", e, directive),
-                    };
-                    new_messages.push(result_msg.clone());
-                    messages.push(result_msg);
-                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                        name: tc.name.clone(),
-                        output: e,
-                        is_error: true,
-                    });
-                    continue; // Skip this tool call
-                }
+            // Workflow validation (extracted to check_workflow_validation)
+            if check_workflow_validation(
+                tc,
+                &workflow_engine,
+                &mut messages,
+                &mut new_messages,
+                &mut turn_memory,
+                unified_tool_mode,
+                &ui_tx,
+            ).await {
+                continue;
             }
 
             // Send detailed ToolStart for UI display
@@ -3499,6 +3439,98 @@ fn check_loop_and_truncation_guards(
         });
         return true;
     }
+    false
+}
+
+// ── Workflow validation extraction ──────────────────────────────────────────
+// P5.2 step 3: extract the read_guard + validate_tool_call checks (72 lines)
+// into a standalone async function. Returns `true` if the tool call should be
+// skipped (error/cached result already pushed to messages/new_messages/ui_tx).
+
+/// Returns `true` if the tool call should be skipped.
+/// - read_guard blocked: cached file_read result or error already pushed.
+/// - workflow step validation failed: error already pushed.
+#[allow(clippy::too_many_arguments)]
+async fn check_workflow_validation(
+    tc: &ToolCall,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    unified_tool_mode: bool,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> bool {
+    let Some(engine_arc) = workflow_engine else {
+        return false;
+    };
+    let engine = engine_arc.lock().await;
+
+    // Parse tool arguments for validation
+    let args_value = if !tc.arguments.trim().is_empty() {
+        serde_json::from_str::<serde_json::Value>(&tc.arguments)
+            .unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // Read guard: duplicate file_read / shell-as-read
+    if let Err(e) = crate::agent::gate::read_guard::check(&tc.name, &args_value, &engine) {
+        if tc.name == "file_read"
+            && let Some(path) = args_value.get("path").and_then(|p| p.as_str())
+            && let Some(cached) =
+                crate::agent::gate::read_guard::cached_file_read_response(&engine, path)
+        {
+            let result_msg = Message::ToolResult {
+                tool_call_id: tc.id.clone(),
+                content: cached.clone(),
+            };
+            new_messages.push(result_msg.clone());
+            messages.push(result_msg);
+            turn_memory.record_tool(&tc.name, &tc.arguments, true);
+            let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                name: tc.name.clone(),
+                output: cached,
+                is_error: false,
+            });
+            return true;
+        }
+        let result_msg = Message::ToolResult {
+            tool_call_id: tc.id.clone(),
+            content: format!("❌ {e}"),
+        };
+        new_messages.push(result_msg.clone());
+        messages.push(result_msg);
+        turn_memory.record_tool(&tc.name, &tc.arguments, false);
+        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+            name: tc.name.clone(),
+            output: e.clone(),
+            is_error: true,
+        });
+        return true;
+    }
+
+    // Validate tool call against current workflow step
+    if let Err(e) = engine.validate_tool_call(&tc.name, &args_value) {
+        tracing::warn!("Workflow validation failed for tool '{}': {}", tc.name, e);
+        let directive = if unified_tool_mode {
+            "\n\n💡 该 action 当前不可用。请改用 [WORKSPACE] 允许的 action，或 finish。"
+        } else {
+            "\n\n💡 该工具当前不可用。请改用其它工具，或完成时输出 ## Done。"
+        };
+        let result_msg = Message::ToolResult {
+            tool_call_id: tc.id.clone(),
+            content: format!("❌ {}\n{}", e, directive),
+        };
+        new_messages.push(result_msg.clone());
+        messages.push(result_msg);
+        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+            name: tc.name.clone(),
+            output: e,
+            is_error: true,
+        });
+        return true;
+    }
+
     false
 }
 
