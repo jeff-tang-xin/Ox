@@ -1138,306 +1138,37 @@ pub async fn run_agent_turn(
                 UnifiedParseOutcome::Proceed => {}
             }
 
-            if unified_tool_mode && tc.name == crate::agent::unified_action::TOOL_NAME {
-                let action_hint = crate::agent::unified_action::parse_request(&tc.arguments)
-                    .map(|r| r.action)
-                    .unwrap_or_else(|_| "?".into());
-                let _ = ui_tx.send(AgentToUiEvent::ToolStart {
-                    name: format!("{}:{action_hint}", crate::agent::unified_action::TOOL_NAME),
-                    id: tc.id.clone(),
-                    detail: Some(tc.arguments.chars().take(200).collect()),
-                });
-
-                tracing::info!("[UNIFIED_CALL] Entering handle_complete_and_check...");
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
-                    crate::agent::unified_handler::handle_complete_and_check(
-                        tc,
-                        &tool_registry,
-                        &tool_ctx,
-                        &trust_manager,
-                        &workflow_engine,
-                        &mut messages,
-                        &ui_tx,
-                        &mut ui_rx,
-                        &cancel_token,
-                        push_interjection_message,
-                    ),
-                )
-                .await;
-                let outcome = match result {
-                    Ok(outcome) => {
-                        tracing::info!("[UNIFIED_CALL] Completed normally");
-                        outcome
-                    }
-                    Err(_elapsed) => {
-                        // 增强超时日志：记录更多上下文信息
-                        let action_hint = tc.arguments.chars().take(100).collect::<String>();
-                        tracing::error!(
-                            "[UNIFIED_CALL] TIMEOUT after 300s — aborting | iteration={} | tool_calls_in_turn={} | action_hint={}",
-                            iteration,
-                            tool_calls.len(),
-                            action_hint
-                        );
-                        let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                            "⏱️ 操作超时 (300s) — 强制结束 | 已重试 {} 次",
-                            iteration
-                        )));
-                        emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                        return;
-                    }
-                };
-                match outcome {
-                    crate::agent::unified_handler::UnifiedHandleOutcome::Result {
-                        content,
-                        is_error,
-                        deferred_system,
-                        delegate_meta,
-                    } => {
-                        tracing::info!(
-                            "[UNIFIED_OUTCOME] Result: error={}, content_len={}",
-                            is_error,
-                            content.len()
-                        );
-                        if is_error {
-                            if content.contains("empty arguments")
-                                || content.contains("invalid JSON")
-                            {
-                                unified_parse_error_streak += 1;
-                                if unified_parse_error_streak >= 3 {
-                                    messages.push(Message::system(
-                                        "⚠️ 已连续 3 次空/无效 complete_and_check 参数。\
-                                         必须发送合法 JSON：{\"action\":\"…\",\"params\":{…}}",
-                                    ));
-                                }
-                                if unified_parse_error_streak >= 5 {
-                                    let _ = ui_tx.send(AgentToUiEvent::Status(
-                                        "⏹️ 连续 5 次无效 complete_and_check — 强制结束本轮"
-                                            .to_string(),
-                                    ));
-                                    emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                                    return;
-                                }
-                            }
-                        } else {
-                            unified_parse_error_streak = 0;
-                        }
-                        // Track findings format errors to break retry loops
-                        if is_error && tc.arguments.contains("\"finding") {
-                            findings_deliver_error_streak += 1;
-                            if findings_deliver_error_streak >= 3 {
-                                messages.push(Message::system(
-                                    "⚠️ 连续 3 次 finding_json 格式错误。改用 finish(params.content=...) 先汇报分析。",
-                                ));
-                                findings_deliver_error_streak = 0;
-                            }
-                        }
-                        deferred_tool_system.extend(deferred_system);
-
-                        // Log full unified handler result. NOTE: truncate by CHARS,
-                        // not bytes — `&s[..n]` panics when byte `n` lands inside a
-                        // multibyte UTF-8 char (e.g. Chinese), which silently killed
-                        // the agent task and froze the UI (no TurnDone ever emitted).
-                        let content_preview: String = if content.len() > 8000 {
-                            let head: String = content.chars().take(8000).collect();
-                            format!("{head}... (truncated, {} total)", content.len())
-                        } else {
-                            content.clone()
-                        };
-                        let args_preview: String = tc.arguments.chars().take(500).collect();
-                        tracing::debug!(
-                            "[UNIFIED_IO] complete_and_check | args={} | error={} | result={}",
-                            args_preview,
-                            is_error,
-                            content_preview
-                        );
-
-                        let result_msg = Message::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: content.clone(),
-                        };
-                        new_messages.push(result_msg.clone());
-                        messages.push(result_msg);
-                        if let Some(meta) = delegate_meta {
-                            turn_memory.record_tool_with_result(
-                                &meta.inner_tool,
-                                &meta.inner_args,
-                                !is_error,
-                                Some(&content),
-                            );
-                            let target = crate::agent::exploration_snapshot::target_from_tool_args(
-                                &meta.inner_tool,
-                                &meta.inner_args,
-                            );
-                            let observation: String =
-                                crate::agent::exploration_snapshot::extract_data_content(&content)
-                                    .lines()
-                                    .map(str::trim)
-                                    .filter(|line| !line.is_empty())
-                                    .take(3)
-                                    .collect::<Vec<_>>()
-                                    .join(" | ")
-                                    .chars()
-                                    .take(260)
-                                    .collect();
-                            let status = if is_error { "失败" } else { "成功" };
-                            turn_memory.record_decision(format!(
-                                "你刚才执行 {}({}) {status}; 观察到: {}; 后续避免重复同一查询",
-                                meta.inner_tool, target, observation
-                            ));
-                            // record_tool_live_update removed — KnowledgeEngine disabled
-                            let _ = (&meta.inner_args, &meta.live_output);
-                            // ── Persist the ReAct triple to react_log (unified path) ──
-                            if let Some(ref ms) = tool_ctx.memory_store {
-                                let (session_id, _react_task) = react_log_ids(
-                                    &workflow_engine,
-                                    user_task.as_deref().unwrap_or(""),
-                                );
-                                let decision = turn_memory
-                                    .decisions
-                                    .last()
-                                    .cloned()
-                                    .unwrap_or_else(|| "本轮仅工具调用".into());
-                                let outcome = if is_error { "error" } else { "ok" };
-                                let _ = record_react_tool(
-                                    ms.as_ref(),
-                                    &session_id,
-                                    user_task.as_deref().unwrap_or(""),
-                                    &meta.inner_tool,
-                                    &target,
-                                    outcome,
-                                    &decision,
-                                    &full_text,
-                                    &reasoning_content,
-                                    unified_tool_mode,
-                                    &meta.inner_args,
-                                    &meta.live_output,
-                                )
-                                .await;
-                            }
-                        } else {
-                            turn_memory.record_tool(&tc.name, &tc.arguments, is_error);
-                            // Also record tool execution result to react_log
-                            if let Some(ref ms) = tool_ctx.memory_store {
-                                let (session_id, task_desc) = react_log_ids(
-                                    &workflow_engine,
-                                    user_task.as_deref().unwrap_or(""),
-                                );
-                                let target_json: Option<serde_json::Value> =
-                                    serde_json::from_str(&tc.arguments).ok();
-                                let target = target_json
-                                    .as_ref()
-                                    .and_then(|v| {
-                                        v.get("params")
-                                            .or_else(|| v.get("path"))
-                                            .or_else(|| v.get("name"))
-                                    })
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_default();
-                                let decision = turn_memory
-                                    .decisions
-                                    .last()
-                                    .cloned()
-                                    .unwrap_or_else(|| "本轮仅工具调用".into());
-                                let outcome = if is_error { "error" } else { "ok" };
-                                let _ = record_react_tool(
-                                    ms.as_ref(),
-                                    &session_id,
-                                    &task_desc,
-                                    &tc.name,
-                                    &target,
-                                    outcome,
-                                    &decision,
-                                    &full_text,
-                                    &reasoning_content,
-                                    unified_tool_mode,
-                                    &tc.arguments,
-                                    &content,
-                                )
-                                .await;
-                            }
-                        }
-                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                            name: tc.name.clone(),
-                            output: content,
-                            is_error,
-                        });
-                    }
-                    crate::agent::unified_handler::UnifiedHandleOutcome::TurnDone { summary } => {
-                        let finish_content_text = summary.clone().unwrap_or_default();
-                        // Persist the agent's final free-text summary so it lives
-                        // in the session transcript (it was previously only
-                        // previewed in the UI via DeliverPreview and lost on
-                        // reload). Prefer attaching it to the finishing assistant
-                        // message (which holds the finish tool call) so we don't
-                        // create back-to-back assistant messages.
-                        if let Some(summary) = summary {
-                            let summary = summary.trim();
-                            if !summary.is_empty() {
-                                match new_messages
-                                    .iter_mut()
-                                    .rev()
-                                    .find(|m| matches!(m, Message::Assistant { .. }))
-                                {
-                                    Some(Message::Assistant { content, .. })
-                                        if content.trim().is_empty() =>
-                                    {
-                                        *content = summary.to_string();
-                                    }
-                                    _ => new_messages.push(Message::assistant(summary)),
-                                }
-                            }
-                        }
-                        // ── Persist the finish action to react_log (cross-round memory) ──
-                        if let Some(ref ms) = tool_ctx.memory_store {
-                            let (session_id, task_desc) =
-                                react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-                            let decision = turn_memory
-                                .decisions
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| "finish: round completed".into());
-                            let _ = record_react_tool(
-                                ms.as_ref(),
-                                &session_id,
-                                &task_desc,
-                                tc.name.as_str(),
-                                finish_content_text.as_str(),
-                                "ok",
-                                &decision,
-                                &full_text,
-                                &reasoning_content,
-                                unified_tool_mode,
-                                &tc.arguments,
-                                &finish_content_text,
-                            )
-                            .await;
-                        }
-                        if let Some(wf) = &workflow_engine
-                            && let Ok(engine) = wf.try_lock()
-                        {
-                            crate::memory::round_memory::append_round(
-                                &engine,
-                                crate::memory::round_memory::RoundRecord {
-                                    round_id: iteration,
-                                    user_intent: user_task.clone().unwrap_or_default(),
-                                    actions_summary: turn_memory.tool_names_summary(),
-                                    deliverables_summary: "finish confirmed".into(),
-                                    gate_outcomes: vec!["finish:user_finished".into()],
-                                },
-                            );
-                        }
-                        emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                        return;
-                    }
-                    crate::agent::unified_handler::UnifiedHandleOutcome::Aborted => {
-                        emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                        return;
-                    }
-                }
-                persist_turn_memory(&workflow_engine, &turn_memory);
-                continue;
+            // Unified handler dispatch (extracted to handle_unified_tool_call)
+            match handle_unified_tool_call(
+                tc,
+                unified_tool_mode,
+                &tool_registry,
+                &tool_ctx,
+                &trust_manager,
+                &workflow_engine,
+                &mut messages,
+                &ui_tx,
+                &mut ui_rx,
+                &cancel_token,
+                push_interjection_message,
+                turn_id,
+                &mut new_messages,
+                &total_usage,
+                iteration,
+                &tool_calls,
+                &mut unified_parse_error_streak,
+                &mut findings_deliver_error_streak,
+                &mut deferred_tool_system,
+                &mut turn_memory,
+                &user_task,
+                &full_text,
+                &reasoning_content,
+            )
+            .await
+            {
+                UnifiedDispatchOutcome::Continue => continue,
+                UnifiedDispatchOutcome::TurnDone => return,
+                UnifiedDispatchOutcome::NotHandled => {}
             }
 
             // Loop guard + truncation check (extracted to check_loop_and_truncation_guards)
@@ -3845,6 +3576,343 @@ fn check_unified_parse_error(
         return UnifiedParseOutcome::TurnDone;
     }
     UnifiedParseOutcome::Skip
+}
+
+// ── Unified handler dispatch extraction ─────────────────────────────────────
+
+/// Outcome of `handle_unified_tool_call`.
+enum UnifiedDispatchOutcome {
+    /// Tool handled; proceed to next tool in the batch.
+    Continue,
+    /// Turn is done (finish/timeout/abort); caller should return immediately.
+    TurnDone,
+    /// Not a unified tool call; caller should proceed with the non-unified path.
+    NotHandled,
+}
+
+/// Handle a `complete_and_check` tool call in unified tool mode.
+///
+/// This is the largest single tool-dispatch path: it wraps
+/// `handle_complete_and_check` with a 300s timeout, processes the
+/// `UnifiedHandleOutcome` (Result / TurnDone / Aborted), records
+/// ReAct logs, and manages parse-error / findings-error streaks.
+#[allow(clippy::too_many_arguments)]
+async fn handle_unified_tool_call(
+    tc: &ToolCall,
+    unified_tool_mode: bool,
+    tool_registry: &Arc<ToolRegistry>,
+    tool_ctx: &Arc<ToolContext>,
+    trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &mut Vec<Message>,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    ui_rx: &mut mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
+    cancel_token: &CancellationToken,
+    push_interjection_message: fn(
+        &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+        &mut Vec<Message>,
+        &str,
+        &mpsc::UnboundedSender<AgentToUiEvent>,
+    ),
+    turn_id: u64,
+    new_messages: &mut Vec<Message>,
+    total_usage: &crate::message::TokenUsage,
+    iteration: u32,
+    tool_calls: &[ToolCall],
+    unified_parse_error_streak: &mut u32,
+    findings_deliver_error_streak: &mut u32,
+    deferred_tool_system: &mut Vec<String>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    user_task: &Option<String>,
+    full_text: &str,
+    reasoning_content: &str,
+) -> UnifiedDispatchOutcome {
+    if !unified_tool_mode || tc.name != crate::agent::unified_action::TOOL_NAME {
+        return UnifiedDispatchOutcome::NotHandled;
+    }
+    let action_hint = crate::agent::unified_action::parse_request(&tc.arguments)
+        .map(|r| r.action)
+        .unwrap_or_else(|_| "?".into());
+    let _ = ui_tx.send(AgentToUiEvent::ToolStart {
+        name: format!("{}:{action_hint}", crate::agent::unified_action::TOOL_NAME),
+        id: tc.id.clone(),
+        detail: Some(tc.arguments.chars().take(200).collect()),
+    });
+
+    tracing::info!("[UNIFIED_CALL] Entering handle_complete_and_check...");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        crate::agent::unified_handler::handle_complete_and_check(
+            tc,
+            tool_registry,
+            tool_ctx,
+            trust_manager,
+            workflow_engine,
+            messages,
+            ui_tx,
+            ui_rx,
+            cancel_token,
+            push_interjection_message,
+        ),
+    )
+    .await;
+    let outcome = match result {
+        Ok(outcome) => {
+            tracing::info!("[UNIFIED_CALL] Completed normally");
+            outcome
+        }
+        Err(_elapsed) => {
+            let action_hint = tc.arguments.chars().take(100).collect::<String>();
+            tracing::error!(
+                "[UNIFIED_CALL] TIMEOUT after 300s - aborting | iteration={} | tool_calls_in_turn={} | action_hint={}",
+                iteration,
+                tool_calls.len(),
+                action_hint
+            );
+            let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                "⏱️ 操作超时 (300s) - 强制结束 | 已重试 {} 次",
+                iteration
+            )));
+            emit_turn_done(ui_tx, turn_id, new_messages.clone(), total_usage.clone());
+            return UnifiedDispatchOutcome::TurnDone;
+        }
+    };
+    match outcome {
+        crate::agent::unified_handler::UnifiedHandleOutcome::Result {
+            content,
+            is_error,
+            deferred_system,
+            delegate_meta,
+        } => {
+            tracing::info!(
+                "[UNIFIED_OUTCOME] Result: error={}, content_len={}",
+                is_error,
+                content.len()
+            );
+            if is_error {
+                if content.contains("empty arguments")
+                    || content.contains("invalid JSON")
+                {
+                    *unified_parse_error_streak += 1;
+                    if *unified_parse_error_streak >= 3 {
+                        messages.push(Message::system(
+                            "⚠️ 已连续 3 次空/无效 complete_and_check 参数。\
+                             必须发送合法 JSON：{\"action\":\"…\",\"params\":{…}}",
+                        ));
+                    }
+                    if *unified_parse_error_streak >= 5 {
+                        let _ = ui_tx.send(AgentToUiEvent::Status(
+                            "⏹️ 连续 5 次无效 complete_and_check - 强制结束本轮"
+                                .to_string(),
+                        ));
+                        emit_turn_done(ui_tx, turn_id, new_messages.clone(), total_usage.clone());
+                        return UnifiedDispatchOutcome::TurnDone;
+                    }
+                }
+            } else {
+                *unified_parse_error_streak = 0;
+            }
+            if is_error && tc.arguments.contains("\"finding") {
+                *findings_deliver_error_streak += 1;
+                if *findings_deliver_error_streak >= 3 {
+                    messages.push(Message::system(
+                        "⚠️ 连续 3 次 finding_json 格式错误。改用 finish(params.content=...) 先汇报分析。",
+                    ));
+                    *findings_deliver_error_streak = 0;
+                }
+            }
+            deferred_tool_system.extend(deferred_system);
+
+            let content_preview: String = if content.len() > 8000 {
+                let head: String = content.chars().take(8000).collect();
+                format!("{head}... (truncated, {} total)", content.len())
+            } else {
+                content.clone()
+            };
+            let args_preview: String = tc.arguments.chars().take(500).collect();
+            tracing::debug!(
+                "[UNIFIED_IO] complete_and_check | args={} | error={} | result={}",
+                args_preview,
+                is_error,
+                content_preview
+            );
+
+            let result_msg = Message::ToolResult {
+                tool_call_id: tc.id.clone(),
+                content: content.clone(),
+            };
+            new_messages.push(result_msg.clone());
+            messages.push(result_msg);
+            if let Some(meta) = delegate_meta {
+                turn_memory.record_tool_with_result(
+                    &meta.inner_tool,
+                    &meta.inner_args,
+                    !is_error,
+                    Some(&content),
+                );
+                let target = crate::agent::exploration_snapshot::target_from_tool_args(
+                    &meta.inner_tool,
+                    &meta.inner_args,
+                );
+                let observation: String =
+                    crate::agent::exploration_snapshot::extract_data_content(&content)
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                        .chars()
+                        .take(260)
+                        .collect();
+                let status = if is_error { "失败" } else { "成功" };
+                turn_memory.record_decision(format!(
+                    "你刚才执行 {}({}) {status}; 观察到: {}; 后续避免重复同一查询",
+                    meta.inner_tool, target, observation
+                ));
+                let _ = (&meta.inner_args, &meta.live_output);
+                if let Some(ref ms) = tool_ctx.memory_store {
+                    let (session_id, _react_task) = react_log_ids(
+                        workflow_engine,
+                        user_task.as_deref().unwrap_or(""),
+                    );
+                    let decision = turn_memory
+                        .decisions
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| "本轮仅工具调用".into());
+                    let outcome_str = if is_error { "error" } else { "ok" };
+                    let _ = record_react_tool(
+                        ms.as_ref(),
+                        &session_id,
+                        user_task.as_deref().unwrap_or(""),
+                        &meta.inner_tool,
+                        &target,
+                        outcome_str,
+                        &decision,
+                        full_text,
+                        reasoning_content,
+                        unified_tool_mode,
+                        &meta.inner_args,
+                        &meta.live_output,
+                    )
+                    .await;
+                }
+            } else {
+                turn_memory.record_tool(&tc.name, &tc.arguments, is_error);
+                if let Some(ref ms) = tool_ctx.memory_store {
+                    let (session_id, task_desc) = react_log_ids(
+                        workflow_engine,
+                        user_task.as_deref().unwrap_or(""),
+                    );
+                    let target_json: Option<serde_json::Value> =
+                        serde_json::from_str(&tc.arguments).ok();
+                    let target = target_json
+                        .as_ref()
+                        .and_then(|v| {
+                            v.get("params")
+                                .or_else(|| v.get("path"))
+                                .or_else(|| v.get("name"))
+                        })
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    let decision = turn_memory
+                        .decisions
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| "本轮仅工具调用".into());
+                    let outcome_str = if is_error { "error" } else { "ok" };
+                    let _ = record_react_tool(
+                        ms.as_ref(),
+                        &session_id,
+                        &task_desc,
+                        &tc.name,
+                        &target,
+                        outcome_str,
+                        &decision,
+                        full_text,
+                        reasoning_content,
+                        unified_tool_mode,
+                        &tc.arguments,
+                        &content,
+                    )
+                    .await;
+                }
+            }
+            let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                name: tc.name.clone(),
+                output: content,
+                is_error,
+            });
+        }
+        crate::agent::unified_handler::UnifiedHandleOutcome::TurnDone { summary } => {
+            let finish_content_text = summary.clone().unwrap_or_default();
+            if let Some(summary) = summary {
+                let summary = summary.trim();
+                if !summary.is_empty() {
+                    match new_messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant { .. }))
+                    {
+                        Some(Message::Assistant { content, .. })
+                            if content.trim().is_empty() =>
+                        {
+                            *content = summary.to_string();
+                        }
+                        _ => new_messages.push(Message::assistant(summary)),
+                    }
+                }
+            }
+            if let Some(ref ms) = tool_ctx.memory_store {
+                let (session_id, task_desc) =
+                    react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
+                let decision = turn_memory
+                    .decisions
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "finish: round completed".into());
+                let _ = record_react_tool(
+                    ms.as_ref(),
+                    &session_id,
+                    &task_desc,
+                    tc.name.as_str(),
+                    finish_content_text.as_str(),
+                    "ok",
+                    &decision,
+                    full_text,
+                    reasoning_content,
+                    unified_tool_mode,
+                    &tc.arguments,
+                    &finish_content_text,
+                )
+                .await;
+            }
+            if let Some(wf) = workflow_engine
+                && let Ok(engine) = wf.try_lock()
+            {
+                crate::memory::round_memory::append_round(
+                    &engine,
+                    crate::memory::round_memory::RoundRecord {
+                        round_id: iteration,
+                        user_intent: user_task.clone().unwrap_or_default(),
+                        actions_summary: turn_memory.tool_names_summary(),
+                        deliverables_summary: "finish confirmed".into(),
+                        gate_outcomes: vec!["finish:user_finished".into()],
+                    },
+                );
+            }
+            emit_turn_done(ui_tx, turn_id, new_messages.clone(), total_usage.clone());
+            return UnifiedDispatchOutcome::TurnDone;
+        }
+        crate::agent::unified_handler::UnifiedHandleOutcome::Aborted => {
+            emit_turn_done(ui_tx, turn_id, new_messages.clone(), total_usage.clone());
+            return UnifiedDispatchOutcome::TurnDone;
+        }
+    }
+    persist_turn_memory(workflow_engine, turn_memory);
+    UnifiedDispatchOutcome::Continue
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
