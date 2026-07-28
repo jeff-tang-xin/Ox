@@ -281,6 +281,7 @@ pub fn is_pure_exploration(tool_names: &[String], had_finish: bool) -> bool {
 /// When it reaches [`TOTAL_EXPLORE_CEILING`] the guard stops regardless of gain:
 /// the backstop against unbounded breadth-first wandering that the low-gain
 /// streak alone cannot catch.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     streak: &mut u32,
     reflected: &mut bool,

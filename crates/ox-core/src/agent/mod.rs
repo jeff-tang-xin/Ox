@@ -601,6 +601,7 @@ pub fn strip_all_injection_blocks(messages: &mut Vec<Message>) {
 
 // Legacy code moved to mod_builders.rs and context/assembler.rs
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_turn(
     provider: Arc<dyn LlmProvider>,
     role_providers: collaboration::RoleProviders,
@@ -1188,6 +1189,7 @@ pub async fn run_agent_turn(
 /// and repeat guard.
 ///
 /// Returns `true` if the turn should end (caller must `return`).
+#[allow(clippy::too_many_arguments)]
 fn post_batch_processing(
     deferred_tool_system: &mut Vec<String>,
     messages: &mut Vec<Message>,
@@ -1389,6 +1391,7 @@ enum LlmCollectOutcome {
 /// P5.3: Select active provider, filter tool schemas, and spawn the LLM stream task.
 ///
 /// Extracted verbatim from `run_agent_turn` lines 868-974.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_llm(
     provider: &Arc<dyn LlmProvider>,
     role_providers: &collaboration::RoleProviders,
@@ -3332,6 +3335,7 @@ fn check_repeated_failure_handoff(
 // ── Repeat guard extraction ───────────────────────────────────────────────────
 /// Check for degenerate repeated-output loops. Returns `true` if the turn
 /// should be aborted (Stop), `false` to continue.
+#[allow(clippy::too_many_arguments)]
 fn check_repeat_guard(
     repeat_guard: &mut crate::agent::repeat_guard::RepeatGuard,
     full_text: &str,
@@ -3380,6 +3384,7 @@ enum UnifiedParseOutcome {
 /// Check for empty/invalid `complete_and_check` arguments when in unified tool mode.
 /// Returns `Proceed` if args are valid, `Skip` if invalid (error pushed),
 /// or `TurnDone` if 5 consecutive errors (turn aborted).
+#[allow(clippy::too_many_arguments)]
 fn check_unified_parse_error(
     tc: &ToolCall,
     unified_tool_mode: bool,

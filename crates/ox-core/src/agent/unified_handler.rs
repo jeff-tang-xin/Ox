@@ -393,6 +393,7 @@ fn result_ok_envelope(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_complete_and_check(
     tc: &ToolCall,
     tool_registry: &ToolRegistry,
@@ -650,6 +651,7 @@ where
 ///   Confirm → unlock writes and continue the SAME turn (implement). Discuss → return hint.
 /// - no finding_json → show `content` in chat, END the turn, wait for new user input.
 ///   EXCEPTION: a content reply while in discussion mode keeps the scope gate alive.
+#[allow(clippy::too_many_arguments)]
 async fn handle_finish(
     tc: &ToolCall,
     req: &UnifiedActionRequest,
@@ -874,6 +876,7 @@ async fn handle_finish(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_delegate(
     tc: &ToolCall,
     req: &UnifiedActionRequest,

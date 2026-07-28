@@ -10,6 +10,7 @@ use crate::agent::gate::explore_reflect::ConvergeMode;
 use crate::memory::turn_memory::TurnMemory;
 
 /// Section: task anchor + blackboard + phase/progress + budget gauge + plan recap.
+#[allow(clippy::too_many_arguments)]
 pub fn build_task_anchor_block(
     user_task: &str,
     iteration: u32,

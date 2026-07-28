@@ -50,6 +50,7 @@ pub fn build_system_prompt(
 
 /// Full version with dynamic context layers.
 /// `workflow_step_prompt` — if Some, triggers step-aware trimming (only inject relevant blocks).
+#[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt_with_context(
     rt_env: &RuntimeEnvironment,
     tool_registry: &ToolRegistry,
@@ -75,6 +76,7 @@ pub fn build_system_prompt_with_context(
 
 /// Internal: accepts optional `step_index` for step-aware trimming.
 /// Single-step model uses si==0; legacy 4-step used 1=Plan, 3=Execute.
+#[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt_with_step(
     rt_env: &RuntimeEnvironment,
     tool_registry: &ToolRegistry,
@@ -99,6 +101,7 @@ pub fn build_system_prompt_with_step(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_system_prompt_inner(
     rt_env: &RuntimeEnvironment,
     tool_registry: &ToolRegistry,
