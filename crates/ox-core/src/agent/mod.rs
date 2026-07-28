@@ -1180,68 +1180,21 @@ pub async fn run_agent_turn(
             );
         } // end for tc
 
-        for note in deferred_tool_system {
-            messages.push(Message::system(&note));
-        }
-
-        // ── Post-hoc fix: remove orphaned tool_calls from latest Assistant msg ──
-        prune_orphaned_tool_calls(&mut [&mut messages, &mut new_messages]);
-
-        // 🗺️ Inject task canvas if any results were offloaded
-        if let Some(canvas_ctx) = offloader.get_canvas_context() {
-            messages.push(Message::system(&canvas_ctx));
-        }
-
-        // 🚨 AST recovery + verify hints + Done reminder
-        if !tool_calls.is_empty() {
-            run_post_edit_checks(
-                &tool_calls,
-                &mut messages,
-                &new_messages,
-                &workflow_engine,
-                &tool_ctx,
-                unified_tool_mode,
-            );
-
-            // 🔄 Auto-fix: if build/test failed, inject error for self-repair
-            // Also pass gitnexus for impact analysis when available
-            error_recovery::check_and_recover(
-                &mut messages,
-                &new_messages,
-                &tool_calls,
-                tool_ctx.gitnexus.as_ref(),
-            );
-
-            // Repeated-failure hand-off (extracted to check_repeated_failure_handoff)
-            if check_repeated_failure_handoff(
-                &workflow_engine,
-                &mut messages,
-                &mut new_messages,
-                &mut turn_memory,
-                &ui_tx,
-                turn_id,
-                &total_usage,
-            ) {
-                return;
-            }
-        }
-
-        // Clean up old offloaded refs, keeping at most the 50 most recent ones.
-        if let Err(e) = offloader.cleanup_old_refs(50) {
-            tracing::warn!("Failed to clean up old refs: {}", e);
-        }
-
-        // Repeat guard (extracted to check_repeat_guard)
-        if check_repeat_guard(
-            &mut repeat_guard,
-            &full_text,
+        if post_batch_processing(
+            &mut deferred_tool_system,
             &mut messages,
             &mut new_messages,
-            &mut turn_memory,
+            &mut offloader,
+            &tool_calls,
             &workflow_engine,
+            &tool_ctx,
+            unified_tool_mode,
+            &mut turn_memory,
             &ui_tx,
             turn_id,
-            &total_usage,
+            &mut total_usage,
+            &mut repeat_guard,
+            &full_text,
         ) {
             return;
         }
@@ -1255,6 +1208,98 @@ pub async fn run_agent_turn(
     // Loop exited via break (cancellation or user declined to continue).
     emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
 }
+
+/// Post-batch processing after all tool calls in an iteration have completed.
+///
+/// Handles: deferred system messages, orphan pruning, canvas injection,
+/// post-edit checks, error recovery, repeated-failure hand-off, offloader cleanup,
+/// and repeat guard.
+///
+/// Returns `true` if the turn should end (caller must `return`).
+fn post_batch_processing(
+    deferred_tool_system: &mut Vec<String>,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    offloader: &mut crate::context::context_offloader::ContextOffloader,
+    tool_calls: &[ToolCall],
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    tool_ctx: &Arc<ToolContext>,
+    unified_tool_mode: bool,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    turn_id: u64,
+    total_usage: &mut TokenUsage,
+    repeat_guard: &mut repeat_guard::RepeatGuard,
+    full_text: &str,
+) -> bool {
+    for note in std::mem::take(deferred_tool_system) {
+        messages.push(Message::system(&note));
+    }
+
+    // 鈹€鈹€ Post-hoc fix: remove orphaned tool_calls from latest Assistant msg 鈹€鈹€
+    prune_orphaned_tool_calls(&mut [messages, new_messages]);
+
+    // 馃椇锔?Inject task canvas if any results were offloaded
+    if let Some(canvas_ctx) = offloader.get_canvas_context() {
+        messages.push(Message::system(&canvas_ctx));
+    }
+
+    // 馃毃 AST recovery + verify hints + Done reminder
+    if !tool_calls.is_empty() {
+        run_post_edit_checks(
+            tool_calls,
+            messages,
+            new_messages,
+            workflow_engine,
+            tool_ctx,
+            unified_tool_mode,
+        );
+
+        // 馃攧 Auto-fix: if build/test failed, inject error for self-repair
+        error_recovery::check_and_recover(
+            messages,
+            new_messages,
+            tool_calls,
+            tool_ctx.gitnexus.as_ref(),
+        );
+
+        // Repeated-failure hand-off
+        if check_repeated_failure_handoff(
+            workflow_engine,
+            messages,
+            new_messages,
+            turn_memory,
+            ui_tx,
+            turn_id,
+            total_usage,
+        ) {
+            return true;
+        }
+    }
+
+    // Clean up old offloaded refs, keeping at most the 50 most recent ones.
+    if let Err(e) = offloader.cleanup_old_refs(50) {
+        tracing::warn!("Failed to clean up old refs: {}", e);
+    }
+
+    // Repeat guard
+    if check_repeat_guard(
+        repeat_guard,
+        full_text,
+        messages,
+        new_messages,
+        turn_memory,
+        workflow_engine,
+        ui_tx,
+        turn_id,
+        total_usage,
+    ) {
+        return true;
+    }
+
+    false
+}
+
 /// Resolve the user task from three fallback sources (in priority order):
 /// 1. `user_round::get_turn_user_input` (explicit turn-scoped input)
 /// 2. `_current_user_request` workflow variable
