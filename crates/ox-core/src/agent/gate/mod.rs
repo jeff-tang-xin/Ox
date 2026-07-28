@@ -11,14 +11,14 @@
 //! Gates reuse the existing AST / verify / findings / completion primitives, so
 //! only the control flow is new — the verification logic is unchanged.
 
+pub mod business_gate;
+pub mod explore_reflect;
 pub mod gate;
 pub mod gates;
-pub mod business_gate;
-pub mod safety_gate;
+pub mod idle_narrative;
 pub mod read_guard;
 pub mod repeat_guard;
-pub mod explore_reflect;
-pub mod idle_narrative;
+pub mod safety_gate;
 
 pub use gate::{
     Gate, GateCtx, GateOutcome, GateReport, GateRunner, current_failures, reset_failures,

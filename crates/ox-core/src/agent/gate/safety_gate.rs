@@ -138,7 +138,10 @@ pub async fn await_decision(
     }
 }
 
-pub fn emit_request(ui_tx: &mpsc::UnboundedSender<super::super::AgentToUiEvent>, req: &SafetyGateRequest) {
+pub fn emit_request(
+    ui_tx: &mpsc::UnboundedSender<super::super::AgentToUiEvent>,
+    req: &SafetyGateRequest,
+) {
     let _ = ui_tx.send(super::super::AgentToUiEvent::ToolConfirmationRequest {
         tool_call_id: req.tool_call_id.clone(),
         tool_name: req.tool_name.clone(),

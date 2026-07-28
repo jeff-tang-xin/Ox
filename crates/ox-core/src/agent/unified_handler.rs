@@ -12,8 +12,8 @@ use crate::safety::TrustManager;
 use crate::tools::{ToolContext, ToolOutput, ToolRegistry};
 
 use super::AgentToUiEvent;
-use super::gate::business_gate;
 use super::engine::WorkflowEngine;
+use super::gate::business_gate;
 use super::gate::safety_gate;
 use super::tool_result_envelope::{EnvelopeStatus, ToolResultEnvelope};
 use super::ui_event;
@@ -109,11 +109,7 @@ fn extract_impact_target(file_path: &str) -> String {
         .unwrap_or(file_path)
         .to_string();
 
-    let without_ext = basename
-        .rsplit('.')
-        .next()
-        .unwrap_or(&basename)
-        .to_string();
+    let without_ext = basename.rsplit('.').next().unwrap_or(&basename).to_string();
 
     if without_ext.is_empty() {
         return basename;
@@ -1058,7 +1054,9 @@ async fn handle_delegate(
     //   CRITICAL/HIGH → BLOCK: return error, LLM must confirm or redesign
     //   MEDIUM        → WARN: inject warning, allow edit but record
     //   LOW           → LOG:  inject silently, no action
-    let auto_impact = if (inner_name == "edit_file" || inner_name == "file_write" || inner_name == "delete_range")
+    let auto_impact = if (inner_name == "edit_file"
+        || inner_name == "file_write"
+        || inner_name == "delete_range")
         && let Some(path) = req.params.get("path").and_then(|p| p.as_str())
     {
         let ctx_clone = Arc::clone(tool_ctx);
@@ -1101,7 +1099,10 @@ async fn handle_delegate(
             let engine = wf.lock().await;
             crate::agent::engine::impl_tracking::record_file_impact(
                 &engine,
-                req.params.get("path").and_then(|p| p.as_str()).unwrap_or(""),
+                req.params
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or(""),
                 &format!("BLOCKED({}) — {}", risk_label, impact.summary),
             );
         }
@@ -1122,7 +1123,10 @@ async fn handle_delegate(
             let engine = wf.lock().await;
             crate::agent::engine::impl_tracking::record_file_impact(
                 &engine,
-                req.params.get("path").and_then(|p| p.as_str()).unwrap_or(""),
+                req.params
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or(""),
                 &format!("WARN(MEDIUM) — {}", impact.summary),
             );
         }
@@ -1188,7 +1192,10 @@ async fn handle_delegate(
     // Inject auto-impact analysis into output + deferred system note
     if let Some(impact_note) = &auto_impact_note {
         output.push_str(&format!("\n\n── IMPACT ANALYSIS ──\n{impact_note}"));
-        deferred.push(format!("📊 Impact 分析已自动执行：{}", impact_note.lines().next().unwrap_or("")));
+        deferred.push(format!(
+            "📊 Impact 分析已自动执行：{}",
+            impact_note.lines().next().unwrap_or("")
+        ));
 
         // Record impact status in engine memory for this file
         if let Some(wf) = workflow_engine

@@ -122,12 +122,8 @@ impl ContextOffloader {
         }
 
         match tool_name {
-            "code_search" | "file_list" | "grep" => {
-                content.lines().count() > 50
-            }
-            "shell_exec" => {
-                content.len() > 8000 || content.lines().count() > 100
-            }
+            "code_search" | "file_list" | "grep" => content.lines().count() > 50,
+            "shell_exec" => content.len() > 8000 || content.lines().count() > 100,
             "file_read" => {
                 threshold != usize::MAX
                     && content.len() > crate::tools::file_read::INLINE_CONTENT_THRESHOLD
@@ -221,11 +217,7 @@ impl ContextOffloader {
                 ref_path.display(),
                 e
             );
-            return OffloadedResult::new(
-                summary,
-                format!("fallback_{}", step_index),
-                None,
-            );
+            return OffloadedResult::new(summary, format!("fallback_{}", step_index), None);
         }
 
         tracing::info!(
@@ -350,10 +342,7 @@ fn generate_smart_summary(tool_name: &str, content: &str) -> String {
 
     match tool_name {
         "file_read" => {
-            let first_line = content
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("");
+            let first_line = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
             let preview: String = first_line.chars().take(120).collect();
             if total_chars > 200 {
                 let boundary = content
@@ -394,30 +383,24 @@ fn generate_smart_summary(tool_name: &str, content: &str) -> String {
             )
         }
         "file_list" => {
-            let file_count = content
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .count();
-            let preview: String = content
-                .lines()
-                .take(8)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let file_count = content.lines().filter(|l| !l.trim().is_empty()).count();
+            let preview: String = content.lines().take(8).collect::<Vec<_>>().join("\n");
             let extra = if total_lines > 8 {
                 format!("...({} more)", total_lines - 8)
             } else {
                 String::new()
             };
-            format!("📁 file_list: ~{} entries. {}\n{}", file_count, extra, preview)
+            format!(
+                "📁 file_list: ~{} entries. {}\n{}",
+                file_count, extra, preview
+            )
         }
         "shell_exec" => {
-            let has_error = content.contains("error") || content.contains("Error") || content.contains("FAILED");
+            let has_error = content.contains("error")
+                || content.contains("Error")
+                || content.contains("FAILED");
             let status = if has_error { "⚠️ ERROR" } else { "✅ OK" };
-            let head: String = content
-                .lines()
-                .take(5)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let head: String = content.lines().take(5).collect::<Vec<_>>().join("\n");
             let extra = if total_lines > 5 {
                 format!("\n...({} more lines)", total_lines - 5)
             } else {
@@ -429,19 +412,21 @@ fn generate_smart_summary(tool_name: &str, content: &str) -> String {
             )
         }
         "code_graph" => {
-            format!("🕸️ code_graph: {} chars, {} lines", total_chars, total_lines)
+            format!(
+                "🕸️ code_graph: {} chars, {} lines",
+                total_chars, total_lines
+            )
         }
         "find_symbol" | "read_symbol" => {
             let name_line = content
                 .lines()
                 .find(|l| l.contains("symbol") || l.contains("Symbol"));
-            let head: String = content
-                .lines()
-                .take(3)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let head: String = content.lines().take(3).collect::<Vec<_>>().join("\n");
             let name_info = name_line.unwrap_or("");
-            format!("🔤 {}: {} chars. {}\n{}", tool_name, total_chars, name_info, head)
+            format!(
+                "🔤 {}: {} chars. {}\n{}",
+                tool_name, total_chars, name_info, head
+            )
         }
         "edit_file" => {
             let success = !content.contains("error") && !content.contains("Error");
@@ -460,7 +445,12 @@ fn generate_smart_summary(tool_name: &str, content: &str) -> String {
                     .last()
                     .map(|(i, c)| i + c.len_utf8())
                     .unwrap_or(150);
-                format!("({} lines, {} chars)\n{}...", total_lines, total_chars, &content[..boundary])
+                format!(
+                    "({} lines, {} chars)\n{}...",
+                    total_lines,
+                    total_chars,
+                    &content[..boundary]
+                )
             } else {
                 format!("({} lines) {}", total_lines, content)
             }
@@ -554,10 +544,7 @@ mod tests {
 
     #[test]
     fn test_should_compress_inline() {
-        let offloader = ContextOffloader::new(
-            std::env::temp_dir().as_path(),
-            "test".into(),
-        );
+        let offloader = ContextOffloader::new(std::env::temp_dir().as_path(), "test".into());
 
         let search_content = "result\n".repeat(30);
         assert!(offloader.should_compress_inline("code_search", &search_content, 2000));

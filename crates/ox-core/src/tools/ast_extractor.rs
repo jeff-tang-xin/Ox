@@ -120,12 +120,7 @@ impl LanguageRegistry {
         Ok(errors)
     }
 
-    fn collect_errors(
-        node: Node,
-        code: &str,
-        total_lines: usize,
-        errors: &mut Vec<SyntaxError>,
-    ) {
+    fn collect_errors(node: Node, code: &str, total_lines: usize, errors: &mut Vec<SyntaxError>) {
         if node.is_error() || node.is_missing() {
             let line = node.start_position().row + 1;
             let col = node.start_position().column + 1;
@@ -348,7 +343,8 @@ fn extract_rust(node: Node, code: &str, e: &AstExtractor) -> Option<(&'static st
         "function_item" => Some(("function", e.get_node_name(node, code)?)),
         "impl_item" => Some((
             "impl",
-            e.get_node_name(node, code).unwrap_or_else(|| "<impl>".into()),
+            e.get_node_name(node, code)
+                .unwrap_or_else(|| "<impl>".into()),
         )),
         "struct_item" => Some(("struct", e.get_node_name(node, code)?)),
         "enum_item" => Some(("enum", e.get_node_name(node, code)?)),
@@ -440,8 +436,14 @@ impl User { fn new(name: String) -> Self { Self { name } } }
 "#;
         let mut e = AstExtractor::new();
         let syms = e.extract_symbols("src/main.rs", code).unwrap();
-        assert!(syms.iter().any(|s| s.symbol_type == "function" && s.name == "main"));
-        assert!(syms.iter().any(|s| s.symbol_type == "struct" && s.name == "User"));
+        assert!(
+            syms.iter()
+                .any(|s| s.symbol_type == "function" && s.name == "main")
+        );
+        assert!(
+            syms.iter()
+                .any(|s| s.symbol_type == "struct" && s.name == "User")
+        );
     }
 
     #[test]
@@ -453,8 +455,14 @@ class Calc:
 "#;
         let mut e = AstExtractor::new();
         let syms = e.extract_symbols("m.py", code).unwrap();
-        assert!(syms.iter().any(|s| s.symbol_type == "function" && s.name == "hello"));
-        assert!(syms.iter().any(|s| s.symbol_type == "class" && s.name == "Calc"));
+        assert!(
+            syms.iter()
+                .any(|s| s.symbol_type == "function" && s.name == "hello")
+        );
+        assert!(
+            syms.iter()
+                .any(|s| s.symbol_type == "class" && s.name == "Calc")
+        );
     }
 
     #[test]

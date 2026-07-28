@@ -271,7 +271,8 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
             // 🔴 DO NOT clear turn provenance — this is fix mode,
             // keep file-read records to prevent re-exploration.
             // Preserve original task + append fix instruction.
-            let prev = engine.get_variable("_current_user_request")
+            let prev = engine
+                .get_variable("_current_user_request")
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| user_message.to_string());
             let combined = if prev == user_message {
@@ -324,8 +325,7 @@ pub fn begin_user_round(engine: &mut WorkflowEngine, user_message: &str) -> bool
     }
     engine.reset_workflow();
     engine.clear_turn_provenance();
-    let decision =
-        crate::agent::task_intent::resolve_for_round_with_reason(engine, user_message);
+    let decision = crate::agent::task_intent::resolve_for_round_with_reason(engine, user_message);
     engine.set_task_intent_reason(decision.reason);
     engine.set_variable("_current_user_request", user_message.to_string());
     crate::agent::phase::on_round_started(engine, decision.intent);

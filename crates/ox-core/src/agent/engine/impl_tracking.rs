@@ -22,8 +22,7 @@ pub(crate) fn bootstrap_implementation_plan(engine: &WorkflowEngine) {
         return;
     }
 
-    let report = get_execute_review_report(engine)
-        .or_else(|| engine.get_variable("_step3_output"));
+    let report = get_execute_review_report(engine).or_else(|| engine.get_variable("_step3_output"));
     let Some(report) = report.filter(|s| !s.trim().is_empty()) else {
         return;
     };
@@ -95,9 +94,7 @@ pub(crate) fn record_impl_file_edited(engine: &WorkflowEngine, path: &str) {
     }
 }
 
-pub(crate) fn impl_files_read_set(
-    engine: &WorkflowEngine,
-) -> std::collections::HashSet<String> {
+pub(crate) fn impl_files_read_set(engine: &WorkflowEngine) -> std::collections::HashSet<String> {
     engine
         .get_variable(IMPL_READ_KEY)
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -258,7 +255,9 @@ pub(crate) fn get_file_impact(engine: &WorkflowEngine, path: &str) -> Option<Str
         .get_variable(IMPL_IMPACT_FILES_KEY)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    map.get(&norm).and_then(|v| v.as_str()).map(|s| s.to_string())
+    map.get(&norm)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Check if impact analysis has been recorded for a specific file.

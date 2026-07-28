@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::agent::engine::WorkflowEngine;
-use crate::message::Message;
 use crate::memory::store::MemoryStore;
 use crate::memory::turn_memory::TurnMemory;
+use crate::message::Message;
 
 /// Unified context assembler — the **single entry point** for building
 /// the LLM's context window each turn.
@@ -71,7 +71,8 @@ impl ContextAssembler {
         // 2a. Memory graph (pinned at top, only after offload)
         if let Some(wf) = workflow_engine
             && let Ok(engine) = wf.try_lock()
-            && let Some(graph) = engine.get_variable(crate::memory::memory_offload::MEMORY_GRAPH_VAR)
+            && let Some(graph) =
+                engine.get_variable(crate::memory::memory_offload::MEMORY_GRAPH_VAR)
             && !graph.trim().is_empty()
         {
             block.push_str("📚 Archived Memory:\n");
@@ -92,7 +93,9 @@ impl ContextAssembler {
         ));
 
         // 2c. Edit dedup (from TurnMemory — unique info, not in react_log)
-        block.push_str(&crate::agent::mod_builders::build_edit_dedup_block(turn_memory));
+        block.push_str(&crate::agent::mod_builders::build_edit_dedup_block(
+            turn_memory,
+        ));
 
         // 2d. 🔄 ReAct Log — the LLM's backbone memory (single source of truth)
         // Every LLM action is recorded here, from oldest to newest.
@@ -111,7 +114,10 @@ impl ContextAssembler {
         if let Some(wf) = workflow_engine
             && let Ok(engine) = wf.try_lock()
         {
-            block.push_str(&crate::agent::mod_builders::build_workspace_block(&engine, unified_tool_mode));
+            block.push_str(&crate::agent::mod_builders::build_workspace_block(
+                &engine,
+                unified_tool_mode,
+            ));
         }
 
         messages.push(Message::system(&block));

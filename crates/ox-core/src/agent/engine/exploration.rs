@@ -87,9 +87,7 @@ pub(crate) fn lookup_exploration_cache(
     let norm = crate::agent::plan_tracker::normalize_path(target);
     get_exploration_entries(engine)
         .into_iter()
-        .find(|e| {
-            e.tool == tool && crate::agent::plan_tracker::normalize_path(&e.target) == norm
-        })
+        .find(|e| e.tool == tool && crate::agent::plan_tracker::normalize_path(&e.target) == norm)
         .map(|e| {
             let mut out = format!(
                 "✅ 【缓存】已探索过 `{target}`（勿重复 {tool}）\n\n{}",
@@ -137,16 +135,11 @@ pub(crate) fn lookup_execute_exploration_cache(
 }
 
 pub(crate) fn has_file_read_snapshot(engine: &WorkflowEngine, path: &str) -> bool {
-    crate::agent::exploration_snapshot::find_file_read_entry(
-        &get_exploration_entries(engine),
-        path,
-    )
-    .is_some()
+    crate::agent::exploration_snapshot::find_file_read_entry(&get_exploration_entries(engine), path)
+        .is_some()
 }
 
-pub(crate) fn get_explored_path_set(
-    engine: &WorkflowEngine,
-) -> std::collections::HashSet<String> {
+pub(crate) fn get_explored_path_set(engine: &WorkflowEngine) -> std::collections::HashSet<String> {
     engine
         .get_variable("_explored_paths")
         .and_then(|s| serde_json::from_str(&s).ok())

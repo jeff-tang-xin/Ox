@@ -30,8 +30,12 @@ pub fn build_task_anchor_block(
     b.push_str(&format!("[TURN_CONTEXT]\n"));
     // Task anchor with clear boundary
     b.push_str(&format!("🎯 **当前任务**: {task}{ellipsis}\n"));
-    b.push_str(&format!("📌 **完成标准**: 能回答用户的问题 / 修复用户指出的问题\n"));
-    b.push_str(&format!("🚧 **任务边界**: 仅探索与上述任务直接相关的代码，偏离时立即收敛\n"));
+    b.push_str(&format!(
+        "📌 **完成标准**: 能回答用户的问题 / 修复用户指出的问题\n"
+    ));
+    b.push_str(&format!(
+        "🚧 **任务边界**: 仅探索与上述任务直接相关的代码，偏离时立即收敛\n"
+    ));
 
     if let Some(wf) = workflow_engine
         && let Ok(engine) = wf.try_lock()
@@ -90,10 +94,17 @@ pub fn build_task_anchor_block(
     {
         let paths_read = crate::agent::gate::read_guard::paths_read(&engine);
         let total_tools = turn_memory.entries.len();
-        let read_tools = turn_memory.entries.iter()
-            .filter(|e| matches!(e.tool.as_str(), "file_read" | "find_symbol" | "code_search" | "code_graph"))
+        let read_tools = turn_memory
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.tool.as_str(),
+                    "file_read" | "find_symbol" | "code_search" | "code_graph"
+                )
+            })
             .count();
-        
+
         if total_tools > 0 {
             let files_read = paths_read.len();
             b.push_str(&format!(
@@ -103,29 +114,32 @@ pub fn build_task_anchor_block(
                 read_tools,
                 turn_memory.decisions.len()
             ));
-            
+
             // Convergence hint: suggest stopping exploration after reading enough files
             if files_read >= 5 && read_tools > 0 {
-                b.push_str(&format!(
-                    "⚠️ 已探索 {} 个文件，建议：\n",
-                    files_read
-                ));
+                b.push_str(&format!("⚠️ 已探索 {} 个文件，建议：\n", files_read));
                 b.push_str("   - 如果你能用 2-3 句话描述方案 → 立即开始实施\n");
                 b.push_str("   - 如果还缺信息 → 针对性读 1-2 个文件，不要全量探索\n");
                 b.push_str("   - 新功能开发：优先写第一版，边写边补充探索\n");
             }
-            
+
             // Show recently read files for quick reference
             if !paths_read.is_empty() {
                 let recent: Vec<_> = paths_read.iter().rev().take(5).collect();
                 b.push_str("📂 最近读取: ");
-                b.push_str(&recent.iter().map(|p| {
-                    let name = std::path::Path::new(p)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(p);
-                    name.to_string()
-                }).collect::<Vec<_>>().join(", "));
+                b.push_str(
+                    &recent
+                        .iter()
+                        .map(|p| {
+                            let name = std::path::Path::new(p)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(p);
+                            name.to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
                 b.push('\n');
             }
         }
@@ -187,10 +201,7 @@ pub fn build_edit_dedup_block(turn_memory: &TurnMemory) -> String {
 }
 
 /// Section: workspace-derived guidance — required_action, scope gate, review handoff, durable memory.
-pub fn build_workspace_block(
-    engine: &WorkflowEngine,
-    unified_tool_mode: bool,
-) -> String {
+pub fn build_workspace_block(engine: &WorkflowEngine, unified_tool_mode: bool) -> String {
     let mut b = String::new();
 
     if crate::agent::phase::should_inject_workspace(engine)
@@ -372,9 +383,7 @@ fn format_required_action_one_liner_unified(
             finding_index,
             ..
         } => {
-            format!(
-                "edit_file / patch_file finding #{finding_index}: `{path}`"
-            )
+            format!("edit_file / patch_file finding #{finding_index}: `{path}`")
         }
         crate::agent::workspace::RequiredAction::Verify {
             command,

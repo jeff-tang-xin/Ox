@@ -569,7 +569,6 @@ impl ModelsConfig {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BehaviorRulesConfig {

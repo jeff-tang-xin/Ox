@@ -1,13 +1,13 @@
-﻿pub mod auto_reflect; // 🆕 Auto-reflection for skill generation
+pub mod auto_reflect; // 🆕 Auto-reflection for skill generation
 pub mod collaboration;
 pub mod completion; // Machine-verifiable completion receipt
 pub mod engine;
 pub mod error_recovery; // 🆕 Build/test failure auto-fix
 pub mod exploration_snapshot; // Plan-step tool results for cross-step handoff
 pub mod findings; // Canonical findings store (review → park → implement)
-pub mod gate; // Validation / safety / guard primitives (Done gates, business, safety, loop guards)
 #[cfg(test)]
 mod flow_e2e;
+pub mod gate; // Validation / safety / guard primitives (Done gates, business, safety, loop guards)
 pub mod git_undo; // Git checkout undo per finding
 pub mod intent_routing;
 pub mod interjection;
@@ -240,7 +240,11 @@ pub fn build_reasoning_fallback(
             let target_json: Option<serde_json::Value> = serde_json::from_str(tool_arguments).ok();
             let target: String = target_json
                 .as_ref()
-                .and_then(|v| v.get("path").or_else(|| v.get("name")).or_else(|| v.get("params")))
+                .and_then(|v| {
+                    v.get("path")
+                        .or_else(|| v.get("name"))
+                        .or_else(|| v.get("params"))
+                })
                 .map(|x| {
                     if let Some(s) = x.as_str() {
                         s.chars().take(80).collect()
@@ -651,7 +655,8 @@ pub async fn run_agent_turn(
             })
         });
 
-    let mut turn_memory = crate::memory::turn_memory::TurnMemory::new(user_task.as_deref().unwrap_or(""));
+    let mut turn_memory =
+        crate::memory::turn_memory::TurnMemory::new(user_task.as_deref().unwrap_or(""));
     if let Some(wf) = &workflow_engine {
         // FIX: Add warning when lock acquisition fails
         if let Ok(engine) = wf.try_lock() {
@@ -689,13 +694,10 @@ pub async fn run_agent_turn(
         .and_then(|wf| wf.try_lock().ok())
         .map(|e| {
             let val = e.get_counter("_total_explore");
-            let user_req = e.get_variable("_current_user_request")
-                .unwrap_or_default();
+            let user_req = e.get_variable("_current_user_request").unwrap_or_default();
             if crate::agent::workflow_session::looks_like_new_task(&user_req) {
                 e.set_counter("_total_explore", 0);
-                tracing::info!(
-                    "[EXPLORE_RESET] total_explore reset to 0 (new task detected)"
-                );
+                tracing::info!("[EXPLORE_RESET] total_explore reset to 0 (new task detected)");
                 0u32
             } else {
                 val
@@ -717,16 +719,6 @@ pub async fn run_agent_turn(
         std::collections::HashSet::new();
 
     // Hide findings JSON from UI stream during review-phase single-step turns.
-    fn review_stream_filter(
-        workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
-    ) -> bool {
-        workflow_engine
-            .as_ref()
-            .and_then(|wf| wf.try_lock().ok())
-            .is_some_and(|e| {
-                e.is_single_step() && !crate::agent::phase::is_implementation_phase(&e)
-            })
-    }
 
     loop {
         // Check cancellation before each LLM call.
@@ -865,340 +857,62 @@ pub async fn run_agent_turn(
             .map(|e| e.get_current_step_index())
             .unwrap_or(0);
 
-        // Stream LLM response.
-        let (llm_tx, mut llm_rx) = mpsc::unbounded_channel::<LlmStreamEvent>();
+        // Stream LLM response -- P5.3: extracted to dispatch_llm()
+        let dispatch = dispatch_llm(
+            &provider,
+            &role_providers,
+            &workflow_engine,
+            &messages,
+            &tool_schemas,
+            unified_tool_mode,
+            planning_mode,
+            iteration,
+            &ui_tx,
+            &cancel_token,
+        )
+        .await;
+        let active_provider = dispatch.active_provider;
+        let mut llm_rx = dispatch.llm_rx;
+        let mut stream_handle = dispatch.stream_handle;
 
-        let active_provider = if let Some(ref engine_arc) = workflow_engine {
-            let engine = engine_arc.lock().await;
-            let picked = role_providers.pick(&provider, &engine);
-            if role_providers.enabled {
-                let role = role_providers.role_label(&engine);
-                let name = picked.model_name();
-                if name != provider.model_name() {
-                    let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                        "🤝 协作模型 [{role}]: {name}"
-                    )));
-                }
-            }
-            picked
-        } else {
-            provider.clone()
+        // Collect the full response -- P5.3: extracted to collect_response()
+        let collect = collect_response(
+            &mut llm_rx,
+            &mut stream_handle,
+            &cancel_token,
+            &ui_tx,
+            &workflow_engine,
+            &mut messages,
+            &mut new_messages,
+            &mut total_usage,
+            turn_id,
+            user_task.as_deref().unwrap_or(""),
+            unified_tool_mode,
+            &mut api_error_recovery_streak,
+            MAX_API_ERROR_RECOVERY,
+        )
+        .await;
+        let (full_text, reasoning_content, mut tool_calls, last_prompt_tokens) = match collect {
+            LlmCollectOutcome::TurnAborted => return,
+            LlmCollectOutcome::RetryIteration => continue,
+            LlmCollectOutcome::Collected {
+                full_text,
+                reasoning_content,
+                tool_calls,
+                last_prompt_tokens,
+            } => (full_text, reasoning_content, tool_calls, last_prompt_tokens),
         };
-
-        let provider_clone = Arc::clone(&active_provider);
-        let msgs = messages.clone();
-
-        // Filter tool schemas based on current workflow step
-        let workflow_blocks_planning = if let Some(ref engine_arc) = workflow_engine {
-            engine_arc.lock().await.is_workflow_active()
-        } else {
-            false
-        };
-
-        let schemas: Vec<_> = if unified_tool_mode {
-            if planning_mode && iteration == 0 && !workflow_blocks_planning {
-                vec![]
-            } else if let Some(ref engine_arc) = workflow_engine {
-                let engine = engine_arc.lock().await;
-                if !engine.allows_tool_execution() {
-                    Vec::new()
-                } else {
-                    crate::agent::unified_action::unified_tool_schemas_for_engine(&engine)
-                }
-            } else {
-                crate::agent::unified_action::unified_tool_schemas()
-            }
-        } else if planning_mode && iteration == 0 && !workflow_blocks_planning {
-            vec![]
-        } else if let Some(ref engine_arc) = workflow_engine {
-            let engine = engine_arc.lock().await;
-            if !engine.allows_tool_execution() {
-                Vec::new()
-            } else if engine.is_single_step() {
-                let allowed = crate::agent::tool_graph::allowed_tool_names(&engine);
-                crate::agent::tool_graph::filter_tool_schemas(&tool_schemas, &allowed)
-            } else {
-                tool_schemas.clone()
-            }
-        } else {
-            tool_schemas.clone()
-        };
-
-        // 📝 LOG REQUEST CONTEXT (debug level — expensive, iterates all messages)
-        tracing::debug!("\n{}", "=".repeat(80));
-        tracing::debug!("🤖 LLM REQUEST CONTEXT (Iteration {})", iteration + 1);
-        tracing::debug!("{}", "=".repeat(80));
-        tracing::debug!("Total messages: {}", msgs.len());
-
-        // Show system prompt preview (debug level)
-        if let Some(first_msg) = msgs.first()
-            && let Message::System { content } = first_msg
-        {
-            tracing::debug!(
-                "📋 SYSTEM PROMPT LENGTH: {} characters",
-                content.chars().count()
-            );
-        }
-        tracing::debug!(
-            "Enabled tools: {}",
-            schemas
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        tracing::debug!("{}", "=".repeat(80));
-
-        let mut llm_opts = crate::llm::StreamOptions::default();
-        if !schemas.is_empty() {
-            // Use tool_choice: auto — LLM can choose to call tools or output
-            // plain text. When no tool_calls are returned, it means the LLM
-            // has reached a conclusion and is ending the turn. This replaces
-            // the old "finish" action with natural LLM behavior.
-            llm_opts.tool_choice = Some(crate::llm::ToolChoice::Auto);
-            llm_opts.parallel_tool_calls = Some(true);
-        }
-        let cancel_clone = cancel_token.clone();
-        let llm_tx_err = llm_tx.clone();
-        let mut stream_handle = tokio::spawn(async move {
-            tokio::select! {
-                result = provider_clone.stream_chat(&msgs, &schemas, llm_tx, llm_opts) => {
-                    if let Err(e) = result {
-                        tracing::error!("LLM stream error: {e}");
-                        // Propagate the error so the agent loop can handle it.
-                        let _ = llm_tx_err.send(LlmStreamEvent::Error(format!("Stream failed: {e}")));
-                    }
-                }
-                _ = cancel_clone.cancelled() => {}
-            }
-        });
-
-        // Collect the full response (text + tool calls).
-        let mut full_text = String::new();
-        let mut reasoning_content = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut current_tool_args: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let use_findings_stream = review_stream_filter(&workflow_engine);
-        let mut findings_stream =
-            use_findings_stream.then(crate::agent::perception::FindingsStreamFilter::new);
-        let mut think_stream = crate::agent::think_stream::ThinkTagStreamFilter::new();
-        let mut last_stream_completion_tokens = 0u32;
-        let mut last_prompt_tokens = 0u32;
-
-        // Timeout for the entire LLM response (stream first token → stream done).
-        // Separate from the per-tool 300s timeout; prevents the agent hanging
-        // for 15+ minutes when the API silently drops the connection.
-        const LLM_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-
-        while let Some(event) = tokio::select! {
-            ev = llm_rx.recv() => ev,
-            _ = cancel_token.cancelled() => {
-                tracing::warn!("[AGENT] ⚠️ Cancellation token triggered, stopping LLM stream");
-                None
-            }
-            _ = tokio::time::sleep(LLM_RESPONSE_TIMEOUT) => {
-                tracing::error!(
-                    "[AGENT] ⏱️ LLM response timed out after {:?}",
-                    LLM_RESPONSE_TIMEOUT
-                );
-                // Abort the stream task so it stops waiting on the API
-                stream_handle.abort();
-                let _ = ui_tx.send(AgentToUiEvent::Status(
-                    "⏱️ LLM 响应超时 (180s) — 请重试或简化请求".to_string(),
-                ));
-                // Add interrupt boundary so the next round knows what happened
-                let boundary = crate::agent::user_round::format_interrupt_boundary_message(
-                    &user_task.clone().unwrap_or_default(),
-                );
-                new_messages.push(crate::message::Message::system(&boundary));
-                messages.push(crate::message::Message::system(&boundary));
-                emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                return;
-            }
-        } {
-            match event {
-                LlmStreamEvent::TextDelta(text) => {
-                    let (reasoning_delta, visible_delta) = think_stream.push(&text);
-                    if let Some(r) = reasoning_delta.filter(|s| !s.is_empty()) {
-                        reasoning_content.push_str(&r);
-                        let _ = ui_tx.send(AgentToUiEvent::ReasoningChunk(r));
-                    }
-                    let visible_piece = visible_delta.unwrap_or_default();
-                    // Strip <tool_call> XML tags from visible text so raw
-                    // tool syntax doesn't appear in the UI.
-                    let clean_visible = strip_tool_call_xml(&visible_piece);
-                    // Detect XML tool calls mid-stream and update status bar
-                    if clean_visible.len() < visible_piece.len() {
-                        // Something was stripped — a tool call was detected in the stream
-                        if let Some(action) = extract_action_from_xml(&visible_piece) {
-                            let _ =
-                                ui_tx.send(AgentToUiEvent::Status(format!("🔄 {} ...", action)));
-                        }
-                    }
-                    if let Some(ref mut filter) = findings_stream {
-                        if let Some(visible) = filter.push(&clean_visible)
-                            && !visible.is_empty()
-                        {
-                            let _ = ui_tx.send(AgentToUiEvent::TextChunk(visible));
-                        }
-                    } else if !clean_visible.is_empty() {
-                        let _ = ui_tx.send(AgentToUiEvent::TextChunk(clean_visible));
-                    }
-                    full_text.push_str(&text);
-                }
-                LlmStreamEvent::ReasoningDelta(text) => {
-                    reasoning_content.push_str(&text);
-                    let _ = ui_tx.send(AgentToUiEvent::ReasoningChunk(text));
-                }
-                LlmStreamEvent::ToolCallStart { id, name } => {
-                    // Show tool intent in status bar immediately
-                    tracing::debug!("[AGENT] LLM requested tool: {} (id={})", name, id);
-                    if unified_tool_mode {
-                        let tool_display = if name == crate::agent::unified_action::TOOL_NAME {
-                            "准备执行...".to_string()
-                        } else {
-                            name.clone()
-                        };
-                        let _ = ui_tx.send(AgentToUiEvent::Status(format!("🔄 {tool_display}")));
-                    }
-                    current_tool_args.insert(id.clone(), String::new());
-                    tool_calls.push(ToolCall {
-                        id,
-                        name,
-                        arguments: String::new(),
-                    });
-                }
-                LlmStreamEvent::ToolCallArgumentsDelta { id, delta } => {
-                    if let Some(args) = current_tool_args.get_mut(&id) {
-                        let was_empty = args.is_empty();
-                        args.push_str(&delta);
-                        // Once we have at least the action field, show it in status bar
-                        if was_empty
-                            && unified_tool_mode
-                            && let Ok(action) = serde_json::from_str::<
-                                crate::agent::unified_action::UnifiedActionRequest,
-                            >(args)
-                        {
-                            let _ = ui_tx
-                                .send(AgentToUiEvent::Status(format!("🔄 {} ...", action.action)));
-                        }
-                    }
-                    if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
-                        tc.arguments.push_str(&delta);
-                    }
-                }
-                LlmStreamEvent::ToolCallEnd { .. } => {}
-                LlmStreamEvent::Done { usage } => {
-                    last_stream_completion_tokens = usage.completion_tokens;
-                    tracing::info!(
-                        "[AGENT] ✅ LLM stream completed (prompt: {}, completion: {}, total: {})",
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        usage.total_tokens
-                    );
-                    total_usage.prompt_tokens += usage.prompt_tokens;
-                    total_usage.completion_tokens += usage.completion_tokens;
-                    total_usage.total_tokens += usage.total_tokens;
-                    last_prompt_tokens = usage.prompt_tokens;
-
-                    // 📝 LOG RESPONSE SUMMARY (debug level)
-                    tracing::debug!("\n{}", "-".repeat(80));
-                    tracing::debug!("📤 LLM RESPONSE SUMMARY");
-                    tracing::debug!("{}", "-".repeat(80));
-                    if !full_text.is_empty() {
-                        let preview = if full_text.chars().count() > 300 {
-                            format!("{}...", full_text.chars().take(300).collect::<String>())
-                        } else {
-                            full_text.clone()
-                        };
-                        tracing::debug!("Text response: {}", preview.replace('\n', "\\n"));
-                    }
-                    if !tool_calls.is_empty() {
-                        tracing::debug!(
-                            "Tool calls: {}",
-                            tool_calls
-                                .iter()
-                                .map(|tc| { format!("{}({})", tc.name, tc.id) })
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                        for tc in &tool_calls {
-                            let args_preview = if tc.arguments.chars().count() > 200 {
-                                format!("{}...", tc.arguments.chars().take(200).collect::<String>())
-                            } else {
-                                tc.arguments.clone()
-                            };
-                            tracing::debug!(
-                                "  - {} [{}]: {}",
-                                tc.name,
-                                tc.id,
-                                args_preview.replace('\n', "\\n")
-                            );
-                        }
-                    } else {
-                        tracing::debug!("No tool calls");
-                    }
-                    tracing::debug!("{}", "-".repeat(80));
-
-                    break;
-                }
-                LlmStreamEvent::Error(err) => {
-                    // Log the error to file.
-                    tracing::error!("LLM error: {}", err);
-                    // Abort the stream task if still running, don't block on it.
-                    stream_handle.abort();
-
-                    // Bounded self-heal for client-side API errors (HTTP 4xx):
-                    // ARK returns `400 InvalidParameter` when the request body is
-                    // malformed or oversized. Aborting the turn just resends the
-                    // same body next time, so instead we trim the context and
-                    // retry the same iteration a bounded number of times.
-                    let is_client_api_error = err.contains("API error 400")
-                        || err.contains("API error 413")
-                        || err.contains("API error 422");
-                    if is_client_api_error && api_error_recovery_streak < MAX_API_ERROR_RECOVERY {
-                        api_error_recovery_streak += 1;
-                        tracing::warn!(
-                            "[AGENT] API error recovery {}/{}: trimming context and retrying",
-                            api_error_recovery_streak,
-                            MAX_API_ERROR_RECOVERY
-                        );
-                        let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                            "⚠️ API 拒绝请求（{}/{}）— 正在裁剪上下文后重试…",
-                            api_error_recovery_streak, MAX_API_ERROR_RECOVERY
-                        )));
-                        crate::context::sanitize_tool_pairs(&mut messages);
-                        crate::context::filter_noisy_messages(&mut messages);
-                        crate::memory::memory_offload::hard_trim_public(&mut messages);
-                        continue;
-                    }
-
-                    // Give up: surface the error and end the turn.
-                    let _ = ui_tx.send(AgentToUiEvent::Error(err));
-                    emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                    return;
-                }
-            }
-        }
-
-        // Wait for the stream task to finish, but don't block forever.
-        // If cancelled, abort the stream task immediately.
-        tokio::select! {
-            _ = &mut stream_handle => {}
-            _ = cancel_token.cancelled() => {
-                stream_handle.abort();
-            }
-        }
-
-        if let Some(ref mut filter) = findings_stream
-            && let Some(tail) = filter.flush_tail()
-        {
-            let _ = ui_tx.send(AgentToUiEvent::TextChunk(tail));
-        }
 
         // ── Unified budget offload ──
-        run_memory_offload(last_prompt_tokens, &mut messages, &workflow_engine, &tool_ctx, &ui_tx, &active_provider).await;
+        run_memory_offload(
+            last_prompt_tokens,
+            &mut messages,
+            &workflow_engine,
+            &tool_ctx,
+            &ui_tx,
+            &active_provider,
+        )
+        .await;
 
         // Repair malformed / empty tool arguments (GLM empty JSON, XML hallucinations).
         repair_and_extract_tool_calls(&mut tool_calls, &full_text, &reasoning_content);
@@ -1247,11 +961,20 @@ pub async fn run_agent_turn(
 
         if tool_calls.is_empty() {
             if handle_empty_tool_calls(
-                &full_text, &reasoning_content, &tool_ctx,
-                &workflow_engine, user_task.as_deref(),
-                &mut messages, &mut new_messages, &turn_memory,
-                &ui_tx, turn_id, total_usage.clone(),
-            ).await {
+                &full_text,
+                &reasoning_content,
+                &tool_ctx,
+                &workflow_engine,
+                user_task.as_deref(),
+                &mut messages,
+                &mut new_messages,
+                &turn_memory,
+                &ui_tx,
+                turn_id,
+                total_usage.clone(),
+            )
+            .await
+            {
                 return;
             }
         }
@@ -1267,7 +990,7 @@ pub async fn run_agent_turn(
 
         let execute_step = workflow_engine
             .as_ref()
-                       .and_then(|wf| wf.try_lock().ok())
+            .and_then(|wf| wf.try_lock().ok())
             .map(|e| e.is_task_step())
             .unwrap_or(false);
 
@@ -1319,7 +1042,7 @@ pub async fn run_agent_turn(
             continue;
         }
 
-// Keep ALL tool_calls on the assistant message so every ToolResult has a matching id.
+        // Keep ALL tool_calls on the assistant message so every ToolResult has a matching id.
         // (Filtering caused orphaned ToolResults → API auto-fix → context amnesia.)
         let assistant_msg = Message::Assistant {
             content: content_with_reasoning,
@@ -1329,7 +1052,13 @@ pub async fn run_agent_turn(
         new_messages.push(assistant_msg.clone());
         messages.push(assistant_msg);
 
-        record_turn_decision(&tool_calls, &full_text, &reasoning_content, unified_tool_mode, &mut turn_memory);
+        record_turn_decision(
+            &tool_calls,
+            &full_text,
+            &reasoning_content,
+            unified_tool_mode,
+            &mut turn_memory,
+        );
 
         // Build actions_summary for fallback decision text in react_log below.
         let actions_summary = tool_calls
@@ -1347,7 +1076,8 @@ pub async fn run_agent_turn(
             .join(", ");
         // ── 🔴 UNIFIED RECORD: Capture LLM's decision BEFORE tool execution ──
         if let Some(ref ms) = tool_ctx.memory_store {
-            let (session_id, task_desc) = react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
+            let (session_id, task_desc) =
+                react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
             let first_tool = tool_calls.first();
             let (tool_name, tool_target) = first_tool
                 .map(|tc| extract_tool_name_and_target(tc, unified_tool_mode))
@@ -1370,7 +1100,8 @@ pub async fn run_agent_turn(
                 unified_tool_mode,
                 first_tool.map(|tc| tc.arguments.as_str()).unwrap_or(""),
                 &format!("(待执行) {} 个工具调用", tool_calls.len()),
-            ).await;
+            )
+            .await;
         }
 
         // ── Context Offloader: created once and reused across all tools in this iteration ──
@@ -1398,14 +1129,16 @@ pub async fn run_agent_turn(
                 break;
             }
 
-            if unified_tool_mode
-                && tc.name == crate::agent::unified_action::TOOL_NAME
-            {
+            if unified_tool_mode && tc.name == crate::agent::unified_action::TOOL_NAME {
                 let args_empty = tc.arguments.trim().is_empty();
                 let args_invalid = !tc.arguments.trim().is_empty()
                     && serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err();
                 if args_empty || args_invalid {
-                    let reason = if args_empty { "参数为空" } else { "参数不是合法 JSON" };
+                    let reason = if args_empty {
+                        "参数为空"
+                    } else {
+                        "参数不是合法 JSON"
+                    };
                     let error_msg = format!(
                         "❌ complete_and_check {reason}。\n\n\
                          必须发送合法 JSON，例如：\n\
@@ -1601,7 +1334,10 @@ pub async fn run_agent_turn(
                             let _ = (&meta.inner_args, &meta.live_output);
                             // ── Persist the ReAct triple to react_log (unified path) ──
                             if let Some(ref ms) = tool_ctx.memory_store {
-                                let (session_id, _react_task) = react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
+                                let (session_id, _react_task) = react_log_ids(
+                                    &workflow_engine,
+                                    user_task.as_deref().unwrap_or(""),
+                                );
                                 let decision = turn_memory
                                     .decisions
                                     .last()
@@ -1621,17 +1357,26 @@ pub async fn run_agent_turn(
                                     unified_tool_mode,
                                     &meta.inner_args,
                                     &meta.live_output,
-                                ).await;
+                                )
+                                .await;
                             }
                         } else {
                             turn_memory.record_tool(&tc.name, &tc.arguments, is_error);
                             // Also record tool execution result to react_log
                             if let Some(ref ms) = tool_ctx.memory_store {
-                                let (session_id, task_desc) = react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-                                let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                                let (session_id, task_desc) = react_log_ids(
+                                    &workflow_engine,
+                                    user_task.as_deref().unwrap_or(""),
+                                );
+                                let target_json: Option<serde_json::Value> =
+                                    serde_json::from_str(&tc.arguments).ok();
                                 let target = target_json
                                     .as_ref()
-                                    .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                                    .and_then(|v| {
+                                        v.get("params")
+                                            .or_else(|| v.get("path"))
+                                            .or_else(|| v.get("name"))
+                                    })
                                     .and_then(|x| x.as_str())
                                     .map(|s| s.to_string())
                                     .unwrap_or_default();
@@ -1654,7 +1399,8 @@ pub async fn run_agent_turn(
                                     unified_tool_mode,
                                     &tc.arguments,
                                     &content,
-                                ).await;
+                                )
+                                .await;
                             }
                         }
                         let _ = ui_tx.send(AgentToUiEvent::ToolResult {
@@ -1690,7 +1436,8 @@ pub async fn run_agent_turn(
                         }
                         // ── Persist the finish action to react_log (cross-round memory) ──
                         if let Some(ref ms) = tool_ctx.memory_store {
-                            let (session_id, task_desc) = react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
+                            let (session_id, task_desc) =
+                                react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
                             let decision = turn_memory
                                 .decisions
                                 .last()
@@ -1709,7 +1456,8 @@ pub async fn run_agent_turn(
                                 unified_tool_mode,
                                 &tc.arguments,
                                 &finish_content_text,
-                            ).await;
+                            )
+                            .await;
                         }
                         if let Some(wf) = &workflow_engine
                             && let Ok(engine) = wf.try_lock()
@@ -1778,15 +1526,24 @@ pub async fn run_agent_turn(
                 turn_memory.record_tool(&tc.name, &tc.arguments, false);
                 // Record infinite loop detection to react_log
                 if let Some(ref ms) = tool_ctx.memory_store {
-                    let (session_id, task_desc) = react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-                    let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                    let (session_id, task_desc) =
+                        react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
+                    let target_json: Option<serde_json::Value> =
+                        serde_json::from_str(&tc.arguments).ok();
                     let target = target_json
                         .as_ref()
-                        .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                        .and_then(|v| {
+                            v.get("params")
+                                .or_else(|| v.get("path"))
+                                .or_else(|| v.get("name"))
+                        })
                         .and_then(|x| x.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_default();
-                    let decision = format!("🚨 检测到无限循环: {} 已调用 {} 次，强制阻止", loop_key, call_count);
+                    let decision = format!(
+                        "🚨 检测到无限循环: {} 已调用 {} 次，强制阻止",
+                        loop_key, call_count
+                    );
                     let assistant_text = {
                         let raw = crate::agent::think_stream::visible_only(&full_text);
                         if raw.trim().is_empty() {
@@ -1957,7 +1714,9 @@ pub async fn run_agent_turn(
                 };
 
                 // Read guard: duplicate file_read / shell-as-read
-                if let Err(e) = crate::agent::gate::read_guard::check(&tc.name, &args_value, &engine) {
+                if let Err(e) =
+                    crate::agent::gate::read_guard::check(&tc.name, &args_value, &engine)
+                {
                     if tc.name == "file_read"
                         && let Some(path) = args_value.get("path").and_then(|p| p.as_str())
                         && let Some(cached) =
@@ -2159,11 +1918,17 @@ pub async fn run_agent_turn(
                         messages.push(result_msg);
                         // Record user denial to react_log
                         if let Some(ref ms) = tool_ctx.memory_store {
-                            let (session_id, task_desc) = react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-                            let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                            let (session_id, task_desc) =
+                                react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
+                            let target_json: Option<serde_json::Value> =
+                                serde_json::from_str(&tc.arguments).ok();
                             let target = target_json
                                 .as_ref()
-                                .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                                .and_then(|v| {
+                                    v.get("params")
+                                        .or_else(|| v.get("path"))
+                                        .or_else(|| v.get("name"))
+                                })
                                 .and_then(|x| x.as_str())
                                 .map(|s| s.to_string())
                                 .unwrap_or_default();
@@ -2234,7 +1999,9 @@ pub async fn run_agent_turn(
                             "shell_exec" => "{\"command\": \"ls -la\", \"timeout_ms\": 5000}",
                             "file_search" => "{\"pattern\": \"*.rs\", \"path\": \"src/\"}",
                             "code_search" => "{\"pattern\": \"fn main\", \"path\": \"src/\"}",
-                            "code_graph" => "{\"op\": \"impact\", \"target\": \"funcName\", \"direction\": \"upstream\"}",
+                            "code_graph" => {
+                                "{\"op\": \"impact\", \"target\": \"funcName\", \"direction\": \"upstream\"}"
+                            }
                             _ => "{ /* check tool documentation */ }",
                         };
 
@@ -2485,10 +2252,15 @@ pub async fn run_agent_turn(
 
             // Record decision BEFORE react_log (so react_log reflects current tool, not previous)
             {
-                let dec_target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                let dec_target_json: Option<serde_json::Value> =
+                    serde_json::from_str(&tc.arguments).ok();
                 let dec_target: String = dec_target_json
                     .as_ref()
-                    .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                    .and_then(|v| {
+                        v.get("params")
+                            .or_else(|| v.get("path"))
+                            .or_else(|| v.get("name"))
+                    })
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "?".to_string());
@@ -2512,11 +2284,17 @@ pub async fn run_agent_turn(
 
             // Record to SQLite react_log for cross-round memory
             if let Some(ref ms) = tool_ctx.memory_store {
-                let (session_id, task) = react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-                let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
+                let (session_id, task) =
+                    react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
+                let target_json: Option<serde_json::Value> =
+                    serde_json::from_str(&tc.arguments).ok();
                 let target = target_json
                     .as_ref()
-                    .and_then(|v| v.get("params").or_else(|| v.get("path")).or_else(|| v.get("name")))
+                    .and_then(|v| {
+                        v.get("params")
+                            .or_else(|| v.get("path"))
+                            .or_else(|| v.get("name"))
+                    })
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_default();
@@ -2539,7 +2317,8 @@ pub async fn run_agent_turn(
                     unified_tool_mode,
                     &tc.arguments,
                     &result.content,
-                ).await;
+                )
+                .await;
             }
 
             let mut result_content = format!(
@@ -2828,7 +2607,14 @@ pub async fn run_agent_turn(
 
         // 🚨 AST recovery + verify hints + Done reminder
         if !tool_calls.is_empty() {
-            run_post_edit_checks(&tool_calls, &mut messages, &new_messages, &workflow_engine, &tool_ctx, unified_tool_mode);
+            run_post_edit_checks(
+                &tool_calls,
+                &mut messages,
+                &new_messages,
+                &workflow_engine,
+                &tool_ctx,
+                unified_tool_mode,
+            );
 
             // 🔄 Auto-fix: if build/test failed, inject error for self-repair
             // Also pass gitnexus for impact analysis when available
@@ -2922,6 +2708,403 @@ pub async fn run_agent_turn(
     emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
 }
 
+// ─── P5.3: Extracted from run_agent_turn ───
+
+/// Output of `dispatch_llm` -- everything the caller needs to collect the stream.
+struct LlmDispatch {
+    active_provider: Arc<dyn LlmProvider>,
+    stream_handle: tokio::task::JoinHandle<()>,
+    llm_rx: mpsc::UnboundedReceiver<LlmStreamEvent>,
+}
+
+/// Outcome of `collect_response` -- tells the caller how to proceed.
+enum LlmCollectOutcome {
+    /// Normal completion with full response.
+    Collected {
+        full_text: String,
+        reasoning_content: String,
+        tool_calls: Vec<ToolCall>,
+        last_prompt_tokens: u32,
+    },
+    /// API client error (400/413/422) -- context was trimmed, retry this iteration.
+    RetryIteration,
+    /// Fatal error or timeout -- TurnDone already emitted, caller should return.
+    TurnAborted,
+}
+
+/// P5.3: Select active provider, filter tool schemas, and spawn the LLM stream task.
+///
+/// Extracted verbatim from `run_agent_turn` lines 868-974.
+async fn dispatch_llm(
+    provider: &Arc<dyn LlmProvider>,
+    role_providers: &collaboration::RoleProviders,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &[Message],
+    tool_schemas: &[crate::llm::ToolSchema],
+    unified_tool_mode: bool,
+    planning_mode: bool,
+    iteration: u32,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    cancel_token: &CancellationToken,
+) -> LlmDispatch {
+    let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmStreamEvent>();
+
+    let active_provider = if let Some(engine_arc) = workflow_engine {
+        let engine = engine_arc.lock().await;
+        let picked = role_providers.pick(provider, &engine);
+        if role_providers.enabled {
+            let role = role_providers.role_label(&engine);
+            let name = picked.model_name();
+            if name != provider.model_name() {
+                let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                    "🤝 协作模型 [{role}]: {name}"
+                )));
+            }
+        }
+        picked
+    } else {
+        provider.clone()
+    };
+
+    let provider_clone = Arc::clone(&active_provider);
+    let msgs = messages.to_vec();
+
+    // Filter tool schemas based on current workflow step
+    let workflow_blocks_planning = if let Some(engine_arc) = workflow_engine {
+        engine_arc.lock().await.is_workflow_active()
+    } else {
+        false
+    };
+
+    let schemas: Vec<_> = if unified_tool_mode {
+        if planning_mode && iteration == 0 && !workflow_blocks_planning {
+            vec![]
+        } else if let Some(engine_arc) = workflow_engine {
+            let engine = engine_arc.lock().await;
+            if !engine.allows_tool_execution() {
+                Vec::new()
+            } else {
+                crate::agent::unified_action::unified_tool_schemas_for_engine(&engine)
+            }
+        } else {
+            crate::agent::unified_action::unified_tool_schemas()
+        }
+    } else if planning_mode && iteration == 0 && !workflow_blocks_planning {
+        vec![]
+    } else if let Some(engine_arc) = workflow_engine {
+        let engine = engine_arc.lock().await;
+        if !engine.allows_tool_execution() {
+            Vec::new()
+        } else if engine.is_single_step() {
+            let allowed = crate::agent::tool_graph::allowed_tool_names(&engine);
+            crate::agent::tool_graph::filter_tool_schemas(tool_schemas, &allowed)
+        } else {
+            tool_schemas.to_vec()
+        }
+    } else {
+        tool_schemas.to_vec()
+    };
+
+    // 📝 LOG REQUEST CONTEXT (debug level - expensive, iterates all messages)
+    tracing::debug!("\n{}", "=".repeat(80));
+    tracing::debug!("🤖 LLM REQUEST CONTEXT (Iteration {})", iteration + 1);
+    tracing::debug!("{}", "=".repeat(80));
+    tracing::debug!("Total messages: {}", msgs.len());
+
+    // Show system prompt preview (debug level)
+    if let Some(first_msg) = msgs.first()
+        && let Message::System { content } = first_msg
+    {
+        tracing::debug!(
+            "📋 SYSTEM PROMPT LENGTH: {} characters",
+            content.chars().count()
+        );
+    }
+    tracing::debug!(
+        "Enabled tools: {}",
+        schemas
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    tracing::debug!("{}", "=".repeat(80));
+
+    let mut llm_opts = crate::llm::StreamOptions::default();
+    if !schemas.is_empty() {
+        llm_opts.tool_choice = Some(crate::llm::ToolChoice::Auto);
+        llm_opts.parallel_tool_calls = Some(true);
+    }
+    let cancel_clone = cancel_token.clone();
+    let llm_tx_err = llm_tx.clone();
+    let schemas_clone = schemas.clone();
+    let stream_handle = tokio::spawn(async move {
+        tokio::select! {
+            result = provider_clone.stream_chat(&msgs, &schemas_clone, llm_tx, llm_opts) => {
+                if let Err(e) = result {
+                    tracing::error!("LLM stream error: {e}");
+                    let _ = llm_tx_err.send(LlmStreamEvent::Error(format!("Stream failed: {e}")));
+                }
+            }
+            _ = cancel_clone.cancelled() => {}
+        }
+    });
+
+    LlmDispatch {
+        active_provider,
+        stream_handle,
+        llm_rx,
+    }
+}
+
+/// P5.3: Collect the LLM streamed response (text + reasoning + tool_calls).
+///
+/// Extracted verbatim from `run_agent_turn` lines 976-1198.
+/// Returns `Collected` on normal completion, `RetryIteration` for API error
+/// recovery (caller should `continue` the loop), or `TurnAborted` if TurnDone
+/// was already emitted (caller should `return`).
+#[allow(clippy::too_many_arguments)]
+async fn collect_response(
+    llm_rx: &mut mpsc::UnboundedReceiver<LlmStreamEvent>,
+    stream_handle: &mut tokio::task::JoinHandle<()>,
+    cancel_token: &CancellationToken,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    total_usage: &mut TokenUsage,
+    turn_id: u64,
+    user_task: &str,
+    unified_tool_mode: bool,
+    api_error_recovery_streak: &mut u32,
+    max_api_error_recovery: u32,
+) -> LlmCollectOutcome {
+    const LLM_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+    let mut full_text = String::new();
+    let mut reasoning_content = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut current_tool_args: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let use_findings_stream = review_stream_filter_inner(workflow_engine);
+    let mut findings_stream =
+        use_findings_stream.then(crate::agent::perception::FindingsStreamFilter::new);
+    let mut think_stream = crate::agent::think_stream::ThinkTagStreamFilter::new();
+    let mut last_stream_completion_tokens = 0u32;
+    let mut last_prompt_tokens = 0u32;
+
+    while let Some(event) = tokio::select! {
+        ev = llm_rx.recv() => ev,
+        _ = cancel_token.cancelled() => {
+            tracing::warn!("[AGENT] ⚠️ Cancellation token triggered, stopping LLM stream");
+            None
+        }
+        _ = tokio::time::sleep(LLM_RESPONSE_TIMEOUT) => {
+            tracing::error!(
+                "[AGENT] ⏱️ LLM response timed out after {:?}",
+                LLM_RESPONSE_TIMEOUT
+            );
+            stream_handle.abort();
+            let _ = ui_tx.send(AgentToUiEvent::Status(
+                "⏱️ LLM 响应超时 (180s) - 请重试或简化请求".to_string(),
+            ));
+            let boundary = crate::agent::user_round::format_interrupt_boundary_message(user_task);
+            new_messages.push(crate::message::Message::system(&boundary));
+            messages.push(crate::message::Message::system(&boundary));
+            emit_turn_done(ui_tx, turn_id, std::mem::take(new_messages), total_usage.clone());
+            return LlmCollectOutcome::TurnAborted;
+        }
+    } {
+        match event {
+            LlmStreamEvent::TextDelta(text) => {
+                let (reasoning_delta, visible_delta) = think_stream.push(&text);
+                if let Some(r) = reasoning_delta.filter(|s| !s.is_empty()) {
+                    reasoning_content.push_str(&r);
+                    let _ = ui_tx.send(AgentToUiEvent::ReasoningChunk(r));
+                }
+                let visible_piece = visible_delta.unwrap_or_default();
+                let clean_visible = strip_tool_call_xml(&visible_piece);
+                if clean_visible.len() < visible_piece.len() {
+                    if let Some(action) = extract_action_from_xml(&visible_piece) {
+                        let _ = ui_tx.send(AgentToUiEvent::Status(format!("🔄 {} ...", action)));
+                    }
+                }
+                if let Some(ref mut filter) = findings_stream {
+                    if let Some(visible) = filter.push(&clean_visible)
+                        && !visible.is_empty()
+                    {
+                        let _ = ui_tx.send(AgentToUiEvent::TextChunk(visible));
+                    }
+                } else if !clean_visible.is_empty() {
+                    let _ = ui_tx.send(AgentToUiEvent::TextChunk(clean_visible));
+                }
+                full_text.push_str(&text);
+            }
+            LlmStreamEvent::ReasoningDelta(text) => {
+                reasoning_content.push_str(&text);
+                let _ = ui_tx.send(AgentToUiEvent::ReasoningChunk(text));
+            }
+            LlmStreamEvent::ToolCallStart { id, name } => {
+                tracing::debug!("[AGENT] LLM requested tool: {} (id={})", name, id);
+                if unified_tool_mode {
+                    let tool_display = if name == crate::agent::unified_action::TOOL_NAME {
+                        "准备执行...".to_string()
+                    } else {
+                        name.clone()
+                    };
+                    let _ = ui_tx.send(AgentToUiEvent::Status(format!("🔄 {tool_display}")));
+                }
+                current_tool_args.insert(id.clone(), String::new());
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments: String::new(),
+                });
+            }
+            LlmStreamEvent::ToolCallArgumentsDelta { id, delta } => {
+                if let Some(args) = current_tool_args.get_mut(&id) {
+                    let was_empty = args.is_empty();
+                    args.push_str(&delta);
+                    if was_empty
+                        && unified_tool_mode
+                        && let Ok(action) = serde_json::from_str::<
+                            crate::agent::unified_action::UnifiedActionRequest,
+                        >(args)
+                    {
+                        let _ =
+                            ui_tx.send(AgentToUiEvent::Status(format!("🔄 {} ...", action.action)));
+                    }
+                }
+                if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == id) {
+                    tc.arguments.push_str(&delta);
+                }
+            }
+            LlmStreamEvent::ToolCallEnd { .. } => {}
+            LlmStreamEvent::Done { usage } => {
+                last_stream_completion_tokens = usage.completion_tokens;
+                tracing::info!(
+                    "[AGENT] ✅ LLM stream completed (prompt: {}, completion: {}, total: {})",
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.total_tokens
+                );
+                total_usage.prompt_tokens += usage.prompt_tokens;
+                total_usage.completion_tokens += usage.completion_tokens;
+                total_usage.total_tokens += usage.total_tokens;
+                last_prompt_tokens = usage.prompt_tokens;
+
+                // 📝 LOG RESPONSE SUMMARY (debug level)
+                tracing::debug!("\n{}", "-".repeat(80));
+                tracing::debug!("📤 LLM RESPONSE SUMMARY");
+                tracing::debug!("{}", "-".repeat(80));
+                if !full_text.is_empty() {
+                    let preview = if full_text.chars().count() > 300 {
+                        format!("{}...", full_text.chars().take(300).collect::<String>())
+                    } else {
+                        full_text.clone()
+                    };
+                    tracing::debug!("Text response: {}", preview.replace('\n', "\\n"));
+                }
+                if !tool_calls.is_empty() {
+                    tracing::debug!(
+                        "Tool calls: {}",
+                        tool_calls
+                            .iter()
+                            .map(|tc| { format!("{}({})", tc.name, tc.id) })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    for tc in &tool_calls {
+                        let args_preview = if tc.arguments.chars().count() > 200 {
+                            format!("{}...", tc.arguments.chars().take(200).collect::<String>())
+                        } else {
+                            tc.arguments.clone()
+                        };
+                        tracing::debug!(
+                            "  - {} [{}]: {}",
+                            tc.name,
+                            tc.id,
+                            args_preview.replace('\n', "\\n")
+                        );
+                    }
+                } else {
+                    tracing::debug!("No tool calls");
+                }
+                tracing::debug!("{}", "-".repeat(80));
+
+                break;
+            }
+            LlmStreamEvent::Error(err) => {
+                tracing::error!("LLM error: {}", err);
+                stream_handle.abort();
+
+                let is_client_api_error = err.contains("API error 400")
+                    || err.contains("API error 413")
+                    || err.contains("API error 422");
+                if is_client_api_error && *api_error_recovery_streak < max_api_error_recovery {
+                    *api_error_recovery_streak += 1;
+                    tracing::warn!(
+                        "[AGENT] API error recovery {}/{}: trimming context and retrying",
+                        *api_error_recovery_streak,
+                        max_api_error_recovery
+                    );
+                    let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+                        "⚠️ API 拒绝请求（{}/{}）- 正在裁剪上下文后重试…",
+                        *api_error_recovery_streak, max_api_error_recovery
+                    )));
+                    crate::context::sanitize_tool_pairs(messages);
+                    crate::context::filter_noisy_messages(messages);
+                    crate::memory::memory_offload::hard_trim_public(messages);
+                    return LlmCollectOutcome::RetryIteration;
+                }
+
+                let _ = ui_tx.send(AgentToUiEvent::Error(err));
+                emit_turn_done(
+                    ui_tx,
+                    turn_id,
+                    std::mem::take(new_messages),
+                    total_usage.clone(),
+                );
+                return LlmCollectOutcome::TurnAborted;
+            }
+        }
+    }
+
+    // Wait for the stream task to finish, but don't block forever.
+    tokio::select! {
+        _ = &mut *stream_handle => {}
+        _ = cancel_token.cancelled() => {
+            stream_handle.abort();
+        }
+    }
+
+    if let Some(ref mut filter) = findings_stream
+        && let Some(tail) = filter.flush_tail()
+    {
+        let _ = ui_tx.send(AgentToUiEvent::TextChunk(tail));
+    }
+
+    let _ = last_stream_completion_tokens; // used for logging above
+
+    LlmCollectOutcome::Collected {
+        full_text,
+        reasoning_content,
+        tool_calls,
+        last_prompt_tokens,
+    }
+}
+
+/// Inner helper -- mirrors the nested `review_stream_filter` fn defined inside
+/// `run_agent_turn`. Kept as a standalone so `collect_response` can call it.
+fn review_stream_filter_inner(
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+) -> bool {
+    workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .is_some_and(|e| e.is_single_step() && !crate::agent::phase::is_implementation_phase(&e))
+}
+
 /// Heuristically determine if a JSON parse error is likely due to truncation.
 ///
 /// Truncation typically manifests as:
@@ -2995,8 +3178,7 @@ pub(crate) fn classify_tool_calls(
 ) -> ToolCallClassification {
     let mut truncated_ids = std::collections::HashSet::new();
     let mut exceeded_loop_limit_ids = std::collections::HashSet::new();
-    let mut temp_counts: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
+    let mut temp_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut tool_loop_keys: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
@@ -3299,8 +3481,7 @@ pub(crate) fn evaluate_reflection(
                         ),
                         Err(_) => (
                             tc.name.clone(),
-                            serde_json::from_str(&tc.arguments)
-                                .unwrap_or(serde_json::json!({})),
+                            serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({})),
                         ),
                     }
                 } else {
@@ -3309,11 +3490,7 @@ pub(crate) fn evaluate_reflection(
                         serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({})),
                     )
                 };
-                crate::agent::gate::read_guard::is_discovery_call(
-                    &engine,
-                    &inner_name,
-                    &inner_args,
-                )
+                crate::agent::gate::read_guard::is_discovery_call(&engine, &inner_name, &inner_args)
             })
         })
         .unwrap_or(true);
@@ -3462,10 +3639,11 @@ async fn record_react_tool(
 /// Repair malformed / empty tool-call arguments and extract XML-style tool
 /// calls from text content (GLM models emit `<tool_call>` XML as text instead of
 /// using the OpenAI function-calling protocol).
-fn repair_and_extract_tool_calls(tool_calls: &mut Vec<ToolCall>,
-                                full_text: &str,
-                                reasoning_content: &str)
-{
+fn repair_and_extract_tool_calls(
+    tool_calls: &mut Vec<ToolCall>,
+    full_text: &str,
+    reasoning_content: &str,
+) {
     let fallback_blob = format!("{full_text}\n{reasoning_content}");
     let fallbacks = [fallback_blob.as_str()];
     for tc in tool_calls.iter_mut() {
@@ -3495,7 +3673,9 @@ fn repair_and_extract_tool_calls(tool_calls: &mut Vec<ToolCall>,
 async fn run_memory_offload(
     last_prompt_tokens: u32,
     messages: &mut Vec<Message>,
-    workflow_engine: &Option<std::sync::Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    workflow_engine: &Option<
+        std::sync::Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>,
+    >,
     tool_ctx: &ToolContext,
     ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
     active_provider: &Arc<dyn LlmProvider>,
@@ -3534,28 +3714,38 @@ async fn run_memory_offload(
     let context_window = active_provider.context_window_size();
     let summarizer = tool_ctx.summarizer.clone();
     let ui_tx_offload = ui_tx.clone();
-    let (outcome, new_streak, new_cooldown) = crate::memory::memory_offload::offload_if_over_budget(
-        last_prompt_tokens,
-        context_window,
-        messages,
-        summarizer,
-        active_provider,
-        ms,
-        &session_id,
-        fail_streak,
-        cooldown,
-        gitnexus_available,
-        |s| {
-            let _ = ui_tx_offload.send(AgentToUiEvent::Status(s));
-        },
-    )
-    .await;
+    let (outcome, new_streak, new_cooldown) =
+        crate::memory::memory_offload::offload_if_over_budget(
+            last_prompt_tokens,
+            context_window,
+            messages,
+            summarizer,
+            active_provider,
+            ms,
+            &session_id,
+            fail_streak,
+            cooldown,
+            gitnexus_available,
+            |s| {
+                let _ = ui_tx_offload.send(AgentToUiEvent::Status(s));
+            },
+        )
+        .await;
     if let Some(wf) = workflow_engine
         && let Ok(engine) = wf.try_lock()
     {
-        engine.set_variable(crate::memory::memory_offload::OFFLOAD_FAIL_VAR, new_streak.to_string());
-        engine.set_variable(crate::memory::memory_offload::OFFLOAD_COOLDOWN_VAR, new_cooldown.to_string());
-        if matches!(outcome, crate::memory::memory_offload::OffloadOutcome::Archived { .. }) {
+        engine.set_variable(
+            crate::memory::memory_offload::OFFLOAD_FAIL_VAR,
+            new_streak.to_string(),
+        );
+        engine.set_variable(
+            crate::memory::memory_offload::OFFLOAD_COOLDOWN_VAR,
+            new_cooldown.to_string(),
+        );
+        if matches!(
+            outcome,
+            crate::memory::memory_offload::OffloadOutcome::Archived { .. }
+        ) {
             let block = crate::memory::memory_offload::build_memory_graph_block(ms, &session_id);
             engine.set_variable(crate::memory::memory_offload::MEMORY_GRAPH_VAR, block);
         }
@@ -3599,7 +3789,9 @@ async fn handle_empty_tool_calls(
     full_text: &str,
     reasoning_content: &str,
     tool_ctx: &ToolContext,
-    workflow_engine: &Option<std::sync::Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    workflow_engine: &Option<
+        std::sync::Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>,
+    >,
     user_task: Option<&str>,
     messages: &mut Vec<Message>,
     new_messages: &mut Vec<Message>,
@@ -3710,7 +3902,9 @@ fn extract_tool_name_and_target(tc: &ToolCall, unified_tool_mode: bool) -> (Stri
         crate::agent::unified_action::parse_request(&tc.arguments)
             .ok()
             .map(|req| {
-                let target = req.params.get("path")
+                let target = req
+                    .params
+                    .get("path")
                     .or_else(|| req.params.get("name"))
                     .or_else(|| req.params.get("target"))
                     .and_then(|v| v.as_str())
@@ -3782,10 +3976,12 @@ fn run_post_edit_checks(
     unified_tool_mode: bool,
 ) {
     let has_write = tool_calls.iter().any(|tc| {
-        matches!(tc.name.as_str(), "file_write" | "edit_file" | "delete_range")
+        matches!(
+            tc.name.as_str(),
+            "file_write" | "edit_file" | "delete_range"
+        )
     });
-    let has_ast =
-        post_edit_verification::tool_batch_has_ast_issues(new_messages, tool_calls);
+    let has_ast = post_edit_verification::tool_batch_has_ast_issues(new_messages, tool_calls);
     post_edit_verification::check_ast_and_recover(messages, new_messages, tool_calls);
 
     let execute_coding = workflow_engine.as_ref().is_some_and(|wf| {
@@ -3803,11 +3999,13 @@ fn run_post_edit_checks(
             && let Ok(engine) = engine_arc.try_lock()
         {
             post_edit_verification::track_edits_and_verify_plan(
-                &engine, &project_root, tool_calls, new_messages, true,
+                &engine,
+                &project_root,
+                tool_calls,
+                new_messages,
+                true,
             );
-            if !has_ast
-                && let Some(hint) = post_edit_verification::verify_hint_message(&engine)
-            {
+            if !has_ast && let Some(hint) = post_edit_verification::verify_hint_message(&engine) {
                 messages.push(Message::system(&hint));
             }
         }
@@ -3852,7 +4050,11 @@ mod tests {
     fn classify_valid_json_no_truncation() {
         let mut tcs = vec![
             make_tc("a", "file_read", r#"{"path":"src/main.rs"}"#),
-            make_tc("b", "edit_file", r#"{"path":"x","old_string":"a","new_string":"b"}"#),
+            make_tc(
+                "b",
+                "edit_file",
+                r#"{"path":"x","old_string":"a","new_string":"b"}"#,
+            ),
         ];
         let cls = classify_tool_calls(&mut tcs, 5);
         assert!(cls.truncated_ids.is_empty());
@@ -3923,4 +4125,3 @@ mod tests {
         assert_eq!(cls.tool_loop_keys.len(), 1);
     }
 }
-

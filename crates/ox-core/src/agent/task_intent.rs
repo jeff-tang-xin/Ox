@@ -108,10 +108,7 @@ pub struct IntentDecision {
 /// gauge, so the model can see *why* it was classified this way — useful for
 /// spotting misclassification and requesting clarification instead of
 /// exhausting the exploration budget in silence.
-pub fn resolve_for_round_with_reason(
-    engine: &WorkflowEngine,
-    user_text: &str,
-) -> IntentDecision {
+pub fn resolve_for_round_with_reason(engine: &WorkflowEngine, user_text: &str) -> IntentDecision {
     let t = user_text.trim();
     if t.is_empty() {
         return IntentDecision {

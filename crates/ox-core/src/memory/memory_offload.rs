@@ -174,16 +174,15 @@ fn extract_active_file_paths_from_timeline(timeline: &str) -> Vec<String> {
     for line in timeline.lines() {
         let lower = line.to_lowercase();
         // Detect file paths mentioned in tool calls and results
-        if let Some(path) = lower
-            .find("\"path\"")
-            .and_then(|_| {
-                let rest = &line[lower.find("\"path\"")?..];
-                let start = rest.find('"').and_then(|_| rest[1..].find('"').map(|i| &rest[1..1 + i]))?;
-                let val_start = start.find('"').map(|i| i + 1)?;
-                let val_end = start[val_start..].find('"').map(|i| val_start + i)?;
-                Some(start[val_start..val_end].to_string())
-            })
-        {
+        if let Some(path) = lower.find("\"path\"").and_then(|_| {
+            let rest = &line[lower.find("\"path\"")?..];
+            let start = rest
+                .find('"')
+                .and_then(|_| rest[1..].find('"').map(|i| &rest[1..1 + i]))?;
+            let val_start = start.find('"').map(|i| i + 1)?;
+            let val_end = start[val_start..].find('"').map(|i| val_start + i)?;
+            Some(start[val_start..val_end].to_string())
+        }) {
             if path.len() > 4 && path.contains('.') && !paths.contains(&path) {
                 paths.push(path);
             }
@@ -252,7 +251,12 @@ fn placeholder_old_react_prioritized(
     for msg in messages.iter_mut().take(cut).skip(first_user) {
         let is_active = message_references_active_file(msg, preserved_paths);
 
-        if let Message::Assistant { content, tool_calls, .. } = msg {
+        if let Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } = msg
+        {
             // Compress large assistant text, but preserve more if referencing active files
             let max_content = if is_active { 600 } else { 300 };
             if !content.is_empty() && content.len() > max_content {
@@ -262,14 +266,17 @@ fn placeholder_old_react_prioritized(
                     .last()
                     .map(|(i, c)| i + c.len_utf8())
                     .unwrap_or(max_content);
-                *content = format!("{}... (截断，完整内容在 ReAct 日志中)", &content[..boundary]);
+                *content = format!(
+                    "{}... (截断，完整内容在 ReAct 日志中)",
+                    &content[..boundary]
+                );
                 compressed += 1;
             }
             for tc in tool_calls.iter_mut() {
                 let max_args = if is_active { 1200 } else { 800 };
                 if tc.arguments.len() > max_args {
-                    tc.arguments = tc.arguments.chars().take(max_args).collect::<String>()
-                        + "...(截断)";
+                    tc.arguments =
+                        tc.arguments.chars().take(max_args).collect::<String>() + "...(截断)";
                     compressed += 1;
                 }
             }
@@ -298,17 +305,27 @@ fn message_references_active_file(msg: &Message, preserved_paths: &[String]) -> 
     match msg {
         Message::ToolResult { content, .. } => {
             let lower = content.to_lowercase();
-            preserved_paths.iter().any(|p| lower.contains(&p.to_lowercase()))
+            preserved_paths
+                .iter()
+                .any(|p| lower.contains(&p.to_lowercase()))
         }
-        Message::Assistant { content, tool_calls, .. } => {
+        Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
             let lower_content = content.to_lowercase();
-            let content_match = preserved_paths.iter().any(|p| lower_content.contains(&p.to_lowercase()));
+            let content_match = preserved_paths
+                .iter()
+                .any(|p| lower_content.contains(&p.to_lowercase()));
             if content_match {
                 return true;
             }
             tool_calls.iter().any(|tc| {
                 let lower_args = tc.arguments.to_lowercase();
-                preserved_paths.iter().any(|p| lower_args.contains(&p.to_lowercase()))
+                preserved_paths
+                    .iter()
+                    .any(|p| lower_args.contains(&p.to_lowercase()))
             })
         }
         _ => false,
@@ -442,7 +459,12 @@ fn placeholder_old_react(messages: &mut Vec<Message>, count: usize) {
 
     for msg in messages.iter_mut().take(cut).skip(first_user) {
         // 1. Compress large Assistant messages (not just ToolResults)
-        if let Message::Assistant { content, tool_calls, .. } = msg {
+        if let Message::Assistant {
+            content,
+            tool_calls,
+            ..
+        } = msg
+        {
             if !content.is_empty() && content.len() > 500 {
                 // Truncate long assistant text to first 300 chars
                 if content.len() > 300 {
@@ -452,15 +474,18 @@ fn placeholder_old_react(messages: &mut Vec<Message>, count: usize) {
                         .last()
                         .map(|(i, c)| i + c.len_utf8())
                         .unwrap_or(300);
-                    *content = format!("{}... (truncated, full text in ReAct log)", &content[..boundary]);
+                    *content = format!(
+                        "{}... (truncated, full text in ReAct log)",
+                        &content[..boundary]
+                    );
                     compressed += 1;
                 }
             }
             // Also compress tool_calls arguments that are large
             for tc in tool_calls.iter_mut() {
                 if tc.arguments.len() > 800 {
-                    tc.arguments = tc.arguments.chars().take(800).collect::<String>()
-                        + "...(truncated)";
+                    tc.arguments =
+                        tc.arguments.chars().take(800).collect::<String>() + "...(truncated)";
                     compressed += 1;
                 }
             }
@@ -511,7 +536,11 @@ fn hard_trim(messages: &mut Vec<Message>) {
     for msg in messages.iter().skip(1).take(tail_start - 1) {
         let keep = match msg {
             Message::User { .. } => true,
-            Message::Assistant { content, tool_calls, .. } => {
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
                 content.contains("## Plan")
                     || content.contains("## Done")
                     || (!tool_calls.is_empty() && content.is_empty())

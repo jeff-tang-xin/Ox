@@ -108,10 +108,7 @@ impl Tool for ReadSymbolTool {
         let code = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                return ToolOutput::error(format!(
-                    "❌ Cannot read {}: {e}",
-                    hit.file_path
-                ));
+                return ToolOutput::error(format!("❌ Cannot read {}: {e}", hit.file_path));
             }
         };
         let symbols = extractor.extract_symbols(&path, &code).unwrap_or_default();
@@ -140,11 +137,7 @@ impl Tool for ReadSymbolTool {
         }
         out.push('\n');
         for i in start..=stop {
-            out.push_str(&format!(
-                "{:>5} | {}\n",
-                i,
-                lines.get(i - 1).unwrap_or(&"")
-            ));
+            out.push_str(&format!("{:>5} | {}\n", i, lines.get(i - 1).unwrap_or(&"")));
         }
         ToolOutput::success(out)
     }

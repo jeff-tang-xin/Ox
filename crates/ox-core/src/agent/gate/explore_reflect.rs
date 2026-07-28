@@ -521,14 +521,7 @@ mod tests {
     fn gauge_shows_intent_reason_when_present() {
         // When the classifier records why it picked the intent, the gauge must
         // echo it so the model can spot misclassification.
-        let g = budget_gauge(
-            0,
-            3,
-            0,
-            false,
-            ConvergeMode::Answer,
-            Some("关键词: qa类"),
-        );
+        let g = budget_gauge(0, 3, 0, false, ConvergeMode::Answer, Some("关键词: qa类"));
         assert!(g.contains("Qa"));
         assert!(g.contains("关键词: qa类"));
     }

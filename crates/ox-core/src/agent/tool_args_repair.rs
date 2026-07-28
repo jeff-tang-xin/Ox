@@ -454,7 +454,8 @@ mod tests {
 
     #[test]
     fn repairs_delete_range_anchor_aliases() {
-        let raw = r#"{"action":"delete_range","params":{"path":"x.rs","start_line":10,"end_line":20}}"#;
+        let raw =
+            r#"{"action":"delete_range","params":{"path":"x.rs","start_line":10,"end_line":20}}"#;
         let out = repair_unified_arguments(raw).unwrap();
         let req: UnifiedActionRequest = serde_json::from_str(&out).unwrap();
         assert_eq!(req.params["start_anchor"], 10);
