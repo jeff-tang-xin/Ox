@@ -187,6 +187,14 @@
 
 ## 4. 风险登记
 
+| 本轮 | P5.2 step 17 | 1b76f35 | handle_unified_tool_call() ~300L; UnifiedDispatchOutcome enum | check 0 err / 385 pass |
+| 本轮 | P5.2 step 18 | 239e13c | record_react_log() 36L; async | check 0 err / 385 pass |
+| 本轮 | P5.2 step 19 | 06efbb7 | prepare_llm_context() 56L; returns slim_in_impl_phase | check 0 err / 385 pass |
+| 本轮 | P5.2 step 20 | 92e58ec | record_llm_decision() 43L; async | check 0 err / 385 pass |
+| 本轮 | P5.2 step 21 | f9363a3 | handle_review_findings() 40L; ReviewFindingsOutcome enum | check 0 err / 385 pass |
+| 本轮 | P5.2 step 22 | 98dc3a5 | check_reflection_skip() 33L; bool return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 23 | d48b231 | drain_interjections_pre_llm() 39L; fn pointer | check 0 err / 385 pass |
+| 本轮 | P5.2 step 24 | acacb78 | drain_interjections_pre_tool() 20L; fn pointer | check 0 err / 385 pass |
 | 风险 | 阶段 | 缓解 |
 |------|------|------|
 | 阈值迁移引入行为漂移 | P1/P4 | 迁移前逐一读取现值写入常量并注释来源 |
