@@ -1,4 +1,4 @@
-﻿pub mod auto_reflect; // 🆕 Auto-reflection for skill generation
+pub mod auto_reflect; // 🆕 Auto-reflection for skill generation
 pub mod collaboration;
 pub mod completion; // Machine-verifiable completion receipt
 pub mod engine;
@@ -58,6 +58,14 @@ use crate::message::{Message, TokenUsage, ToolCall};
 use crate::safety::TrustManager;
 use crate::safety::injection;
 use crate::tools::{SafetyLevel, ToolContext, ToolRegistry};
+/// Callback that appends any pending interjection text as a message.
+type PushInterjectionFn = fn(
+    &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    &mut Vec<Message>,
+    &str,
+    &mpsc::UnboundedSender<AgentToUiEvent>,
+);
+
 
 /// Events sent from the agent to the UI.
 #[derive(Debug, Clone)]
@@ -3484,12 +3492,7 @@ async fn handle_unified_tool_call(
     ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
     ui_rx: &mut mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
     cancel_token: &CancellationToken,
-    push_interjection_message: fn(
-        &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
-        &mut Vec<Message>,
-        &str,
-        &mpsc::UnboundedSender<AgentToUiEvent>,
-    ),
+    push_interjection_message: PushInterjectionFn,
     turn_id: u64,
     new_messages: &mut Vec<Message>,
     total_usage: &crate::message::TokenUsage,
@@ -3879,12 +3882,7 @@ fn drain_interjections_pre_tool(
     workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
     messages: &mut Vec<Message>,
     ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    push_interjection_message: fn(
-        &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
-        &mut Vec<Message>,
-        &str,
-        &mpsc::UnboundedSender<AgentToUiEvent>,
-    ),
+    push_interjection_message: PushInterjectionFn,
 ) {
     while let Ok(ev) = ui_rx.try_recv() {
         match ev {
@@ -3917,12 +3915,7 @@ fn drain_interjections_pre_llm(
     workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
     messages: &mut Vec<Message>,
     ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
-    push_interjection_message: fn(
-        &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
-        &mut Vec<Message>,
-        &str,
-        &mpsc::UnboundedSender<AgentToUiEvent>,
-    ),
+    push_interjection_message: PushInterjectionFn,
 ) {
     while let Ok(ev) = ui_rx.try_recv() {
         match ev {
@@ -4030,12 +4023,7 @@ async fn handle_review_findings(
     turn_memory: &mut crate::memory::turn_memory::TurnMemory,
     tools_used_this_turn: &mut std::collections::HashSet<String>,
     pre_llm_step_idx: usize,
-    push_interjection_message: fn(
-        &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
-        &mut Vec<Message>,
-        &str,
-        &mpsc::UnboundedSender<AgentToUiEvent>,
-    ),
+    push_interjection_message: PushInterjectionFn,
 ) -> ReviewFindingsOutcome {
     if unified_tool_mode || !try_capture_review_findings(workflow_engine, full_text, ui_tx) {
         return ReviewFindingsOutcome::Proceed;

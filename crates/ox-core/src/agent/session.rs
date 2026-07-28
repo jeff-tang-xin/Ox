@@ -75,10 +75,13 @@ impl SessionState {
     }
 }
 
+/// Validator predicate for a session state.
+type ValidatorFn = Box<dyn Fn(&SessionState) -> bool>;
+
 /// State Registry - manages validation functions and session states
 pub struct StateRegistry {
     /// Registered validation functions
-    validators: std::collections::HashMap<String, Box<dyn Fn(&SessionState) -> bool>>,
+    validators: std::collections::HashMap<String, ValidatorFn>,
     /// Active sessions
     sessions: std::collections::HashMap<String, SessionState>,
     /// Current active session ID
