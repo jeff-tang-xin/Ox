@@ -1329,26 +1329,9 @@ pub async fn run_agent_turn(
         new_messages.push(assistant_msg.clone());
         messages.push(assistant_msg);
 
-        let visible_summary = crate::agent::think_stream::visible_only(&full_text)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let mut visible_summary: String = visible_summary.chars().take(260).collect();
-        // The model usually puts its reasoning inside <think>, leaving the visible
-        // text empty. Fall back to a reasoning digest so the decision record
-        // captures WHY this action was chosen — not just that it was chosen.
-        if visible_summary.trim().is_empty() && !reasoning_content.trim().is_empty() {
-            let r = crate::agent::think_stream::visible_only(&reasoning_content);
-            let r = if r.is_empty() {
-                reasoning_content.clone()
-            } else {
-                r
-            };
-            visible_summary = digest_reasoning(&r, 260);
-        }
+        record_turn_decision(&tool_calls, &full_text, &reasoning_content, unified_tool_mode, &mut turn_memory);
+
+        // Build actions_summary for fallback decision text in react_log below.
         let actions_summary = tool_calls
             .iter()
             .map(|tc| {
@@ -1362,12 +1345,6 @@ pub async fn run_agent_turn(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        if !actions_summary.is_empty() {
-            turn_memory.record_decision(format!(
-                "你刚才选择动作: {actions_summary}; 当时的可见依据: {visible_summary}"
-            ));
-        }
-
         // 🧠 Record this turn as L0 WorkingMemory with the LLM's raw response
         let user_text = user_task.as_deref().unwrap_or("");
         let assistant_preview: String = full_text.chars().take(400).collect();
@@ -3828,6 +3805,52 @@ async fn handle_empty_tool_calls(
     persist_turn_memory(workflow_engine, turn_memory);
     emit_turn_done(ui_tx, turn_id, std::mem::take(new_messages), total_usage);
     true
+}
+
+/// Build a summary of the LLM's visible text and tool actions for this turn,
+/// then record it as a decision in turn_memory.
+fn record_turn_decision(
+    tool_calls: &[ToolCall],
+    full_text: &str,
+    reasoning_content: &str,
+    unified_tool_mode: bool,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+) {
+    let mut visible_summary: String = crate::agent::think_stream::visible_only(full_text)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    visible_summary = visible_summary.chars().take(260).collect();
+    if visible_summary.trim().is_empty() && !reasoning_content.trim().is_empty() {
+        let r = crate::agent::think_stream::visible_only(reasoning_content);
+        let r = if r.is_empty() {
+            reasoning_content.to_string()
+        } else {
+            r
+        };
+        visible_summary = digest_reasoning(&r, 260);
+    }
+    let actions_summary = tool_calls
+        .iter()
+        .map(|tc| {
+            if unified_tool_mode && tc.name == crate::agent::unified_action::TOOL_NAME {
+                crate::agent::unified_action::parse_request(&tc.arguments)
+                    .map(|req| req.action)
+                    .unwrap_or_else(|_| tc.name.clone())
+            } else {
+                tc.name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !actions_summary.is_empty() {
+        turn_memory.record_decision(format!(
+            "你刚才选择动作: {actions_summary}; 当时的可见依据: {visible_summary}"
+        ));
+    }
 }
 
 #[cfg(test)]
