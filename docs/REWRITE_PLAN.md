@@ -138,7 +138,7 @@
 **P5 拆分策略**：
 
 - [x] **P5.1** ✅ 提取 `TurnBudget` 结构体，收编 17 个局部变量 → 减少传参爆炸
-- [x] **P5.2** extract tool execution loop helpers (15 steps done: safety_gate 163L, loop/trunc 118L, workflow_validation 72L, file_write_path 34L, tool_lookup 29L, parse_args 41L, execute_retry 53L, log_sanitize 55L, offload_record 64L, read_queries 29L, snapshot_turn 45L, verify_hint 42L, success_updates 138L, repeat_failure 40L, repeat_guard 21L = ~884 lines extracted)
+- [x] **P5.2** COMPLETE: 24 extraction steps, ~1280 lines extracted from tool exec loop
 - [x] **P5.3** ✅ 提取 `collect_response()`（976-1183）+ `dispatch_llm()`（841-960）
 - [x] **P5.4** ✅ 提取 `evaluate_reflection()`（1500-1678）
 - [ ] **P5.5** 提取 `loop_head()` + `loop_tail()` + `post_edit_checks()`（✅ post_edit_checks 已提取；✅ loop_tail 部分完成：提取 `build_truncation_error()` + `build_arg_parse_error()` 消除两个大内联 error-msg 块）
