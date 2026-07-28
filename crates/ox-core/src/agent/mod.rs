@@ -1559,46 +1559,15 @@ pub async fn run_agent_turn(
                 SafetyGateOutcome::TurnDone => return,
             }
 
-            let args: serde_json::Value = if tc.arguments.trim().is_empty() {
-                // LLM sent no arguments — treat as empty object (common for no-param tools).
-                serde_json::Value::Object(serde_json::Map::new())
-            } else {
-                // Clean think tags from arguments before parsing
-                let cleaned_args = clean_think_tags(&tc.arguments);
-
-                match serde_json::from_str(&cleaned_args) {
-                    Ok(v) => v,
-                    Err(parse_err) => {
-                        // Provide helpful guidance with examples
-                        let error_msg = build_arg_parse_error(&tc.name, &parse_err);
-
-                        tracing::warn!(
-                            "Tool argument parse error for '{}': {} | Raw: {}",
-                            tc.name,
-                            parse_err,
-                            {
-                                if tc.arguments.chars().count() > 100 {
-                                    tc.arguments.chars().take(100).collect::<String>()
-                                } else {
-                                    tc.arguments.clone()
-                                }
-                            }
-                        );
-
-                        let result_msg = Message::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: error_msg.clone(),
-                        };
-                        new_messages.push(result_msg.clone());
-                        messages.push(result_msg);
-                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                            name: tc.name.clone(),
-                            output: error_msg,
-                            is_error: true,
-                        });
-                        continue;
-                    }
-                }
+            // Parse tool arguments (extracted to parse_tool_args)
+            let args = match parse_tool_args(
+                tc,
+                &mut messages,
+                &mut new_messages,
+                &ui_tx,
+            ) {
+                Ok(v) => v,
+                Err(()) => continue,
             };
 
             // Check for queued interjections before tool execution.
@@ -3572,6 +3541,54 @@ fn lookup_tool_or_error<'a>(
                 is_error: true,
             });
             None
+        }
+    }
+}
+
+// ── Tool argument parsing extraction ──────────────────────────────────────────
+/// Parse tool-call arguments into a `serde_json::Value`.
+/// Returns `Ok(value)` on success, or `Err(())` if parsing failed
+/// (error already pushed to messages/new_messages/ui_tx).
+fn parse_tool_args(
+    tc: &ToolCall,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> Result<serde_json::Value, ()> {
+    if tc.arguments.trim().is_empty() {
+        // LLM sent no arguments - treat as empty object (common for no-param tools).
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    // Clean think tags from arguments before parsing
+    let cleaned_args = clean_think_tags(&tc.arguments);
+    match serde_json::from_str(&cleaned_args) {
+        Ok(v) => Ok(v),
+        Err(parse_err) => {
+            let error_msg = build_arg_parse_error(&tc.name, &parse_err);
+            tracing::warn!(
+                "Tool argument parse error for '{}': {} | Raw: {}",
+                tc.name,
+                parse_err,
+                {
+                    if tc.arguments.chars().count() > 100 {
+                        tc.arguments.chars().take(100).collect::<String>()
+                    } else {
+                        tc.arguments.clone()
+                    }
+                }
+            );
+            let result_msg = Message::ToolResult {
+                tool_call_id: tc.id.clone(),
+                content: error_msg.clone(),
+            };
+            new_messages.push(result_msg.clone());
+            messages.push(result_msg);
+            let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                name: tc.name.clone(),
+                output: error_msg,
+                is_error: true,
+            });
+            Err(())
         }
     }
 }
