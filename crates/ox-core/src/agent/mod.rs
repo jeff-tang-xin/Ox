@@ -872,46 +872,29 @@ pub async fn run_agent_turn(
         // Repair malformed / empty tool arguments (GLM empty JSON, XML hallucinations).
         repair_and_extract_tool_calls(&mut tool_calls, &full_text, &reasoning_content);
 
-        if !unified_tool_mode && try_capture_review_findings(&workflow_engine, &full_text, &ui_tx) {
-            let visible = crate::agent::think_stream::visible_only(&full_text);
-            let content_for_session =
-                execute_user_display(&workflow_engine, pre_llm_step_idx, &visible);
-            let msg = Message::Assistant {
-                content: content_for_session,
-                tool_calls: Vec::new(),
-                reasoning_content: None,
-            };
-            upsert_review_report_assistant(&mut messages, &msg);
-            upsert_review_report_assistant(&mut new_messages, &msg);
-
-            match business_gate::await_findings_scope_gate(
-                &mut ui_rx,
-                &cancel_token,
-                &workflow_engine,
-                &mut messages,
-                &ui_tx,
-                push_interjection_message,
-            )
-            .await
-            {
-                business_gate::BusinessGateResume::Cancelled => break,
-                business_gate::BusinessGateResume::Acknowledged => {
-                    refresh_turn_memory_for_implement(&workflow_engine, &mut turn_memory);
-                    tools_used_this_turn.clear();
-                    persist_turn_memory(&workflow_engine, &turn_memory);
-                    iteration += 1;
-                    continue;
-                }
-                business_gate::BusinessGateResume::Discuss => {
-                    messages.push(Message::system(
-                        "📋 用户提供了反馈。请根据反馈更新 findings/计划，重新提交。禁止直接进入实施。",
-                    ));
-                    persist_turn_memory(&workflow_engine, &turn_memory);
-                    iteration += 1;
-                    continue;
-                }
-            }
+        // Review findings + business gate (extracted to handle_review_findings)
+        match handle_review_findings(
+            unified_tool_mode,
+            &workflow_engine,
+            &full_text,
+            &ui_tx,
+            &mut ui_rx,
+            &cancel_token,
+            &mut messages,
+            &mut new_messages,
+            &mut turn_memory,
+            &mut tools_used_this_turn,
+            pre_llm_step_idx,
+            push_interjection_message,
+        )
+        .await
+        {
+            ReviewFindingsOutcome::Break => break,
+            ReviewFindingsOutcome::Continue => continue,
+            ReviewFindingsOutcome::Proceed => {}
         }
+
+
 
         if tool_calls.is_empty() {
             if handle_empty_tool_calls(
@@ -3896,6 +3879,82 @@ async fn record_react_tool(
         &reasoning_fallback,
         live_output,
     );
+}
+
+/// Outcome of `handle_review_findings`.
+enum ReviewFindingsOutcome {
+    /// Gate cancelled; break the main loop.
+    Break,
+    /// Gate acknowledged or discuss; continue the main loop.
+    Continue,
+    /// No review findings captured; proceed with tool execution.
+    Proceed,
+}
+
+/// Handle non-unified review findings capture + business gate.
+///
+/// If the LLM's response contains review findings and we're not in unified
+/// mode, this captures the findings, opens the business scope gate, and
+/// returns the gate's resume decision.
+#[allow(clippy::too_many_arguments)]
+async fn handle_review_findings(
+    unified_tool_mode: bool,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    full_text: &str,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    ui_rx: &mut mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
+    cancel_token: &CancellationToken,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    tools_used_this_turn: &mut std::collections::HashSet<String>,
+    pre_llm_step_idx: usize,
+    push_interjection_message: fn(
+        &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+        &mut Vec<Message>,
+        &str,
+        &mpsc::UnboundedSender<AgentToUiEvent>,
+    ),
+) -> ReviewFindingsOutcome {
+    if unified_tool_mode || !try_capture_review_findings(workflow_engine, full_text, ui_tx) {
+        return ReviewFindingsOutcome::Proceed;
+    }
+    let visible = crate::agent::think_stream::visible_only(full_text);
+    let content_for_session =
+        execute_user_display(workflow_engine, pre_llm_step_idx, &visible);
+    let msg = Message::Assistant {
+        content: content_for_session,
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+    };
+    upsert_review_report_assistant(messages, &msg);
+    upsert_review_report_assistant(new_messages, &msg);
+
+    match business_gate::await_findings_scope_gate(
+        ui_rx,
+        cancel_token,
+        workflow_engine,
+        messages,
+        ui_tx,
+        push_interjection_message,
+    )
+    .await
+    {
+        business_gate::BusinessGateResume::Cancelled => ReviewFindingsOutcome::Break,
+        business_gate::BusinessGateResume::Acknowledged => {
+            refresh_turn_memory_for_implement(workflow_engine, turn_memory);
+            tools_used_this_turn.clear();
+            persist_turn_memory(workflow_engine, turn_memory);
+            ReviewFindingsOutcome::Continue
+        }
+        business_gate::BusinessGateResume::Discuss => {
+            messages.push(Message::system(
+                "📋 用户提供了反馈。请根据反馈更新 findings/计划，重新提交。禁止直接进入实施。",
+            ));
+            persist_turn_memory(workflow_engine, turn_memory);
+            ReviewFindingsOutcome::Continue
+        }
+    }
 }
 
 /// Prepare messages and turn memory for the next LLM call.
