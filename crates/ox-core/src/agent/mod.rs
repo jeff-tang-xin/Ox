@@ -2818,49 +2818,8 @@ pub async fn run_agent_turn(
             messages.push(Message::system(&note));
         }
 
-        // ── Post-hoc fix: remove tool_calls from LATEST Assistant msg that have no ToolResult ──
-        // The Assistant message was pushed before execution. Tools rejected by
-        // validation/safety/truncation/loop-limit were skipped. Fix the LATEST
-        // Assistant message only — NOT previous iterations' messages (which were
-        // already clean). Previous messages MUST be preserved for context continuity.
-        {
-            // Collect tool call IDs that have ToolResults in THIS iteration's batch.
-            // Also include FULL message list IDs to protect previous iterations.
-            let all_result_ids: std::collections::HashSet<String> = messages
-                .iter()
-                .filter_map(|m| {
-                    if let Message::ToolResult { tool_call_id, .. } = m {
-                        Some(tool_call_id.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            // Only fix the LAST Assistant message in each list (the one just pushed).
-            // Previous iterations' Assistant messages are already correctly paired.
-            for msgs in [&mut messages, &mut new_messages] {
-                if let Some(last_assistant_pos) = msgs
-                    .iter()
-                    .rposition(|m| matches!(m, Message::Assistant { .. }))
-                    && let Message::Assistant { tool_calls, .. } = &mut msgs[last_assistant_pos]
-                {
-                    let before = tool_calls.len();
-                    tool_calls.retain(|tc| all_result_ids.contains(&tc.id));
-                    if tool_calls.len() != before {
-                        tracing::info!(
-                            "[POST-FILTER] Removed {} orphaned tool_calls from latest Assistant msg ({} → {})",
-                            before - tool_calls.len(),
-                            before,
-                            tool_calls.len()
-                        );
-                    }
-                }
-                // Remove Assistant at that position if it became empty
-                if let Some(pos) = msgs.iter().rposition(|m| matches!(m, Message::Assistant { content, tool_calls, .. } if content.is_empty() && tool_calls.is_empty())) {
-                    msgs.remove(pos);
-                }
-            }
-        }
+        // ── Post-hoc fix: remove orphaned tool_calls from latest Assistant msg ──
+        prune_orphaned_tool_calls(&mut [&mut messages, &mut new_messages]);
 
         // 🗺️ Inject task canvas if any results were offloaded
         if let Some(canvas_ctx) = offloader.get_canvas_context() {
@@ -3832,6 +3791,45 @@ fn extract_tool_name_and_target(tc: &ToolCall, unified_tool_mode: bool) -> (Stri
             .map(|s| s.to_string())
             .unwrap_or_default();
         (tc.name.clone(), target)
+    }
+}
+
+/// Remove tool_calls from the latest Assistant message that have no matching
+/// ToolResult (tools skipped by validation/safety/truncation/loop-limit).
+/// Also remove the Assistant message entirely if it became empty.
+fn prune_orphaned_tool_calls(messages: &mut [&mut Vec<Message>]) {
+    let all_result_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .flat_map(|msgs| {
+            msgs.iter().filter_map(|m| {
+                if let Message::ToolResult { tool_call_id, .. } = m {
+                    Some(tool_call_id.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    for msgs in messages {
+        if let Some(last_assistant_pos) = msgs
+            .iter()
+            .rposition(|m| matches!(m, Message::Assistant { .. }))
+            && let Message::Assistant { tool_calls, .. } = &mut msgs[last_assistant_pos]
+        {
+            let before = tool_calls.len();
+            tool_calls.retain(|tc| all_result_ids.contains(&tc.id));
+            if tool_calls.len() != before {
+                tracing::info!(
+                    "[POST-FILTER] Removed {} orphaned tool_calls from latest Assistant msg ({} -> {})",
+                    before - tool_calls.len(),
+                    before,
+                    tool_calls.len()
+                );
+            }
+        }
+        if let Some(pos) = msgs.iter().rposition(|m| matches!(m, Message::Assistant { content, tool_calls, .. } if content.is_empty() && tool_calls.is_empty())) {
+            msgs.remove(pos);
+        }
     }
 }
 
