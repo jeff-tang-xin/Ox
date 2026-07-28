@@ -1,4 +1,4 @@
-pub mod auto_reflect; // 🆕 Auto-reflection for skill generation
+﻿pub mod auto_reflect; // 🆕 Auto-reflection for skill generation
 pub mod collaboration;
 pub mod completion; // Machine-verifiable completion receipt
 pub mod engine;
@@ -1476,125 +1476,27 @@ pub async fn run_agent_turn(
                 continue;
             }
 
-            // 🚨 Detect infinite loop: same tool called too many times
-            // Note: We already calculated exceeded_loop_limit_ids above, so just check if this ID is in the set
-            if exceeded_loop_limit_ids.contains(&tc.id) {
-                let loop_key = tool_loop_keys
-                    .get(&tc.id)
-                    .cloned()
-                    .unwrap_or_else(|| tc.name.clone());
-                let call_count = temp_counts.get(&loop_key).copied().unwrap_or(0);
-                tracing::error!(
-                    "🚨 INFINITE LOOP DETECTED: {} called {} times in one turn. Stopping.",
-                    loop_key,
-                    call_count
-                );
-
-                let hint = if tc.name == "file_read" && execute_step {
-                    "\n5. 大文件用 file_read 的 offset/limit 分段读取（例如 offset=200, limit=200）"
-                } else {
-                    ""
-                };
-
-                let error_msg = format!(
-                    "❌ Infinite Loop Detected:\n\
-                     `{loop_key}` has been called {call_count} times in this LLM response.\n\
-                     This suggests the AI is stuck in a loop.\n\n\
-                     💡 Solutions:\n\
-                     1. Try a different approach to solve the problem\n\
-                     2. Break the task into smaller steps\n\
-                     3. Provide more specific instructions\n\
-                     4. Use /clear to start fresh if needed{hint}",
-                    hint = hint
-                );
-
-                let result_msg = Message::ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: error_msg.clone(),
-                };
-                new_messages.push(result_msg.clone());
-                messages.push(result_msg);
-                turn_memory.record_tool(&tc.name, &tc.arguments, false);
-                // Record infinite loop detection to react_log
-                if let Some(ref ms) = tool_ctx.memory_store {
-                    let (session_id, task_desc) =
-                        react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-                    let target_json: Option<serde_json::Value> =
-                        serde_json::from_str(&tc.arguments).ok();
-                    let target = target_json
-                        .as_ref()
-                        .and_then(|v| {
-                            v.get("params")
-                                .or_else(|| v.get("path"))
-                                .or_else(|| v.get("name"))
-                        })
-                        .and_then(|x| x.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-                    let decision = format!(
-                        "🚨 检测到无限循环: {} 已调用 {} 次，强制阻止",
-                        loop_key, call_count
-                    );
-                    let assistant_text = {
-                        let raw = crate::agent::think_stream::visible_only(&full_text);
-                        if raw.trim().is_empty() {
-                            "(LLM 陷入循环，被系统阻止)".into()
-                        } else {
-                            raw
-                        }
-                    };
-                    let reasoning_fallback = build_reasoning_fallback(
-                        &reasoning_content,
-                        &tc.name,
-                        &tc.arguments,
-                        &full_text,
-                        unified_tool_mode,
-                    );
-                    let _ = ms.record_react(
-                        &session_id,
-                        &task_desc,
-                        &tc.name,
-                        &target,
-                        "blocked",
-                        &decision,
-                        &assistant_text,
-                        &reasoning_fallback,
-                        &error_msg,
-                    );
-                }
-                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                    name: tc.name.clone(),
-                    output: error_msg,
-                    is_error: true,
-                });
+            // Loop guard + truncation check (extracted to check_loop_and_truncation_guards)
+            if check_loop_and_truncation_guards(
+                tc,
+                &exceeded_loop_limit_ids,
+                &truncated_ids,
+                &tool_loop_keys,
+                &temp_counts,
+                execute_step,
+                &workflow_engine,
+                &mut messages,
+                &mut new_messages,
+                &mut turn_memory,
+                &user_task,
+                &full_text,
+                &reasoning_content,
+                unified_tool_mode,
+                tool_ctx.memory_store.as_ref(),
+                &ui_tx,
+            ) {
                 continue;
             }
-
-            // Skip truncated tool calls — return error so LLM can retry.
-            if truncated_ids.contains(&tc.id) {
-                let error_msg = build_truncation_error(&tc.name, &tc.arguments);
-                tracing::warn!(
-                    "Tool '{}' (id={}) had truncated arguments ({} bytes). Sending error to LLM.",
-                    tc.name,
-                    tc.id,
-                    tc.arguments.len()
-                );
-
-                let result_msg = Message::ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: error_msg.clone(),
-                };
-                new_messages.push(result_msg.clone());
-                messages.push(result_msg);
-                turn_memory.record_tool(&tc.name, &tc.arguments, false);
-                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                    name: tc.name.clone(),
-                    output: error_msg,
-                    is_error: true,
-                });
-                continue;
-            }
-
             let _ = ui_tx.send(AgentToUiEvent::Status(format!("Running tool: {}", tc.name)));
 
             // ── Workflow validation before execution ──
@@ -3458,6 +3360,146 @@ async fn check_safety_gate(
             SafetyGateOutcome::Allow
         }
     }
+}
+
+// ── Loop / truncation guard extraction ─────────────────────────────────────
+// P5.2 step 2: extract the infinite-loop and truncation guard checks (118
+// lines) into a standalone function. Both paths end with `continue`, so the
+// function returns `true` (skip) or `false` (proceed).
+
+/// Returns `true` if the tool call should be skipped (error already pushed to
+/// messages/new_messages/ui_tx/turn_memory). Covers two cases:
+/// - Infinite loop: same tool called too many times in one turn.
+/// - Truncated args: arguments were cut off by the LLM output window.
+#[allow(clippy::too_many_arguments)]
+fn check_loop_and_truncation_guards(
+    tc: &ToolCall,
+    exceeded_loop_limit_ids: &std::collections::HashSet<String>,
+    truncated_ids: &std::collections::HashSet<String>,
+    tool_loop_keys: &std::collections::HashMap<String, String>,
+    temp_counts: &std::collections::HashMap<String, u32>,
+    execute_step: bool,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    user_task: &Option<String>,
+    full_text: &str,
+    reasoning_content: &str,
+    unified_tool_mode: bool,
+    memory_store: Option<&Arc<crate::memory::store::MemoryStore>>,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> bool {
+    if exceeded_loop_limit_ids.contains(&tc.id) {
+        let loop_key = tool_loop_keys
+            .get(&tc.id)
+            .cloned()
+            .unwrap_or_else(|| tc.name.clone());
+        let call_count = temp_counts.get(&loop_key).copied().unwrap_or(0);
+        tracing::error!(
+            "🚨 INFINITE LOOP DETECTED: {} called {} times in one turn. Stopping.",
+            loop_key,
+            call_count
+        );
+        let hint = if tc.name == "file_read" && execute_step {
+            "\n5. 大文件用 file_read 的 offset/limit 分段读取（例如 offset=200, limit=200）"
+        } else {
+            ""
+        };
+        let error_msg = format!(
+            "❌ Infinite Loop Detected:\n\
+             `{loop_key}` has been called {call_count} times in this LLM response.\n\
+             This suggests the AI is stuck in a loop.\n\n\
+             💡 Solutions:\n\
+             1. Try a different approach to solve the problem\n\
+             2. Break the task into smaller steps\n\
+             3. Provide more specific instructions\n\
+             4. Use /clear to start fresh if needed{hint}",
+            hint = hint
+        );
+        let result_msg = Message::ToolResult {
+            tool_call_id: tc.id.clone(),
+            content: error_msg.clone(),
+        };
+        new_messages.push(result_msg.clone());
+        messages.push(result_msg);
+        turn_memory.record_tool(&tc.name, &tc.arguments, false);
+        if let Some(ms) = memory_store {
+            let (session_id, task_desc) =
+                react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
+            let target_json: Option<serde_json::Value> =
+                serde_json::from_str(&tc.arguments).ok();
+            let target = target_json
+                .as_ref()
+                .and_then(|v| {
+                    v.get("params")
+                        .or_else(|| v.get("path"))
+                        .or_else(|| v.get("name"))
+                })
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let decision = format!(
+                "🚨 检测到无限循环: {} 已调用 {} 次，强制阻止",
+                loop_key, call_count
+            );
+            let assistant_text = {
+                let raw = crate::agent::think_stream::visible_only(full_text);
+                if raw.trim().is_empty() {
+                    "(LLM 陷入循环，被系统阻止)".into()
+                } else {
+                    raw
+                }
+            };
+            let reasoning_fallback = build_reasoning_fallback(
+                reasoning_content,
+                &tc.name,
+                &tc.arguments,
+                full_text,
+                unified_tool_mode,
+            );
+            let _ = ms.record_react(
+                &session_id,
+                &task_desc,
+                &tc.name,
+                &target,
+                "blocked",
+                &decision,
+                &assistant_text,
+                &reasoning_fallback,
+                &error_msg,
+            );
+        }
+        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+            name: tc.name.clone(),
+            output: error_msg,
+            is_error: true,
+        });
+        return true;
+    }
+    if truncated_ids.contains(&tc.id) {
+        let error_msg = build_truncation_error(&tc.name, &tc.arguments);
+        tracing::warn!(
+            "Tool '{}' (id={}) had truncated arguments ({} bytes). Sending error to LLM.",
+            tc.name,
+            tc.id,
+            tc.arguments.len()
+        );
+        let result_msg = Message::ToolResult {
+            tool_call_id: tc.id.clone(),
+            content: error_msg.clone(),
+        };
+        new_messages.push(result_msg.clone());
+        messages.push(result_msg);
+        turn_memory.record_tool(&tc.name, &tc.arguments, false);
+        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+            name: tc.name.clone(),
+            output: error_msg,
+            is_error: true,
+        });
+        return true;
+    }
+    false
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
