@@ -1328,44 +1328,19 @@ pub async fn run_agent_turn(
                 &ui_tx,
             );
 
-            // Record to SQLite react_log for cross-round memory
-            if let Some(ref ms) = tool_ctx.memory_store {
-                let (session_id, task) =
-                    react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-                let target_json: Option<serde_json::Value> =
-                    serde_json::from_str(&tc.arguments).ok();
-                let target = target_json
-                    .as_ref()
-                    .and_then(|v| {
-                        v.get("params")
-                            .or_else(|| v.get("path"))
-                            .or_else(|| v.get("name"))
-                    })
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let outcome = if result.is_error { "error" } else { "ok" };
-                let decision = turn_memory
-                    .decisions
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| "本轮仅工具调用".into());
-                let _ = record_react_tool(
-                    ms.as_ref(),
-                    &session_id,
-                    &task,
-                    &tc.name,
-                    &target,
-                    outcome,
-                    &decision,
-                    &full_text,
-                    &reasoning_content,
-                    unified_tool_mode,
-                    &tc.arguments,
-                    &result.content,
-                )
-                .await;
-            }
+            // Record to SQLite react_log (extracted to record_react_log)
+            record_react_log(
+                tc,
+                &result,
+                &tool_ctx,
+                &workflow_engine,
+                &user_task,
+                &turn_memory,
+                &full_text,
+                &reasoning_content,
+                unified_tool_mode,
+            )
+            .await;
 
             let mut result_content = format!(
                 "── DATA ({}) ──\n{}\n── END DATA ──",
@@ -3991,6 +3966,59 @@ async fn record_react_tool(
         &reasoning_fallback,
         live_output,
     );
+}
+
+/// Record a legacy (non-unified) tool execution to the SQLite react_log.
+/// This is the simple path: tool name + raw args + result content.
+#[allow(clippy::too_many_arguments)]
+async fn record_react_log(
+    tc: &ToolCall,
+    result: &crate::tools::ToolOutput,
+    tool_ctx: &Arc<ToolContext>,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    user_task: &Option<String>,
+    turn_memory: &crate::memory::turn_memory::TurnMemory,
+    full_text: &str,
+    reasoning_content: &str,
+    unified_tool_mode: bool,
+) {
+    if let Some(ref ms) = tool_ctx.memory_store {
+        let (session_id, task) =
+            react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
+        let target_json: Option<serde_json::Value> =
+            serde_json::from_str(&tc.arguments).ok();
+        let target = target_json
+            .as_ref()
+            .and_then(|v| {
+                v.get("params")
+                    .or_else(|| v.get("path"))
+                    .or_else(|| v.get("name"))
+            })
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let outcome = if result.is_error { "error" } else { "ok" };
+        let decision = turn_memory
+            .decisions
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "本轮仅工具调用".into());
+        let _ = record_react_tool(
+            ms.as_ref(),
+            &session_id,
+            &task,
+            &tc.name,
+            &target,
+            outcome,
+            &decision,
+            full_text,
+            reasoning_content,
+            unified_tool_mode,
+            &tc.arguments,
+            &result.content,
+        )
+        .await;
+    }
 }
 
 /// Repair malformed / empty tool-call arguments and extract XML-style tool
