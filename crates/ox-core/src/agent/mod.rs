@@ -1,7 +1,6 @@
 pub mod auto_reflect; // 🆕 Auto-reflection for skill generation
 pub mod collaboration;
 pub mod completion; // Machine-verifiable completion receipt
-pub mod enforcer;
 pub mod engine;
 pub mod error_recovery; // 🆕 Build/test failure auto-fix
 pub mod exploration_snapshot; // Plan-step tool results for cross-step handoff
@@ -2624,45 +2623,6 @@ pub async fn run_agent_turn(
                 } else {
                     false
                 };
-
-            // 🆕 Workflow step validation before execution
-            // In pipeline mode, Steps 0-2 handle planning/review. Rule enforcement
-            // (plan_before_edit, read_before_edit) is bypassed for Step 3 (Execute).
-            let skip_plan_rules = matches!(&workflow_engine, Some(wf) if {
-                wf.try_lock().is_ok_and(|e| {
-                    e.is_single_step()
-                        || (e.is_workflow_active() && e.get_current_step_index() >= 3)
-                })
-            });
-
-            if !skip_plan_rules
-                && let Err(violation_msg) = crate::agent::enforcer::RuleEnforcer::validate(
-                    &tool_ctx.config.enforcement_rules,
-                    tc,
-                    &messages,
-                )
-            {
-                tracing::warn!(
-                    "🚫 Rule Enforcer blocked tool '{}': {}",
-                    tc.name,
-                    violation_msg
-                );
-
-                let error_result = Message::ToolResult {
-                    tool_call_id: tc.id.clone(),
-                    content: violation_msg.clone(),
-                };
-                new_messages.push(error_result.clone());
-                messages.push(error_result);
-
-                let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                    name: tc.name.clone(),
-                    output: violation_msg,
-                    is_error: true,
-                });
-
-                continue;
-            }
 
             let mut blacklist_warning: Option<String> = None;
             if tc.name == "shell_exec"

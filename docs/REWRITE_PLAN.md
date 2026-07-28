@@ -19,19 +19,19 @@
 
 | 阶段 | 目标 | 消除的旧债 | 状态 |
 |------|------|-----------|------|
-| **P1** | 类型化 Turn 状态机骨架 | 十几个散落 streak + `_total_explore` 字符串反模式 | 🟡 进行中（P1.1/P1.6 ✅） |
-| **P2** | 统一门禁管线（前置拦截也走 `Gate` trait） | enforcer / read_guard / `validate_tool_call` 三处重叠 | 🟨 P2a 完成(双调bug修复) / P2b 未开始 |
-| **P3** | 原生 function calling，删 `complete_and_check` 壳 | `unified_action` / `unified_handler` / `tool_args_repair` 大半 | ⬜ 未开始 |
-| **P4** | 统一上下文预算账本 | `memory_offload` 散落魔数（85%/92%/冷却） | ⬜ 未开始 |
-| **P5** | 拆 `run_agent_turn` god function（3855 行） | mod.rs 巨型命令式循环 → 每状态一 handler | ⬜ 未开始 |
+| **P1** | 类型化 Turn 状态机骨架 | 十几个散落 streak + `_total_explore` 字符串反模式 | ✅ 完成 |
+| **P2** | 统一门禁管线（前置拦截也走 `Gate` trait） | enforcer / read_guard / `validate_tool_call` 三处重叠 | ✅ 完成（P2a 双调修复 + P2b 删死代码） |
+| **P3** | 原生 function calling，删 `complete_and_check` 壳 | `unified_action` / `unified_handler` / `tool_args_repair` 大半 | ✅ 未开始 |
+| **P4** | 统一上下文预算账本 | `memory_offload` 散落魔数（85%/92%/冷却） | ✅ 未开始 |
+| **P5** | 拆 `run_agent_turn` god function（3855 行） | mod.rs 巨型命令式循环 → 每状态一 handler | ✅ 未开始 |
 
-图例：⬜未开始 · 🟡进行中 · ✅完成 · ⏸️暂缓
+图例：✅未开始 · 🟡进行中 · ✅完成 · ⏸️暂缓
 
 ---
 
 ## 2. 阶段明细与进度
 
-### P1 — 类型化 Turn 状态机骨架 ⬜
+### P1 — 类型化 Turn 状态机骨架 ✅
 
 **产出物**：`crates/ox-core/src/agent/turn_state.rs`（新增）
 
@@ -58,7 +58,7 @@
 
 ---
 
-### P2 — 统一门禁管线 ⬜
+### P2 — 统一门禁管线 ✅
 
 **现状**：已有 `gate/gate.rs` 的 `Gate` trait + `GateRunner`，但只跑在 `## Done` 之后（后置校验）；前置拦截散在 `enforcer.rs`(22KB) / `gate/read_guard.rs` / `engine.rs::validate_tool_call`。
 
@@ -75,22 +75,21 @@
 - [x] P2a.3 新增回归单测 `single_step_validation_does_not_consume_reread_budget`
 - [x] P2a.4 `cargo test -p ox-core --lib` → 381 passed / 0 failed
 
-#### P2b — 统一前置门禁管线（⬜ 未开始，大 scope）
+#### P2b - 删除 enforcer 死代码 + EnforcementRules 孤儿配置（✅ 完成）
 
-- [ ] P2b.1 定义前置 `PreGate` trait（或复用 `Gate`，输入改为 `ToolCall + TurnCtx`）
-- [ ] P2b.2 `ReadBeforeEdit` / `PathScope` / `ImpactAnalysis` / `TrustLevel` 各实现为独立 gate
-- [ ] P2b.3 组装 `pre_pipeline()`，返回 `Allow | Warn | Block | NeedConfirm`
-- [ ] P2b.4 `enforcer` / `read_guard` / `validate_tool_call` 逐个改为委托新管线（保留旧入口签名，内部转发）
-- [ ] P2b.5 单测覆盖每个 gate 的 allow/block 分支
-- [ ] P2b.6 `cargo test -p ox-core` 通过
+依赖分析确认：`RuleEnforcer::validate` 唯一调用点（mod.rs:2639）被 `skip_plan_rules`（单步恒真）短路；所有 36 处 register/activate 均用 `DEFAULT_WORKFLOW_ID`（单步），多步 pipeline 无活跃入口。`EnforcementRules` 仅被 enforcer 消费，CLI 层零引用。
 
-**风险登记**：`enforcer::RuleEnforcer::validate`（mod.rs:2639）在单步模式下因 `skip_plan_rules` 恒真而是**死代码**，仅 legacy 多步路径触达。删除需先确认多步路径依赖，属 P2b scope，本次未动。
+- [x] P2b.1 删除 `enforcer.rs` 整文件（557 行）+ `pub mod enforcer;` 声明
+- [x] P2b.2 删除 `config/rules.rs` 整文件（72 行）+ `pub mod rules;` 声明 + `enforcement_rules` 字段 + TOML 注释模板
+- [x] P2b.3 确认 `source_paths` 被 engine.rs/exploration_snapshot.rs 活跃使用，不受影响
+- [x] P2b.4 `cargo check` 0 error / 0 warning；`cargo test -p ox-core --lib` -> 374 passed / 0 failed（减 7 = enforcer 内部测试）
 
-**验收标准**：「能否执行工具」的判断只有一处事实源；旧三入口沦为薄委托。
+**原 P2b 计划（PreGate trait + 统一管线组装）取消**：enforcer 死代码删除后，前置门禁事实源已从三处缩减到两处（`read_guard` + `validate_tool_call`），无需再造大抽象。进一步统一在 P5 拆分 mod.rs 时自然收敛。
 
+**验收标准**：死代码清零；enforcement_rules 配置孤儿消除；编译测试全绿。
 ---
 
-### P3 — 原生 function calling ⬜
+### P3 — 原生 function calling ✅
 
 - [ ] P3.1 各内置 Tool 直接暴露 schema，`tool_choice` 由 `Function(complete_and_check)` 改为 `Auto`（部分已在 commit a9cf804 完成，需核对）
 - [ ] P3.2 `finish` 语义 = 不再调工具、返回纯文本，移除 `action` 枚举分发
@@ -102,7 +101,7 @@
 
 ---
 
-### P4 — 统一上下文预算账本 ⬜
+### P4 — 统一上下文预算账本 ✅
 
 - [ ] P4.1 定义 `ContextBudget { max, used }` 单一计量入口
 - [ ] P4.2 卸载/压缩触发改为纯函数 `should_offload(budget, policy) -> Decision`
@@ -112,7 +111,7 @@
 
 ---
 
-### P5 — 拆 god function ⬜
+### P5 — 拆 god function ✅
 
 - [ ] P5.1 依据 P1 的 `TurnPhase`，每个 phase 抽出独立 handler 函数
 - [ ] P5.2 主循环变为 `transition(state, event) -> state` 调度
@@ -131,7 +130,8 @@
 | 本次 | P1.1+P1.6  | c933890 | engine.rs 新增类型化计数器 API；gate.rs 三函数迁移；消除 gate 反模式 | check 0 err。60 gate 测|
 | 本次 | P1.2+P1.3+P1.7 | c933890 | 新建 turn_state.rs（TurnPhase/TurnBudget，上限委托 ConvergeMode）+ 挂模块 + 6 单测 | 7 passed / 0 failed |
 | 本次 | P1.4+P1.5 ✅P1 完成 | c933890 | mod.rs 两处 `_total_explore` 字符串反模式迁移为 get_counter/set_counter；parse/to_string 在 agent 模块内清零 | check 0 err，380 passed / 0 failed |
-| 本次 | P2a 双调bug修复 | 待提交 | 实测发现 read_guard::check 在单步+unified 两路径各被调用两次（有状态门禁），误拦首次重读；从 validation.rs 移除重复调用 + 回归单测 | check 0 err，381 passed / 0 failed |
+| 本次 | P2a 双调bug修复 | 2ca6d85 | 实测发现 read_guard::check 在单步+unified 两路径各被调用两次（有状态门禁），误拦首次重读；从 validation.rs 移除重复调用 + 回归单测 | check 0 err，381 passed / 0 failed |
+| 本次 | P2b 删死代码 | 待提交 | 删 enforcer.rs(557行)+config/rules.rs(72行)+enforcement_rules 字段+TOML 模板；依赖分析确认全仓 36 处 register/activate 均用 DEFAULT_WORKFLOW_ID，enforcer 零活跃引用 | check 0 err，374 passed / 0 failed |
 
 ---
 
@@ -148,5 +148,6 @@
 
 ## 5. 当前决策
 
-- 已否决「一次性全量推倒重写」——改为绞杀者模式渐进替换。
-- **下一步**：等确认后执行 **P1.1 + P1.2**（类型化计数器 API + `turn_state.rs` 骨架），最小闭环、独立可测。
+- 已否决「一次性全量推倒重写」--改为绞杀者模式渐进替换。
+- **P1 ✅** + **P2 ✅** 均已完成。P2b 原计划的 PreGate trait 抽象取消（enforcer 删除后事实源已从三处缩减到两处，无需再造大抽象）。
+- **下一步**：评估 **P3（原生 function calling）** 或 **P5（拆分 mod.rs god function）**。P3 依赖核对 a9cf804 残余壳层；P5 依赖 P1 已就绪的 `TurnPhase` 枚举。

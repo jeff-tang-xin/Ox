@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub mod rules;
 use serde::{Deserialize, Serialize};
 
 // ──────────────────────────── Top-level ────────────────────────────
@@ -21,7 +20,6 @@ pub struct OxConfig {
     pub models: ModelsConfig,
     pub agent: AgentConfig,
     pub behavior_rules: BehaviorRulesConfig,
-    pub enforcement_rules: rules::EnforcementRules,
     pub safety: SafetyConfig,
     pub cost: CostConfig,
     pub spec: SpecConfig,
@@ -294,15 +292,6 @@ store_refined_memories = true  # Enable refined memory storage (default: true)
 #     "Document public APIs with /// doc comments",
 #     "Run cargo fmt and cargo clippy before committing"
 # ]
-
-# ── Enforcement Rules (Hard Constraints) ─────────────────
-# These rules are enforced by code. If violated, tool calls are blocked immediately.
-# Extracted from system-level Skills (coding-principles, engineering-practices).
-
-[enforcement_rules]
-# enabled = true               # Enable global enforcement
-# plan_before_edit = true      # Require LLM to propose a plan before file_write/edit_file
-# steps_before_shell = true    # Require LLM to list steps before shell_exec
 
 # ── Safety Settings ──────────────────────────────────────
 [safety]
