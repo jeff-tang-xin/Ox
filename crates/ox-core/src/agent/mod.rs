@@ -1710,167 +1710,29 @@ pub async fn run_agent_turn(
             };
 
             // ── Safety check before execution ──
-            tracing::info!("[AGENT] Processing tool call: {} (id: {})", tc.name, tc.id);
-            tracing::info!("[AGENT] About to check safety level for: {}", tc.name);
-            let safety_level = tool.safety_level();
-            tracing::info!("[AGENT] Safety level for {}: {:?}", tc.name, safety_level);
-
-            // Check if tool args reference a path outside working directory.
-            let path_outside =
-                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                    if let Some(path_str) = args_val.get("path").and_then(|v| v.as_str()) {
-                        let resolved = tool_ctx.working_dir.join(path_str);
-                        !crate::safety::is_path_within_workdir(&resolved, &tool_ctx.working_dir)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-            let mut blacklist_warning: Option<String> = None;
-            if tc.name == "shell_exec"
-                && let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                && let Some(cmd) = args_val.get("command").and_then(|v| v.as_str())
-            {
-                blacklist_warning = safety_gate::shell_blacklist_warning(&trust_manager, cmd);
-            }
-
-            let should_confirm = safety_gate::needs_confirmation(
+            match check_safety_gate(
+                tc,
+                tool,
+                &tool_ctx,
                 &trust_manager,
-                &tc.name,
-                safety_level,
-                path_outside,
-                blacklist_warning.is_some(),
-            );
-
-            if should_confirm {
-                tracing::info!("[SAFETY_GATE] Tool {} requires confirmation", tc.name);
-                let high_risk_warning = if tc.name == "shell_exec" {
-                    if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                        if let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
-                            let mut warning = None;
-                            if crate::safety::is_high_risk_command(cmd) {
-                                warning = Some("HIGH RISK COMMAND".to_string());
-                            }
-                            if let Some(ref bw) = blacklist_warning {
-                                warning = Some(match warning {
-                                    Some(mut w) => {
-                                        w.push_str(" + ");
-                                        w.push_str(bw);
-                                        w
-                                    }
-                                    None => bw.clone(),
-                                });
-                            }
-                            warning
-                        } else {
-                            blacklist_warning.clone()
-                        }
-                    } else {
-                        blacklist_warning.clone()
-                    }
-                } else {
-                    None
-                };
-
-                let req = safety_gate::build_request(
-                    tc.id.clone(),
-                    tc.name.clone(),
-                    &tc.arguments,
-                    safety_level,
-                    high_risk_warning,
-                );
-                safety_gate::emit_request(&ui_tx, &req);
-
-                let decision = match safety_gate::await_decision(
-                    &mut ui_rx,
-                    &cancel_token,
-                    &tc.id,
-                    &workflow_engine,
-                    &mut messages,
-                    &ui_tx,
-                    push_interjection_message,
-                )
-                .await
-                {
-                    Ok(d) => d,
-                    Err(safety_gate::SafetyGateCancelled) => {
-                        let _ = ui_tx.send(AgentToUiEvent::Status("Interrupted.".to_string()));
-                        emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-                        return;
-                    }
-                };
-
-                match decision {
-                    ui_event::ConfirmationDecision::Deny => {
-                        tracing::info!("[AGENT] User denied tool: {}", tc.name);
-                        let error_msg = "User denied tool execution".to_string();
-                        let result_msg = Message::ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content: error_msg.clone(),
-                        };
-                        new_messages.push(result_msg.clone());
-                        messages.push(result_msg);
-                        // Record user denial to react_log
-                        if let Some(ref ms) = tool_ctx.memory_store {
-                            let (session_id, task_desc) =
-                                react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-                            let target_json: Option<serde_json::Value> =
-                                serde_json::from_str(&tc.arguments).ok();
-                            let target = target_json
-                                .as_ref()
-                                .and_then(|v| {
-                                    v.get("params")
-                                        .or_else(|| v.get("path"))
-                                        .or_else(|| v.get("name"))
-                                })
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_string())
-                                .unwrap_or_default();
-                            let decision = format!("👤 用户拒绝执行: {}", tc.name);
-                            let assistant_text = {
-                                let raw = crate::agent::think_stream::visible_only(&full_text);
-                                if raw.trim().is_empty() {
-                                    "(用户拒绝了此工具执行)".into()
-                                } else {
-                                    raw
-                                }
-                            };
-                            let reasoning_fallback = build_reasoning_fallback(
-                                &reasoning_content,
-                                &tc.name,
-                                &tc.arguments,
-                                &full_text,
-                                unified_tool_mode,
-                            );
-                            let _ = ms.record_react(
-                                &session_id,
-                                &task_desc,
-                                &tc.name,
-                                &target,
-                                "denied",
-                                &decision,
-                                &assistant_text,
-                                &reasoning_fallback,
-                                &error_msg,
-                            );
-                        }
-                        let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                            name: tc.name.clone(),
-                            output: error_msg,
-                            is_error: true,
-                        });
-                        continue;
-                    }
-                    ui_event::ConfirmationDecision::TrustAlways => {
-                        tracing::info!("[AGENT] User trusted all tools");
-                        safety_gate::apply_trust_all(&trust_manager);
-                    }
-                    ui_event::ConfirmationDecision::Allow => {
-                        tracing::info!("[AGENT] User allowed tool: {}", tc.name);
-                    }
-                }
+                &workflow_engine,
+                &cancel_token,
+                &ui_tx,
+                &mut ui_rx,
+                &mut messages,
+                &mut new_messages,
+                &user_task,
+                &full_text,
+                &reasoning_content,
+                unified_tool_mode,
+                turn_id,
+                &total_usage,
+            )
+            .await
+            {
+                SafetyGateOutcome::Allow => {}
+                SafetyGateOutcome::Skip => continue,
+                SafetyGateOutcome::TurnDone => return,
             }
 
             let args: serde_json::Value = if tc.arguments.trim().is_empty() {
@@ -3383,6 +3245,217 @@ pub(crate) fn evaluate_reflection(
             budget.explore_streak = 0;
             budget.total_explore = 0;
             Some(gate_msg)
+        }
+    }
+}
+
+// ── Safety gate extraction ──────────────────────────────────────────────────
+// P5.2 step 1: extract the pre-execution confirmation gate (163 lines) into
+// a standalone async function. The loop body calls this, then matches on the
+// returned `SafetyGateOutcome` to decide whether to execute, skip, or end
+// the turn.
+
+/// Outcome of the pre-execution safety gate check.
+enum SafetyGateOutcome {
+    /// Tool is approved, proceed to execute.
+    Allow,
+    /// Tool was denied; error already pushed to messages/ui_tx. Skip to next.
+    Skip,
+    /// Turn is over (`emit_turn_done` already called). Caller must `return`.
+    TurnDone,
+}
+
+/// Checks whether the tool call needs user confirmation (based on safety
+/// level, path containment, and shell blacklist), awaits the user's decision,
+/// and records the outcome.
+///
+/// - `Allow`  -> proceed with tool execution
+/// - `Skip`   -> user denied; error msg already in messages/new_messages/ui_tx
+/// - `TurnDone` -> cancelled or aborted; `emit_turn_done` already sent
+#[allow(clippy::too_many_arguments)]
+async fn check_safety_gate(
+    tc: &ToolCall,
+    tool: &dyn crate::tools::Tool,
+    tool_ctx: &crate::tools::ToolContext,
+    trust_manager: &Arc<std::sync::Mutex<TrustManager>>,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    cancel_token: &CancellationToken,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    ui_rx: &mut mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    user_task: &Option<String>,
+    full_text: &str,
+    reasoning_content: &str,
+    unified_tool_mode: bool,
+    turn_id: u64,
+    total_usage: &crate::message::TokenUsage,
+) -> SafetyGateOutcome {
+    tracing::info!("[AGENT] Processing tool call: {} (id: {})", tc.name, tc.id);
+    tracing::info!("[AGENT] About to check safety level for: {}", tc.name);
+    let safety_level = tool.safety_level();
+    tracing::info!("[AGENT] Safety level for {}: {:?}", tc.name, safety_level);
+
+    // Check if tool args reference a path outside working directory.
+    let path_outside =
+        if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+            if let Some(path_str) = args_val.get("path").and_then(|v| v.as_str()) {
+                let resolved = tool_ctx.working_dir.join(path_str);
+                !crate::safety::is_path_within_workdir(&resolved, &tool_ctx.working_dir)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+    let mut blacklist_warning: Option<String> = None;
+    if tc.name == "shell_exec"
+        && let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        && let Some(cmd) = args_val.get("command").and_then(|v| v.as_str())
+    {
+        blacklist_warning = safety_gate::shell_blacklist_warning(&trust_manager, cmd);
+    }
+
+    let should_confirm = safety_gate::needs_confirmation(
+        &trust_manager,
+        &tc.name,
+        safety_level,
+        path_outside,
+        blacklist_warning.is_some(),
+    );
+
+    if !should_confirm {
+        return SafetyGateOutcome::Allow;
+    }
+
+    tracing::info!("[SAFETY_GATE] Tool {} requires confirmation", tc.name);
+    let high_risk_warning = if tc.name == "shell_exec" {
+        if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+            if let Some(cmd) = args_val.get("command").and_then(|v| v.as_str()) {
+                let mut warning = None;
+                if crate::safety::is_high_risk_command(cmd) {
+                    warning = Some("HIGH RISK COMMAND".to_string());
+                }
+                if let Some(ref bw) = blacklist_warning {
+                    warning = Some(match warning {
+                        Some(mut w) => {
+                            w.push_str(" + ");
+                            w.push_str(bw);
+                            w
+                        }
+                        None => bw.clone(),
+                    });
+                }
+                warning
+            } else {
+                blacklist_warning.clone()
+            }
+        } else {
+            blacklist_warning.clone()
+        }
+    } else {
+        None
+    };
+
+    let req = safety_gate::build_request(
+        tc.id.clone(),
+        tc.name.clone(),
+        &tc.arguments,
+        safety_level,
+        high_risk_warning,
+    );
+    safety_gate::emit_request(&ui_tx, &req);
+
+    let decision = match safety_gate::await_decision(
+        ui_rx,
+        cancel_token,
+        &tc.id,
+        workflow_engine,
+        messages,
+        ui_tx,
+        push_interjection_message,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(safety_gate::SafetyGateCancelled) => {
+            let _ = ui_tx.send(AgentToUiEvent::Status("Interrupted.".to_string()));
+            let nm = std::mem::take(new_messages);
+            emit_turn_done(ui_tx, turn_id, nm, total_usage.clone());
+            return SafetyGateOutcome::TurnDone;
+        }
+    };
+
+    match decision {
+        ui_event::ConfirmationDecision::Deny => {
+            tracing::info!("[AGENT] User denied tool: {}", tc.name);
+            let error_msg = "User denied tool execution".to_string();
+            let result_msg = Message::ToolResult {
+                tool_call_id: tc.id.clone(),
+                content: error_msg.clone(),
+            };
+            new_messages.push(result_msg.clone());
+            messages.push(result_msg);
+            // Record user denial to react_log
+            if let Some(ref ms) = tool_ctx.memory_store {
+                let (session_id, task_desc) =
+                    react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
+                let target_json: Option<serde_json::Value> =
+                    serde_json::from_str(&tc.arguments).ok();
+                let target = target_json
+                    .as_ref()
+                    .and_then(|v| {
+                        v.get("params")
+                            .or_else(|| v.get("path"))
+                            .or_else(|| v.get("name"))
+                    })
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let decision = format!("👤 用户拒绝执行: {}", tc.name);
+                let assistant_text = {
+                    let raw = crate::agent::think_stream::visible_only(full_text);
+                    if raw.trim().is_empty() {
+                        "(用户拒绝了此工具执行)".into()
+                    } else {
+                        raw
+                    }
+                };
+                let reasoning_fallback = build_reasoning_fallback(
+                    reasoning_content,
+                    &tc.name,
+                    &tc.arguments,
+                    full_text,
+                    unified_tool_mode,
+                );
+                let _ = ms.record_react(
+                    &session_id,
+                    &task_desc,
+                    &tc.name,
+                    &target,
+                    "denied",
+                    &decision,
+                    &assistant_text,
+                    &reasoning_fallback,
+                    &error_msg,
+                );
+            }
+            let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                name: tc.name.clone(),
+                output: error_msg,
+                is_error: true,
+            });
+            SafetyGateOutcome::Skip
+        }
+        ui_event::ConfirmationDecision::TrustAlways => {
+            tracing::info!("[AGENT] User trusted all tools");
+            safety_gate::apply_trust_all(&trust_manager);
+            SafetyGateOutcome::Allow
+        }
+        ui_event::ConfirmationDecision::Allow => {
+            tracing::info!("[AGENT] User allowed tool: {}", tc.name);
+            SafetyGateOutcome::Allow
         }
     }
 }
