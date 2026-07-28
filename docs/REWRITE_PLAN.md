@@ -1,7 +1,7 @@
-# Ox 渐进式重写计划（Strangler Fig）
+﻿# Ox 渐进式重写计划（Strangler Fig）
 
 > 单一进度源。每完成一小步就更新对应复选框与「变更记录」表。
-> 维护者：Ox agent + 项目负责人。最后更新：P5 拆分启动。
+> 维护者：Ox agent + 项目负责人。最后更新：P5.1+P5.4+P5.6 完成，P5.2 进行中。
 
 ---
 
@@ -140,9 +140,9 @@
 - [ ] **P5.1** 提取 `TurnContext` 结构体，收编 17 个局部变量 → 减少传参爆炸
 - [ ] **P5.2** 提取 `execute_tool_batch()`（1855-3401，最大块 ~1550 行）→ 最大收益
 - [ ] **P5.3** 提取 `collect_response()`（976-1183）+ `dispatch_llm()`（841-960）
-- [ ] **P5.4** 提取 `evaluate_reflection()`（1500-1678）
+- [x] **P5.4** ✅ 提取 `evaluate_reflection()`（1500-1678）
 - [ ] **P5.5** 提取 `loop_head()` + `loop_tail()` + `post_edit_checks()`
-- [ ] **P5.6** 提取 `handle_idle()` + `capture_review_findings()` + `filter_tool_calls()`
+- [x] **P5.6** ✅ 提取 `handle_idle()` + `capture_review_findings()` + `filter_tool_calls()`
 - [ ] **P5.7** `run_agent_turn` 从 3814 行降到数百行，主循环变成 `transition(state, event)` 调度
 - [ ] **P5.8** 全量回归
 
@@ -160,6 +160,8 @@
 | 本轮 | P1.4+P1.5 ✅P1 完成 | c933890 | mod.rs 两处 `_total_explore` 字符串反模式迁移为 get_counter/set_counter；parse/to_string 在 agent 模块内清扫 | check 0 err·380 passed / 0 failed |
 | 本轮 | P2a 双调bug修复 | 2ca6d85 | 实测发现 read_guard::check 在单步 unified 两路径各自被调用两次（有状态门禁），误判首次重读；从 validation.rs 移除重复调用 + 回归单测 | check 0 err·381 passed / 0 failed |
 | 本轮 | P2b 删死代码 | 待提交 | 删 enforcer.rs(557行)+config/rules.rs(72行)+enforcement_rules 字段+TOML 模板；依赖分析确认全 36 处 register/activate 均用 DEFAULT_WORKFLOW_ID，enforcer 零活跃引用 | check 0 err·374 passed / 0 failed |
+| 本轮 | P2b 删死代码 | 61df638 | 删 enforcer.rs(557行)+config/rules.rs(72行)+enforcement_rules 字段+TOML 模板；依赖分析确认全 36 处 register/activate 均用 DEFAULT_WORKFLOW_ID，enforcer 零活跃引用 | check 0 err·374 passed / 0 failed |
+| 本轮 | P5.1+P5.4+P5.6 | b173ccd | 提取 classify_tool_calls()（6 单测）+ evaluate_reflection() + TurnContext 结构体；mod.rs 净减 227 行 | check 0 err·380 passed / 0 failed |
 
 ---
 
