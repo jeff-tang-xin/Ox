@@ -734,46 +734,16 @@ pub async fn run_agent_turn(
             format!("🧠 Thinking... (iteration {})", iteration + 1)
         }));
 
-        // Check for queued interjections before LLM call.
-        while let Ok(ev) = ui_rx.try_recv() {
-            match ev {
-                ui_event::UiToAgentEvent::Interjection(text) => {
-                    let trimmed = text.trim();
-                    let is_confirm = trimmed == "c"
-                        || trimmed.starts_with("/confirm")
-                        || trimmed.starts_with("/fix")
-                        || trimmed.contains("确认")
-                        || trimmed.contains("开始实施");
-                    if is_confirm {
-                        // Set pre-ack so scope gate skips waiting
-                        if let Some(wf) = &workflow_engine
-                            && let Ok(engine) = wf.try_lock()
-                        {
-                            engine.set_variable(
-                                crate::agent::gate::business_gate::PRE_ACK_KEY,
-                                "1".to_string(),
-                            );
-                        }
-                    }
-                    push_interjection_message(&workflow_engine, &mut messages, &text, &ui_tx);
-                }
-                // ScopeConfirmed / BusinessAck sent by the UI when user presses "c".
-                // These would be consumed by try_recv() and dropped — set pre-ack
-                // so the scope gate can find it via engine variable instead.
-                ui_event::UiToAgentEvent::ScopeConfirmed
-                | ui_event::UiToAgentEvent::BusinessAck { .. } => {
-                    if let Some(wf) = &workflow_engine
-                        && let Ok(engine) = wf.try_lock()
-                    {
-                        engine.set_variable(
-                            crate::agent::gate::business_gate::PRE_ACK_KEY,
-                            "1".to_string(),
-                        );
-                    }
-                }
-                _ => {} // Other events ignored
-            }
-        }
+        // Check for queued interjections before LLM call (extracted to drain_interjections_pre_llm)
+        drain_interjections_pre_llm(
+            &mut ui_rx,
+            &workflow_engine,
+            &mut messages,
+            &ui_tx,
+            push_interjection_message,
+        );
+
+
 
         turn_memory.bump_iteration();
         persist_turn_memory(&workflow_engine, &turn_memory);
@@ -3862,6 +3832,60 @@ async fn record_react_tool(
         &reasoning_fallback,
         live_output,
     );
+}
+
+/// Drain queued interjections before the LLM call.
+///
+/// Detects confirmation messages ("c", "/confirm", "/fix", etc.) and sets
+/// pre-ack so the scope gate skips waiting. Also handles ScopeConfirmed /
+/// BusinessAck events by setting pre-ack.
+fn drain_interjections_pre_llm(
+    ui_rx: &mut mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &mut Vec<Message>,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    push_interjection_message: fn(
+        &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+        &mut Vec<Message>,
+        &str,
+        &mpsc::UnboundedSender<AgentToUiEvent>,
+    ),
+) {
+    while let Ok(ev) = ui_rx.try_recv() {
+        match ev {
+            ui_event::UiToAgentEvent::Interjection(text) => {
+                let trimmed = text.trim();
+                let is_confirm = trimmed == "c"
+                    || trimmed.starts_with("/confirm")
+                    || trimmed.starts_with("/fix")
+                    || trimmed.contains("确认")
+                    || trimmed.contains("开始实施");
+                if is_confirm {
+                    if let Some(wf) = workflow_engine
+                        && let Ok(engine) = wf.try_lock()
+                    {
+                        engine.set_variable(
+                            crate::agent::gate::business_gate::PRE_ACK_KEY,
+                            "1".to_string(),
+                        );
+                    }
+                }
+                push_interjection_message(workflow_engine, messages, &text, ui_tx);
+            }
+            ui_event::UiToAgentEvent::ScopeConfirmed
+            | ui_event::UiToAgentEvent::BusinessAck { .. } => {
+                if let Some(wf) = workflow_engine
+                    && let Ok(engine) = wf.try_lock()
+                {
+                    engine.set_variable(
+                        crate::agent::gate::business_gate::PRE_ACK_KEY,
+                        "1".to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Check if reflection should fire, and if so, inject reflection prompt
