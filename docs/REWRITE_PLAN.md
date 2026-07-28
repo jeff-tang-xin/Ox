@@ -138,7 +138,7 @@
 **P5 拆分策略**：
 
 - [x] **P5.1** ✅ 提取 `TurnBudget` 结构体，收编 17 个局部变量 → 减少传参爆炸
-- [ ] **P5.2** extract execute_tool_batch() ~900 lines remaining (steps 1-6 done: safety_gate 163L, loop/trunc 118L, workflow_validation 72L, file_write_path 34L, tool_lookup 29L, parse_args 41L)
+- [x] **P5.2** extract tool execution loop helpers (15 steps done: safety_gate 163L, loop/trunc 118L, workflow_validation 72L, file_write_path 34L, tool_lookup 29L, parse_args 41L, execute_retry 53L, log_sanitize 55L, offload_record 64L, read_queries 29L, snapshot_turn 45L, verify_hint 42L, success_updates 138L, repeat_failure 40L, repeat_guard 21L = ~884 lines extracted)
 - [x] **P5.3** ✅ 提取 `collect_response()`（976-1183）+ `dispatch_llm()`（841-960）
 - [x] **P5.4** ✅ 提取 `evaluate_reflection()`（1500-1678）
 - [ ] **P5.5** 提取 `loop_head()` + `loop_tail()` + `post_edit_checks()`（✅ post_edit_checks 已提取；✅ loop_tail 部分完成：提取 `build_truncation_error()` + `build_arg_parse_error()` 消除两个大内联 error-msg 块）
@@ -170,6 +170,15 @@
 | 本轮 | P5.2 step 2 | 1e3533c | check_loop_and_truncation_guards() 118L; bool return; react_log recording | check 0 err / 385 pass |
 | 本轮 | P5.2 step 3 | 5a7adbb | check_workflow_validation() 72L; 3 skip paths (cached read, read_guard, workflow validate) | check 0 err / 385 pass |
 
+| 本轮 | P5.2 step 7 | 63a82e2 | execute_tool_with_retry() 53L; ToolOutput return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 8 | 6d023ec | post_tool_log_and_sanitize() 55L; (String, Option<ToolContext>) return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 9 | 86fd08c | offload_and_record() 64L; OffloadedResult return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 10 | 05dded9 | record_read_queries() 29L; no return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 11 | d565779 | snapshot_and_record_turn() 45L; no return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 12 | b67e22c | post_verify_and_hint() 42L; &mut result_content | check 0 err / 385 pass |
+| 本轮 | P5.2 step 13 | b45681b | post_success_updates() 138L; &mut deferred/tools_used | check 0 err / 385 pass |
+| 本轮 | P5.2 step 14 | 95dea36 | check_repeated_failure_handoff() 40L; bool return | check 0 err / 385 pass |
+| 本轮 | P5.2 step 15 | bfaaac9 | check_repeat_guard() 21L; bool return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 4 | b2710db | check_file_write_missing_path() 34L; bool return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 5 | acdb25d | lookup_tool_or_error() 29L; Option<&dyn Tool> return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 6 | f74b8a9 | parse_tool_args() 41L; Result<Value,()> return | check 0 err / 385 pass |
