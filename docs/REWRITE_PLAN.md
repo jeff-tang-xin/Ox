@@ -1,7 +1,7 @@
 ﻿# Ox 渐进式重写计划（Strangler Fig）
 
 > 单一进度源。每完成一小步就更新对应复选框与「变更记录」表。
-> 维护者：Ox agent + 项目负责人。最后更新：P5.2 step 1-2 完成（check_safety_gate + check_loop_and_truncation_guards 提取），0 warnings。
+> 维护者：Ox agent + 项目负责人。最后更新：P5.2 steps 1-3 完成（safety_gate + loop/trunc + workflow_validation 提取），0 warnings。
 
 ---
 
@@ -138,7 +138,7 @@
 **P5 拆分策略**：
 
 - [x] **P5.1** ✅ 提取 `TurnBudget` 结构体，收编 17 个局部变量 → 减少传参爆炸
-- [ ] **P5.2** 提取 execute_tool_batch() ~1350 lines (step 1: check_safety_gate 163L; step 2: check_loop_and_truncation_guards 118L)
+- [ ] **P5.2** extract execute_tool_batch() ~1068 lines (step1: safety_gate 163L; step2: loop/trunc 118L; step3: workflow_validation 72L)
 - [x] **P5.3** ✅ 提取 `collect_response()`（976-1183）+ `dispatch_llm()`（841-960）
 - [x] **P5.4** ✅ 提取 `evaluate_reflection()`（1500-1678）
 - [ ] **P5.5** 提取 `loop_head()` + `loop_tail()` + `post_edit_checks()`（✅ post_edit_checks 已提取；✅ loop_tail 部分完成：提取 `build_truncation_error()` + `build_arg_parse_error()` 消除两个大内联 error-msg 块）
@@ -168,6 +168,7 @@
 | 本轮 | P5.1 | 待提交 | TurnBudget 接入 run_agent_turn；6 个 loose locals（explore_streak/explore_reflected/total_explore/impl_streak/impl_reflected/content_only_streak）收编为 `budget` 结构体字段；evaluate_reflection 签名从 5 个 &mut 参数缩减为 1 个 &mut TurnBudget；ContextAssembler::assemble 调用点改用 budget.xxx；turn_state.rs 删未用 content_only_streak 字段 + 更新模块文档 | check 0 err·0 warn·385 passed / 0 failed |
 | 本轮 | P5.2 step 1 | b94070c | check_safety_gate() 163L; SafetyGateOutcome{Allow,Skip,TurnDone} | check 0 err / 385 pass |
 | 本轮 | P5.2 step 2 | 1e3533c | check_loop_and_truncation_guards() 118L; bool return; react_log recording | check 0 err / 385 pass |
+| 本轮 | P5.2 step 3 | 5a7adbb | check_workflow_validation() 72L; 3 skip paths (cached read, read_guard, workflow validate) | check 0 err / 385 pass |
 
 ---
 
