@@ -13,6 +13,7 @@
 
 pub mod business_gate;
 pub mod explore_reflect;
+#[allow(clippy::module_inception)]
 pub mod gate;
 pub mod gates;
 pub mod idle_narrative;

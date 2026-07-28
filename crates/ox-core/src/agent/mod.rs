@@ -3185,14 +3185,11 @@ fn post_success_updates(
             let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
             if let Some(engine_arc) = workflow_engine
                 && let Ok(engine) = engine_arc.try_lock()
-            {
-                if crate::agent::phase::get(&engine)
+                && (crate::agent::phase::get(&engine)
                     == crate::agent::phase::SingleFlowPhase::Review
-                {
-                    engine.record_explored_path(&tool_name, path);
-                } else if engine.is_task_step() && tool_name == "file_list" {
-                    engine.record_explored_path(&tool_name, path);
-                }
+                    || (engine.is_task_step() && tool_name == "file_list"))
+            {
+                engine.record_explored_path(&tool_name, path);
             }
         }
 

@@ -705,7 +705,7 @@ fn estimate_message_tokens(msg: &Message) -> usize {
 
 /// Deduplicate repeated file_read results — keep only the most recent read per file.
 /// Older reads of the same file are replaced with a compact summary.
-fn deduplicate_file_reads(messages: &mut Vec<Message>) {
+fn deduplicate_file_reads(messages: &mut [Message]) {
     use std::collections::HashMap;
 
     // Find all file_read tool_call IDs and their paths

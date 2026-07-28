@@ -1,7 +1,7 @@
-/// Shared content validation utilities for file write/patch operations.
-///
-/// This module provides consistent validation logic across all file modification tools
-/// to prevent garbled/corrupted text from being written.
+//! Shared content validation utilities for file write/patch operations.
+//!
+//! This module provides consistent validation logic across all file modification tools
+//! to prevent garbled/corrupted text from being written.
 
 /// Validate file content to prevent garbled/corrupted text from being written.
 ///
@@ -24,7 +24,7 @@
 /// assert!(validate_content("Hello World").is_ok());
 ///
 /// // Content with emoji (allowed)
-/// assert!(validate_content("Hello 😀 World").is_ok());
+/// assert!(validate_content("Hello 馃榾 World").is_ok());
 ///
 /// // Content with null bytes (rejected)
 /// assert!(validate_content("Hello\x00World").is_err());
@@ -34,10 +34,10 @@ pub fn validate_content(content: &str) -> Result<(), String> {
 
     // Check 1: Detect null bytes (definite corruption indicator)
     if content.contains('\x00') {
-        return Err("❌ Corrupted Content: File contains null bytes (\\x00)\n\n\
-                    💡 This indicates:\n\
-                    • Binary data mixed with text\n\
-                    • Severe encoding errors\n\n\
+        return Err("鉂?Corrupted Content: File contains null bytes (\\x00)\n\n\
+                    馃挕 This indicates:\n\
+                    鈥?Binary data mixed with text\n\
+                    鈥?Severe encoding errors\n\n\
                      Please verify and regenerate the content."
             .to_string());
     }
@@ -75,11 +75,11 @@ pub fn validate_content(content: &str) -> Result<(), String> {
         if ratio > 0.10 {
             // >10% non-printable
             return Err(format!(
-                "❌ Suspicious Content: {:.1}% control characters detected\n\n\
-                 💡 This suggests:\n\
-                 • Binary data mixed with text\n\
-                 • Severe encoding corruption\n\n\
-                 📝 Please verify content integrity.",
+                "鉂?Suspicious Content: {:.1}% control characters detected\n\n\
+                 馃挕 This suggests:\n\
+                 鈥?Binary data mixed with text\n\
+                 鈥?Severe encoding corruption\n\n\
+                 馃摑 Please verify content integrity.",
                 ratio * 100.0
             ));
         }
@@ -96,19 +96,19 @@ mod tests {
     #[test]
     fn test_valid_text() {
         assert!(validate_content("Hello World").is_ok());
-        assert!(validate_content("你好世界").is_ok());
-        assert!(validate_content("Mixed: Hello 世界 🌍").is_ok());
+        assert!(validate_content("浣犲ソ涓栫晫").is_ok());
+        assert!(validate_content("Mixed: Hello 涓栫晫 馃實").is_ok());
     }
 
     #[test]
     fn test_emoji_allowed() {
-        assert!(validate_content("Hello 😀 World 🚀").is_ok());
+        assert!(validate_content("Hello 馃榾 World 馃殌").is_ok());
     }
 
     #[test]
     fn test_special_unicode_allowed() {
-        assert!(validate_content("Math: ∑∫∞ ≈≠≤≥").is_ok());
-        assert!(validate_content("Arrows: →←↑↓").is_ok());
+        assert!(validate_content("Math: 鈭戔埆鈭?鈮堚墵鈮も墺").is_ok());
+        assert!(validate_content("Arrows: 鈫掆啇鈫戔啌").is_ok());
     }
 
     #[test]

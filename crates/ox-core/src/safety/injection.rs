@@ -1,29 +1,29 @@
-/// Prompt injection detection and prevention for LLM inputs.
-///
-/// Detects common prompt injection patterns in user input
-/// and untrusted tool results (web_fetch, file_read outputs),
-/// then flags or sanitizes them before they reach the LLM context.
-///
-/// # Architecture
-///
-/// This is a multi-layered defense:
-/// - **Detection** — regex-based pattern matching
-/// - **Sanitization** — replace injection content with placeholders
-/// - **Boundary enforcement** — partners with the system prompt to tell the
-///   LLM that tool outputs are DATA, not instructions
+//! Prompt injection detection and prevention for LLM inputs.
+//!
+//! Detects common prompt injection patterns in user input
+//! and untrusted tool results (web_fetch, file_read outputs),
+//! then flags or sanitizes them before they reach the LLM context.
+//!
+//! # Architecture
+//!
+//! This is a multi-layered defense:
+//! - **Detection** 鈥?regex-based pattern matching
+//! - **Sanitization** 鈥?replace injection content with placeholders
+//! - **Boundary enforcement** 鈥?partners with the system prompt to tell the
+//!   LLM that tool outputs are DATA, not instructions
 
 /// Categories of detected prompt injection patterns
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InjectionType {
-    /// "Ignore all previous instructions" — tries to override system prompt
+    /// "Ignore all previous instructions" 鈥?tries to override system prompt
     InstructionOverride,
-    /// "You are now..." — tries to change the AI's role/persona
+    /// "You are now..." 鈥?tries to change the AI's role/persona
     RoleSwitch,
-    /// "Print your system prompt" — attempts to extract the system prompt
+    /// "Print your system prompt" 鈥?attempts to extract the system prompt
     PromptExtraction,
-    /// "DAN", "jailbreak" — known jailbreak keywords
+    /// "DAN", "jailbreak" 鈥?known jailbreak keywords
     Jailbreak,
-    /// "Send this to [url]" — tries to exfiltrate data
+    /// "Send this to [url]" 鈥?tries to exfiltrate data
     DataExfiltration,
     /// Suspicious but not clearly classified
     Suspicious,
@@ -215,7 +215,7 @@ impl PromptInjectionDetector {
         let mut result_str = text.to_string();
         // Process matches in reverse order so earlier offsets stay valid
         let mut sorted = result.matches.clone();
-        sorted.sort_by(|a, b| b.offset.cmp(&a.offset));
+        sorted.sort_by_key(|m| std::cmp::Reverse(m.offset));
 
         for m in &sorted {
             let end = m.offset

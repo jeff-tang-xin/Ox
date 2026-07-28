@@ -393,7 +393,7 @@ pub fn gather_git_context(working_dir: &std::path::Path) -> Option<String> {
 
 pub fn gather_dir_context(working_dir: &std::path::Path) -> Option<String> {
     let mut result = String::new();
-    gather_dir_recursive(working_dir, working_dir, &mut result, 0, 1);
+        gather_dir_recursive(working_dir, &mut result, 0, 1);
     if result.is_empty() {
         None
     } else {
@@ -402,7 +402,6 @@ pub fn gather_dir_context(working_dir: &std::path::Path) -> Option<String> {
 }
 
 fn gather_dir_recursive(
-    base: &std::path::Path,
     dir: &std::path::Path,
     out: &mut String,
     depth: usize,
@@ -433,7 +432,7 @@ fn gather_dir_recursive(
             let indent = "  ".repeat(depth);
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 out.push_str(&format!("{}{}/\n", indent, name));
-                gather_dir_recursive(base, &entry.path(), out, depth + 1, max_depth);
+                gather_dir_recursive(&entry.path(), out, depth + 1, max_depth);
             } else if depth > 0 {
                 out.push_str(&format!("{}{}\n", indent, name));
             }

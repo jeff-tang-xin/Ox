@@ -154,7 +154,6 @@ impl Session {
         });
 
         // Auto-truncate old sessions (>7 days) to prevent unbounded disk growth
-        let mut messages = messages;
         if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&meta.created_at) {
             let age_days = (Utc::now().timestamp() - created.timestamp()) / 86400;
             if age_days > 7 && messages.len() > 500 {
@@ -378,7 +377,7 @@ impl Session {
                 // Try to read first line for meta info.
                 let file = File::open(e.path()).ok()?;
                 let reader = BufReader::new(file);
-                let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+                let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
 
                 if lines.is_empty() {
                     return None;

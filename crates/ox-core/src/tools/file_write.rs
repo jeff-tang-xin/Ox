@@ -47,6 +47,7 @@ impl Tool for FileWriteTool {
         SafetyLevel::RequiresConfirmation
     }
 
+    #[allow(clippy::manual_strip)]
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
         // ── Resolve path (path-only) ──
         let path_str = match args.get("path").and_then(|p| p.as_str()) {

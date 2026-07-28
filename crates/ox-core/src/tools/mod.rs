@@ -240,7 +240,7 @@ impl ToolRegistry {
         let mut skills = loader.load_enabled_skills()?;
         const MAX_SKILLS: usize = 10;
         if skills.len() > MAX_SKILLS {
-            skills.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            skills.sort_by_key(|s| std::cmp::Reverse(s.created_at));
             skills.truncate(MAX_SKILLS);
             tracing::info!("Capped skills at {} (oldest by mtime trimmed)", MAX_SKILLS);
         }

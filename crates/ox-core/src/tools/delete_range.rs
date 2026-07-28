@@ -105,13 +105,13 @@ impl Tool for DeleteRangeTool {
             let mut start_idx = None;
             for (i, line) in lines.iter().enumerate() {
                 if line == &start_anchor {
-                    if start_idx.is_some() {
+                    if let Some(prev) = start_idx {
                         return Err(format!(
                             "❌ start_anchor matches multiple lines in {}.\n\
                              Lines {} and {} both match:\n  {}\n\
                              💡 Add more text to make the anchor unique.",
                             display_path,
-                            start_idx.unwrap() + 1,
+                            prev + 1,
                             i + 1,
                             start_anchor
                         ));

@@ -1,4 +1,4 @@
-/// Manages satisfaction tracking for implicit feedback system.
+// Manages satisfaction tracking for implicit feedback system.
 
 /// Decision made by the rollback evaluation
 #[derive(Debug)]

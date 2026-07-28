@@ -1319,9 +1319,9 @@ fn apply_delegate_success_effects(
             .get("path")
             .and_then(|p| p.as_str())
             .unwrap_or(".");
-        if crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::Review {
-            engine.record_explored_path(inner_name, path);
-        } else if engine.is_task_step() && inner_name == "file_list" {
+        if crate::agent::phase::get(engine) == crate::agent::phase::SingleFlowPhase::Review
+            || (engine.is_task_step() && inner_name == "file_list")
+        {
             engine.record_explored_path(inner_name, path);
         }
     }
