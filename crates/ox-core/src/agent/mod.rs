@@ -789,62 +789,21 @@ pub async fn run_agent_turn(
         // exist in the context, causing the LLM to see no actual code content.
         // File contents must stay visible so the LLM can edit them.
 
-        // Sync turn memory from full message scan (survives compaction)
-        let include_writes = workflow_engine
-            .as_ref()
-            .and_then(|wf| wf.try_lock().ok())
-            .map(|e| e.is_task_step())
-            .unwrap_or(true);
-        turn_memory.sync_from_messages(&messages, include_writes);
-        if let Some(wf) = &workflow_engine
-            && let Ok(engine) = wf.try_lock()
-            && let Some(ti) = user_round::get_turn_user_input(&engine)
-        {
-            turn_memory.user_task = ti;
-        }
-
-        // Workflow: collapse repeated idle narration (keeps LLM context lean)
-        if workflow_engine
-            .as_ref()
-            .and_then(|wf| wf.try_lock().ok())
-            .is_some_and(|e| e.is_workflow_active())
-        {
-            crate::agent::gate::idle_narrative::collapse_redundant_idle(&mut messages);
-        }
-
-        // ── Unified context assembly ──
-        // Single entry point for building the LLM's full context window each turn.
-        let slim_in_impl_phase = workflow_engine
-            .as_ref()
-            .and_then(|wf| wf.try_lock().ok())
-            .map(|e| crate::agent::phase::is_implementation_phase(&e))
-            .unwrap_or(false);
-        crate::context::assembler::ContextAssembler::assemble(
+        // Prepare context for LLM call (extracted to prepare_llm_context)
+        prepare_llm_context(
             &mut messages,
-            user_task.as_deref().unwrap_or(""),
-            iteration,
-            &turn_memory,
+            &mut turn_memory,
             &workflow_engine,
+            iteration,
+            user_task.as_deref().unwrap_or(""),
             unified_tool_mode,
             &tool_ctx.memory_store,
-            &workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .map(|e| e.session_id().to_string())
-                .unwrap_or_default(),
             budget.explore_streak,
             budget.total_explore,
             budget.impl_streak,
-            slim_in_impl_phase,
         );
 
-        // 🚨 Sanitize tool pairs before EVERY LLM call within the agent turn.
-        // This prevents OpenAI API errors like "ToolResult references non-existent tool call"
-        // when a tool_call was skipped or only partially executed.
-        crate::context::sanitize_tool_pairs(&mut messages);
 
-        // Think/reasoning is display-only — strip before context assembly & LLM call.
-        crate::agent::think_stream::prepare_messages_for_llm(&mut messages);
 
         // Single-step model: always show assistant output to the user.
         let pre_llm_step_idx = workflow_engine
@@ -3966,6 +3925,78 @@ async fn record_react_tool(
         &reasoning_fallback,
         live_output,
     );
+}
+
+/// Prepare messages and turn memory for the next LLM call.
+///
+/// Syncs turn memory from message scan, collapses redundant idle narration,
+/// assembles context window, sanitizes tool pairs, and strips reasoning.
+/// Returns `slim_in_impl_phase` flag for downstream use.
+#[allow(clippy::too_many_arguments)]
+fn prepare_llm_context(
+    messages: &mut Vec<Message>,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    iteration: u32,
+    user_task: &str,
+    unified_tool_mode: bool,
+    memory_store: &Option<std::sync::Arc<crate::memory::store::MemoryStore>>,
+    explore_streak: u32,
+    total_explore: u32,
+    impl_streak: u32,
+) -> bool {
+    // Sync turn memory from full message scan (survives compaction)
+    let include_writes = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|e| e.is_task_step())
+        .unwrap_or(true);
+    turn_memory.sync_from_messages(messages, include_writes);
+    if let Some(wf) = workflow_engine
+        && let Ok(engine) = wf.try_lock()
+        && let Some(ti) = user_round::get_turn_user_input(&engine)
+    {
+        turn_memory.user_task = ti;
+    }
+
+    // Workflow: collapse repeated idle narration (keeps LLM context lean)
+    if workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .is_some_and(|e| e.is_workflow_active())
+    {
+        crate::agent::gate::idle_narrative::collapse_redundant_idle(messages);
+    }
+
+    // ── Unified context assembly ──
+    let slim_in_impl_phase = workflow_engine
+        .as_ref()
+        .and_then(|wf| wf.try_lock().ok())
+        .map(|e| crate::agent::phase::is_implementation_phase(&e))
+        .unwrap_or(false);
+    crate::context::assembler::ContextAssembler::assemble(
+        messages,
+        user_task,
+        iteration,
+        turn_memory,
+        workflow_engine,
+        unified_tool_mode,
+        memory_store,
+        &workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .map(|e| e.session_id().to_string())
+            .unwrap_or_default(),
+        explore_streak,
+        total_explore,
+        impl_streak,
+        slim_in_impl_phase,
+    );
+
+    crate::context::sanitize_tool_pairs(messages);
+    crate::agent::think_stream::prepare_messages_for_llm(messages);
+
+    slim_in_impl_phase
 }
 
 /// Record a legacy (non-unified) tool execution to the SQLite react_log.
