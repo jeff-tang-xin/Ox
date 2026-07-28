@@ -1707,144 +1707,16 @@ pub async fn run_agent_turn(
             new_messages.push(result_msg.clone());
             messages.push(result_msg);
 
-            // 📋 Status log: tell LLM what it just accomplished (critical for multi-step awareness)
-            if !result.is_error {
-                let tool_name = tc.name.clone();
-                let file_info = if matches!(tool_name.as_str(), "file_write" | "edit_file") {
-                    serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("path")
-                                .and_then(|p| p.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .map(|p| format!(" → {}", p))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let done_label = if matches!(
-                    tool_name.as_str(),
-                    "file_write" | "edit_file" | "delete_range"
-                ) {
-                    "工具执行成功（清单是否勾选见下方进度）"
-                } else {
-                    "已完成"
-                };
-                deferred_tool_system.push(format!(
-                    "📋 ✅ {tool_name}{file_info} — {done_label}",
-                    tool_name = tool_name,
-                    file_info = file_info,
-                    done_label = done_label
-                ));
-                tools_used_this_turn.insert(tool_name.clone());
-
-                // Track explored paths during Plan only (Execute may re-read files)
-                if matches!(tool_name.as_str(), "file_list" | "file_read")
-                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                {
-                    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-                    if let Some(ref engine_arc) = workflow_engine
-                        && let Ok(engine) = engine_arc.try_lock()
-                    {
-                        if crate::agent::phase::get(&engine)
-                            == crate::agent::phase::SingleFlowPhase::Review
-                        {
-                            engine.record_explored_path(&tool_name, path);
-                        } else if engine.is_task_step() && tool_name == "file_list" {
-                            engine.record_explored_path(&tool_name, path);
-                        }
-                    }
-                }
-
-                // Execute: update plan tracker for completing tools
-                if let Some(ref engine_arc) = workflow_engine
-                    && let Ok(engine) = engine_arc.try_lock()
-                {
-                    if engine.is_task_step() {
-                        if tool_name == "file_read"
-                            && crate::agent::phase::is_implementation_phase(&engine)
-                            && let Ok(args) =
-                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                            && let Some(path) = args.get("path").and_then(|p| p.as_str())
-                        {
-                            engine.record_impl_file_read(path, &tc.arguments);
-                            if let Some(nudge) =
-                                engine.impl_edit_nudge_after_read(path, &result_content)
-                            {
-                                deferred_tool_system.push(nudge);
-                            }
-                        }
-                        let (plan_changed, plan_hint) = engine.record_execute_tool_success(
-                            &tool_name,
-                            &tc.arguments,
-                            &result_content,
-                        );
-                        if let Some(hint) = plan_hint {
-                            deferred_tool_system.push(hint);
-                        }
-                        if plan_changed
-                            && let Some(msg) = engine.plan_progress_message_after_tool(&tool_name)
-                        {
-                            deferred_tool_system.push(msg);
-                        }
-                        if matches!(
-                            tool_name.as_str(),
-                            "edit_file" | "file_write" | "delete_range"
-                        ) && crate::agent::phase::is_implementation_phase(&engine)
-                            && let Ok(args) =
-                                serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                            && let Some(path) = args.get("path").and_then(|p| p.as_str())
-                        {
-                            engine.record_impl_file_edited(path);
-                            let idx = engine
-                                .get_plan_tracker()
-                                .and_then(|t| t.current_step().map(|s| s.index))
-                                .unwrap_or(1);
-                            if let Some(note) = crate::agent::verifier::after_edit_note(
-                                &engine,
-                                idx,
-                                path,
-                                &result_content,
-                            ) {
-                                deferred_tool_system.push(note);
-                            }
-                        }
-                    }
-                    if matches!(
-                        tool_name.as_str(),
-                        "file_write" | "edit_file" | "delete_range"
-                    ) && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                        && let Some(path) = args.get("path").and_then(|p| p.as_str())
-                        && let Some(verify) = engine.verify_hint_for_path(path)
-                    {
-                        deferred_tool_system.push(format!(
-                                            "📋 计划验证: `{verify}` — 请用 shell_exec 执行（需用户确认），验证通过后再继续下一项。"
-                                        ));
-                    }
-                }
-            }
-
-            // 📖 Verify-after-edit: prompt LLM to verify changes
-            if matches!(
-                tc.name.as_str(),
-                "edit_file" | "delete_range" | "file_write"
-            ) && !result.is_error
-            {
-                let is_skill = tc.arguments.contains(".ox/skills/");
-
-                let is_execute_step = workflow_engine
-                    .as_ref()
-                    .is_some_and(|wf| wf.try_lock().is_ok_and(|e| e.is_task_step()));
-
-                if is_execute_step && is_skill {
-                    deferred_tool_system.push(if unified_tool_mode {
-                        "✅ 文件已写入。若全部完成，调用 complete_and_check(action=finish, params={summary:\"...\"})。".to_string()
-                    } else {
-                        "✅ 文件已写入。如果所有需要的文件都已完成，输出 `## Done` 结束。".to_string()
-                    });
-                }
-            } // verify-after-edit
+            // Status log + plan tracker + verify-after-edit (extracted to post_success_updates)
+            post_success_updates(
+                tc,
+                &result,
+                &result_content,
+                &workflow_engine,
+                unified_tool_mode,
+                &mut deferred_tool_system,
+                &mut tools_used_this_turn,
+            );
         } // end for tc
 
         for note in deferred_tool_system {
@@ -3717,6 +3589,159 @@ fn post_verify_and_hint(
         };
         result_content.push_str(&hint);
     }
+}
+
+// ── Post-success status log + plan tracker extraction ─────────────────────────
+/// After a successful tool execution: push status log, update plan tracker,
+/// record explored paths, and add verify-after-edit prompts.
+/// All deferred system messages are pushed to `deferred_tool_system`.
+fn post_success_updates(
+    tc: &ToolCall,
+    result: &crate::tools::ToolOutput,
+    result_content: &str,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    unified_tool_mode: bool,
+    deferred_tool_system: &mut Vec<String>,
+    tools_used_this_turn: &mut std::collections::HashSet<String>,
+) {
+    // 📋 Status log: tell LLM what it just accomplished (critical for multi-step awareness)
+    if !result.is_error {
+        let tool_name = tc.name.clone();
+        let file_info = if matches!(tool_name.as_str(), "file_write" | "edit_file") {
+            serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                .ok()
+                .and_then(|v| {
+                    v.get("path")
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.to_string())
+                })
+                .map(|p| format!(" -> {}", p))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let done_label = if matches!(
+            tool_name.as_str(),
+            "file_write" | "edit_file" | "delete_range"
+        ) {
+            "工具执行成功（清单是否勾选见下方进度）"
+        } else {
+            "已完成"
+        };
+        deferred_tool_system.push(format!(
+            "📋 ✅ {tool_name}{file_info} - {done_label}",
+            tool_name = tool_name,
+            file_info = file_info,
+            done_label = done_label
+        ));
+        tools_used_this_turn.insert(tool_name.clone());
+
+        // Track explored paths during Plan only (Execute may re-read files)
+        if matches!(tool_name.as_str(), "file_list" | "file_read")
+            && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        {
+            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+            if let Some(engine_arc) = workflow_engine
+                && let Ok(engine) = engine_arc.try_lock()
+            {
+                if crate::agent::phase::get(&engine)
+                    == crate::agent::phase::SingleFlowPhase::Review
+                {
+                    engine.record_explored_path(&tool_name, path);
+                } else if engine.is_task_step() && tool_name == "file_list" {
+                    engine.record_explored_path(&tool_name, path);
+                }
+            }
+        }
+
+        // Execute: update plan tracker for completing tools
+        if let Some(engine_arc) = workflow_engine
+            && let Ok(engine) = engine_arc.try_lock()
+        {
+            if engine.is_task_step() {
+                if tool_name == "file_read"
+                    && crate::agent::phase::is_implementation_phase(&engine)
+                    && let Ok(args) =
+                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    && let Some(path) = args.get("path").and_then(|p| p.as_str())
+                {
+                    engine.record_impl_file_read(path, &tc.arguments);
+                    if let Some(nudge) =
+                        engine.impl_edit_nudge_after_read(path, result_content)
+                    {
+                        deferred_tool_system.push(nudge);
+                    }
+                }
+                let (plan_changed, plan_hint) = engine.record_execute_tool_success(
+                    &tool_name,
+                    &tc.arguments,
+                    result_content,
+                );
+                if let Some(hint) = plan_hint {
+                    deferred_tool_system.push(hint);
+                }
+                if plan_changed
+                    && let Some(msg) = engine.plan_progress_message_after_tool(&tool_name)
+                {
+                    deferred_tool_system.push(msg);
+                }
+                if matches!(
+                    tool_name.as_str(),
+                    "edit_file" | "file_write" | "delete_range"
+                ) && crate::agent::phase::is_implementation_phase(&engine)
+                    && let Ok(args) =
+                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    && let Some(path) = args.get("path").and_then(|p| p.as_str())
+                {
+                    engine.record_impl_file_edited(path);
+                    let idx = engine
+                        .get_plan_tracker()
+                        .and_then(|t| t.current_step().map(|s| s.index))
+                        .unwrap_or(1);
+                    if let Some(note) = crate::agent::verifier::after_edit_note(
+                        &engine,
+                        idx,
+                        path,
+                        result_content,
+                    ) {
+                        deferred_tool_system.push(note);
+                    }
+                }
+            }
+            if matches!(
+                tool_name.as_str(),
+                "file_write" | "edit_file" | "delete_range"
+            ) && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                && let Some(path) = args.get("path").and_then(|p| p.as_str())
+                && let Some(verify) = engine.verify_hint_for_path(path)
+            {
+                deferred_tool_system.push(format!(
+                                    "📋 计划验证: `{verify}` - 请用 shell_exec 执行（需用户确认），验证通过后再继续下一项。"
+                                ));
+            }
+        }
+    }
+
+    // 📖 Verify-after-edit: prompt LLM to verify changes
+    if matches!(
+        tc.name.as_str(),
+        "edit_file" | "delete_range" | "file_write"
+    ) && !result.is_error
+    {
+        let is_skill = tc.arguments.contains(".ox/skills/");
+
+        let is_execute_step = workflow_engine
+            .as_ref()
+            .is_some_and(|wf| wf.try_lock().is_ok_and(|e| e.is_task_step()));
+
+        if is_execute_step && is_skill {
+            deferred_tool_system.push(if unified_tool_mode {
+                "✅ 文件已写入。若全部完成，调用 complete_and_check(action=finish, params={summary:\"...\"})。".to_string()
+            } else {
+                "✅ 文件已写入。如果所有需要的文件都已完成，输出 `## Done` 结束。".to_string()
+            });
+        }
+    } // verify-after-edit
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
