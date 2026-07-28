@@ -1640,39 +1640,15 @@ pub async fn run_agent_turn(
                 }
             }
 
-            // ── Pre-execution validation for file_write tool ──
-            if tc.name == "file_write" {
-                let has_path = args.get("path").is_some();
-                let has_filename = args.get("filename").is_some();
-                let has_file_id = args.get("file_id").is_some();
-
-                if !has_path && !has_filename && !has_file_id {
-                    // Return error to LLM before executing
-                    let error_msg = "❌ CRITICAL ERROR: Missing 'path' parameter for file_write!\n\n\
-                                     💡 For NEW files, you MUST provide a COMPLETE path:\n\
-                                     • Include directory structure (e.g., 'src/utils/helper.rs')\n\
-                                     • NOT just filename (e.g., 'helper.rs' is WRONG)\n\n\
-                                     📝 Correct Examples:\n\
-                                     {\"path\": \"src/main.rs\", \"content\": \"...\"}\n\
-                                     {\"path\": \"docs/guide.md\", \"content\": \"...\"}\n\
-                                     {\"path\": \"tests/unit_test.rs\", \"content\": \"...\"}\n\n\
-                                     ❌ Wrong Example:\n\
-                                     {\"content\": \"...\"} ← NO PATH PROVIDED!\n\
-                                     {\"filename\": \"main.rs\"} ← Only works for EXISTING files!";
-
-                    let result_msg = Message::ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: error_msg.to_string(),
-                    };
-                    new_messages.push(result_msg.clone());
-                    messages.push(result_msg);
-                    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                        name: tc.name.clone(),
-                        output: error_msg.to_string(),
-                        is_error: true,
-                    });
-                    continue;
-                }
+            // file_write path validation (extracted to check_file_write_missing_path)
+            if check_file_write_missing_path(
+                tc,
+                &args,
+                &mut messages,
+                &mut new_messages,
+                &ui_tx,
+            ) {
+                continue;
             }
 
             // Send toolProgress event to indicate execution starting
@@ -3532,6 +3508,50 @@ async fn check_workflow_validation(
     }
 
     false
+}
+
+// ── file_write path validation extraction ─────────────────────────────────────
+/// Returns `true` if the tool call should be skipped (error already pushed).
+/// Checks that file_write has a path/filename/file_id parameter.
+fn check_file_write_missing_path(
+    tc: &ToolCall,
+    args: &serde_json::Value,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> bool {
+    if tc.name != "file_write" {
+        return false;
+    }
+    let has_path = args.get("path").is_some();
+    let has_filename = args.get("filename").is_some();
+    let has_file_id = args.get("file_id").is_some();
+    if has_path || has_filename || has_file_id {
+        return false;
+    }
+    let error_msg = "❌ CRITICAL ERROR: Missing 'path' parameter for file_write!\n\n\
+                     💡 For NEW files, you MUST provide a COMPLETE path:\n\
+                     • Include directory structure (e.g., 'src/utils/helper.rs')\n\
+                     • NOT just filename (e.g., 'helper.rs' is WRONG)\n\n\
+                     📝 Correct Examples:\n\
+                     {\"path\": \"src/main.rs\", \"content\": \"...\"}\n\
+                     {\"path\": \"docs/guide.md\", \"content\": \"...\"}\n\
+                     {\"path\": \"tests/unit_test.rs\", \"content\": \"...\"}\n\n\
+                     ❌ Wrong Example:\n\
+                     {\"content\": \"...\"} ← NO PATH PROVIDED!\n\
+                     {\"filename\": \"main.rs\"} ← Only works for EXISTING files!";
+    let result_msg = Message::ToolResult {
+        tool_call_id: tc.id.clone(),
+        content: error_msg.to_string(),
+    };
+    new_messages.push(result_msg.clone());
+    messages.push(result_msg);
+    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+        name: tc.name.clone(),
+        output: error_msg.to_string(),
+        is_error: true,
+    });
+    true
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
