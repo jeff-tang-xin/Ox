@@ -141,7 +141,7 @@
 - [x] **P5.2** COMPLETE: 24 extraction steps, ~1280 lines extracted from tool exec loop
 - [x] **P5.3** ✅ 提取 `collect_response()`（976-1183）+ `dispatch_llm()`（841-960）
 - [x] **P5.4** ✅ 提取 `evaluate_reflection()`（1500-1678）
-- [ ] **P5.5** 提取 `loop_head()` + `loop_tail()` + `post_edit_checks()`（✅ post_edit_checks 已提取；✅ loop_tail 部分完成：提取 `build_truncation_error()` + `build_arg_parse_error()` 消除两个大内联 error-msg 块）
+- [x] **P5.5** ✅ 提取 loop_head() + loop_tail() + post_edit_checks() + setup helpers (resolve_user_task, init_turn_memory, init_total_explore)
 - [x] **P5.6** ✅ 提取 `handle_idle()` + `capture_review_findings()` + `filter_tool_calls()`
 - [ ] **P5.7** `run_agent_turn` 从 3814 行降到数百行，主循环变成 `transition(state, event)` 调度
 - [ ] **P5.8** 全量回归
@@ -195,6 +195,7 @@
 | 本轮 | P5.2 step 22 | 98dc3a5 | check_reflection_skip() 33L; bool return | check 0 err / 385 pass |
 | 本轮 | P5.2 step 23 | d48b231 | drain_interjections_pre_llm() 39L; fn pointer | check 0 err / 385 pass |
 | 本轮 | P5.2 step 24 | acacb78 | drain_interjections_pre_tool() 20L; fn pointer | check 0 err / 385 pass |
+| 本轮 | P5.5 | 85842ef | resolve_user_task() 21L + init_turn_memory() 25L + init_total_explore() 17L; run_agent_turn 718->653L | check 0 err / 385 pass |
 | 风险 | 阶段 | 缓解 |
 |------|------|------|
 | 阈值迁移引入行为漂移 | P1/P4 | 迁移前逐一读取现值写入常量并注释来源 |
