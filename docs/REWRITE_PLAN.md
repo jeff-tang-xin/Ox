@@ -1,7 +1,7 @@
 ﻿# Ox 渐进式重写计划（Strangler Fig）
 
 > 单一进度源。每完成一小步就更新对应复选框与「变更记录」表。
-> 维护者：Ox agent + 项目负责人。最后更新：P5.2 steps 1-6 完成（safety_gate + loop/trunc + workflow_validation 提取），0 warnings。
+> Last update: P5 complete (P5.1-P5.8), run_agent_turn 3814->579 lines (-85%), 0 warnings.
 
 ---
 
@@ -23,7 +23,7 @@
 | **P2** | 统一门禁管线（前置拦截也走 `Gate` trait） | enforcer / read_guard / `validate_tool_call` 三处重叠 | ✅ 完成（P2a 双调修复 + P2b 删死代码） |
 | **P3** | 原生 function calling，删 `complete_and_check` 壳 | `unified_action` / `unified_handler` / `tool_args_repair` 大半 | 🔄 暂缓（依赖 P5 先拆开 god function 才好改） |
 | **P4** | 统一上下文预算账本 | `memory_offload` 散落魔数（85%/92%/冷却） | ⬜ 未开始 |
-| **P5** | 拆 `run_agent_turn` god function（3814 行） | mod.rs 巨型命令式循环 → 每状态一 handler | 🔄 进行中 |
+| **P5** | 拆 run_agent_turn god function | mod.rs -> handlers | Done (579L, -85%) |
 
 图例：⬜未开始 · 🔄进行中 · ✅完成 · ⏸️暂缓
 
