@@ -1246,54 +1246,14 @@ pub async fn run_agent_turn(
         }
 
         if tool_calls.is_empty() {
-            let visible = crate::agent::think_stream::visible_only(&full_text);
-            let reasoning = crate::agent::think_stream::visible_only(&reasoning_content);
-
-            // Record to react_log: LLM's plain-text output (thinking + text).
-            if let Some(ref ms) = tool_ctx.memory_store {
-                let (session_id, task_desc) = react_log_ids(&workflow_engine, user_task.as_deref().unwrap_or(""));
-                let assistant_text = if visible.trim().is_empty() {
-                    reasoning.clone()
-                } else {
-                    visible.clone()
-                };
-                let decision = if !reasoning.is_empty() {
-                    reasoning.chars().take(200).collect()
-                } else {
-                    "LLM 输出文本".to_string()
-                };
-                let _ = ms.record_react(
-                    &session_id,
-                    &task_desc,
-                    "(llm_text)",
-                    "",
-                    "ok",
-                    &decision,
-                    &assistant_text,
-                    &reasoning_content,
-                    "LLM 纯文本输出，本轮结束",
-                );
+            if handle_empty_tool_calls(
+                &full_text, &reasoning_content, &tool_ctx,
+                &workflow_engine, user_task.as_deref(),
+                &mut messages, &mut new_messages, &turn_memory,
+                &ui_tx, turn_id, total_usage.clone(),
+            ).await {
+                return;
             }
-
-            let msg_content = if visible.trim().is_empty() {
-                reasoning_content.clone()
-            } else {
-                visible.clone()
-            };
-            let msg = Message::Assistant {
-                content: msg_content.clone(),
-                tool_calls: Vec::new(),
-                reasoning_content: Some(reasoning_content.clone()),
-            };
-            new_messages.push(msg.clone());
-            messages.push(msg);
-
-            let _ = ui_tx.send(AgentToUiEvent::Status(
-                "✅ LLM 输出完成，本轮结束".to_string(),
-            ));
-            persist_turn_memory(&workflow_engine, &turn_memory);
-            emit_turn_done(&ui_tx, turn_id, new_messages, total_usage);
-            return;
         }
 
         // Classify tool calls: detect truncated arguments and infinite loops.
@@ -1319,33 +1279,8 @@ pub async fn run_agent_turn(
             &crate::agent::think_stream::visible_only(&full_text),
         );
 
-        // Persist a digest of this turn's reasoning alongside the action. glm-style
-        // models put nearly all their analysis inside <think> and emit only a
-        // tool_call as visible output; dropping the reasoning every turn means the
-        // model can't see WHY it did what it did last turn, driving re-exploration.
-        // We fold a short head+tail digest into the content so it survives into the
-        // next turn's context (and the message history) without bloating tokens.
-        let reasoning_digest_for_action = {
-            let r = crate::agent::think_stream::visible_only(&reasoning_content);
-            let r = if r.is_empty() {
-                reasoning_content.trim().to_string()
-            } else {
-                r
-            };
-            if r.is_empty() {
-                String::new()
-            } else {
-                digest_reasoning(&r, 320)
-            }
-        };
-        let content_with_reasoning = if reasoning_digest_for_action.is_empty() {
-            display
-        } else if display.trim().is_empty() {
-            format!("(本轮思考) {reasoning_digest_for_action}")
-        } else {
-            format!("{display}\n(本轮思考) {reasoning_digest_for_action}")
-        };
-
+        // Fold reasoning digest into content so it survives into next turn.
+        let content_with_reasoning = build_content_with_reasoning(&display, &reasoning_content);
         // 🪞 Reflect-FIRST guard (fires BEFORE this turn's tools execute).
         //
         // Two separate loops we catch here:
@@ -3798,6 +3733,101 @@ async fn run_memory_offload(
             engine.set_variable(crate::memory::memory_offload::MEMORY_GRAPH_VAR, block);
         }
     }
+}
+
+/// Build a content string that folds a short reasoning digest into the
+/// visible display text. GLM-style models put nearly all their analysis inside
+/// `<think>` and emit only a tool_call as visible output; dropping the reasoning
+/// every turn means the model can't see WHY it did what it did last turn,
+/// driving re-exploration. We fold a short head+tail digest into the content
+/// so it survives into the next turn's context without bloating tokens.
+fn build_content_with_reasoning(display: &str, reasoning_content: &str) -> String {
+    let reasoning_digest = {
+        let r = crate::agent::think_stream::visible_only(reasoning_content);
+        let r = if r.is_empty() {
+            reasoning_content.trim().to_string()
+        } else {
+            r
+        };
+        if r.is_empty() {
+            String::new()
+        } else {
+            digest_reasoning(&r, 320)
+        }
+    };
+    if reasoning_digest.is_empty() {
+        display.to_string()
+    } else if display.trim().is_empty() {
+        format!("(本轮思考) {reasoning_digest}")
+    } else {
+        format!("{display}\n(本轮思考) {reasoning_digest}")
+    }
+}
+
+/// Handle the case where the LLM produced only text (no tool calls).
+/// Records to react_log, pushes assistant message, emits turn done.
+/// Always returns `true` so the caller knows to `return`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_empty_tool_calls(
+    full_text: &str,
+    reasoning_content: &str,
+    tool_ctx: &ToolContext,
+    workflow_engine: &Option<std::sync::Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    user_task: Option<&str>,
+    messages: &mut Vec<Message>,
+    new_messages: &mut Vec<Message>,
+    turn_memory: &crate::memory::turn_memory::TurnMemory,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    turn_id: u64,
+    total_usage: TokenUsage,
+) -> bool {
+    let visible = crate::agent::think_stream::visible_only(full_text);
+    let reasoning = crate::agent::think_stream::visible_only(reasoning_content);
+
+    if let Some(ref ms) = tool_ctx.memory_store {
+        let (session_id, task_desc) = react_log_ids(workflow_engine, user_task.unwrap_or(""));
+        let assistant_text = if visible.trim().is_empty() {
+            reasoning.clone()
+        } else {
+            visible.clone()
+        };
+        let decision = if !reasoning.is_empty() {
+            reasoning.chars().take(200).collect()
+        } else {
+            "LLM 输出文本".to_string()
+        };
+        let _ = ms.record_react(
+            &session_id,
+            &task_desc,
+            "(llm_text)",
+            "",
+            "ok",
+            &decision,
+            &assistant_text,
+            reasoning_content,
+            "LLM 纯文本输出，本轮结束",
+        );
+    }
+
+    let msg_content = if visible.trim().is_empty() {
+        reasoning_content.to_string()
+    } else {
+        visible.clone()
+    };
+    let msg = Message::Assistant {
+        content: msg_content,
+        tool_calls: Vec::new(),
+        reasoning_content: Some(reasoning_content.to_string()),
+    };
+    new_messages.push(msg.clone());
+    messages.push(msg);
+
+    let _ = ui_tx.send(AgentToUiEvent::Status(
+        "✅ LLM 输出完成，本轮结束".to_string(),
+    ));
+    persist_turn_memory(workflow_engine, turn_memory);
+    emit_turn_done(ui_tx, turn_id, std::mem::take(new_messages), total_usage);
+    true
 }
 
 #[cfg(test)]
