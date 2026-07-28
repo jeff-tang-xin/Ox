@@ -1691,48 +1691,14 @@ pub async fn run_agent_turn(
                 &mut turn_memory,
             );
 
-            if tc.name == "shell_exec"
-                && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                && let Some(cmd) = args.get("command").and_then(|c| c.as_str())
-            {
-                let succeeded = post_edit_verification::shell_result_success(&sanitized_content);
-                if let Some(ref engine_arc) = workflow_engine
-                    && let Ok(engine) = engine_arc.try_lock()
-                {
-                    post_edit_verification::note_shell_verify_result(&engine, cmd, succeeded);
-                    if succeeded
-                        && let Some(idx) = engine.get_plan_tracker().and_then(|t| {
-                            t.steps
-                                .iter()
-                                .find(|s| !s.verify.is_empty() && s.awaiting_verify)
-                                .map(|s| s.index)
-                        })
-                    {
-                        crate::agent::verifier::after_verify_pass(&engine, idx);
-                    }
-                }
-            }
-
-            if result.is_error
-                && tc.name == "edit_file"
-                && let Some(ref engine_arc) = workflow_engine
-                && let Ok(engine) = engine_arc.try_lock()
-                && crate::agent::phase::is_implementation_phase(&engine)
-                && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                && let Some(path) = args.get("path").and_then(|p| p.as_str())
-            {
-                let hint = if engine.impl_file_already_read(path) {
-                    "\n\n💡 **edit 恢复：** old_string 须与上条 file_read 内容**逐字一致**（含空格/缩进）。\
-                                         缩小到 3–8 行唯一片段重试；先 file_read 该文件再编辑。"
-                                            .to_string()
-                } else {
-                    format!(
-                        "\n\n💡 **edit 恢复：** 先 `file_read` `{path}`（实施每文件 1 次），\
-                                             从返回内容复制 old_string，再 edit_file。"
-                    )
-                };
-                result_content.push_str(&hint);
-            }
+            // Verify shell result + edit_file error hint (extracted to post_verify_and_hint)
+            post_verify_and_hint(
+                tc,
+                &result,
+                &sanitized_content,
+                &workflow_engine,
+                &mut result_content,
+            );
 
             let result_msg = Message::ToolResult {
                 tool_call_id: tc.id.clone(),
@@ -3697,6 +3663,60 @@ fn snapshot_and_record_turn(
         tc.name, target, observation
     ));
     persist_turn_memory(workflow_engine, turn_memory);
+}
+
+// ── Post-verify + edit hint extraction ─────────────────────────────────────────
+/// After tool execution: check shell_exec verify results, and if edit_file
+/// failed, append a recovery hint to `result_content`.
+fn post_verify_and_hint(
+    tc: &ToolCall,
+    result: &crate::tools::ToolOutput,
+    sanitized_content: &str,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    result_content: &mut String,
+) {
+    if tc.name == "shell_exec"
+        && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        && let Some(cmd) = args.get("command").and_then(|c| c.as_str())
+    {
+        let succeeded = post_edit_verification::shell_result_success(sanitized_content);
+        if let Some(engine_arc) = workflow_engine
+            && let Ok(engine) = engine_arc.try_lock()
+        {
+            post_edit_verification::note_shell_verify_result(&engine, cmd, succeeded);
+            if succeeded
+                && let Some(idx) = engine.get_plan_tracker().and_then(|t| {
+                    t.steps
+                        .iter()
+                        .find(|s| !s.verify.is_empty() && s.awaiting_verify)
+                        .map(|s| s.index)
+                })
+            {
+                crate::agent::verifier::after_verify_pass(&engine, idx);
+            }
+        }
+    }
+
+    if result.is_error
+        && tc.name == "edit_file"
+        && let Some(engine_arc) = workflow_engine
+        && let Ok(engine) = engine_arc.try_lock()
+        && crate::agent::phase::is_implementation_phase(&engine)
+        && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+        && let Some(path) = args.get("path").and_then(|p| p.as_str())
+    {
+        let hint = if engine.impl_file_already_read(path) {
+            "\n\n💡 **edit 恢复：** old_string 须与上条 file_read 内容**逐字一致**（含空格/缩进）。\
+                                 缩小到 3–8 行唯一片段重试；先 file_read 该文件再编辑。"
+                                    .to_string()
+        } else {
+            format!(
+                "\n\n💡 **edit 恢复：** 先 `file_read` `{path}`（实施每文件 1 次），\
+                                     从返回内容复制 old_string，再 edit_file。"
+            )
+        };
+        result_content.push_str(&hint);
+    }
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
