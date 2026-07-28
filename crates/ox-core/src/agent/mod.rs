@@ -1622,70 +1622,16 @@ pub async fn run_agent_turn(
                 tool_ctx = Arc::new(ctx);
             }
 
-            // ── Context Offloading: only offload shell_exec (build logs can be huge) ──
-            // file_read results are essential context — never offload
-            let offload_threshold: usize = if tc.name == "shell_exec" {
-                4000
-            } else {
-                usize::MAX // Never offload non-shell_exec results
-            };
-            let offloaded = offloader.process_result(
-                &tc.name,
-                &tc.arguments,
+            // Offload + notify + record decision (extracted to offload_and_record)
+            let offloaded = offload_and_record(
+                tc,
+                &result,
                 &sanitized_content,
                 iteration as usize,
-                offload_threshold,
+                &mut offloader,
+                &mut turn_memory,
+                &ui_tx,
             );
-
-            // Send notification about offloading
-            if offloaded.is_offloaded {
-                let path_display = offloaded
-                    .ref_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                let _ = ui_tx.send(AgentToUiEvent::Status(format!(
-                    "📄 Result offloaded to: {path_display}",
-                )));
-            }
-
-            let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                name: tc.name.clone(),
-                output: offloaded.to_context_message(),
-                is_error: result.is_error,
-            });
-
-            // Record decision BEFORE react_log (so react_log reflects current tool, not previous)
-            {
-                let dec_target_json: Option<serde_json::Value> =
-                    serde_json::from_str(&tc.arguments).ok();
-                let dec_target: String = dec_target_json
-                    .as_ref()
-                    .and_then(|v| {
-                        v.get("params")
-                            .or_else(|| v.get("path"))
-                            .or_else(|| v.get("name"))
-                    })
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                let observation: String =
-                    crate::agent::exploration_snapshot::extract_data_content(&result.content)
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .take(3)
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                        .chars()
-                        .take(260)
-                        .collect();
-                let status = if result.is_error { "失败" } else { "成功" };
-                turn_memory.record_decision(format!(
-                    "你刚才执行 {}({}) {status}; 观察到: {}; 后续避免重复同一查询",
-                    tc.name, dec_target, observation
-                ));
-            }
 
             // Record to SQLite react_log for cross-round memory
             if let Some(ref ms) = tool_ctx.memory_store {
@@ -3639,6 +3585,86 @@ fn post_tool_log_and_sanitize(
     };
 
     (sanitized_content, new_ctx)
+}
+
+// ── Context offloading + decision recording extraction ────────────────────────
+/// Offload large tool results, send UI notifications, and record the
+/// decision to turn memory. Returns the `OffloadedResult`.
+fn offload_and_record(
+    tc: &ToolCall,
+    result: &crate::tools::ToolOutput,
+    sanitized_content: &str,
+    step_index: usize,
+    offloader: &mut crate::context::context_offloader::ContextOffloader,
+    turn_memory: &mut crate::memory::turn_memory::TurnMemory,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+) -> crate::context::context_offloader::OffloadedResult {
+    // ── Context Offloading: only offload shell_exec (build logs can be huge) ──
+    // file_read results are essential context - never offload
+    let offload_threshold: usize = if tc.name == "shell_exec" {
+        4000
+    } else {
+        usize::MAX // Never offload non-shell_exec results
+    };
+    let offloaded = offloader.process_result(
+        &tc.name,
+        &tc.arguments,
+        sanitized_content,
+        step_index,
+        offload_threshold,
+    );
+
+    // Send notification about offloading
+    if offloaded.is_offloaded {
+        let path_display = offloaded
+            .ref_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let _ = ui_tx.send(AgentToUiEvent::Status(format!(
+            "📄 Result offloaded to: {path_display}",
+        )));
+    }
+
+    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+        name: tc.name.clone(),
+        output: offloaded.to_context_message(),
+        is_error: result.is_error,
+    });
+
+    // Record decision BEFORE react_log (so react_log reflects current tool, not previous)
+    {
+        let dec_target_json: Option<serde_json::Value> =
+            serde_json::from_str(&tc.arguments).ok();
+        let dec_target: String = dec_target_json
+            .as_ref()
+            .and_then(|v| {
+                v.get("params")
+                    .or_else(|| v.get("path"))
+                    .or_else(|| v.get("name"))
+            })
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let observation: String =
+            crate::agent::exploration_snapshot::extract_data_content(&result.content)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ")
+                .chars()
+                .take(260)
+                .collect();
+        let status = if result.is_error { "失败" } else { "成功" };
+        turn_memory.record_decision(format!(
+            "你刚才执行 {}({}) {status}; 观察到: {}; 后续避免重复同一查询",
+            tc.name, dec_target, observation
+        ));
+    }
+
+    offloaded
 }
 
 // ── ReAct log helpers ──────────────────────────────────────────────────────
