@@ -1,4 +1,4 @@
-pub mod auto_reflect; // 🆕 Auto-reflection for skill generation
+﻿pub mod auto_reflect; // 🆕 Auto-reflection for skill generation
 pub mod collaboration;
 pub mod completion; // Machine-verifiable completion receipt
 pub mod engine;
@@ -1198,96 +1198,10 @@ pub async fn run_agent_turn(
         }
 
         // ── Unified budget offload ──
-        // When the API's real prompt-token count crosses the adaptive threshold,
-        // cluster the un-archived ReAct log into memory-graph nodes, persist
-        // them, and placeholder the old ReAct messages (one action = archive +
-        // compaction). Runs here, after the stream fully ends, so `messages`
-        // isn't borrowed mid-loop.
-        if last_prompt_tokens > 0
-            && let Some(ref ms) = tool_ctx.memory_store
-        {
-            let session_id = workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .map(|e| e.session_id())
-                .unwrap_or_else(|| "default".to_string());
-            let fail_streak = workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .and_then(|e| e.get_variable(crate::memory::memory_offload::OFFLOAD_FAIL_VAR))
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
-            let cooldown = workflow_engine
-                .as_ref()
-                .and_then(|wf| wf.try_lock().ok())
-                .and_then(|e| e.get_variable(crate::memory::memory_offload::OFFLOAD_COOLDOWN_VAR))
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
-            let gitnexus_available = if let Some(svc) = tool_ctx.gitnexus.as_ref() {
-                svc.is_ready().await
-            } else {
-                false
-            };
-            let context_window = active_provider.context_window_size();
-            let summarizer = tool_ctx.summarizer.clone();
-            let ui_tx_offload = ui_tx.clone();
-            let (outcome, new_streak, new_cooldown) = crate::memory::memory_offload::offload_if_over_budget(
-                last_prompt_tokens,
-                context_window,
-                &mut messages,
-                summarizer,
-                &active_provider,
-                ms,
-                &session_id,
-                fail_streak,
-                cooldown,
-                gitnexus_available,
-                |s| {
-                    let _ = ui_tx_offload.send(AgentToUiEvent::Status(s));
-                },
-            )
-            .await;
-            if let Some(wf) = &workflow_engine
-                && let Ok(engine) = wf.try_lock()
-            {
-                engine.set_variable(crate::memory::memory_offload::OFFLOAD_FAIL_VAR, new_streak.to_string());
-                engine.set_variable(crate::memory::memory_offload::OFFLOAD_COOLDOWN_VAR, new_cooldown.to_string());
-                // Refresh the top-of-context graph block after any archival.
-                if matches!(outcome, crate::memory::memory_offload::OffloadOutcome::Archived { .. }) {
-                    let block = crate::memory::memory_offload::build_memory_graph_block(ms, &session_id);
-                    engine.set_variable(crate::memory::memory_offload::MEMORY_GRAPH_VAR, block);
-                }
-            }
-        }
+        run_memory_offload(last_prompt_tokens, &mut messages, &workflow_engine, &tool_ctx, &ui_tx, &active_provider).await;
 
-        // Repair malformed / empty tool arguments (GLM empty JSON, XML <tool_call> hallucinations).
-        // If arguments are XML, return error immediately — don't silently repair.
-        let fallback_blob = format!("{full_text}\n{reasoning_content}");
-        let fallbacks = [fallback_blob.as_str()];
-        for tc in &mut tool_calls {
-            // XML-style args (`<tool_call>` / `<arg_key>`) are auto-repaired to JSON
-            // inside `recover_tool_call_arguments`. Repair is reliable, so we do it
-            // silently — no scolding, no extra system noise for the model.
-            tc.arguments = crate::agent::tool_args_repair::recover_tool_call_arguments(
-                &tc.name,
-                &tc.arguments,
-                &fallbacks,
-            );
-        }
-
-        // 🚨 GLM models output `<tool_call>` XML as text CONTENT instead of
-        // using the OpenAI function-calling protocol. The SSE parser sees these
-        // as regular text, so tool_calls stays empty. Extract them from the text.
-        if tool_calls.is_empty() {
-            let extracted = crate::agent::tool_args_repair::extract_xml_tool_calls(&full_text);
-            if !extracted.is_empty() {
-                tracing::info!(
-                    "[XML_EXTRACT] Extracted {} tool call(s) from <tool_call> XML in text content",
-                    extracted.len()
-                );
-                tool_calls = extracted;
-            }
-        }
+        // Repair malformed / empty tool arguments (GLM empty JSON, XML hallucinations).
+        repair_and_extract_tool_calls(&mut tool_calls, &full_text, &reasoning_content);
 
         if !unified_tool_mode && try_capture_review_findings(&workflow_engine, &full_text, &ui_tx) {
             let visible = crate::agent::think_stream::visible_only(&full_text);
@@ -3781,6 +3695,109 @@ async fn record_react_tool(
         &reasoning_fallback,
         live_output,
     );
+}
+
+/// Repair malformed / empty tool-call arguments and extract XML-style tool
+/// calls from text content (GLM models emit `<tool_call>` XML as text instead of
+/// using the OpenAI function-calling protocol).
+fn repair_and_extract_tool_calls(tool_calls: &mut Vec<ToolCall>,
+                                full_text: &str,
+                                reasoning_content: &str)
+{
+    let fallback_blob = format!("{full_text}\n{reasoning_content}");
+    let fallbacks = [fallback_blob.as_str()];
+    for tc in tool_calls.iter_mut() {
+        tc.arguments = crate::agent::tool_args_repair::recover_tool_call_arguments(
+            &tc.name,
+            &tc.arguments,
+            &fallbacks,
+        );
+    }
+
+    if tool_calls.is_empty() {
+        let extracted = crate::agent::tool_args_repair::extract_xml_tool_calls(full_text);
+        if !extracted.is_empty() {
+            tracing::info!(
+                "[XML_EXTRACT] Extracted {} tool call(s) from <tool_call> XML in text content",
+                extracted.len()
+            );
+            *tool_calls = extracted;
+        }
+    }
+}
+
+/// Run the unified budget offload check. When the API's real prompt-token count
+/// crosses the adaptive threshold, cluster the un-archived ReAct log into
+/// memory-graph nodes, persist them, and placeholder the old ReAct messages.
+#[allow(clippy::too_many_arguments)]
+async fn run_memory_offload(
+    last_prompt_tokens: u32,
+    messages: &mut Vec<Message>,
+    workflow_engine: &Option<std::sync::Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    tool_ctx: &ToolContext,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    active_provider: &Arc<dyn LlmProvider>,
+) {
+    if last_prompt_tokens == 0 {
+        return;
+    }
+    let Some(ref ms) = tool_ctx.memory_store else {
+        return;
+    };
+    let (session_id, fail_streak, cooldown) = {
+        let session_id = workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .map(|e| e.session_id())
+            .unwrap_or_else(|| "default".to_string());
+        let fail_streak = workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .and_then(|e| e.get_variable(crate::memory::memory_offload::OFFLOAD_FAIL_VAR))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let cooldown = workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .and_then(|e| e.get_variable(crate::memory::memory_offload::OFFLOAD_COOLDOWN_VAR))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        (session_id, fail_streak, cooldown)
+    };
+    let gitnexus_available = if let Some(svc) = tool_ctx.gitnexus.as_ref() {
+        svc.is_ready().await
+    } else {
+        false
+    };
+    let context_window = active_provider.context_window_size();
+    let summarizer = tool_ctx.summarizer.clone();
+    let ui_tx_offload = ui_tx.clone();
+    let (outcome, new_streak, new_cooldown) = crate::memory::memory_offload::offload_if_over_budget(
+        last_prompt_tokens,
+        context_window,
+        messages,
+        summarizer,
+        active_provider,
+        ms,
+        &session_id,
+        fail_streak,
+        cooldown,
+        gitnexus_available,
+        |s| {
+            let _ = ui_tx_offload.send(AgentToUiEvent::Status(s));
+        },
+    )
+    .await;
+    if let Some(wf) = workflow_engine
+        && let Ok(engine) = wf.try_lock()
+    {
+        engine.set_variable(crate::memory::memory_offload::OFFLOAD_FAIL_VAR, new_streak.to_string());
+        engine.set_variable(crate::memory::memory_offload::OFFLOAD_COOLDOWN_VAR, new_cooldown.to_string());
+        if matches!(outcome, crate::memory::memory_offload::OffloadOutcome::Archived { .. }) {
+            let block = crate::memory::memory_offload::build_memory_graph_block(ms, &session_id);
+            engine.set_variable(crate::memory::memory_offload::MEMORY_GRAPH_VAR, block);
+        }
+    }
 }
 
 #[cfg(test)]
