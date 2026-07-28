@@ -1130,27 +1130,14 @@ pub async fn run_agent_turn(
                 Ok(v) => v,
                 Err(()) => continue,
             };
-
             // Check for queued interjections before tool execution.
-            while let Ok(ev) = ui_rx.try_recv() {
-                match ev {
-                    ui_event::UiToAgentEvent::Interjection(text) => {
-                        push_interjection_message(&workflow_engine, &mut messages, &text, &ui_tx);
-                    }
-                    ui_event::UiToAgentEvent::ScopeConfirmed
-                    | ui_event::UiToAgentEvent::BusinessAck { .. } => {
-                        if let Some(wf) = &workflow_engine
-                            && let Ok(engine) = wf.try_lock()
-                        {
-                            engine.set_variable(
-                                crate::agent::gate::business_gate::PRE_ACK_KEY,
-                                "1".to_string(),
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            drain_interjections_pre_tool(
+                &mut ui_rx,
+                &workflow_engine,
+                &mut messages,
+                &ui_tx,
+                push_interjection_message,
+            );
 
             // file_write path validation (extracted to check_file_write_missing_path)
             if check_file_write_missing_path(
@@ -3832,6 +3819,44 @@ async fn record_react_tool(
         &reasoning_fallback,
         live_output,
     );
+}
+
+/// Drain queued interjections before each tool execution (simpler variant).
+///
+/// Unlike `drain_interjections_pre_llm`, this does not check for confirmation
+/// messages -- it simply forwards interjection text and handles pre-ack for
+/// ScopeConfirmed / BusinessAck events.
+fn drain_interjections_pre_tool(
+    ui_rx: &mut mpsc::UnboundedReceiver<ui_event::UiToAgentEvent>,
+    workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    messages: &mut Vec<Message>,
+    ui_tx: &mpsc::UnboundedSender<AgentToUiEvent>,
+    push_interjection_message: fn(
+        &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+        &mut Vec<Message>,
+        &str,
+        &mpsc::UnboundedSender<AgentToUiEvent>,
+    ),
+) {
+    while let Ok(ev) = ui_rx.try_recv() {
+        match ev {
+            ui_event::UiToAgentEvent::Interjection(text) => {
+                push_interjection_message(workflow_engine, messages, &text, ui_tx);
+            }
+            ui_event::UiToAgentEvent::ScopeConfirmed
+            | ui_event::UiToAgentEvent::BusinessAck { .. } => {
+                if let Some(wf) = workflow_engine
+                    && let Ok(engine) = wf.try_lock()
+                {
+                    engine.set_variable(
+                        crate::agent::gate::business_gate::PRE_ACK_KEY,
+                        "1".to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Drain queued interjections before the LLM call.
