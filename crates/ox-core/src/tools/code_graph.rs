@@ -44,14 +44,7 @@ impl Tool for CodeGraphTool {
     }
 
     fn description(&self) -> &str {
-        "查询代码知识图谱(GitNexus)。改代码前用它建立关系模型与影响面。\
-         先用 list_repos 看有哪些仓库，再选正确仓库查关系。\
-         params.op 选择能力，其余字段按该 op 透传：\n\
-         • query{query} 概念→执行流(调用链)  • context{name|uid} 单符号360°(谁调谁/读写)\n\
-         • impact{target,direction:upstream|downstream} 改动爆炸半径  • detect_changes{} 未提交改动影响\n\
-         • api_impact{route|file} 路由改动报告  • route_map/tool_map/shape_check API面貌\n\
-         • cypher{query} 原生图查询  • rename{symbol_name,new_name}(默认dry_run预览)\n\
-         • list_repos{} / group_list{} / group_sync{name}"
+        "Query the code knowledge graph (GitNexus). Use it before modifying code to understand relationships and blast radius. Pick an 'op' then pass that op's native params - everything except op is forwarded. Ops: query (call chains), context (symbol 360), impact (change blast radius), detect_changes, api_impact, route_map, tool_map, shape_check, cypher, rename (dry-run preview), list_repos, group_list, group_sync."
     }
 
     fn parameters_schema(&self) -> Value {

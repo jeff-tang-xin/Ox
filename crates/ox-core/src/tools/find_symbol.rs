@@ -16,14 +16,7 @@ impl Tool for FindSymbolTool {
     }
 
     fn description(&self) -> &str {
-        "定位符号位置(functions, classes, structs) by name. \
-         Tree-sitter exact/substring match first, then semantic vector fallback (up to ~20 hits). \
-         When code graph is ready, results include caller/callee for the top match. \
-         \n\
-         **用途**: 快速定位单个符号的定义位置。\
-         **不适合**: 分析执行流程、调用链、主流程 → 用 code_graph op=query。\
-         \n\
-         Not a full-text search — use code_search for text in file contents."
+        "Locate symbol definitions (functions, structs, classes, etc.) by name. Returns file path + line number. When code graph is ready, results include caller/callee for the top match. Use 'name' or 'pattern' (both work). Not a full-text search - use code_search for text in file contents."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -32,7 +25,11 @@ impl Tool for FindSymbolTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Symbol name to search for. Exact/substring tree-sitter match first, then semantic search."
+                    "description": "Symbol name to search for."
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Alias for 'name'. Use either 'name' or 'pattern'."
                 },
                 "top_k": {
                     "type": "integer",
@@ -48,9 +45,11 @@ impl Tool for FindSymbolTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
-        let name = match args.get("name").and_then(|n| n.as_str()) {
+        let name = match args.get("name").and_then(|n| n.as_str())
+            .or_else(|| args.get("pattern").and_then(|p| p.as_str()))
+        {
             Some(n) if !n.is_empty() => n,
-            _ => return ToolOutput::error("❌ Missing required parameter: 'name'."),
+            _ => return ToolOutput::error("Missing required parameter: 'name' or 'pattern'."),
         };
         let top_k = args
             .get("top_k")

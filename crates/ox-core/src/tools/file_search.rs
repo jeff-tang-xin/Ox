@@ -20,7 +20,7 @@ impl Tool for FileSearchTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "✅ REQUIRED: Glob pattern (e.g., '*.rs', 'Cargo.*')"
+                    "description": "Glob pattern (e.g., '*.rs', 'Cargo.*')"
                 },
                 "path": {
                     "type": "string",

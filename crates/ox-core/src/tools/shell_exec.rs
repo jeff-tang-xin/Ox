@@ -42,24 +42,7 @@ impl Tool for ShellExecTool {
     }
 
     fn description(&self) -> &str {
-        "🐚 Execute shell commands in the system shell (bash/cmd/PowerShell).
-         
-         💡 Common use cases:
-         • Git operations: git status, git diff, git commit
-         • Build & run: cargo build, npm run dev, python script.py
-         • System info: ls, pwd, uname, whoami
-         • Package management: pip install, npm install, apt-get
-         
-         ⚠️ Safety:
-         • This is a DANGEROUS tool - requires user confirmation
-         • Avoid destructive commands (rm -rf, del /s, etc.)
-         • Commands timeout after 30 seconds by default
-         
-         📝 Examples:
-         • {\"command\": \"git status\"} - Check git status
-         • {\"command\": \"git diff HEAD~1\"} - View last commit changes
-         • {\"command\": \"git add . && git commit -m 'fix bug'\"} - Commit changes
-         • {\"command\": \"cargo test\", \"timeout_ms\": 60000} - Run tests with 60s timeout"
+        "Execute shell commands (bash/cmd/PowerShell). Requires user confirmation. Default timeout: 30s. Use timeout_ms for longer runs. Avoid destructive commands (rm -rf, del /s)."
     }
 
     fn parameters_schema(&self) -> Value {

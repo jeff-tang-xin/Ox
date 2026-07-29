@@ -17,10 +17,7 @@ impl Tool for ReadSymbolTool {
     }
 
     fn description(&self) -> &str {
-        "按精确/子串名定位符号并直接返回其完整源码（AST 抽取起止行 + 上下文）。\n\
-         选型：确定符号名用 read_symbol；只要位置列表或模糊探索用 find_symbol。\n\
-         参数 name 必填；kind 可选（function/struct/enum/impl/trait/const/static/mod/macro）消歧；\n\
-         context_lines 默认 5，上限 50。多同名时返回 top-1 并在首行提示候选数——传 kind 收窄或改用 find_symbol。"
+        "Read symbol full source code by name (AST-extracted body + context lines). Use 'kind' to disambiguate same-name symbols. context_lines default 5, max 50."
     }
 
     fn parameters_schema(&self) -> Value {

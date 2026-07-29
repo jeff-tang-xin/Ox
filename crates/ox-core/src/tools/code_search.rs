@@ -32,7 +32,7 @@ impl Tool for CodeSearchTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "✅ REQUIRED: Text or regex pattern to search for."
+                    "description": "Text or regex pattern to search for."
                 },
                 "path": {
                     "type": "string",
@@ -41,25 +41,12 @@ impl Tool for CodeSearchTool {
                 "file_pattern": {
                     "type": "string",
                     "description": "Filter by filename only (e.g. '*.rs'), NOT a path pattern. Default: all files."
-                },
-                "max_files": {
-                    "type": "integer",
-                    "description": "Maximum number of files to return results from. Default: 20."
-                },
-                "max_matches_per_file": {
-                    "type": "integer",
-                    "description": "Maximum number of matches to return per file. Default: 5."
-                },
-                "case_insensitive": {
-                    "type": "boolean",
-                    "description": "Enable case-insensitive search. Default: false."
                 }
             },
             "required": ["pattern"],
             "examples": [
                 {"pattern": "fn main"},
-                {"pattern": "pub struct", "file_pattern": "*.rs"},
-                {"pattern": "error", "max_files": 10, "max_matches_per_file": 3, "case_insensitive": true}
+                {"pattern": "pub struct", "file_pattern": "*.rs"}
             ]
         })
     }

@@ -29,9 +29,7 @@ impl Tool for FileListTool {
     }
 
     fn description(&self) -> &str {
-        "List ONE directory level only (non-recursive). Returns immediate files and subdirectory \
-         names — does NOT list files inside subdirectories. To go deeper, call file_list again \
-         with each subdirectory path. For recursive filename search use file_search(glob), not file_list."
+        "List ONE directory level (non-recursive). To go deeper, call file_list again with each subdirectory path. For recursive filename search use file_search."
     }
 
     fn parameters_schema(&self) -> Value {
