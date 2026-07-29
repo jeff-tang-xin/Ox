@@ -415,7 +415,11 @@ fn read_full_then_slice(
     offset: usize,
     limit: usize,
 ) -> Result<(String, usize), String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("Cannot read file: {e}"))?;
+    let mut content = std::fs::read_to_string(path).map_err(|e| format!("Cannot read file: {e}"))?;
+    // Strip UTF-8 BOM so it doesn't appear as an invisible char on line 1
+    if content.starts_with('\u{FEFF}') {
+        content = content['\u{FEFF}'.len_utf8()..].to_string();
+    }
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     let start = offset.min(total);
@@ -449,7 +453,11 @@ fn read_with_encoding_then_slice(
     if had_errors {
         tracing::warn!("File {} may have encoding issues.", path.display());
     }
-    let content = cow.into_owned();
+    let mut content = cow.into_owned();
+    // Strip UTF-8 BOM so it doesn't appear as an invisible char on line 1
+    if content.starts_with('\u{FEFF}') {
+        content = content['\u{FEFF}'.len_utf8()..].to_string();
+    }
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     let start = offset.min(total);
@@ -476,7 +484,11 @@ fn stream_read_lines(
     let mut line_num: usize = 0;
 
     for line_result in reader.lines() {
-        let line = line_result.map_err(|e| format!("Read error at line {}: {e}", line_num + 1))?;
+        let mut line = line_result.map_err(|e| format!("Read error at line {}: {e}", line_num + 1))?;
+        // Strip UTF-8 BOM from the first line only
+        if line_num == 0 && line.starts_with('\u{FEFF}') {
+            line = line['\u{FEFF}'.len_utf8()..].to_string();
+        }
 
         if line_num >= offset && (line_num - offset) < limit {
             formatted.push(format!("{:>4}\t{line}", line_num + 1));
@@ -541,6 +553,31 @@ mod tests {
             out.chars().count()
         );
         assert!(out.contains("已截断"), "must include truncation notice");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bom_is_stripped_from_first_line() {
+        // A file with a UTF-8 BOM (EF BB BF) must not show an invisible
+        // \u{FEFF} char on line 1.  Otherwise the LLM copies it into
+        // old_string and edit_file silently fails to match.
+        let dir = std::env::temp_dir().join("ox_test_file_read_bom");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = dir.join("bom.rs");
+        // Write BOM bytes then normal content
+        let mut f = std::fs::File::create(&fp).unwrap();
+        f.write_all(&[0xEF, 0xBB, 0xBF]).unwrap();
+        f.write_all(b"/// doc comment\nfn main() {}\n").unwrap();
+        drop(f);
+        let abs = fp.to_string_lossy().replace('\\', "/");
+        let out = read_file_slice(&dir, &abs, 0, 200).unwrap();
+        // Line 1 must start with "///", not with \u{FEFF}///
+        assert!(
+            out.contains("/// doc comment"),
+            "BOM not stripped: first 60 chars = {:?}",
+            &out[..out.len().min(60)]
+        );
+        assert!(!out.contains('\u{FEFF}'), "BOM leaked into output");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

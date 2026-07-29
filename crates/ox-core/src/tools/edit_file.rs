@@ -248,6 +248,11 @@ impl EditFileTool {
                     ));
                 }
             };
+            // Strip UTF-8 BOM if present - it breaks exact string matching
+            let content = content
+                .strip_prefix('\u{FEFF}')
+                .map(|s| s.to_string())
+                .unwrap_or(content);
 
             // Phase 2: Apply each edit sequentially
             let mut current = content;
@@ -514,7 +519,9 @@ fn apply_one_edit(content: &str, edit: &SingleEdit, display_path: &str) -> Resul
                 let mut similar = Vec::new();
                 for (i, line) in file_lines.iter().enumerate() {
                     let t = line.trim();
-                    if t.contains(search_first) || search_first.contains(t) {
+                    if !t.is_empty()
+                        && (t.contains(search_first) || search_first.contains(t))
+                    {
                         similar.push(format!(
                             "  Line {}: {}",
                             i + 1,
@@ -821,4 +828,50 @@ fn find_locations(content: &str, needle: &str) -> Vec<String> {
         }
     }
     locations
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    #[test]
+    fn bom_file_exact_match_first_line() {
+        // A file with a UTF-8 BOM: exact match on line 1 must succeed
+        // (before the fix, the BOM char \u{FEFF} was prepended to content,
+        //  so content.contains(old) returned false for any line-1 snippet).
+        let dir = std::env::temp_dir().join("ox_test_edit_bom");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = dir.join("bom.rs");
+        let mut f = std::fs::File::create(&fp).unwrap();
+        f.write_all(&[0xEF, 0xBB, 0xBF]).unwrap();
+        f.write_all(b"fn hello() -> i32 {\n    42\n}\n").unwrap();
+        drop(f);
+
+        let content = std::fs::read_to_string(&fp).unwrap();
+        let content = content
+            .strip_prefix('\u{FEFF}')
+            .map(|s| s.to_string())
+            .unwrap_or(content);
+        assert!(content.contains("fn hello"), "BOM not stripped, match failed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_similar_skips_empty_lines() {
+        // The "similar text" diagnostic must NOT list blank lines as matches.
+        // Before the fix, search_first.contains("") returned true for every
+        // blank line, drowning the real match.
+        let content = "line one\n\nline two\n\nline three\n";
+        let file_lines: Vec<&str> = content.lines().collect();
+        let search_first = "line two";
+        let mut similar = Vec::new();
+        for (i, line) in file_lines.iter().enumerate() {
+            let t = line.trim();
+            if !t.is_empty() && (t.contains(search_first) || search_first.contains(t)) {
+                similar.push(i + 1); // 1-based
+            }
+        }
+        // Should only find line 3 ("line two"), not lines 2 and 4 (blank)
+        assert_eq!(similar, vec![3], "blank lines leaked into similar: {:?}", similar);
+    }
 }
