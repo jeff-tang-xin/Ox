@@ -1,4 +1,4 @@
-/// System prompt builder — slim, structured, < 600 tokens.
+﻿/// System prompt builder — slim, structured, < 600 tokens.
 ///
 /// Design spec:
 /// 1. 控制长度: core < 600 tokens, structured with 【】 tags
@@ -328,20 +328,20 @@ fn build_unified_tool_block() -> String {
      ╔══ 读取（Safe · 无副作用）\n\
      ║ file_read: {path, offset?, limit?} — 读取文件（图片 png/jpg/gif/webp/bmp/svg/... ≤256KB 自动以 Base64 返回）\n\
      ║ file_list: {path} — 列出目录\n\
-     ║ file_search: {pattern, path?, file_pattern?} — 文件名搜索\n\
-     ║ code_search: {pattern, path?, file_pattern?, case_insensitive?} — 代码内容搜索\n\
-     ║ find_symbol: {name, kind?, file_pattern?} — 查找符号定义位置\n\
+     ║ file_search: {pattern, path?} — 文件名搜索\n\
+     ║ code_search: {pattern, path?, file_pattern?} — 代码内容搜索\n\
+     ║ find_symbol: {name?, pattern?, top_k?} — 查找符号定义位置\n\
      ║ read_symbol: {name, kind?, context_lines?} — 读取符号完整源码\n\
      ║ project_detect: {} — 检测项目类型\n\
      ║ git_status: {} — Git 状态\n\
      ║ git_diff: {path?} — Git diff\n\
      ║ web_fetch: {url} — 抓取网页\n\
      ║ load_skill: {name} — 加载 Skill\n\
-     ║ recall: {} — 回忆历史会话\n\
+     ║ recall: {node_id} — 回忆历史会话\n\
      ║\n\
      ╠══ 代码图谱（GitNexus · Safe）\n\
      ║ code_graph: {op, ...args} — 代码图谱分析\n\
-     ║   op 值: query | context | impact | detect_changes | route_map\n\
+     ║   op 值: query | context | cypher | list_repos | impact | detect_changes | api_impact | route_map | tool_map | shape_check | rename | group_list | group_sync\n\
      ║   impact 示例: {op:\"impact\", target:\"funcName\", direction:\"upstream\"}\n\
      ║   context 示例: {op:\"context\", name:\"TypeName\"}\n\
      ║\n\
@@ -393,7 +393,7 @@ pub fn gather_git_context(working_dir: &std::path::Path) -> Option<String> {
 
 pub fn gather_dir_context(working_dir: &std::path::Path) -> Option<String> {
     let mut result = String::new();
-        gather_dir_recursive(working_dir, &mut result, 0, 1);
+    gather_dir_recursive(working_dir, &mut result, 0, 1);
     if result.is_empty() {
         None
     } else {
@@ -401,12 +401,7 @@ pub fn gather_dir_context(working_dir: &std::path::Path) -> Option<String> {
     }
 }
 
-fn gather_dir_recursive(
-    dir: &std::path::Path,
-    out: &mut String,
-    depth: usize,
-    max_depth: usize,
-) {
+fn gather_dir_recursive(dir: &std::path::Path, out: &mut String, depth: usize, max_depth: usize) {
     if depth > max_depth {
         return;
     }

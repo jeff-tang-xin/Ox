@@ -66,3 +66,7 @@ ox-core = { path = "crates/ox-core" }
 
 # Base64 encoding (for image read)
 base64 = "0.22"
+
+# Document parsing (file_read: PDF / Excel / ODS)
+calamine = "0.26"
+pdf-extract = "0.7"

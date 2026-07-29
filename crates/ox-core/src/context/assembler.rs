@@ -102,11 +102,12 @@ impl ContextAssembler {
         if let Some(ms) = memory_store {
             let mainline_limit = if in_impl_phase { 50 } else { 30 };
             if let Ok(mainline) = ms.get_react_mainline(session_id, mainline_limit)
-                && !mainline.trim().is_empty() {
-                    block.push_str("📜 历史行动轨迹 (ReAct Log, 由远及近):\n");
-                    block.push_str(&mainline);
-                    block.push('\n');
-                }
+                && !mainline.trim().is_empty()
+            {
+                block.push_str("📜 历史行动轨迹 (ReAct Log, 由远及近):\n");
+                block.push_str(&mainline);
+                block.push('\n');
+            }
         }
 
         // 2e. Workspace state

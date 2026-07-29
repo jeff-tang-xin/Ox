@@ -28,6 +28,30 @@ fn is_image_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Max document (PDF/Excel/ODS) size for parsing. Larger files return a note.
+pub const DOCUMENT_MAX_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Max rows extracted per spreadsheet worksheet (context-window guard).
+pub const SPREADSHEET_MAX_ROWS: usize = 500;
+
+const PDF_EXTENSIONS: &[&str] = &["pdf"];
+const SPREADSHEET_EXTENSIONS: &[&str] = &["xlsx", "xls", "xlsm", "ods"];
+
+fn has_extension(path: &Path, exts: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| exts.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn is_pdf_path(path: &Path) -> bool {
+    has_extension(path, PDF_EXTENSIONS)
+}
+
+fn is_spreadsheet_path(path: &Path) -> bool {
+    has_extension(path, SPREADSHEET_EXTENSIONS)
+}
+
 fn image_mime(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("png") => "image/png",
@@ -54,6 +78,85 @@ fn read_image_as_base64(path: &Path, file_size: u64) -> Result<String, String> {
          data:{mime};base64,{b64}\n\
          ```"
     ))
+}
+
+/// Extract plain text from a PDF file.
+fn read_pdf_text(path: &Path) -> Result<String, String> {
+    let text =
+        pdf_extract::extract_text(path).map_err(|e| format!("Cannot extract PDF text: {e}"))?;
+    if text.trim().is_empty() {
+        return Ok("📄 PDF 已解析，但未提取到文本（可能是扫描件/纯图片 PDF）。".to_string());
+    }
+    Ok(format!("📄 PDF 文本提取\n\n{text}"))
+}
+
+/// Extract text from a spreadsheet (xlsx/xls/xlsm/ods) as tab-separated tables.
+fn read_spreadsheet_text(path: &Path) -> Result<String, String> {
+    use calamine::{Data, Reader, open_workbook_auto};
+    let mut workbook =
+        open_workbook_auto(path).map_err(|e| format!("Cannot open spreadsheet: {e}"))?;
+    let sheet_names = workbook.sheet_names().to_owned();
+    if sheet_names.is_empty() {
+        return Ok("📊 表格已打开，但没有任何工作表。".to_string());
+    }
+    let mut out = String::new();
+    for name in &sheet_names {
+        let range = match workbook.worksheet_range(name) {
+            Ok(r) => r,
+            Err(e) => {
+                out.push_str(&format!("\n## Sheet: {name}\n⚠️ 读取失败: {e}\n"));
+                continue;
+            }
+        };
+        let total_rows = range.rows().count();
+        out.push_str(&format!("\n## Sheet: {name} ({total_rows} rows)\n"));
+        for (i, row) in range.rows().enumerate() {
+            if i >= SPREADSHEET_MAX_ROWS {
+                out.push_str(&format!(
+                    "… (已截断，仅显示前 {SPREADSHEET_MAX_ROWS} 行 / 共 {total_rows} 行)\n"
+                ));
+                break;
+            }
+            let cells: Vec<String> = row
+                .iter()
+                .map(|c| match c {
+                    Data::Empty => String::new(),
+                    other => other.to_string(),
+                })
+                .collect();
+            out.push_str(&cells.join("\t"));
+            out.push('\n');
+        }
+    }
+    Ok(format!("📊 表格文本提取{out}"))
+}
+
+/// Dispatch a PDF/spreadsheet path to the right parser, with size +guards.
+fn read_document(path: &Path, file_size: u64) -> ToolOutput {
+    if file_size > DOCUMENT_MAX_SIZE {
+        let mb = DOCUMENT_MAX_SIZE / (1024 * 1024);
+        return ToolOutput::success(format!(
+            "📄 文档过大（{}KB），超过 {mb}MB 解析上限，未解析。",
+            file_size / 1024,
+        ));
+    }
+    let parsed = if is_pdf_path(path) {
+        read_pdf_text(path)
+    } else {
+        read_spreadsheet_text(path)
+    };
+    match parsed {
+        Ok(text) => {
+            let capped = if text.chars().count() > MAX_READ_OUTPUT_CHARS {
+                let cut: String = text.chars().take(MAX_READ_OUTPUT_CHARS).collect();
+                format!("{cut}\n\n⚠️ 内容过大，已截断（前 {MAX_READ_OUTPUT_CHARS} 字符）。")
+            } else {
+                text
+            };
+            ToolOutput::success(capped)
+        }
+        Err(e) => ToolOutput::error(e),
+    }
 }
 
 /// Hard character cap on a single file_read tool result. The line-based
@@ -177,7 +280,8 @@ impl Tool for FileReadTool {
     fn description(&self) -> &str {
         "Read file contents with line numbers. Default: 200 lines from offset 0. \
          Large files are NOT read in full — use offset/limit to paginate (e.g. offset=200, limit=200 for next page). \
-         Image files (png/jpg/gif/webp/bmp/svg/...) under 256KB are auto-returned as Base64 data URIs."
+         Image files (png/jpg/gif/webp/bmp/svg/...) under 256KB are auto-returned as Base64 data URIs. \
+         PDF and spreadsheet files (pdf/xlsx/xls/xlsm/ods) under 10MB are auto-parsed to plain text."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -278,6 +382,10 @@ impl Tool for FileReadTool {
                     img_max = IMAGE_MAX_SIZE / 1024,
                 ));
             }
+        }
+
+        if is_pdf_path(&path) || is_spreadsheet_path(&path) {
+            return read_document(&path, file_size);
         }
 
         let result = if file_size < SMALL_FILE_THRESHOLD && encoding.is_none() {

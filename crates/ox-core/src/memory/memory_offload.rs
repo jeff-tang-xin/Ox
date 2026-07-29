@@ -182,10 +182,12 @@ fn extract_active_file_paths_from_timeline(timeline: &str) -> Vec<String> {
             let val_start = start.find('"').map(|i| i + 1)?;
             let val_end = start[val_start..].find('"').map(|i| val_start + i)?;
             Some(start[val_start..val_end].to_string())
-        })
-            && path.len() > 4 && path.contains('.') && !paths.contains(&path) {
-                paths.push(path);
-            }
+        }) && path.len() > 4
+            && path.contains('.')
+            && !paths.contains(&path)
+        {
+            paths.push(path);
+        }
     }
     paths
 }
@@ -283,10 +285,12 @@ fn placeholder_old_react_prioritized(
 
         // Replace old ToolResults with placeholders, but preserve active file results
         if let Message::ToolResult { content, .. } = msg
-            && !content.starts_with("（已归纳") && !is_active {
-                *content = "（已归纳到记忆图谱，recall #<编号> 可重放）".to_string();
-                replaced += 1;
-            }
+            && !content.starts_with("（已归纳")
+            && !is_active
+        {
+            *content = "（已归纳到记忆图谱，recall #<编号> 可重放）".to_string();
+            replaced += 1;
+        }
     }
 
     cleanup_only(messages);

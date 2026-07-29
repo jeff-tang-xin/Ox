@@ -36,7 +36,7 @@ impl Tool for FindSymbolTool {
                     "description": "Max results (default 10)."
                 }
             },
-            "required": ["name"]
+            "required": []
         })
     }
 

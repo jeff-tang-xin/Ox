@@ -154,9 +154,128 @@ pub fn validate_path_within_workdir(path: &Path, _working_dir: &Path) -> anyhow:
     Ok(path.to_path_buf())
 }
 
+/// Case-sensitive Levenshtein edit distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let a_len = a.len();
+    let b_len = b.len();
+    let mut prev: Vec<usize> = (0..=b_len).collect();
+    let mut curr = vec![0usize; b_len + 1];
+    for i in 0..a_len {
+        curr[0] = i + 1;
+        for j in 0..b_len {
+            let cost = if a[i] == b[j] { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_len]
+}
+
+/// Suggest correct path candidates when a given path does not exist.
+///
+/// Walks `working_dir` (respecting .gitignore) and matches files by basename:
+/// exact basename match first, then Levenshtein distance <= 2 fuzzy match.
+/// Returns a formatted suggestion string listing up to 5 relative-path
+/// candidates, or `None` if no plausible candidate is found.
+pub fn suggest_path_correction(bad_path: &Path, working_dir: &Path) -> Option<String> {
+    let target = bad_path.file_name()?.to_string_lossy().to_string();
+
+    let mut exact: Vec<String> = Vec::new();
+    let mut fuzzy: Vec<(usize, String)> = Vec::new();
+
+    for entry in ignore::WalkBuilder::new(working_dir).build().flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let rel = entry
+            .path()
+            .strip_prefix(working_dir)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if name == target {
+            exact.push(rel);
+        } else {
+            let dist = levenshtein(&name, &target);
+            if dist <= 2 {
+                fuzzy.push((dist, rel));
+            }
+        }
+    }
+
+    let mut candidates: Vec<String> = if !exact.is_empty() {
+        exact
+    } else {
+        fuzzy.sort_by_key(|(d, _)| *d);
+        fuzzy.into_iter().map(|(_, r)| r).collect()
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.truncate(5);
+
+    let list = candidates
+        .iter()
+        .map(|c| format!("  • {c}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "💡 路径可能写错了。根据文件名，你是不是指：\n{list}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn levenshtein_basic() {
+        assert_eq!(levenshtein("validation.rs", "validation.rs"), 0);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("validatirs", "validation.rs"), 3);
+    }
+
+    #[test]
+    fn suggest_exact_basename_match() {
+        let dir = std::env::temp_dir().join(format!("ox_sug_exact_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/validation.rs"), "x").unwrap();
+        let bad = dir.join("wrong/place/validation.rs");
+        let out = suggest_path_correction(&bad, &dir);
+        assert!(out.is_some());
+        assert!(out.unwrap().contains("a/b/validation.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suggest_fuzzy_match() {
+        let dir = std::env::temp_dir().join(format!("ox_sug_fuzzy_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("validation.rs"), "x").unwrap();
+        // basename off by 2 chars
+        let bad = dir.join("validaton.rs");
+        let out = suggest_path_correction(&bad, &dir);
+        assert!(out.is_some());
+        assert!(out.unwrap().contains("validation.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suggest_no_match_returns_none() {
+        let dir = std::env::temp_dir().join(format!("ox_sug_none_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.rs"), "x").unwrap();
+        let bad = dir.join("zzzzzzzzzz.rs");
+        assert!(suggest_path_correction(&bad, &dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn safe_always_skips() {

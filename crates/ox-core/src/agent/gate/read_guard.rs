@@ -72,7 +72,10 @@ pub fn check(
                     engine.record_impl_file_read(path, "");
                     return Ok(());
                 }
-                return Err("该文件已读过 2 次以上，建议基于已有内容推进。如需重读请加 offset。".to_string());
+                return Err(
+                    "该文件已读过 2 次以上，建议基于已有内容推进。如需重读请加 offset。"
+                        .to_string(),
+                );
             }
         }
         "shell_exec" => {

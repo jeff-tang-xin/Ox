@@ -103,6 +103,14 @@ impl Tool for EditFileTool {
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
             };
 
+        // ── Existence check with path-correction hint ──
+        if !path.exists() {
+            let hint = crate::safety::suggest_path_correction(&path, &ctx.working_dir)
+                .map(|s| format!("\n\n{s}"))
+                .unwrap_or_default();
+            return ToolOutput::error(format!("❌ File not found: {}{hint}", path.display()));
+        }
+
         // ── Determine mode: single or multi ──
         let is_multi = args.get("edits").is_some();
 

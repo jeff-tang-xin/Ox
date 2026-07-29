@@ -66,7 +66,6 @@ type PushInterjectionFn = fn(
     &mpsc::UnboundedSender<AgentToUiEvent>,
 );
 
-
 /// Events sent from the agent to the UI.
 #[derive(Debug, Clone)]
 pub enum AgentToUiEvent {
@@ -648,8 +647,9 @@ pub async fn run_agent_turn(
     let mut turn_memory = init_turn_memory(&workflow_engine, &mut messages, user_task.as_deref());
 
     let mut iteration = 0u32;
-    let mut budget =
-        crate::agent::turn_state::TurnBudget::with_total_explore(init_total_explore(&workflow_engine));
+    let mut budget = crate::agent::turn_state::TurnBudget::with_total_explore(init_total_explore(
+        &workflow_engine,
+    ));
     let mut repeat_guard = repeat_guard::RepeatGuard::new();
     let mut unified_parse_error_streak = 0u32;
     let mut findings_deliver_error_streak = 0u32;
@@ -803,9 +803,9 @@ pub async fn run_agent_turn(
                 total_usage.clone(),
             )
             .await
-            {
-                return;
-            }
+        {
+            return;
+        }
 
         // Classify tool calls: detect truncated arguments and infinite loops.
         // Extracted into `classify_tool_calls()` for testability -- pure computation,
@@ -988,7 +988,9 @@ pub async fn run_agent_turn(
                 &mut turn_memory,
                 unified_tool_mode,
                 &ui_tx,
-            ).await {
+            )
+            .await
+            {
                 continue;
             }
 
@@ -1040,12 +1042,7 @@ pub async fn run_agent_turn(
             }
 
             // Parse tool arguments (extracted to parse_tool_args)
-            let args = match parse_tool_args(
-                tc,
-                &mut messages,
-                &mut new_messages,
-                &ui_tx,
-            ) {
+            let args = match parse_tool_args(tc, &mut messages, &mut new_messages, &ui_tx) {
                 Ok(v) => v,
                 Err(()) => continue,
             };
@@ -1059,32 +1056,15 @@ pub async fn run_agent_turn(
             );
 
             // file_write path validation (extracted to check_file_write_missing_path)
-            if check_file_write_missing_path(
-                tc,
-                &args,
-                &mut messages,
-                &mut new_messages,
-                &ui_tx,
-            ) {
+            if check_file_write_missing_path(tc, &args, &mut messages, &mut new_messages, &ui_tx) {
                 continue;
             }
 
             // Execute tool with retry (extracted to execute_tool_with_retry)
-            let result = execute_tool_with_retry(
-                tc,
-                &args,
-                tool,
-                &tool_ctx,
-                &ui_tx,
-            ).await;
+            let result = execute_tool_with_retry(tc, &args, tool, &tool_ctx, &ui_tx).await;
             // Log + sanitize + update working dir (extracted to post_tool_log_and_sanitize)
-            let (sanitized_content, new_tool_ctx) = post_tool_log_and_sanitize(
-                tc,
-                &args,
-                &result,
-                &tool_ctx,
-                &ui_tx,
-            );
+            let (sanitized_content, new_tool_ctx) =
+                post_tool_log_and_sanitize(tc, &args, &result, &tool_ctx, &ui_tx);
             if let Some(ctx) = new_tool_ctx {
                 tool_ctx = Arc::new(ctx);
             }
@@ -1323,8 +1303,7 @@ fn init_turn_memory(
     messages: &mut Vec<Message>,
     user_task: Option<&str>,
 ) -> crate::memory::turn_memory::TurnMemory {
-    let mut turn_memory =
-        crate::memory::turn_memory::TurnMemory::new(user_task.unwrap_or(""));
+    let mut turn_memory = crate::memory::turn_memory::TurnMemory::new(user_task.unwrap_or(""));
     if let Some(wf) = workflow_engine {
         if let Ok(engine) = wf.try_lock() {
             crate::agent::gate::reset_failures(&engine);
@@ -1370,7 +1349,6 @@ fn init_total_explore(
         })
         .unwrap_or(0)
 }
-
 
 // ─── P5.3: Extracted from run_agent_turn ───
 
@@ -1590,9 +1568,10 @@ async fn collect_response(
                 let visible_piece = visible_delta.unwrap_or_default();
                 let clean_visible = strip_tool_call_xml(&visible_piece);
                 if clean_visible.len() < visible_piece.len()
-                    && let Some(action) = extract_action_from_xml(&visible_piece) {
-                        let _ = ui_tx.send(AgentToUiEvent::Status(format!("🔄 {} ...", action)));
-                    }
+                    && let Some(action) = extract_action_from_xml(&visible_piece)
+                {
+                    let _ = ui_tx.send(AgentToUiEvent::Status(format!("🔄 {} ...", action)));
+                }
                 if let Some(ref mut filter) = findings_stream {
                     if let Some(visible) = filter.push(&clean_visible)
                         && !visible.is_empty()
@@ -2166,7 +2145,8 @@ pub(crate) fn evaluate_reflection(
             };
             tracing::info!(
                 "[REFLECT] Pre-exec reflect (impl_phase={in_impl_phase}, explore_streak={}, impl_streak={}) - skipping this tool batch",
-                budget.explore_streak, budget.impl_streak
+                budget.explore_streak,
+                budget.impl_streak
             );
             let _ = ui_tx.send(AgentToUiEvent::Status(label.to_string()));
             Some(prompt)
@@ -2463,8 +2443,7 @@ fn check_loop_and_truncation_guards(
         if let Some(ms) = memory_store {
             let (session_id, task_desc) =
                 react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
-            let target_json: Option<serde_json::Value> =
-                serde_json::from_str(&tc.arguments).ok();
+            let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
             let target = target_json
                 .as_ref()
                 .and_then(|v| {
@@ -2563,8 +2542,7 @@ async fn check_workflow_validation(
 
     // Parse tool arguments for validation
     let args_value = if !tc.arguments.trim().is_empty() {
-        serde_json::from_str::<serde_json::Value>(&tc.arguments)
-            .unwrap_or(serde_json::json!({}))
+        serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or(serde_json::json!({}))
     } else {
         serde_json::json!({})
     };
@@ -2795,28 +2773,25 @@ async fn execute_tool_with_retry(
     let ui_tx_clone = ui_tx.clone();
     let _tool_call_id_clone = tc.id.clone();
     let _tool_name_clone = tc.name.clone();
-    let tool_ctx_with_progress =
-        Arc::new(crate::tools::ToolContext::with_progress_callback(
-            tool_ctx.runtime.clone(),
-            tool_ctx.working_dir.clone(),
-            tool_ctx.config.clone(),
-            tc.id.clone(),
-            move |progress: crate::tools::ToolProgress| {
-                let _ = ui_tx_clone.send(AgentToUiEvent::ToolProgress {
-                    tool_call_id: progress.tool_call_id,
-                    tool_name: progress.tool_name,
-                    message: progress.message,
-                    progress_percent: progress.progress_percent,
-                });
-            },
-        ));
+    let tool_ctx_with_progress = Arc::new(crate::tools::ToolContext::with_progress_callback(
+        tool_ctx.runtime.clone(),
+        tool_ctx.working_dir.clone(),
+        tool_ctx.config.clone(),
+        tc.id.clone(),
+        move |progress: crate::tools::ToolProgress| {
+            let _ = ui_tx_clone.send(AgentToUiEvent::ToolProgress {
+                tool_call_id: progress.tool_call_id,
+                tool_name: progress.tool_name,
+                message: progress.message,
+                progress_percent: progress.progress_percent,
+            });
+        },
+    ));
 
     tracing::info!("[AGENT] Executing tool.execute() for: {}", tc.name);
     let mut result = tool.execute(args.clone(), &tool_ctx_with_progress).await;
     // Retry once for transient failures on write/network tools
-    if result.is_error
-        && matches!(tc.name.as_str(), "file_write" | "shell_exec" | "web_fetch")
-    {
+    if result.is_error && matches!(tc.name.as_str(), "file_write" | "shell_exec" | "web_fetch") {
         tracing::warn!(
             "[AGENT] Tool {} failed, retrying once: {}",
             tc.name,
@@ -2951,8 +2926,7 @@ fn offload_and_record(
 
     // Record decision BEFORE react_log (so react_log reflects current tool, not previous)
     {
-        let dec_target_json: Option<serde_json::Value> =
-            serde_json::from_str(&tc.arguments).ok();
+        let dec_target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
         let dec_target: String = dec_target_json
             .as_ref()
             .and_then(|v| {
@@ -3039,16 +3013,9 @@ fn snapshot_and_record_turn(
     {
         let step = engine.get_current_step_index();
         if crate::agent::exploration_snapshot::should_snapshot_for_step(step, &tc.name) {
-            let target = crate::agent::exploration_snapshot::target_from_tool_args(
-                &tc.name,
-                &tc.arguments,
-            );
-            engine.record_exploration_result(
-                working_dir,
-                &tc.name,
-                &target,
-                result_content,
-            );
+            let target =
+                crate::agent::exploration_snapshot::target_from_tool_args(&tc.name, &tc.arguments);
+            engine.record_exploration_result(working_dir, &tc.name, &target, result_content);
         }
     }
 
@@ -3058,8 +3025,7 @@ fn snapshot_and_record_turn(
         !result.is_error,
         Some(result_content),
     );
-    let target =
-        crate::agent::exploration_snapshot::target_from_tool_args(&tc.name, &tc.arguments);
+    let target = crate::agent::exploration_snapshot::target_from_tool_args(&tc.name, &tc.arguments);
     let observation: String =
         crate::agent::exploration_snapshot::extract_data_content(result_content)
             .lines()
@@ -3122,7 +3088,7 @@ fn post_verify_and_hint(
         let hint = if engine.impl_file_already_read(path) {
             "\n\n💡 **edit 恢复：** old_string 须与上条 file_read 内容**逐字一致**（含空格/缩进）。\
                                  缩小到 3–8 行唯一片段重试；先 file_read 该文件再编辑。"
-                                    .to_string()
+                .to_string()
         } else {
             format!(
                 "\n\n💡 **edit 恢复：** 先 `file_read` `{path}`（实施每文件 1 次），\
@@ -3200,22 +3166,16 @@ fn post_success_updates(
             if engine.is_task_step() {
                 if tool_name == "file_read"
                     && crate::agent::phase::is_implementation_phase(&engine)
-                    && let Ok(args) =
-                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                     && let Some(path) = args.get("path").and_then(|p| p.as_str())
                 {
                     engine.record_impl_file_read(path, &tc.arguments);
-                    if let Some(nudge) =
-                        engine.impl_edit_nudge_after_read(path, result_content)
-                    {
+                    if let Some(nudge) = engine.impl_edit_nudge_after_read(path, result_content) {
                         deferred_tool_system.push(nudge);
                     }
                 }
-                let (plan_changed, plan_hint) = engine.record_execute_tool_success(
-                    &tool_name,
-                    &tc.arguments,
-                    result_content,
-                );
+                let (plan_changed, plan_hint) =
+                    engine.record_execute_tool_success(&tool_name, &tc.arguments, result_content);
                 if let Some(hint) = plan_hint {
                     deferred_tool_system.push(hint);
                 }
@@ -3228,8 +3188,7 @@ fn post_success_updates(
                     tool_name.as_str(),
                     "edit_file" | "file_write" | "delete_range"
                 ) && crate::agent::phase::is_implementation_phase(&engine)
-                    && let Ok(args) =
-                        serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                    && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                     && let Some(path) = args.get("path").and_then(|p| p.as_str())
                 {
                     engine.record_impl_file_edited(path);
@@ -3237,12 +3196,9 @@ fn post_success_updates(
                         .get_plan_tracker()
                         .and_then(|t| t.current_step().map(|s| s.index))
                         .unwrap_or(1);
-                    if let Some(note) = crate::agent::verifier::after_edit_note(
-                        &engine,
-                        idx,
-                        path,
-                        result_content,
-                    ) {
+                    if let Some(note) =
+                        crate::agent::verifier::after_edit_note(&engine, idx, path, result_content)
+                    {
                         deferred_tool_system.push(note);
                     }
                 }
@@ -3280,7 +3236,7 @@ fn post_success_updates(
                 "✅ 文件已写入。如果所有需要的文件都已完成，输出 `## Done` 结束。".to_string()
             });
         }
-} // verify-after-edit
+    } // verify-after-edit
 }
 
 // ── Repeated-failure hand-off extraction ───────────────────────────────────────
@@ -3566,9 +3522,7 @@ async fn handle_unified_tool_call(
                 content.len()
             );
             if is_error {
-                if content.contains("empty arguments")
-                    || content.contains("invalid JSON")
-                {
+                if content.contains("empty arguments") || content.contains("invalid JSON") {
                     *unified_parse_error_streak += 1;
                     if *unified_parse_error_streak >= 3 {
                         messages.push(Message::system(
@@ -3578,8 +3532,7 @@ async fn handle_unified_tool_call(
                     }
                     if *unified_parse_error_streak >= 5 {
                         let _ = ui_tx.send(AgentToUiEvent::Status(
-                            "⏹️ 连续 5 次无效 complete_and_check - 强制结束本轮"
-                                .to_string(),
+                            "⏹️ 连续 5 次无效 complete_and_check - 强制结束本轮".to_string(),
                         ));
                         emit_turn_done(ui_tx, turn_id, new_messages.clone(), total_usage.clone());
                         return UnifiedDispatchOutcome::TurnDone;
@@ -3648,10 +3601,8 @@ async fn handle_unified_tool_call(
                 ));
                 let _ = (&meta.inner_args, &meta.live_output);
                 if let Some(ref ms) = tool_ctx.memory_store {
-                    let (session_id, _react_task) = react_log_ids(
-                        workflow_engine,
-                        user_task.as_deref().unwrap_or(""),
-                    );
+                    let (session_id, _react_task) =
+                        react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
                     let decision = turn_memory
                         .decisions
                         .last()
@@ -3677,10 +3628,8 @@ async fn handle_unified_tool_call(
             } else {
                 turn_memory.record_tool(&tc.name, &tc.arguments, is_error);
                 if let Some(ref ms) = tool_ctx.memory_store {
-                    let (session_id, task_desc) = react_log_ids(
-                        workflow_engine,
-                        user_task.as_deref().unwrap_or(""),
-                    );
+                    let (session_id, task_desc) =
+                        react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
                     let target_json: Option<serde_json::Value> =
                         serde_json::from_str(&tc.arguments).ok();
                     let target = target_json
@@ -3732,9 +3681,7 @@ async fn handle_unified_tool_call(
                         .rev()
                         .find(|m| matches!(m, Message::Assistant { .. }))
                     {
-                        Some(Message::Assistant { content, .. })
-                            if content.trim().is_empty() =>
-                        {
+                        Some(Message::Assistant { content, .. }) if content.trim().is_empty() => {
                             *content = summary.to_string();
                         }
                         _ => new_messages.push(Message::assistant(summary)),
@@ -3925,13 +3872,13 @@ fn drain_interjections_pre_llm(
                     || trimmed.contains("开始实施");
                 if is_confirm
                     && let Some(wf) = workflow_engine
-                        && let Ok(engine) = wf.try_lock()
-                    {
-                        engine.set_variable(
-                            crate::agent::gate::business_gate::PRE_ACK_KEY,
-                            "1".to_string(),
-                        );
-                    }
+                    && let Ok(engine) = wf.try_lock()
+                {
+                    engine.set_variable(
+                        crate::agent::gate::business_gate::PRE_ACK_KEY,
+                        "1".to_string(),
+                    );
+                }
                 push_interjection_message(workflow_engine, messages, &text, ui_tx);
             }
             ui_event::UiToAgentEvent::ScopeConfirmed
@@ -4026,8 +3973,7 @@ async fn handle_review_findings(
         return ReviewFindingsOutcome::Proceed;
     }
     let visible = crate::agent::think_stream::visible_only(full_text);
-    let content_for_session =
-        execute_user_display(workflow_engine, pre_llm_step_idx, &visible);
+    let content_for_session = execute_user_display(workflow_engine, pre_llm_step_idx, &visible);
     let msg = Message::Assistant {
         content: content_for_session,
         tool_calls: Vec::new(),
@@ -4206,10 +4152,8 @@ async fn record_react_log(
     unified_tool_mode: bool,
 ) {
     if let Some(ref ms) = tool_ctx.memory_store {
-        let (session_id, task) =
-            react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
-        let target_json: Option<serde_json::Value> =
-            serde_json::from_str(&tc.arguments).ok();
+        let (session_id, task) = react_log_ids(workflow_engine, user_task.as_deref().unwrap_or(""));
+        let target_json: Option<serde_json::Value> = serde_json::from_str(&tc.arguments).ok();
         let target = target_json
             .as_ref()
             .and_then(|v| {
