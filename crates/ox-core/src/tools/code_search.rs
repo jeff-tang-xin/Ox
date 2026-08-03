@@ -65,16 +65,18 @@ impl Tool for CodeSearchTool {
             }
         };
 
+        // 📌 Resolve relative paths against the STABLE project root (path_base).
+        let path_base = ctx.path_base();
         let base = if let Some(p) = args.get("path").and_then(|p| p.as_str()) {
             let normalized_path = p.trim().replace('\\', "/");
-            let resolved = ctx.working_dir.join(&normalized_path);
+            let resolved = path_base.join(&normalized_path);
 
-            match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
+            match crate::safety::validate_path_within_workdir(&resolved, &path_base) {
                 Ok(validated) => validated,
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
             }
         } else {
-            ctx.working_dir.to_path_buf()
+            path_base.clone()
         };
 
         let file_pattern = args
@@ -95,7 +97,7 @@ impl Tool for CodeSearchTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let working_dir = ctx.working_dir.clone();
+        let working_dir = path_base.clone();
 
         // Run blocking file I/O on a dedicated thread to avoid blocking the Tokio runtime.
         let result = tokio::task::spawn_blocking(move || {

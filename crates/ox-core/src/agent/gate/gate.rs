@@ -27,6 +27,8 @@ pub struct GateCtx<'a> {
 pub enum GateOutcome {
     /// Requirement satisfied.
     Pass,
+    /// Pass but with advisory feedback (non-blocking warning).
+    PassFeedback { feedback: String },
     /// Rejected — inject `feedback` and let the model try again.
     Fail { feedback: String },
     /// Needs a human decision — stop the loop and prompt the user.
@@ -68,9 +70,14 @@ impl GateRunner {
     /// once cumulative failures reach `budget`, a `Fail` is upgraded to
     /// `NeedsUser` so the loop stops instead of spinning.
     pub fn run(&self, ctx: &GateCtx) -> GateReport {
+        let mut advisory_feedback: Vec<String> = Vec::new();
         for gate in &self.gates {
             match gate.check(ctx) {
                 GateOutcome::Pass => continue,
+                GateOutcome::PassFeedback { feedback } => {
+                    advisory_feedback.push(feedback);
+                    continue;
+                }
                 GateOutcome::NeedsUser { prompt } => {
                     return GateReport::NeedsUser {
                         gate: gate.id().to_string(),

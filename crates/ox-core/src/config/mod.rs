@@ -775,7 +775,7 @@ impl Default for AgentConfig {
             skill_reflect_enabled: false, // Disabled: no auto-reflection after workflow completion
             skill_reflect_rounds: crate::agent::skill_reflect_buffer::DEFAULT_REFLECT_THRESHOLD,
             collaboration: CollaborationConfig::default(),
-            unified_tool_mode: true,
+            unified_tool_mode: false,
         }
     }
 }

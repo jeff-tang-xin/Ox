@@ -58,30 +58,43 @@ impl Tool for FileWriteTool {
                 );
             }
         };
-        let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
-            std::path::PathBuf::from(&path_str)
-        } else {
-            ctx.working_dir.join(&path_str)
+        // 📌 Resolve relative paths against the STABLE project root (path_base),
+        // NOT ctx.working_dir — which can be mutated by `/cd` and would break
+        // the LLM's "paths are relative to the project root" mental model.
+        //
+        // Auto-fallback: if LLM passes just a basename (e.g. "openai.rs"),
+        // search the project root and auto-resolve when exactly one match is found.
+        let path_base = ctx.path_base();
+        let (resolved_path, _was_auto_resolved) = match crate::safety::resolve_short_path(&path_str, &path_base) {
+            Some((p, auto)) => (p, auto),
+            None => {
+                if std::path::Path::new(&path_str).is_absolute() {
+                    (std::path::PathBuf::from(&path_str), false)
+                } else {
+                    (path_base.join(&path_str), false)
+                }
+            }
         };
 
         let path =
-            match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
+            match crate::safety::validate_path_within_workdir(&resolved_path, &path_base) {
                 Ok(p) => p,
                 Err(e) => {
                     return ToolOutput::error(format!(
                         "❌ Security Error: {}\n\nWorking directory: {}",
                         e,
-                        ctx.working_dir.display()
+                        path_base.display()
                     ));
                 }
             };
+        let path_owned = path.to_path_buf();
 
         // Validate path for platform-specific invalid characters
         let path_str = path.to_string_lossy();
 
         // 🚨 WORKFLOW VALIDATION: Check if file is being created in correct location during Spec Mode
         // When in workflow mode, files should be in .ox/{requirement_name}/ not directly in .ox/
-        let relative_path = path.strip_prefix(&ctx.working_dir).unwrap_or(&path);
+        let relative_path = path.strip_prefix(&path_base).unwrap_or(&path);
         let rel_str = relative_path.to_string_lossy().into_owned();
 
         // Check if file is being written directly to .ox/ without subdirectory
@@ -178,15 +191,11 @@ impl Tool for FileWriteTool {
         });
 
         // ── Skill dedup: .ox/skills/*.md ──
-        let mut path = path;
+        let mut path = path_owned;
         let mut content = content.to_string();
         let mut skill_write_notice = String::new();
         if let Some(skill_id) = crate::skill::dedup::parse_project_skill_rel_path(&rel_str) {
-            let project_root = ctx
-                .runtime
-                .project_root
-                .clone()
-                .unwrap_or_else(|| ctx.working_dir.clone());
+            let project_root = ctx.path_base();
 
             // 主动检测相似 skill 并警告
             let new_desc = args
@@ -220,9 +229,9 @@ impl Tool for FileWriteTool {
                 } => {
                     skill_write_notice = format!("\n↪️ {reason} → `.ox/skills/{canonical_id}.md`");
                     let new_rel = format!(".ox/skills/{canonical_id}.md");
-                    path = ctx.working_dir.join(&new_rel);
+                    path = path_base.join(&new_rel);
                     if let Err(e) =
-                        crate::safety::validate_path_within_workdir(&path, &ctx.working_dir)
+                        crate::safety::validate_path_within_workdir(&path, &path_base)
                     {
                         return ToolOutput::error(format!("Path validation failed: {e}"));
                     }
@@ -353,16 +362,22 @@ impl Tool for FileWriteTool {
                 // AST syntax check removed — KnowledgeEngine disabled
                 let ast_warning = String::new();
 
-                ToolOutput::success(format!(
+                let success_msg = format!(
                     "✅ Successfully written {} bytes to {}{}\n\
                      📄 Encoding: {}{}{}",
                     bytes_written,
-                    display_path.display(),
+                    crate::tools::canonical_rel_path(&resolved_path, &path_base),
                     size_info,
                     encoding_name,
                     skill_write_notice,
                     ast_warning
-                ))
+                );
+                // 📌 Always prepend canonical path header — calibrates LLM mental model
+                // so it sees the correct project-relative path regardless of input form.
+                let path_header =
+                    format!("📄 {}\n\n", crate::tools::canonical_rel_path(&resolved_path, &path_base));
+                let final_msg = format!("{path_header}{success_msg}");
+                ToolOutput::success(final_msg)
             }
             Err(e) => {
                 // Clean up temp file if it exists

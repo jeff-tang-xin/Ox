@@ -129,20 +129,18 @@ fn user_fix_pivots_to_implement_with_edit_action() {
 }
 
 #[test]
-fn edit_blocked_in_review_allowed_in_implement() {
+fn edit_allowed_in_all_phases() {
     let engine = active_engine();
     phase::on_round_started(&engine, TaskIntent::Review);
     let args = serde_json::json!({"path": "src/Foo.java"});
-    assert!(engine.validate_tool_call("edit_file", &args).is_err());
+    // 📌 门禁已移除 — edit_file 在 Review 阶段也允许执行。
+    // 安全控制由 unified_safety_gate() 在工具执行层兜底。
+    assert!(engine.validate_tool_call("edit_file", &args).is_ok());
 
     seed_findings(&engine);
     phase::pivot_to_fix_mode(&engine, "/fix");
-    // edit_file requires prior file_read in Implement phase
-    assert!(engine.validate_tool_call("edit_file", &args).is_err());
-    // After reading the file, edit is allowed
-    crate::agent::engine::impl_tracking::record_impl_file_read(&engine, "src/Foo.java", "");
+    // Implement 阶段同样允许。
     assert!(engine.validate_tool_call("edit_file", &args).is_ok());
-    assert!(engine.allows_code_modification());
 }
 
 #[test]

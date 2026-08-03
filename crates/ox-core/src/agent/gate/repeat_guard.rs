@@ -10,9 +10,10 @@
 //! none) — normalized string equality plus a cheap word-overlap (Jaccard) ratio.
 
 /// Consecutive near-identical turns before we intervene with a break-the-loop nudge.
-pub const NUDGE_AT: u32 = 2;
-/// Consecutive near-identical turns before we stop and hand back to the user.
-pub const STOP_AT: u32 = 4;
+pub const NUDGE_AT: u32 = 3;
+/// No longer used for hard stop — relaxed to informational nudge only.
+/// Kept for backward compatibility; observe() never returns Stop anymore.
+pub const STOP_AT: u32 = u32::MAX;
 /// Jaccard word-overlap ratio above which two outputs are "the same".
 const SIMILAR_RATIO: f32 = 0.85;
 
@@ -39,6 +40,9 @@ impl RepeatGuard {
 
     /// Feed this turn's visible output; decide what to do.
     /// Empty/whitespace output is ignored (does not affect the streak).
+    ///
+    /// Relaxed: never returns `Stop` — only nudges as an informational hint.
+    /// The LLM is free to continue; the nudge just suggests breaking the pattern.
     pub fn observe(&mut self, visible: &str) -> RepeatAction {
         let norm = normalize(visible);
         if norm.is_empty() {
@@ -52,9 +56,8 @@ impl RepeatGuard {
             return RepeatAction::Continue;
         }
         self.streak += 1;
-        if self.streak >= STOP_AT {
-            RepeatAction::Stop(stop_message(self.streak))
-        } else if self.streak >= NUDGE_AT {
+        // Relaxed: only nudge, never stop. Let the LLM decide when to converge.
+        if self.streak >= NUDGE_AT {
             RepeatAction::Nudge(nudge_message(self.streak))
         } else {
             RepeatAction::Continue
@@ -83,14 +86,14 @@ fn is_similar(a: &str, b: &str) -> bool {
 
 fn nudge_message(streak: u32) -> String {
     format!(
-        "🔁 你已连续 {streak} 次输出几乎相同的思考，却没有推进。\n\
-         停止重复，立即二选一：\n\
-         • 直接发出一个具体动作（file_read 一个**还没读过**的文件 / edit_file / finish）；\n\
-         • 如果卡住了，明确说出卡在哪、需要什么，不要再复述同一句话。"
+        "📊 提示：已连续 {streak} 次输出相似内容。\n\
+         如需推进：发一个具体动作（file_read 未读文件 / edit_file / finish）；\n\
+         如仍在思考：可继续，但建议换个角度或补充新信息。"
     )
 }
 
 fn stop_message(streak: u32) -> String {
+    // Kept for backward compatibility; observe() no longer returns Stop.
     format!(
         "## Failed\n连续 {streak} 次输出重复思考、无法推进 — 停止本轮，交给你判断。\n\
          可能是缺少关键信息或陷入了死循环。请补充指示或换个方向。"
@@ -116,14 +119,15 @@ mod tests {
         let mut g = RepeatGuard::new();
         let line = "Let me read the implementation method and the VO to understand the logic";
         assert_eq!(g.observe(line), RepeatAction::Continue); // 1st: baseline
+        g.observe(line); // 2nd: below NUDGE_AT
         match g.observe(line) {
-            RepeatAction::Nudge(_) => {} // 2nd: streak hits NUDGE_AT
+            RepeatAction::Nudge(_) => {} // 3rd: streak hits NUDGE_AT
             other => panic!("expected Nudge, got {other:?}"),
         }
-        g.observe(line); // 3rd
+        // Relaxed: 4th+ continues to Nudge, never Stop
         match g.observe(line) {
-            RepeatAction::Stop(_) => {} // 4th: streak hits STOP_AT
-            other => panic!("expected Stop, got {other:?}"),
+            RepeatAction::Nudge(_) => {} // 4th: still Nudge (no Stop)
+            other => panic!("expected Nudge (relaxed, no Stop), got {other:?}"),
         }
     }
 
@@ -132,7 +136,9 @@ mod tests {
         let mut g = RepeatGuard::new();
         g.observe("Let me read the implementation method and the VO to understand");
         // One word different — still > 0.85 overlap.
-        match g.observe("Let me read the implementation method and the VO to understand it") {
+        g.observe("Let me read the implementation method and the VO to understand it"); // streak=2
+        // Another near-identical line triggers Nudge at streak=3
+        match g.observe("Let me read the implementation method and the VO to understand it fully") {
             RepeatAction::Nudge(_) => {}
             other => panic!("expected Nudge, got {other:?}"),
         }
@@ -143,7 +149,8 @@ mod tests {
         let mut g = RepeatGuard::new();
         let line = "same thinking over and over again here";
         g.observe(line);
-        g.observe(line); // nudge
+        g.observe(line); // streak=2, below NUDGE_AT
+        g.observe(line); // streak=3, Nudge
         assert_eq!(
             g.observe("completely different action: editing the mapper now"),
             RepeatAction::Continue
@@ -157,7 +164,9 @@ mod tests {
         g.observe(line);
         assert_eq!(g.observe("   "), RepeatAction::Continue);
         // Streak preserved across the empty turn.
+        g.observe(line); // streak=2, below NUDGE_AT
         match g.observe(line) {
+            // streak=3, hits NUDGE_AT
             RepeatAction::Nudge(_) => {}
             other => panic!("expected Nudge, got {other:?}"),
         }

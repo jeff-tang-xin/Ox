@@ -683,12 +683,20 @@ async fn run_app(
         ox_core::context::compressed_store::CompressedContextStore::open(
             &db_dir.join("compressed_context.db"),
         )
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to open compressed context store: {e}");
+        .or_else(|e| {
+            tracing::warn!(
+                "[CompressedContextStore] primary path failed: {e}, falling back to temp dir"
+            );
             ox_core::context::compressed_store::CompressedContextStore::open(
-                &std::env::temp_dir().join("compressed_context.db"),
+                &std::env::temp_dir().join("ox_compressed_context.db"),
             )
-            .unwrap()
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "[CompressedContextStore] disk open failed: {e}, falling back to in-memory store"
+            );
+            ox_core::context::compressed_store::CompressedContextStore::open_in_memory()
+                .expect("in-memory store creation must not fail")
         }),
     );
 

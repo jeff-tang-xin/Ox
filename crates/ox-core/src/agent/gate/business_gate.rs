@@ -49,12 +49,18 @@ pub fn is_pending_scope(engine: &WorkflowEngine) -> bool {
     if engine.get_variable(PRE_ACK_KEY).as_deref() == Some("1") {
         return false;
     }
-    // Only show scope gate if there are PENDING findings
+    // Check if scope is armed (pending confirmation)
+    let is_scope_pending = engine.get_variable(PENDING_SCOPE_KEY).as_deref() == Some("1");
+    if !is_scope_pending {
+        return false;
+    }
+    // Check if there are pending findings
     let has_pending = findings::load_or_migrate(engine)
         .map(|s| s.has_pending_findings())
         .unwrap_or(false);
-
-    has_pending && engine.get_variable(PENDING_SCOPE_KEY).as_deref() == Some("1")
+    // Allow confirmation even without findings — scope can be armed independently
+    // when LLM requests user confirmation directly (without finding_json)
+    has_pending || is_scope_pending
 }
 
 pub fn scope_implementation_unlocked(engine: &WorkflowEngine) -> bool {
@@ -94,7 +100,7 @@ pub async fn await_findings_scope_gate(
     }
 
     let _ = ui_tx.send(super::super::AgentToUiEvent::Status(
-        "⏸ 业务流程门禁：等待确认 findings 范围 — 面板选 finding 后 c /confirm；可输入讨论"
+        "⏸ **阻塞式编辑确认门禁** — 已自动触发，等待用户 c 确认后方可执行编辑\n\nc 确认 · 输入讨论"
             .to_string(),
     ));
 

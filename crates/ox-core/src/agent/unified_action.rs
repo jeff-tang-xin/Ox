@@ -12,14 +12,75 @@ use super::workspace::WorkspaceMode;
 
 pub const TOOL_NAME: &str = "complete_and_check";
 pub const UNIFIED_ROUTE_TAG: &str = "[UNIFIED_ROUTE]";
+pub const FINISH_TOOL_NAME: &str = "finish";
 
 /// Example call shape for injection blocks.
 pub const UNIFIED_CALL_EXAMPLE: &str =
-    r#"complete_and_check({"action":"file_read","params":{"path":"src/main.rs"}})"#;
+    r#"file_read({"path":"src/main.rs"})"#;
+
+/// finish 工具的 ToolSchema — 用于结束本轮
+pub fn finish_tool_schema() -> ToolSchema {
+    ToolSchema {
+        name: FINISH_TOOL_NAME.to_string(),
+        description: "结束本轮，交还用户。可附带说明内容、发现列表或会话摘要。".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "结束说明：总结本轮发现、向用户提问或请求确认"
+                },
+                "finding_json": {
+                    "type": "array",
+                    "description": "需要用户审核的发现列表（可选）",
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "session_summary": {
+                    "type": "object",
+                    "description": "会话摘要（可选）：记录学到的内容、修改的文件等",
+                    "properties": {
+                        "learnings": { "type": "string" },
+                        "key_facts": { "type": "array" },
+                        "files_read": { "type": "array" },
+                        "files_modified": { "type": "array" }
+                    }
+                }
+            }
+        }),
+    }
+}
+
+/// 将原生 tool_call 转换为 UnifiedActionRequest
+/// 用于直接工具调用模式的拦截层
+pub fn tool_call_to_unified_request(name: &str, arguments: &Value) -> Option<UnifiedActionRequest> {
+    // finish 特殊处理
+    if name == FINISH_TOOL_NAME {
+        return Some(UnifiedActionRequest {
+            action: "finish".to_string(),
+            params: arguments.clone(),
+        });
+    }
+    
+    // 其他工具直接映射
+    let action = match name {
+        "file_read" | "file_write" | "edit_file" | "delete_range" |
+        "file_list" | "file_search" | "code_search" | "symbol" |
+        "shell_exec" | "git" | "project_detect" | "web_fetch" |
+        "code_graph" | "load_skill" | "recall" => name.to_string(),
+        _ => return None, // 不支持的工具
+    };
+    
+    Some(UnifiedActionRequest {
+        action,
+        params: arguments.clone(),
+    })
+}
 
 /// Authoritative whitelist of legal `action` values, shown to the LLM in every
 /// prompt block. Keep in sync with `action_to_tool_name` + `route`.
-pub const UNIFIED_ACTIONS_LIST: &str = "file_read | file_write | edit_file | delete_range | file_list | file_search | code_search | find_symbol | read_symbol | shell_exec | git_status | git_diff | project_detect | web_fetch | code_graph | load_skill | recall | finish";
+pub const UNIFIED_ACTIONS_LIST: &str = "file_read | file_write | edit_file | delete_range | file_list | file_search | code_search | symbol | shell_exec | git | project_detect | web_fetch | code_graph | load_skill | recall | finish";
 
 /// Parsed LLM request body for `complete_and_check`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,12 +187,25 @@ pub fn route(req: &UnifiedActionRequest) -> UnifiedRoute {
         "finish" | "deliver" | "report" | "done" | "complete" => UnifiedRoute::Finish,
         "recall" => UnifiedRoute::Recall,
         a if action_to_tool_name(a).is_some() => UnifiedRoute::DelegateTool,
-        _ => UnifiedRoute::Unknown,
+        _ => {
+            // Fuzzy-match: catch typos and case variations (read_file -> file_read)
+            if let Some(corrected) = fuzzy_match_action(&req.action) {
+                tracing::info!(
+                    "[UNIFIED] Fuzzy-matched action `{}` -> `{}`",
+                    req.action, corrected
+                );
+                if action_to_tool_name(&corrected).is_some() {
+                    return UnifiedRoute::DelegateTool;
+                }
+            }
+            UnifiedRoute::Unknown
+        }
     }
 }
 
 pub fn action_to_tool_name(action: &str) -> Option<&'static str> {
     match action {
+        // ── Primary actions ──
         "file_read" => Some("file_read"),
         "file_write" => Some("file_write"),
         "edit_file" => Some("edit_file"),
@@ -139,28 +213,171 @@ pub fn action_to_tool_name(action: &str) -> Option<&'static str> {
         "file_search" => Some("file_search"),
         "code_search" => Some("code_search"),
         "delete_range" => Some("delete_range"),
-        "find_symbol" => Some("find_symbol"),
-        "read_symbol" => Some("read_symbol"),
+        "code_graph" => Some("code_graph"),
         "load_skill" => Some("load_skill"),
         "shell_exec" => Some("shell_exec"),
         "project_detect" => Some("project_detect"),
         "web_fetch" => Some("web_fetch"),
+        "recall" => None, // recall is its own route, not a delegate
+
+        // ── Composite actions (resolve_inner_tool reads `op` param) ──
+        "git" => Some("git_status"),     // default inner; resolve_inner_tool overrides
+        "symbol" => Some("find_symbol"), // default inner; resolve_inner_tool overrides
+
+        // ── Legacy aliases (still accepted for backward compat) ──
+        "find_symbol" => Some("find_symbol"),
+        "read_symbol" => Some("read_symbol"),
         "git_status" => Some("git_status"),
         "git_diff" => Some("git_diff"),
-        "code_graph" => Some("code_graph"),
+
+        // ── Short aliases ──
         "read" => Some("file_read"),
         "write" => Some("file_write"),
         "edit" => Some("edit_file"),
-        "git" => Some("git_status"),
         _ => None,
     }
 }
 
+/// Resolve a composite action to the actual inner tool name by inspecting `params`.
+///
+/// Composite actions (`git`, `symbol`) carry an `op` param that selects the
+/// underlying tool. Legacy aliases (`git_status`, `find_symbol`, etc.) pass
+/// through unchanged. Callers that only need a routing decision (not execution)
+/// can use `action_to_tool_name` instead.
+pub fn resolve_inner_tool(action: &str, params: &Value) -> Option<&'static str> {
+    match action {
+        "git" => {
+            let op = params.get("op").and_then(|v| v.as_str()).unwrap_or("");
+            match op {
+                "diff" => Some("git_diff"),
+                _ => Some("git_status"), // default to status
+            }
+        }
+        "symbol" => {
+            let op = params.get("op").and_then(|v| v.as_str()).unwrap_or("");
+            match op {
+                "read" => Some("read_symbol"),
+                "find" => Some("find_symbol"),
+                _ => {
+                    // Infer from params: `pattern` -> find, `name` -> read
+                    if params.get("pattern").is_some() {
+                        Some("find_symbol")
+                    } else if params.get("name").is_some() {
+                        Some("read_symbol")
+                    } else {
+                        Some("find_symbol") // default
+                    }
+                }
+            }
+        }
+        // Non-composite: delegate to action_to_tool_name
+        other => action_to_tool_name(other),
+    }
+}
+
+/// Fuzzy-match an unrecognized action name to a canonical one.
+///
+/// Strategies (in priority order):
+/// 1. Case-insensitive exact match ("FileRead" -> "file_read")
+/// 2. Underscore/hyphen swap ("file-read" -> "file_read")
+/// 3. Word swap ("read_file" -> "file_read", "status_git" -> "git_status")
+/// 4. Levenshtein distance ≤ 2 ("file_reed" -> "file_read")
+pub fn fuzzy_match_action(input: &str) -> Option<String> {
+    let canonical = ALL_ACTIONS;
+    let lower = input.to_lowercase();
+
+    // Strategy 1: case-insensitive exact
+    for &a in canonical {
+        if a == lower {
+            return Some(a.to_string());
+        }
+    }
+    // Also check legacy aliases
+    let legacy: &[&str] = &[
+        "git_status",
+        "git_diff",
+        "find_symbol",
+        "read_symbol",
+        "read",
+        "write",
+        "edit",
+        "deliver",
+        "report",
+        "done",
+        "complete",
+    ];
+    for &a in legacy {
+        if a == lower {
+            return Some(a.to_string());
+        }
+    }
+
+    // Strategy 2: hyphen -> underscore
+    let normalized = lower.replace('-', "_");
+    for &a in canonical {
+        if a == normalized {
+            return Some(a.to_string());
+        }
+    }
+
+    // Strategy 3: word swap (split on '_', reverse, rejoin)
+    let parts: Vec<&str> = normalized.split('_').collect();
+    if parts.len() == 2 {
+        let swapped = format!("{}_{}", parts[1], parts[0]);
+        for &a in canonical {
+            if a == swapped {
+                return Some(a.to_string());
+            }
+        }
+        // Also check legacy aliases
+        for &a in legacy {
+            if a == swapped {
+                return Some(a.to_string());
+            }
+        }
+    }
+
+    // Strategy 4: Levenshtein distance ≤ 2
+    for &a in canonical {
+        if levenshtein(&lower, a) <= 2 && lower.len() >= 3 {
+            return Some(a.to_string());
+        }
+    }
+
+    None
+}
+
+/// Simple Levenshtein distance (character-level).
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
 pub fn gate_for_action(action: &str, safety: SafetyLevel) -> ActionGate {
     match action {
-        "finish" => ActionGate::Finish,
+        "finish" | "deliver" | "report" | "done" | "complete" => ActionGate::Finish,
         "shell_exec" => ActionGate::Safety,
         "file_write" | "edit_file" | "edit" | "write" | "delete_range" => ActionGate::Safety,
+        // Composite actions inherit safety from the resolved inner tool (always Safe for git/symbol)
+        "git" | "symbol" => ActionGate::None,
         _ => match safety {
             SafetyLevel::Safe => ActionGate::None,
             SafetyLevel::RequiresConfirmation | SafetyLevel::Dangerous => ActionGate::Safety,
@@ -249,7 +466,7 @@ pub fn tool_schema_with_actions(actions: &[&str]) -> ToolSchema {
                 },
                 "params": {
                     "type": "object",
-                    "description": "动作参数对象，格式: {\"action\":\"xxx\",\"params\":{...}}。\n\n读取类:\n- file_read: {path, offset?, limit?}\n- file_list: {path}\n- file_search: {pattern, path?}\n- code_search: {pattern, path?, file_pattern?}\n- find_symbol: {name?, pattern?, top_k?} (name 或 pattern 二选一)\n- read_symbol: {name, kind?, context_lines?}\n- git_status/git_diff/project_detect/web_fetch/load_skill: 各自参数\n- recall: {node_id} (记忆图谱 #<编号> 或 offload node_id)\n\n代码图谱(GitNexus — 优先使用):\n- code_graph: {op, ...} — op=query|context|cypher|list_repos|impact|detect_changes|api_impact|route_map|tool_map|shape_check|rename|group_list|group_sync\n\n写入类(直接执行，无需提交 finding_json):\n- edit_file: {path, old_string, new_string}\n- file_write: {path, content}\n- delete_range: {path, start_anchor, end_anchor}\n- shell_exec: {command}\n\n结束:\n- finish: {content?} — 结束本轮\n- finish: {finding_json:[...]} — 复杂改动时才需要提交审核\n\n❌ 禁止 CLI 语法(--flag) | 禁止空 params | 禁止 XML 格式",
+                    "description": "动作参数对象，格式: {\"action\":\"xxx\",\"params\":{...}}。\n\n读取类:\n- file_read: {path, offset?, limit?}\n- file_list: {path}\n- file_search: {pattern, path?}\n- code_search: {pattern, path?, file_pattern?}\n- symbol: {op:\"find\"|\"read\", name?, pattern?, top_k?, kind?, context_lines?} - op=find 查找符号位置(默认); op=read 读取完整源码\n- git: {op:\"status\"|\"diff\", staged?, path?} - op=status(默认) 看状态; op=diff 看 diff\n- project_detect/web_fetch/load_skill: 各自参数\n- recall: {node_id} (记忆图谱 #<编号> 或 offload node_id)\n\n代码图谱(GitNexus — 优先使用):\n- code_graph: {op, ...} — op=query|context|cypher|list_repos|impact|detect_changes|api_impact|route_map|tool_map|shape_check|rename|group_list|group_sync\n\n写入类(直接执行，无需提交 finding_json):\n- edit_file: {path, old_string, new_string}\n- file_write: {path, content}\n- delete_range: {path, start_anchor, end_anchor}\n- shell_exec: {command}\n\n结束:\n- finish: {content?} — 结束本轮\n- finish: {finding_json:[...]} — 复杂改动时才需要提交审核\n\n❌ 禁止 CLI 语法(--flag) | 禁止空 params | 禁止 XML 格式",
                 }
             },
             "required": ["action", "params"]
@@ -269,15 +486,13 @@ const ALL_ACTIONS: &[&str] = &[
     "file_search",
     "code_search",
     "delete_range",
-    "find_symbol",
-    "read_symbol",
+    "symbol",
     "code_graph",
     "load_skill",
     "shell_exec",
     "project_detect",
     "web_fetch",
-    "git_status",
-    "git_diff",
+    "git",
     "recall",
     "finish",
 ];
@@ -315,16 +530,14 @@ fn unified_route_spec(engine: &WorkflowEngine) -> UnifiedRouteSpec {
             vec!["finish"],
             vec![
                 "file_read",
-                "find_symbol",
-                "read_symbol",
+                "symbol",
                 "code_search",
                 "code_graph",
                 "file_list",
                 "file_search",
                 "load_skill",
                 "recall",
-                "git_status",
-                "git_diff",
+                "git",
                 "finish",
             ],
             vec!["edit_file", "file_write", "delete_range", "shell_exec"],
@@ -339,12 +552,10 @@ fn unified_route_spec(engine: &WorkflowEngine) -> UnifiedRouteSpec {
                         "edit_file",
                         "file_write",
                         "delete_range",
-                        "find_symbol",
-                        "read_symbol",
+                        "symbol",
                         "code_graph",
                         "shell_exec",
-                        "git_status",
-                        "git_diff",
+                        "git",
                         "load_skill",
                         "recall",
                         "finish",
@@ -355,19 +566,17 @@ fn unified_route_spec(engine: &WorkflowEngine) -> UnifiedRouteSpec {
             } else {
                 // Discussion mode: read-only + finish to respond. Writes blocked individually.
                 (
-                    vec!["finish", "file_read", "find_symbol", "code_graph"],
+                    vec!["finish", "file_read", "symbol", "code_graph"],
                     vec![
                         "file_read",
-                        "find_symbol",
-                        "read_symbol",
+                        "symbol",
                         "code_search",
                         "code_graph",
                         "file_list",
                         "file_search",
                         "load_skill",
                         "recall",
-                        "git_status",
-                        "git_diff",
+                        "git",
                         "finish",
                     ],
                     vec!["edit_file", "file_write", "delete_range", "shell_exec"],
@@ -382,12 +591,10 @@ fn unified_route_spec(engine: &WorkflowEngine) -> UnifiedRouteSpec {
                 "edit_file",
                 "file_write",
                 "delete_range",
-                "find_symbol",
-                "read_symbol",
+                "symbol",
                 "code_graph",
                 "shell_exec",
-                "git_status",
-                "git_diff",
+                "git",
                 "load_skill",
                 "recall",
                 "finish",
@@ -402,7 +609,7 @@ fn unified_route_spec(engine: &WorkflowEngine) -> UnifiedRouteSpec {
                     vec!["finish"],
                     vec!["load_skill", "recall", "finish"],
                     vec![
-                        "find_symbol",
+                        "symbol",
                         "code_search",
                         "file_search",
                         "file_list",
@@ -419,21 +626,19 @@ fn unified_route_spec(engine: &WorkflowEngine) -> UnifiedRouteSpec {
                         "project_detect",
                         "file_list",
                         "file_read",
-                        "find_symbol",
+                        "symbol",
                     ],
                     vec![
                         "project_detect",
                         "file_list",
                         "file_search",
                         "file_read",
-                        "find_symbol",
-                        "read_symbol",
+                        "symbol",
                         "code_search",
                         "code_graph",
                         "load_skill",
                         "recall",
-                        "git_status",
-                        "git_diff",
+                        "git",
                         "finish",
                     ],
                     vec!["edit_file", "file_write", "delete_range", "shell_exec"],
@@ -512,14 +717,13 @@ pub fn build_unified_route(engine: &WorkflowEngine) -> String {
         );
     }
     out.push_str(
-        "结束本轮 = 你主动调 `finish`（深思后的收尾，结束本轮、交还用户；不锁后续）：\n\
-         • 有需用户审核的内容(plan/bug/将改动) → finish(params.finding_json=[...]) → 门禁仅校验，等 c 确认后继续\n\
+        "结束本轮 = 调 `finish`：\n\
          • 已完成/纯分析/回答 → finish(params.content=…) 收尾\n\
-         • **用户明确拒绝修复（说 不修复/不改/算了）→ 直接 finish(params.content=…) 结束，勿再生成 finding_json**\n\
-         • 即使 finding_json 确认并改完代码，也由你**自己** finish 收尾；门禁/工具永不替你结束\n\
+         • **用户明确拒绝修复（说 不修复/不改/算了）→ 直接 finish(params.content=…) 结束**\n\
+         • 即使改完代码，也由你**自己** finish 收尾\n\
          • 中间想说明但还要继续 → 文字随下一个工具动作一起输出，勿用 finish 投递中间内容\n\
-         finding_json 形态: {\"findings_summary\":\"…\",\"findings\":[{\"index\":1,\"severity\":\"high\",\"file\":\"…\",\"issue\":\"…\",\"recommendation\":\"…\",\"fix_plan\":\"第几行+怎么改+代码草图\"}]}\n\
-         用户 c 确认后，本轮所有 edit/write/shell 自动执行，不再逐个确认；禁止改计划外文件。\n",
+         • **编辑工具会自动触发阻塞式确认门禁，无需提前请求**\n\
+         • 可选择性附带 finding_json 记录变更：{\"findings_summary\":\"…\",\"findings\":[{\"index\":1,\"severity\":\"high\",\"file\":\"…\",\"issue\":\"…\"}]}\n",
     );
     out.push_str(&format!("💡 {}", spec.note));
     out
@@ -529,11 +733,11 @@ pub fn build_unified_route(engine: &WorkflowEngine) -> String {
 pub fn build_unified_route_compact(engine: &WorkflowEngine) -> String {
     let spec = unified_route_spec(engine);
     let lock = if super::gate::business_gate::scope_implementation_unlocked(engine) {
-        "🔓 写权限已解锁 — edit/write/shell 自动执行（硬安全例外仍拦截）"
+        "🔓 写权限已解锁 — edit/write/shell 自动执行"
     } else if super::gate::business_gate::is_pending_scope(engine) {
-        "⏸ 等待用户 c 确认 — 禁止一切 action"
+        "⏸ 阻塞等待用户 c 确认"
     } else {
-        "🔒 只读 — 动手前先 finish(finding_json=[...]) 提交计划，用户 c 确认后解锁"
+        "🔒 只读 — 编辑工具会自动触发阻塞式确认门禁"
     };
     let mut out = format!("### 工具路由\n{lock}\n");
     if !spec.allowed.is_empty() {
@@ -554,9 +758,9 @@ pub fn build_unified_route_fallback() -> String {
     format!(
         "[WORKSPACE]\n\
          ## 当前任务（非 workflow 会话）\n\n\
-         **主流程:** 探索 → finish 提交 finding_json 确认一次 → 实施 → finish 结束\n\n\
+         **主流程:** 探索 → finish 提交计划或直接确认 → 实施 → finish 结束\n\n\
          ### 工具路由\n\
-         🔒 动手前先 finish(finding_json=[...]) 提交计划，用户 c 确认后解锁写权限\n\
+         🔒 只读 — finish 提交计划或直接请求确认，用户 c 确认后解锁写权限\n\
          唯一出口: `complete_and_check` — {UNIFIED_CALL_EXAMPLE}\n\
          禁止 assistant 纯文本交付与 `## Done` prose。"
     )
@@ -579,8 +783,7 @@ pub fn allowed_actions_for_phase(phase: &str) -> &'static [&'static str] {
         "review" => &[
             "file_read",
             "code_search",
-            "find_symbol",
-            "read_symbol",
+            "symbol",
             "code_graph",
             "file_list",
             "project_detect",
@@ -595,16 +798,14 @@ pub fn allowed_actions_for_phase(phase: &str) -> &'static [&'static str] {
             "file_search",
             "code_search",
             "delete_range",
-            "find_symbol",
-            "read_symbol",
+            "symbol",
             "code_graph",
             "load_skill",
             "recall",
             "shell_exec",
             "project_detect",
             "web_fetch",
-            "git_status",
-            "git_diff",
+            "git",
             "finish",
         ],
     }
@@ -617,8 +818,8 @@ pub fn tool_loop_key(arguments: &str) -> String {
     };
     match req.action.as_str() {
         "finish" | "deliver" | "report" | "done" | "complete" => format!("{TOOL_NAME}:finish"),
-        a if action_to_tool_name(a).is_some() => {
-            let inner = action_to_tool_name(a).unwrap();
+        a if resolve_inner_tool(a, &req.params).is_some() => {
+            let inner = resolve_inner_tool(a, &req.params).unwrap();
             delegate_tool_loop_key(inner, &req.params)
         }
         _ => format!("{TOOL_NAME}:unknown"),
@@ -730,5 +931,80 @@ mod tests {
     #[test]
     fn tool_loop_key_invalid() {
         assert_eq!(tool_loop_key(""), format!("{TOOL_NAME}:invalid"));
+    }
+
+    // ── Composite action tests ──
+
+    #[test]
+    fn git_composite_resolves_status_by_default() {
+        assert_eq!(resolve_inner_tool("git", &json!({})), Some("git_status"));
+    }
+
+    #[test]
+    fn git_composite_resolves_diff() {
+        assert_eq!(
+            resolve_inner_tool("git", &json!({"op":"diff"})),
+            Some("git_diff")
+        );
+    }
+
+    #[test]
+    fn symbol_composite_resolves_find_by_default() {
+        assert_eq!(resolve_inner_tool("symbol", &json!({})), Some("find_symbol"));
+    }
+
+    #[test]
+    fn symbol_composite_resolves_read_with_name() {
+        assert_eq!(
+            resolve_inner_tool("symbol", &json!({"name":"foo"})),
+            Some("read_symbol")
+        );
+    }
+
+    #[test]
+    fn symbol_composite_resolves_find_with_pattern() {
+        assert_eq!(
+            resolve_inner_tool("symbol", &json!({"pattern":"foo*"})),
+            Some("find_symbol")
+        );
+    }
+
+    // ── Fuzzy matching tests ──
+
+    #[test]
+    fn fuzzy_case_insensitive() {
+        assert_eq!(fuzzy_match_action("FileRead"), Some("file_read".into()));
+        assert_eq!(fuzzy_match_action("GIT"), Some("git".into()));
+    }
+
+    #[test]
+    fn fuzzy_word_swap() {
+        assert_eq!(fuzzy_match_action("read_file"), Some("file_read".into()));
+        assert_eq!(fuzzy_match_action("status_git"), Some("git_status".into()));
+    }
+
+    #[test]
+    fn fuzzy_typos() {
+        assert_eq!(fuzzy_match_action("file_reed"), Some("file_read".into()));
+        assert_eq!(fuzzy_match_action("symbal"), Some("symbol".into()));
+    }
+
+    #[test]
+    fn fuzzy_no_match_for_garbage() {
+        assert!(fuzzy_match_action("zzzzzz").is_none());
+    }
+
+    // ── Legacy alias still routes ──
+
+    #[test]
+    fn legacy_git_status_still_routes() {
+        let req = parse_request(r#"{"action":"git_status","params":{}}"#).unwrap();
+        assert_eq!(route(&req), UnifiedRoute::DelegateTool);
+    }
+
+    #[test]
+    fn legacy_find_symbol_still_routes() {
+        let req = parse_request(r#"{"action":"find_symbol","params":{"name":"foo"}}"#).unwrap();
+        assert_eq!(route(&req), UnifiedRoute::DelegateTool);
     }
 }

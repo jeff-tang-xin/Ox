@@ -58,7 +58,7 @@ impl Tool for FindSymbolTool {
             .unwrap_or(10);
 
         let name_owned = name.to_string();
-        let working_dir = ctx.working_dir.clone();
+        let working_dir = ctx.path_base();
         let _ = top_k;
 
         // Before tree-sitter search, try code_graph query to get execution flow

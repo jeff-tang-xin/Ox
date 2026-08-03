@@ -9,20 +9,15 @@ pub(crate) fn validate_single_step_tool(
     tool_name: &str,
     args: &serde_json::Value,
 ) -> Result<(), String> {
-    // 单一门禁：编辑类工具需先确认。
-    // 不再区分接单/实施阶段，不再区分“业务门禁”与“只读门禁”，
-    // 也不要求编辑前先 file_read。allows_code_modification() 内部
-    // 已含 scope 确认逻辑，作为唯一判据。
+    // 📌 代码修改门禁已移除 — edit_file/file_write/delete_range 在任何阶段都可直接执行。
+    // 安全控制由 unified_safety_gate() 在工具执行层兜底（写操作仍需用户确认）。
+    // 之前的 allows_code_modification() 门禁会导致 LLM 困惑："工具存在但调用被拒"。
     //
     // NOTE: phase==Complete is intentionally NOT a hard block. `finish` is the
     // LLM's explicit end and yields the turn back to the user; gates/tools must
     // never forbid future actions. The next user round resets the workflow.
-    if is_code_modifying_tool(tool_name) && !engine.allows_code_modification() {
-        return Err(
-            "⏸️ 编辑确认门禁 — 动手前先 finish(finding_json=[...]) 提交计划，用户 c 确认后解锁编辑；讨论请直接输入文字。"
-                .to_string(),
-        );
-    }
+    let _ = engine; // engine no longer used for gate checks, but kept for future extensions
+    let _ = tool_name;
 
     // read_guard::check is intentionally NOT called here. It is a
     // stateful gate (records impl_file_read on first re-read) and MUST run

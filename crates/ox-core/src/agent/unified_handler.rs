@@ -439,6 +439,39 @@ pub async fn handle_complete_and_check(
             .await
         }
         UnifiedRoute::DelegateTool => {
+            // Auto-trigger blocking confirmation gate for code-modifying tools
+            let inner_name = unified_action::resolve_inner_tool(&req.action, &req.params).unwrap_or("");
+            let is_code_modifying = matches!(inner_name, "file_write" | "edit_file" | "delete_range");
+            
+            if is_code_modifying {
+                if let Some(wf) = workflow_engine
+                    && let Ok(engine) = wf.try_lock()
+                    && !engine.allows_code_modification()
+                {
+                    // Auto-arm the scope gate — this is a BLOCKING safety gate
+                    business_gate::arm_findings_scope(&engine);
+                    drop(engine);
+                    
+                    // Block here until user confirms or cancels
+                    let outcome = run_findings_scope_gate(
+                        workflow_engine,
+                        messages,
+                        ui_tx,
+                        ui_rx,
+                        cancel_token,
+                        |engine, msgs, text, tx| { push_interjection(engine, msgs, text, tx) },
+                    ).await;
+                    
+                    match outcome {
+                        UnifiedHandleOutcome::Result { is_error: false, .. } => {
+                            // User confirmed — proceed with edit
+                            tracing::info!("[UNIFIED] User confirmed, proceeding with {}", inner_name);
+                        }
+                        other => return other,  // Cancelled or discuss — stop
+                    }
+                }
+            }
+            
             handle_delegate(
                 tc,
                 &req,
@@ -513,8 +546,11 @@ async fn handle_recall(
     }
 
     // Offloader ref retrieval (file-based node_id).
+    // 📌 Use path_base (stable project root) — offloader stores refs under
+    // .ox/refs/ at the project root, not under the current working_dir.
+    // Using working_dir here would cause recall() to fail after /cd.
     let offloader =
-        crate::context::context_offloader::ContextOffloader::new(&tool_ctx.working_dir, "session");
+        crate::context::context_offloader::ContextOffloader::new(&tool_ctx.path_base(), "session");
     match offloader.retrieve_full_content(&node_id) {
         Some(content) => UnifiedHandleOutcome::Result {
             content,
@@ -784,6 +820,42 @@ async fn handle_finish(
             )
             .await;
         }
+
+        // ── NEW: Allow direct confirmation without finding_json ──
+        // If LLM is in Review/AwaitUser phase and user hasn't confirmed yet,
+        // allow triggering the scope gate even without findings.
+        // This supports the requirement: "直接触发确认不需要 find_json"
+        let needs_direct_confirm = workflow_engine
+            .as_ref()
+            .and_then(|wf| wf.try_lock().ok())
+            .is_some_and(|e| {
+                let phase = crate::agent::phase::get(&e);
+                let is_unlocked = business_gate::scope_implementation_unlocked(&e);
+                // If in Review or AwaitUser phase and not yet confirmed, allow direct confirm
+                !is_unlocked && matches!(phase, 
+                    crate::agent::phase::SingleFlowPhase::Review | 
+                    crate::agent::phase::SingleFlowPhase::AwaitUser
+                )
+            });
+        if needs_direct_confirm {
+            // Arm the scope gate for direct confirmation (without finding_json)
+            if let Some(wf) = workflow_engine
+                && let Ok(engine) = wf.try_lock()
+            {
+                business_gate::arm_findings_scope(&engine);
+                drop(engine);
+            }
+            return run_findings_scope_gate(
+                workflow_engine,
+                messages,
+                ui_tx,
+                ui_rx,
+                cancel_token,
+                push_interjection,
+            )
+            .await;
+        }
+
         if let Some(wf) = workflow_engine
             && let Ok(mut engine) = wf.try_lock()
         {
@@ -906,7 +978,7 @@ async fn handle_delegate(
             req.clone()
         };
 
-    let inner_name = match unified_action::action_to_tool_name(&req.action) {
+    let inner_name = match unified_action::resolve_inner_tool(&req.action, &req.params) {
         Some(n) => n,
         None => {
             let valid = unified_action::UNIFIED_ACTIONS_LIST;
@@ -949,6 +1021,30 @@ async fn handle_delegate(
                     }),
                 );
             }
+            if matches!(inner_name, "find_symbol" | "code_search" | "file_search")
+                && let Some(cached) = crate::agent::gate::read_guard::cached_search_response(
+                    &engine,
+                    inner_name,
+                    &req.params,
+                )
+            {
+                return result_ok_envelope(
+                    json!({
+                        "action": req.action,
+                        "inner_tool": inner_name,
+                        "output": cached,
+                        "cached": true,
+                    }),
+                    vec![format!(
+                        "📋 ✅ {inner_name} - 本轮已查询过（返回缓存，未重复 IO）"
+                    )],
+                    Some(DelegateMeta {
+                        inner_tool: inner_name.to_string(),
+                        inner_args: params_str,
+                        live_output: cached.clone(),
+                    }),
+                );
+            }
             return result_err(e);
         }
     }
@@ -969,8 +1065,10 @@ async fn handle_delegate(
             .get("path")
             .and_then(|v| v.as_str())
             .map(|path_str| {
-                let resolved = tool_ctx.working_dir.join(path_str);
-                !crate::safety::is_path_within_workdir(&resolved, &tool_ctx.working_dir)
+                // 📌 Use stable path_base (project root) for sandbox check.
+                let path_base = tool_ctx.path_base();
+                let resolved = path_base.join(path_str);
+                !crate::safety::is_path_within_workdir(&resolved, &path_base)
             })
             .unwrap_or(false);
 
@@ -1136,8 +1234,72 @@ async fn handle_delegate(
 
     let auto_impact_note = auto_impact.map(|i| i.summary);
 
+    // ── PathGuard: 路径纠偏中间件 ──
+    // 在工具执行前检查路径，自动纠偏或返回候选列表。集中式拦截，不依赖模型自觉。
+    // 这是 harness 层最有效的路径防线：错路径能唯一匹配 → 静默改写 + 回写纠正说明；
+    // 无法置信匹配 → 不执行，直接返回候选列表（省一轮往返，且教会模型真实布局）。
+    //
+    // 使用 ToolContext 中的持久 PathGuard（带 60s TTL 文件索引缓存），
+    // 如果没有则创建临时实例（无缓存复用，但功能仍正确）。
+    let path_guard: std::sync::Arc<crate::tools::path_guard::PathGuard> =
+        tool_ctx.path_guard.clone().unwrap_or_else(|| {
+            std::sync::Arc::new(crate::tools::path_guard::PathGuard::new(
+                tool_ctx.path_base(),
+            ))
+        });
+
+    let mut effective_params = req.params.clone();
+    let path_guard_note: Option<String> = if matches!(
+        inner_name,
+        "file_read" | "edit_file" | "file_write" | "delete_range" | "file_list"
+    ) && let Some(path_str) = effective_params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    {
+        match path_guard.check(inner_name, &path_str, &mut effective_params) {
+            crate::tools::path_guard::GuardAction::Abort(msg) => {
+                tracing::warn!(
+                    "[PATH_GUARD] Aborted {} — path `{}` not found",
+                    inner_name,
+                    path_str
+                );
+                return UnifiedHandleOutcome::Result {
+                    content: msg,
+                    is_error: true,
+                    deferred_system: Vec::new(),
+                    delegate_meta: None,
+                };
+            }
+            crate::tools::path_guard::GuardAction::Proceed { note } => {
+                if note.is_some() {
+                    tracing::info!(
+                        "[PATH_GUARD] Corrected {} path: `{}` → {:?}",
+                        inner_name,
+                        path_str,
+                        effective_params.get("path")
+                    );
+                }
+                note
+            }
+        }
+    } else {
+        None
+    };
+
     tracing::info!("[DELEGATE] Executing inner tool: {}", inner_name);
-    let result = tool.execute(req.params.clone(), tool_ctx).await;
+    let mut result = tool.execute(effective_params, tool_ctx).await;
+
+    // 追加 PathGuard 纠正说明到工具结果末尾（让 LLM 学会真实布局）
+    if let Some(n) = path_guard_note {
+        result.content.push_str(&n);
+    }
+
+    // 写工具执行后刷新索引，让新文件立刻可被纠偏命中（消除 60s TTL 窗口）
+    if matches!(inner_name, "file_write" | "edit_file" | "delete_range") {
+        path_guard.invalidate();
+    }
+
     tracing::info!(
         "[DELEGATE] Tool done: {} (error={}, len={})",
         inner_name,
@@ -1251,12 +1413,25 @@ fn apply_delegate_success_effects(
                 .get("offset")
                 .and_then(|o| o.as_u64())
                 .unwrap_or(0) as u32;
-            crate::agent::gate::read_guard::record_file_read(engine, path);
-            crate::agent::tool_digest::record_read(engine, path, &result.content, offset, None);
+            // 📌 Record BOTH canonical and raw path so that:
+            // - `paths_read` display can show the canonical full path
+            // - `path_already_read` dedup still matches when LLM reuses the raw short path
+            let canonical = crate::agent::gate::read_guard::canonicalize_for_record(
+                path,
+                &tool_ctx.path_base(),
+            );
+            crate::agent::gate::read_guard::record_file_read(engine, &canonical);
+            // Also record the raw input (if different from canonical) for dedup matching.
+            if crate::agent::plan_tracker::normalize_path(path)
+                != crate::agent::plan_tracker::normalize_path(&canonical)
+            {
+                crate::agent::gate::read_guard::record_file_read(engine, path);
+            }
+            crate::agent::tool_digest::record_read(engine, &canonical, &result.content, offset, None);
             // Digest wrapping removed — LLM needs full file content.
         }
-    } else if matches!(inner_name, "find_symbol" | "code_search") {
-        crate::agent::gate::read_guard::record_symbol_query(engine, inner_name, &req.params);
+    } else if matches!(inner_name, "find_symbol" | "code_search" | "file_search") {
+        crate::agent::gate::read_guard::record_symbol_query(engine, inner_name, &req.params, &result.content);
     } else if inner_name == "code_graph" {
         // Record impact analysis so workspace.rs knows not to re-suggest it.
         if req.params.get("op").and_then(|o| o.as_str()) == Some("impact")
@@ -1291,7 +1466,7 @@ fn apply_delegate_success_effects(
         let target =
             crate::agent::exploration_snapshot::target_from_tool_args(inner_name, &params_str);
         engine.record_exploration_result(
-            &tool_ctx.working_dir,
+            &tool_ctx.path_base(),
             inner_name,
             &target,
             &result_content,

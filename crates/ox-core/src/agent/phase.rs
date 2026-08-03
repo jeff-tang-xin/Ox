@@ -131,8 +131,10 @@ pub fn workspace_mode(engine: &WorkflowEngine) -> WorkspaceMode {
     }
     match get(engine) {
         SingleFlowPhase::Implement => WorkspaceMode::ExecuteImpl,
-        SingleFlowPhase::AwaitUser if has_findings(engine) => WorkspaceMode::ScopeConfirm,
-        SingleFlowPhase::Receive | SingleFlowPhase::Review | SingleFlowPhase::AwaitUser => {
+        // Allow ScopeConfirm mode even without findings — LLM can request
+        // user confirmation directly without submitting finding_json first
+        SingleFlowPhase::AwaitUser => WorkspaceMode::ScopeConfirm,
+        SingleFlowPhase::Receive | SingleFlowPhase::Review => {
             WorkspaceMode::ExecuteReview
         }
         SingleFlowPhase::Complete => {
@@ -160,6 +162,7 @@ pub fn fix_impl_session(engine: &WorkflowEngine) -> bool {
 }
 
 /// Scope-confirm gate: findings stored, tools blocked, same ReAct session suspended.
+/// Now activates even without findings — LLM can request user confirmation directly.
 pub fn is_scope_gate_active(engine: &WorkflowEngine) -> bool {
     if crate::agent::workflow_session::is_feedback_discuss(engine) {
         return false;
@@ -167,8 +170,9 @@ pub fn is_scope_gate_active(engine: &WorkflowEngine) -> bool {
     if super::gate::business_gate::is_pending_scope(engine) {
         return true;
     }
+    // Allow scope gate to be active without findings
+    // (removed has_findings check to support direct confirmation)
     matches!(get(engine), SingleFlowPhase::AwaitUser)
-        && has_findings(engine)
         && !super::gate::business_gate::scope_implementation_unlocked(engine)
 }
 

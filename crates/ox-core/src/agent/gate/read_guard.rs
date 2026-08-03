@@ -5,6 +5,7 @@ use super::super::plan_tracker;
 
 const TURN_FILES_READ_KEY: &str = "_turn_files_read";
 const TURN_SYMBOLS_QUERIED_KEY: &str = "_turn_symbols_queried";
+const TURN_SEARCH_CACHE_KEY: &str = "_turn_search_cache";
 
 pub fn clear(engine: &WorkflowEngine) {
     engine.set_variable(TURN_FILES_READ_KEY, "[]".to_string());
@@ -14,6 +15,30 @@ pub fn clear(engine: &WorkflowEngine) {
 /// Reset per-turn symbol search dedup (new agent spawn — file-read state may persist).
 pub fn clear_symbol_queries(engine: &WorkflowEngine) {
     engine.set_variable(TURN_SYMBOLS_QUERIED_KEY, "[]".to_string());
+    engine.set_variable(TURN_SEARCH_CACHE_KEY, "{}".to_string());
+}
+
+/// Canonicalize a raw path input by the LLM into a stable project-relative path
+/// for recording in `paths_read`.
+///
+/// This is the bridge between "LLM input path" (which may be a short basename,
+/// a misspelled path, or a path with wrong prefixes) and "canonical path" (the
+/// actual project-relative path that `resolve_short_path` resolved to).
+///
+/// We use `resolve_short_path` to find the actual file, then strip the project
+/// root to get the canonical relative path. If resolution fails, we fall back to
+/// the raw input (normalized) so the record still happens — better to record a
+/// raw path than to skip recording entirely.
+pub fn canonicalize_for_record(raw_path: &str, path_base: &std::path::Path) -> String {
+    // Try to resolve via the same cascade file_read uses.
+    if let Some((resolved, _auto)) = crate::safety::resolve_short_path(raw_path, path_base) {
+        let canonical = crate::tools::canonical_rel_path(&resolved, path_base);
+        if !canonical.is_empty() {
+            return canonical;
+        }
+    }
+    // Fallback: just normalize the raw input (preserve backward compatibility).
+    plan_tracker::normalize_path(raw_path)
 }
 
 pub fn record_file_read(engine: &WorkflowEngine, path: &str) {
@@ -96,9 +121,6 @@ pub fn check(
             }
         }
         "find_symbol" | "code_search" | "file_search" => {
-            // Simplified: only block truly duplicate queries within the same turn.
-            // Phase-based gating (execute_report_already_delivered) is removed
-            // to allow simple tasks to proceed without artificial barriers.
             if let Some(query) = symbol_query_key(tool_name, args)
                 && symbol_already_queried(engine, &query)
             {
@@ -112,7 +134,12 @@ pub fn check(
     Ok(())
 }
 
-pub fn record_symbol_query(engine: &WorkflowEngine, tool_name: &str, args: &serde_json::Value) {
+pub fn record_symbol_query(
+    engine: &WorkflowEngine,
+    tool_name: &str,
+    args: &serde_json::Value,
+    result_content: &str,
+) {
     let Some(query) = symbol_query_key(tool_name, args) else {
         return;
     };
@@ -121,10 +148,22 @@ pub fn record_symbol_query(engine: &WorkflowEngine, tool_name: &str, args: &serd
         .get_variable(TURN_SYMBOLS_QUERIED_KEY)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    if set.insert(norm)
+    if set.insert(norm.clone())
         && let Ok(json) = serde_json::to_string(&set)
     {
         engine.set_variable(TURN_SYMBOLS_QUERIED_KEY, json);
+    }
+
+    // Store the result content so cached_search_response can replay it when
+    // a duplicate query is blocked by the read guard.
+    let mut cache: std::collections::HashMap<String, String> = engine
+        .get_variable(TURN_SEARCH_CACHE_KEY)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let trimmed: String = result_content.chars().take(6000).collect();
+    cache.insert(norm, trimmed);
+    if let Ok(json) = serde_json::to_string(&cache) {
+        engine.set_variable(TURN_SEARCH_CACHE_KEY, json);
     }
 }
 
@@ -152,12 +191,12 @@ pub fn is_discovery_call(
             }
             !path_already_read(engine, path)
         }
-        "find_symbol" | "code_search" => match symbol_query_key(tool_name, args) {
+        "find_symbol" | "code_search" | "file_search" => match symbol_query_key(tool_name, args) {
             Some(q) => !symbol_already_queried(engine, &q),
             None => false,
         },
         // Structural exploration — almost always surfaces new layout/paths.
-        "file_list" | "file_search" | "project_detect" | "code_graph" => true,
+        "file_list" | "project_detect" | "code_graph" => true,
         // Read-only but not obviously novel — a repeat here is likely circling,
         // so it must NOT count as discovery (otherwise the budget never trips).
         "git_status" | "git_diff" | "load_skill" | "recall" | "web_fetch" => false,
@@ -183,7 +222,7 @@ fn symbol_query_key(tool_name: &str, args: &serde_json::Value) -> Option<String>
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
-        "code_search" => args
+        "code_search" | "file_search" => args
             .get("pattern")
             .or_else(|| args.get("query"))
             .and_then(|v| v.as_str())
@@ -217,6 +256,28 @@ pub fn cached_file_read_response(engine: &WorkflowEngine, path: &str) -> Option<
              摘要: {}\n\
              符号: {symbols}{impl_hint}",
             d.summary,
+        )
+    })
+}
+
+/// Return cached search result instead of an empty error when a duplicate
+/// find_symbol / code_search / file_search is blocked by the read guard.
+/// This prevents "phantom reads" where the LLM loses context after compaction,
+/// re-queries, and gets back only a bare error with no data.
+pub fn cached_search_response(
+    engine: &WorkflowEngine,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    let query = symbol_query_key(tool_name, args)?;
+    let norm = query.to_lowercase();
+    let cache: std::collections::HashMap<String, String> = engine
+        .get_variable(TURN_SEARCH_CACHE_KEY)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    cache.get(&norm).map(|content| {
+        format!(
+            "✅ 【缓存】本轮已执行过 `{tool_name}({query})`（未重复 IO）\n\n{content}"
         )
     })
 }
@@ -305,8 +366,21 @@ mod tests {
     fn blocks_duplicate_find_symbol() {
         let e = engine();
         let args = serde_json::json!({"name": "MaintainDeliveryRequest"});
-        record_symbol_query(&e, "find_symbol", &args);
+        record_symbol_query(&e, "find_symbol", &args, "result text");
         assert!(check("find_symbol", &args, &e).is_err());
+    }
+
+    #[test]
+    fn cached_search_response_returns_stored_result() {
+        let e = engine();
+        let args = serde_json::json!({"name": "MyFunc"});
+        record_symbol_query(&e, "find_symbol", &args, "symbol MyFunc found at line 42");
+        // Blocked by dedup
+        assert!(check("find_symbol", &args, &e).is_err());
+        // But cached result is retrievable
+        let cached = cached_search_response(&e, "find_symbol", &args);
+        assert!(cached.is_some());
+        assert!(cached.unwrap().contains("symbol MyFunc found at line 42"));
     }
 
     #[test]
@@ -314,7 +388,7 @@ mod tests {
         let e = engine();
         let sym = serde_json::json!({"name": "MaintainDeliveryStrategy"});
         let search = serde_json::json!({"pattern": "MaintainDeliveryStrategy"});
-        record_symbol_query(&e, "find_symbol", &sym);
+        record_symbol_query(&e, "find_symbol", &sym, "sym result");
         assert!(check("code_search", &search, &e).is_ok());
     }
 

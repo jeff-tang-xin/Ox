@@ -141,8 +141,16 @@ pub fn is_path_within_workdir(path: &Path, working_dir: &Path) -> bool {
     false
 }
 
-/// Resolve a path to an absolute path if it exists.
-/// For non-existent paths (e.g., new files), returns the path as-is.
+/// Normalize a path to an absolute form if it exists.
+/// For non-existent paths (e.g., new files being created), returns the path as-is.
+///
+/// NOTE: This function does NOT enforce sandbox containment — that is the job
+/// of `is_path_within_workdir`, called by the agent layer
+/// (`unified_handler.rs`, `agent/mod.rs`) which flags out-of-project paths for
+/// safety confirmation. Keeping normalization and sandbox-check separate avoids
+/// breaking legitimate reads of absolute paths outside the project (e.g.
+/// `/etc/hosts`, `~/.ox/config.toml`).
+///
 /// Uses dunce for Windows-friendly path normalization.
 pub fn validate_path_within_workdir(path: &Path, _working_dir: &Path) -> anyhow::Result<PathBuf> {
     // Try to normalize if the path exists
@@ -171,6 +179,125 @@ fn levenshtein(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[b_len]
+}
+
+/// Auto-resolve a short or misspelled path by searching the project root.
+///
+/// Resolution cascade (each step only fires if the previous fails):
+/// 1. **Direct hit**: `path_base.join(path_str)` exists → return it.
+/// 2. **Exact basename** (no directory separators in input): walk project root,
+///    match files by exact basename. If exactly one match → auto-resolve.
+/// 3. **Fuzzy basename** (no directory separators in input): Levenshtein
+///    distance ≤ 2. If exactly one candidate → auto-resolve.
+/// 4. **Suffix match** (input HAS directory separators): treat the input as a
+///    path suffix and match any file whose relative path ends with the input.
+///    e.g. `ox-core/llm/openai.rs` matches `crates/ox-core/src/llm/openai.rs`.
+///    If exactly one match → auto-resolve.
+/// 5. Give up → caller reports error with `suggest_path_correction` hint.
+///
+/// **Returns** `Option<(PathBuf, bool)>`:
+/// - `(PathBuf, false)` — direct hit, no auto-resolution
+/// - `(PathBuf, true)` — auto-resolved via steps 2-4 (LLM should be informed)
+/// - `None` — couldn't resolve, caller falls back to error + suggestion
+///
+/// Design goal: minimize LLM cognitive load on path spelling while keeping
+/// ambiguity-safe (never auto-resolves when multiple candidates exist).
+pub fn resolve_short_path(path_str: &str, path_base: &Path) -> Option<(PathBuf, bool)> {
+    // 1. Normalize separators and try direct resolution
+    let normalized = path_str.trim().replace('\\', "/");
+    let direct = if Path::new(&normalized).is_absolute() {
+        PathBuf::from(&normalized)
+    } else {
+        path_base.join(&normalized)
+    };
+    if direct.exists() {
+        return Some((direct, false));
+    }
+
+    // Collect all files once (reuse for steps 2-4)
+    let all_files: Vec<PathBuf> = ignore::WalkBuilder::new(path_base)
+        .build()
+        .flatten()
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    let has_dir_sep = normalized.contains('/');
+
+    // 2-3. Basename-only input: try exact then fuzzy basename match
+    if !has_dir_sep {
+        // 2. Exact basename match
+        let exact: Vec<PathBuf> = all_files
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == normalized))
+            .cloned()
+            .collect();
+        if exact.len() == 1 {
+            let resolved = exact.into_iter().next().unwrap();
+            tracing::debug!(
+                "[PATH_RESOLVE] Auto-resolved '{}' → '{}' (exact basename, single match)",
+                path_str,
+                resolved.display()
+            );
+            return Some((resolved, true));
+        }
+
+        // 3. Fuzzy basename match (Levenshtein ≤ 2)
+        let fuzzy: Vec<(usize, PathBuf)> = all_files
+            .iter()
+            .filter_map(|p| {
+                let name = p.file_name()?.to_string_lossy().to_string();
+                let dist = levenshtein(&name, &normalized);
+                if dist > 0 && dist <= 2 {
+                    Some((dist, p.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if fuzzy.len() == 1 {
+            let (dist, resolved) = fuzzy.into_iter().next().unwrap();
+            tracing::debug!(
+                "[PATH_RESOLVE] Auto-resolved '{}' → '{}' (fuzzy basename, distance={})",
+                path_str,
+                resolved.display(),
+                dist
+            );
+            return Some((resolved, true));
+        }
+        // Multiple or zero fuzzy matches → fall through to None
+        return None;
+    }
+
+    // 4. Input has directory separators: try suffix match
+    //    e.g. "ox-core/llm/openai.rs" matches "crates/ox-core/src/llm/openai.rs"
+    //    because the relative path ends with the input suffix.
+    let suffix = normalized.as_str();
+    let suffix_matches: Vec<PathBuf> = all_files
+        .iter()
+        .filter(|p| {
+            let rel = p
+                .strip_prefix(path_base)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            rel == suffix || rel.ends_with(&format!("/{suffix}"))
+        })
+        .cloned()
+        .collect();
+
+    if suffix_matches.len() == 1 {
+        let resolved = suffix_matches.into_iter().next().unwrap();
+        tracing::debug!(
+            "[PATH_RESOLVE] Auto-resolved '{}' → '{}' (suffix match, single match)",
+            path_str,
+            resolved.display()
+        );
+        return Some((resolved, true));
+    }
+
+    // 5. Could not auto-resolve
+    None
 }
 
 /// Suggest correct path candidates when a given path does not exist.
@@ -264,6 +391,158 @@ mod tests {
         let out = suggest_path_correction(&bad, &dir);
         assert!(out.is_some());
         assert!(out.unwrap().contains("validation.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── resolve_short_path tests ──
+
+    #[test]
+    fn resolve_direct_hit() {
+        let dir = std::env::temp_dir().join(format!("ox_rsp_direct_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("exact.rs"), "x").unwrap();
+
+        // Full relative path works directly
+        let result = resolve_short_path("exact.rs", &dir);
+        assert!(result.is_some());
+        let (path, auto) = result.unwrap();
+        assert_eq!(path.file_name().unwrap(), "exact.rs");
+        assert!(!auto); // Direct hit, no auto-resolution
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_basename_single_match() {
+        let dir = std::env::temp_dir().join(format!("ox_rsp_single_{}", std::process::id()));
+        let sub = dir.join("sub").join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("unique.rs"), "x").unwrap();
+
+        // Basename-only, exactly one match → auto-resolved
+        let result = resolve_short_path("unique.rs", &dir);
+        assert!(result.is_some());
+        let (resolved, auto) = result.unwrap();
+        assert!(resolved.to_string_lossy().contains("sub"));
+        assert_eq!(resolved.file_name().unwrap(), "unique.rs");
+        assert!(auto); // Auto-resolution happened
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_basename_multi_match_returns_none() {
+        let dir = std::env::temp_dir().join(format!("ox_rsp_multi_{}", std::process::id()));
+        let sub1 = dir.join("a");
+        let sub2 = dir.join("b");
+        std::fs::create_dir_all(&sub1).unwrap();
+        std::fs::create_dir_all(&sub2).unwrap();
+        std::fs::write(sub1.join("dup.rs"), "x").unwrap();
+        std::fs::write(sub2.join("dup.rs"), "x").unwrap();
+
+        // Multiple matches → don't auto-resolve (ambiguous)
+        let result = resolve_short_path("dup.rs", &dir);
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_with_directory_separator_no_match() {
+        let dir = std::env::temp_dir().join(format!("ox_rsp_sep_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Path with directory separator, no matching suffix → no fallback
+        let result = resolve_short_path("nonexistent/foo.rs", &dir);
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_fuzzy_basename_single_match() {
+        // LLM misspells basename by 1 char → fuzzy match auto-resolves
+        let dir = std::env::temp_dir().join(format!("ox_rsp_fuzzy_{}", std::process::id()));
+        let sub = dir.join("crates").join("ox-core").join("src").join("llm");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("openai_sse.rs"), "x").unwrap();
+
+        // "openi_sse.rs" (missing 'a') → Levenshtein distance 1 → auto-resolved
+        let result = resolve_short_path("openi_sse.rs", &dir);
+        assert!(result.is_some());
+        let (resolved, auto) = result.unwrap();
+        assert_eq!(resolved.file_name().unwrap(), "openai_sse.rs");
+        assert!(auto); // Auto-resolution happened
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_fuzzy_basename_multi_match_returns_none() {
+        // Multiple fuzzy matches → ambiguous, don't auto-resolve
+        let dir = std::env::temp_dir().join(format!("ox_rsp_fm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test.rs"), "x").unwrap();
+        std::fs::write(dir.join("tests.rs"), "x").unwrap();
+
+        // "tst.rs" → distance 1 to both "test.rs" and "tests.rs" → ambiguous
+        let result = resolve_short_path("tst.rs", &dir);
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_suffix_match_single() {
+        // LLM writes partial path (missing prefix) → suffix match auto-resolves
+        let dir = std::env::temp_dir().join(format!("ox_rsp_suf_{}", std::process::id()));
+        let deep = dir.join("crates").join("ox-core").join("src").join("llm");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("openai.rs"), "x").unwrap();
+
+        // "ox-core/src/llm/openai.rs" matches "crates/ox-core/src/llm/openai.rs"
+        let result = resolve_short_path("ox-core/src/llm/openai.rs", &dir);
+        assert!(result.is_some());
+        let (resolved, auto) = result.unwrap();
+        assert_eq!(resolved.file_name().unwrap(), "openai.rs");
+        assert!(resolved.to_string_lossy().contains("crates"));
+        assert!(auto);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_suffix_match_short_segment() {
+        // Even a short suffix like "llm/openai.rs" should match
+        let dir = std::env::temp_dir().join(format!("ox_rsp_suf2_{}", std::process::id()));
+        let deep = dir.join("crates").join("ox-core").join("src").join("llm");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("openai.rs"), "x").unwrap();
+
+        let result = resolve_short_path("llm/openai.rs", &dir);
+        assert!(result.is_some());
+        let (resolved, auto) = result.unwrap();
+        assert_eq!(resolved.file_name().unwrap(), "openai.rs");
+        assert!(auto);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_suffix_match_multi_returns_none() {
+        // Multiple files with same suffix → ambiguous
+        let dir = std::env::temp_dir().join(format!("ox_rsp_sufm_{}", std::process::id()));
+        let a = dir.join("a").join("mod");
+        let b = dir.join("b").join("mod");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("foo.rs"), "x").unwrap();
+        std::fs::write(b.join("foo.rs"), "x").unwrap();
+
+        // "mod/foo.rs" matches both "a/mod/foo.rs" and "b/mod/foo.rs"
+        let result = resolve_short_path("mod/foo.rs", &dir);
+        assert!(result.is_none());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

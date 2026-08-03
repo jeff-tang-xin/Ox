@@ -20,8 +20,25 @@
 use std::sync::Arc;
 
 use crate::llm::{LlmProvider, LlmStreamEvent, StreamOptions};
+use crate::memory::react_index::ReactRecord;
 use crate::memory::store::{GraphNode, MemoryStore};
 use crate::message::Message;
+
+/// A single extracted keyword with its category.
+/// Categories: problem | conclusion | fix | file | error | concept
+#[derive(Debug, Clone)]
+pub struct KeywordItem {
+    pub cat: String,
+    pub kw: String,
+}
+
+/// One keyword extraction result for a single source (react_log or memory_graph).
+#[derive(Debug, Clone)]
+pub struct KeywordExtraction {
+    /// "react:<id>" or "graph:<id>"
+    pub source_id: String,
+    pub keywords: Vec<KeywordItem>,
+}
 
 /// Default fraction of the context window at which offload triggers.
 pub const OFFLOAD_THRESHOLD: f32 = 0.85;
@@ -92,16 +109,60 @@ pub async fn offload_if_over_budget(
     } else {
         OFFLOAD_THRESHOLD
     };
+
+    // 🛡️ Defensive: Some compatible APIs (e.g. deepseek-v4-flash, open-source models)
+    // return cumulative session token counts in usage.prompt_tokens instead of
+    // per-request prompt tokens. Two anomaly patterns:
+    //   (a) prompt_tokens >> context_window (e.g. 500k for 128k window) — cumulative
+    //   (b) prompt_tokens == 0 — API never returned a valid value (every call was
+    //       anomalous, so last_prompt_tokens was never updated from its init of 0)
+    //
+    // STRATEGY: For both patterns, estimate token count from message count
+    // (approx 200 tokens/message average). This is rough but safe — it prevents
+    // both false-positive triggers (every round) AND the dangerous "never trigger"
+    // scenario that would happen if we skipped the check entirely.
+    let (display_tokens, effective_tokens, anomaly) =
+        if prompt_tokens > context_window || prompt_tokens == 0 {
+            // Estimate: avg ~200 tokens per message (conservative for safety check)
+            let estimated = (messages.len() as u32).saturating_mul(200);
+            tracing::warn!(
+                "[OFFLOAD] Anomalous prompt_tokens ({}) — \
+                 using message-count estimate ({} msgs × 200 ≈ {} tokens) for budget check.",
+                prompt_tokens,
+                messages.len(),
+                estimated
+            );
+            (prompt_tokens, estimated, true)
+        } else {
+            (prompt_tokens, prompt_tokens, false)
+        };
+
     let budget = (context_window as f32 * threshold) as u32;
-    if prompt_tokens < budget {
+    if effective_tokens < budget {
+        if anomaly {
+            emit_status(format!(
+                "⚠️ API返回异常token值 {}% — 估算约 {} tokens（{} 条消息），未达阈值 {}%",
+                (display_tokens as f64 / context_window as f64 * 100.0) as u32,
+                effective_tokens,
+                messages.len(),
+                (threshold * 100.0) as u32
+            ));
+        }
         return (OffloadOutcome::NotNeeded, fail_streak, 0);
     }
 
-    let pct = (prompt_tokens as f64 / context_window as f64 * 100.0) as u32;
+    // Display the REAL percentage — users should see the actual number
+    let pct = (display_tokens as f64 / context_window as f64 * 100.0) as u32;
+    let anom_note = if anomaly {
+        format!("（⚠️ 异常值，估算{}tokens≈{}%）", effective_tokens, (effective_tokens as f64 / context_window as f64 * 100.0) as u32)
+    } else {
+        String::new()
+    };
     emit_status(format!(
-        "🔒 上下文达 {}%（阈值 {}%） — 正在归纳记忆图谱…（可继续输入，将排队）",
+        "🔒 上下文达 {}%（阈值 {}%）{} — 正在归纳记忆图谱…（可继续输入，将排队）",
         pct,
-        (threshold * 100.0) as u32
+        (threshold * 100.0) as u32,
+        anom_note
     ));
 
     // ── 3. Build GitNexus codebase context block (cheap, synchronous prep) ──
@@ -120,7 +181,8 @@ pub async fn offload_if_over_budget(
 
     if timeline.trim().is_empty() {
         cleanup_only(messages);
-        return (OffloadOutcome::Degraded, fail_streak.saturating_add(1), 0);
+        // Cooldown=1: skip next turn to avoid retry storm on persistent failures
+        return (OffloadOutcome::Degraded, fail_streak.saturating_add(1), 1);
     }
 
     // ── 5. Summarize ──
@@ -136,7 +198,7 @@ pub async fn offload_if_over_budget(
                 cleanup_only(messages);
                 emit_status("⚠️ 记忆归纳失败 — 本次跳过卸载，稍后重试".to_string());
             }
-            return (OffloadOutcome::Degraded, new_streak, 0);
+            return (OffloadOutcome::Degraded, new_streak, 1);
         }
     };
 
@@ -145,7 +207,23 @@ pub async fn offload_if_over_budget(
     if let Err(e) = store.archive_react_batch(session_id, &clusters) {
         tracing::warn!("[OFFLOAD] archive_react_batch failed: {e}");
         cleanup_only(messages);
-        return (OffloadOutcome::Degraded, fail_streak.saturating_add(1), 0);
+        // Cooldown=1: skip next turn to avoid retry storm
+        return (OffloadOutcome::Degraded, fail_streak.saturating_add(1), 1);
+    }
+
+    // ── 6.5. Semantic keyword extraction (non-fatal) ──
+    let all_react_ids: Vec<i64> = clusters.iter().flat_map(|c| c.react_ids.clone()).collect();
+    if !all_react_ids.is_empty() {
+        match run_keyword_extraction(provider, store, session_id, &all_react_ids).await {
+            Ok((kw_n, graph_n)) => {
+                if kw_n > 0 || graph_n > 0 {
+                    emit_status(format!(
+                        "🔗 已提取语义关键词 (react_log: {kw_n}, memory_graphs: {graph_n})"
+                    ));
+                }
+            }
+            Err(e) => tracing::warn!("[OFFLOAD] keyword extraction failed (non-fatal): {e}"),
+        }
     }
 
     // ── 7. Compact messages with GitNexus-aware priority ──
@@ -436,6 +514,178 @@ fn parse_clusters(raw: &str) -> Option<Vec<GraphNode>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Run semantic keyword extraction on react_log records + memory_graphs summaries.
+/// Returns (react_keyword_count, graph_count) on success.
+async fn run_keyword_extraction(
+    provider: &Arc<dyn LlmProvider>,
+    store: &MemoryStore,
+    session_id: &str,
+    react_ids: &[i64],
+) -> anyhow::Result<(usize, usize)> {
+    // 1. Fetch complete react records (zero truncation, from Tantivy)
+    let react_records = store.get_react_records_by_ids(react_ids)?;
+    // 2. Fetch memory_graphs summaries
+    let graph_summaries = store.get_memory_graphs_for_extraction(session_id)?;
+    // 3. LLM extraction (single call covering both)
+    let extractions = extract_keywords(provider, &react_records, &graph_summaries)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("LLM keyword extraction returned None"))?;
+    // 4. Write back by source type
+    let mut kw_total = 0usize;
+    let mut graph_total = 0usize;
+    for ext in &extractions {
+        if let Some(rid_str) = ext.source_id.strip_prefix("react:") {
+            if let Ok(rid) = rid_str.parse::<i64>() {
+                if let Err(e) = store.update_react_keywords(rid, &ext.keywords) {
+                    tracing::warn!("[KW] react_id={} writeback failed: {e}", rid);
+                }
+                kw_total += ext.keywords.len();
+            }
+        } else if let Some(gid_str) = ext.source_id.strip_prefix("graph:") {
+            if let Ok(gid) = gid_str.parse::<i64>() {
+                if let Err(e) = store.update_graph_keywords(gid, &ext.keywords) {
+                    tracing::warn!("[KW] graph_id={} writeback failed: {e}", gid);
+                }
+                graph_total += 1;
+            }
+        }
+    }
+    Ok((kw_total, graph_total))
+}
+
+/// Ask the LLM to extract categorized keywords from react_log records + memory_graphs.
+/// Returns None on any failure (network, timeout, unparseable) so caller can degrade.
+async fn extract_keywords(
+    provider: &Arc<dyn LlmProvider>,
+    react_records: &[ReactRecord],
+    graph_summaries: &[(i64, String, String)],
+) -> Option<Vec<KeywordExtraction>> {
+    use tokio::sync::mpsc;
+
+    let mut input = String::new();
+    for r in react_records {
+        input.push_str(&format!(
+            "[source_id=react:{}] task={}\n tool={} target={} outcome={}\n reasoning: {}\n assistant: {}\n tool_result: {}\n\n",
+            r.id,
+            truncate_str(&r.task_desc, 200),
+            r.tool,
+            truncate_str(&r.target, 80),
+            r.outcome,
+            truncate_str(&r.reasoning, 600),
+            truncate_str(&r.assistant_text, 400),
+            truncate_str(&r.tool_result, 800),
+        ));
+    }
+    for (gid, topic, detail) in graph_summaries {
+        input.push_str(&format!(
+            "[source_id=graph:{}] topic={}\n detail={}\n\n",
+            gid,
+            truncate_str(topic, 100),
+            truncate_str(detail, 400),
+        ));
+    }
+
+    if input.trim().is_empty() {
+        return None;
+    }
+
+    let prompt = format!(
+        "你是语义关键词提取器。下面是若干 ReAct 步骤和记忆图谱摘要（含完整推理、工具结果）。\n\
+         对每一条提取语义关键词并分类，输出 JSON 数组，每个元素:\n\
+         {{\"source_id\":\"react:<id>\"或\"graph:<id>\",\"keywords\":[{{\"cat\":\"分类\",\"kw\":\"关键词\"}}]}}\n\
+         分类说明:\n\
+         - problem: 用户遇到的问题/异常现象\n\
+         - conclusion: LLM 得出的结论/判断\n\
+         - fix: 实际的修复/解决动作\n\
+         - file: 涉及的文件路径或符号\n\
+         - error: 错误码/异常签名\n\
+         - concept: 涉及的概念/技术名词\n\
+         要求: 关键词简短(≤15字)；每条至少1个关键词；source_id 必须与输入完全一致；只输出 JSON 数组，无 markdown。\n\n\
+         输入:\n{input}"
+    );
+
+    let messages = vec![Message::system(&prompt)];
+    let (tx, mut rx) = mpsc::unbounded_channel::<LlmStreamEvent>();
+
+    if provider
+        .stream_chat(&messages, &[], tx, StreamOptions::default())
+        .await
+        .is_err()
+    {
+        return None;
+    }
+
+    let mut full = String::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            LlmStreamEvent::TextDelta(t) => full.push_str(&t),
+            LlmStreamEvent::Done { .. } => break,
+            LlmStreamEvent::Error(_) => return None,
+            _ => {}
+        }
+    }
+
+    parse_keyword_extractions(&full)
+}
+
+/// Parse keyword extraction JSON output (tolerates ```json fences / leading prose).
+fn parse_keyword_extractions(raw: &str) -> Option<Vec<KeywordExtraction>> {
+    let start = raw.find('[')?;
+    let end = raw.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    let json = &raw[start..=end];
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    let mut out = Vec::new();
+    for v in parsed {
+        let source_id = v
+            .get("source_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        if source_id.is_empty() {
+            continue;
+        }
+        let keywords = v
+            .get("keywords")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| {
+                        let cat = x
+                            .get("cat")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("concept")
+                            .to_string();
+                        let kw = x
+                            .get("kw")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if kw.is_empty() {
+                            None
+                        } else {
+                            Some(KeywordItem { cat, kw })
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(KeywordExtraction { source_id, keywords });
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Truncate a string to at most `max_chars` characters.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 /// Correctness-only cleanup (no archival). Safe to run on any failure.
 fn cleanup_only(messages: &mut Vec<Message>) {
     crate::context::sanitize_tool_pairs(messages);
@@ -657,11 +907,11 @@ pub async fn consolidate_if_due(
     }
 
     // ── 3. Downgrade stale nodes (forgetting) ──
-    let _ = store.downgrade_stale_nodes(DOWNGRADE_STALE_DAYS);
+    let _ = store.downgrade_stale_nodes(session_id, DOWNGRADE_STALE_DAYS);
 
     // ── 4. L3 promotion candidates ──
     let mut candidates = Vec::new();
-    let raw = store.get_l3_candidates(L3_MIN_HITS, 3).unwrap_or_default();
+    let raw = store.get_l3_candidates(session_id, L3_MIN_HITS, 3).unwrap_or_default();
     if !raw.is_empty() {
         let provider = summarizer.as_ref().unwrap_or(default_provider);
         for (gid, summary) in raw {

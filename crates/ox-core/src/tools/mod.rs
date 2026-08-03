@@ -13,6 +13,7 @@ pub mod find_symbol;
 pub mod git;
 pub mod intent_classifier;
 pub mod load_skill;
+pub mod path_guard;
 pub mod project_detect;
 pub mod read_symbol;
 pub mod shell_exec;
@@ -81,6 +82,9 @@ pub struct ToolContext {
     pub tool_call_id: String,
     /// Optional progress callback for real-time updates
     pub progress_callback: Option<Arc<dyn Fn(ToolProgress) + Send + Sync>>,
+    /// PathGuard — 会话级路径纠偏中间件（带 60s TTL 文件索引缓存）。
+    /// None 时 dispatch 层会创建临时实例（无缓存复用）。
+    pub path_guard: Option<Arc<crate::tools::path_guard::PathGuard>>,
 }
 
 /// Progress update from a tool execution
@@ -99,6 +103,11 @@ impl ToolContext {
         working_dir: std::path::PathBuf,
         config: Arc<OxConfig>,
     ) -> Self {
+        // 自动创建会话级 PathGuard（如果 project_root 存在）
+        let path_guard = runtime
+            .project_root
+            .as_ref()
+            .map(|root| Arc::new(crate::tools::path_guard::PathGuard::new(root.clone())));
         Self {
             runtime,
             working_dir,
@@ -108,6 +117,7 @@ impl ToolContext {
             summarizer: None,
             tool_call_id: String::new(),
             progress_callback: None,
+            path_guard,
         }
     }
 
@@ -132,6 +142,14 @@ impl ToolContext {
         self
     }
 
+    /// Attach a session-level PathGuard (builder style).
+    /// When set, the dispatch layer reuses this instance across all tool calls,
+    /// so the 60s TTL file index cache is shared and invalidate() actually works.
+    pub fn with_path_guard(mut self, guard: Option<Arc<crate::tools::path_guard::PathGuard>>) -> Self {
+        self.path_guard = guard;
+        self
+    }
+
     /// Create a new ToolContext with progress callback support
     pub fn with_progress_callback(
         runtime: RuntimeEnvironment,
@@ -140,6 +158,10 @@ impl ToolContext {
         tool_call_id: String,
         progress_callback: impl Fn(ToolProgress) + Send + Sync + 'static,
     ) -> Self {
+        let path_guard = runtime
+            .project_root
+            .as_ref()
+            .map(|root| Arc::new(crate::tools::path_guard::PathGuard::new(root.clone())));
         Self {
             runtime,
             working_dir,
@@ -149,7 +171,34 @@ impl ToolContext {
             summarizer: None,
             tool_call_id,
             progress_callback: Some(Arc::new(progress_callback)),
+            path_guard,
         }
+    }
+
+    /// Stable base for relative file-path resolution.
+    ///
+    /// Returns `runtime.project_root` when available (the project root is
+    /// recomputed by `find_project_root` walking up from the current directory,
+    /// so it stays anchored to the project even after `/cd` into a subdirectory).
+    /// Falls back to `working_dir` when no project markers are found.
+    ///
+    /// File tools (`file_read`, `edit_file`, `file_write`, `code_search`, …)
+    /// MUST resolve relative paths against this base — NOT against
+    /// `working_dir`, which can be mutated by `/cd` and would break the LLM's
+    /// "paths are relative to the project root" mental model. Shell/git tools
+    /// continue to use `working_dir` for process CWD semantics.
+    pub fn path_base(&self) -> std::path::PathBuf {
+        self.runtime
+            .project_root
+            .clone()
+            .unwrap_or_else(|| self.working_dir.clone())
+    }
+
+    /// 获取 PathGuard 纠偏历史的格式化文本（用于 system prompt 注入）
+    /// 超过 2 条纠偏记录就返回文本，用模型自己的错误教模型
+    /// 委托给全局静态存储函数
+    pub fn path_corrections_for_prompt(&self) -> Option<String> {
+        crate::tools::path_guard::get_global_corrections_for_prompt()
     }
 
     /// Report progress if callback is available
@@ -163,6 +212,41 @@ impl ToolContext {
             });
         }
     }
+}
+
+// ── Path display helpers ────────────────────────────────────────────────────
+
+/// Compute the canonical project-relative path for display to the LLM.
+///
+/// Returns the path relative to `path_base` with forward slashes (cross-platform).
+/// Falls back to the resolved path's string form if it can't be stripped (e.g.
+/// absolute path outside the project root).
+///
+/// This is the **single source of truth** for how paths appear in tool outputs.
+/// Every path-based tool (file_read/edit_file/file_write/delete_range) MUST use
+/// this to format the path in its success output, so the LLM always sees the
+/// canonical project-relative path — calibrating its mental model and preventing
+/// the "short path" hallucination loop where it keeps using `openai.rs` instead
+/// of `crates/ox-core/src/llm/openai.rs`.
+pub fn canonical_rel_path(resolved_path: &std::path::Path, path_base: &std::path::Path) -> String {
+    resolved_path
+        .strip_prefix(path_base)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| {
+            // Outside project root or absolute — normalize separators only.
+            resolved_path.to_string_lossy().replace('\\', "/")
+        })
+}
+
+/// Format a path header line for tool success output.
+///
+/// Prepend this to file_read/edit_file/file_write/delete_range success messages
+/// so the LLM sees the canonical path as the first line of every result.
+///
+/// Example: `📄 crates/ox-core/src/llm/openai.rs\n`
+pub fn format_path_header(resolved_path: &std::path::Path, path_base: &std::path::Path) -> String {
+    let rel = canonical_rel_path(resolved_path, path_base);
+    format!("📄 {rel}\n")
 }
 
 /// Trait for all tools that the agent can invoke.
@@ -288,12 +372,15 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Agent tool list: unified single schema or full registry.
+    /// Agent tool list: unified single schema or full registry + finish.
     pub fn schemas_for_agent(&self, unified_tool_mode: bool) -> Vec<crate::llm::ToolSchema> {
         if unified_tool_mode {
             crate::agent::unified_action::unified_tool_schemas()
         } else {
-            self.schemas()
+            let mut schemas = self.schemas();
+            // 添加 finish 工具（用于结束本轮）
+            schemas.push(crate::agent::unified_action::finish_tool_schema());
+            schemas
         }
     }
 

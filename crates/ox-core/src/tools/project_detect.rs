@@ -36,17 +36,19 @@ impl Tool for ProjectDetectTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolOutput {
+        // 📌 Resolve relative paths against the STABLE project root (path_base).
+        let path_base = ctx.path_base();
         let base = if let Some(p) = args.get("path").and_then(|p| p.as_str()) {
             // Normalize path: trim whitespace and standardize separators
             let normalized_path = p.trim().replace('\\', "/");
-            let resolved = ctx.working_dir.join(&normalized_path);
+            let resolved = path_base.join(&normalized_path);
 
-            match crate::safety::validate_path_within_workdir(&resolved, &ctx.working_dir) {
+            match crate::safety::validate_path_within_workdir(&resolved, &path_base) {
                 Ok(validated) => validated,
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
             }
         } else {
-            ctx.working_dir.to_path_buf()
+            path_base
         };
 
         let mut info = Vec::new();

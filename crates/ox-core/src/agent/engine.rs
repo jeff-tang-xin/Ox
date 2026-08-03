@@ -759,25 +759,9 @@ impl WorkflowEngine {
 
         crate::agent::workflow_session::validate_feedback_discuss_tool(self, tool_name)?;
 
-        // Check if code modification is allowed (step + exploring read-only override)
-        if !self.allows_code_modification() {
-            // Check if this is a code-modifying tool
-            let is_code_tool = matches!(tool_name, "file_write" | "edit_file" | "delete_range");
-
-            if is_code_tool {
-                // Extract file path from arguments
-                let file_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-
-                // Check if it's a source code file
-                if crate::source_paths::is_source_code_path(file_path) {
-                    return Err(format!(
-                        "Code modification not allowed in current step. You can only create/modify documentation files (.md, .txt, etc.), not {}. Attempted to modify: {}",
-                        crate::source_paths::source_code_guard_hint(),
-                        file_path
-                    ));
-                }
-            }
-        }
+        // 📌 代码修改门禁已移除 — edit_file/file_write/delete_range 在任何阶段都可直接执行。
+        // 安全控制由 unified_safety_gate() 在工具执行层兜底（写操作仍需用户确认）。
+        // 之前的 allows_code_modification() 门禁会导致 LLM 困惑："工具存在但调用被拒"。
 
         Ok(())
     }

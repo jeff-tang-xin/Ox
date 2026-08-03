@@ -120,24 +120,27 @@ pub fn build_task_anchor_block(
                 b.push_str("   - 新功能开发：优先写第一版，边写边补充探索\n");
             }
 
-            // Show recently read files for quick reference
+            // Show recently read files with FULL canonical path (not just basename).
+            // This is critical: showing only basename (e.g. "openai.rs") reinforces
+            // the LLM's habit of using short paths. Showing the full project-relative
+            // path (e.g. "crates/ox-core/src/llm/openai.rs") calibrates its mental model
+            // and gives it a copy-pasteable correct path for the next tool call.
+            //
+            // Filter out basename-only entries (no '/') — these are the raw short paths
+            // also recorded for dedup matching. We only show the canonical full paths.
             if !paths_read.is_empty() {
-                let recent: Vec<_> = paths_read.iter().rev().take(5).collect();
-                b.push_str("📂 最近读取: ");
-                b.push_str(
-                    &recent
-                        .iter()
-                        .map(|p| {
-                            let name = std::path::Path::new(p)
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or(p);
-                            name.to_string()
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-                b.push('\n');
+                let canonical_only: Vec<_> = paths_read
+                    .iter()
+                    .rev()
+                    .filter(|p| p.contains('/'))
+                    .take(5)
+                    .collect();
+                if !canonical_only.is_empty() {
+                    b.push_str("📂 最近读取 (直接复用这些完整路径):\n");
+                    for p in &canonical_only {
+                        b.push_str(&format!("  · {p}\n"));
+                    }
+                }
             }
         }
     }

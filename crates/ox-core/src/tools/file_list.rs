@@ -58,7 +58,8 @@ impl Tool for FileListTool {
             .get("path")
             .and_then(|p| p.as_str())
             .map(|s| s.to_string());
-        let working_dir = ctx.working_dir.clone();
+        // 📌 Resolve relative paths against the STABLE project root (path_base).
+        let working_dir = ctx.path_base();
 
         let result = tokio::task::spawn_blocking(move || {
             let dir = match path_str {

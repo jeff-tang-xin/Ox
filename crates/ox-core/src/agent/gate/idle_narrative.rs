@@ -7,7 +7,7 @@ pub const RESPONSE_DISCIPLINE: &str = "【输出纪律】每轮二选一：① �
 禁止空转：不说「好的/明白/让我先/被摘要/需重读」而不立刻行动。详见 ox-output-discipline skill。";
 
 pub const UNIFIED_RESPONSE_DISCIPLINE: &str = "【输出纪律】每轮必须调用 `complete_and_check`（禁止纯文本）。\
-二选一：① action=read/write/探索 ② action=finish（有 finding_json→确认 / 无→结束）。禁止空转寒暄。";
+二选一：① action=read/write/探索 ② action=finish（有 finding_json→确认 / 无→直接请求确认或结束）。禁止空转寒暄。";
 
 const OUTPUT_DISCIPLINE_SKILL: &str = include_str!("../../skill/builtin/ox-output-discipline.md");
 
@@ -29,7 +29,7 @@ pub fn discipline_for_iteration_unified(iteration: u32) -> String {
     }
     format!(
         "{UNIFIED_RESPONSE_DISCIPLINE}\n\
-         主流程见 [WORKSPACE]：探索 → finish(finding_json) 确认一次 → 实施 → finish 结束。"
+         主流程见 [WORKSPACE]：探索 → finish 提交计划或直接确认 → 实施 → finish 结束。"
     )
 }
 

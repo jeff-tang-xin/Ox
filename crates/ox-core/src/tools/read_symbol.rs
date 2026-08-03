@@ -66,7 +66,7 @@ impl Tool for ReadSymbolTool {
         let mut extractor = crate::tools::ast_extractor::AstExtractor::new();
         let hits = crate::tools::find_symbol::search_symbols_public(
             &mut extractor,
-            &ctx.working_dir,
+            &ctx.path_base(),
             &name,
         );
 

@@ -97,16 +97,26 @@ impl ContextAssembler {
             turn_memory,
         ));
 
-        // 2d. 🔄 ReAct Log — the LLM's backbone memory (single source of truth)
-        // Every LLM action is recorded here, from oldest to newest.
+        // 2d. ReAct Log — Active Memory + Archived Graphs
+        // All data stored in Tantivy with ZERO truncation
         if let Some(ms) = memory_store {
-            let mainline_limit = if in_impl_phase { 50 } else { 30 };
-            if let Ok(mainline) = ms.get_react_mainline(session_id, mainline_limit)
-                && !mainline.trim().is_empty()
-            {
-                block.push_str("📜 历史行动轨迹 (ReAct Log, 由远及近):\n");
-                block.push_str(&mainline);
-                block.push('\n');
+            let current_files: Vec<String> = turn_memory
+                .entries
+                .iter()
+                .filter_map(|e| {
+                    if crate::memory::store::is_file_path(&e.target) {
+                        Some(e.target.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if let Ok(context) = ms.get_context_for_injection(session_id, user_task, &current_files) {
+                if !context.trim().is_empty() {
+                    block.push_str(&context);
+                    block.push_str("\n");
+                }
             }
         }
 

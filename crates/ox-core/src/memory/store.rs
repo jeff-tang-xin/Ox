@@ -1,17 +1,29 @@
-//! SQLite-backed session memory store.
+//! Tantivy-backed session memory store.
 //! Persists LLM's session summaries (learnings, facts, file changes) across sessions.
 //! Path: `<project_root>/.ox/memory.db`
+//! react_log is stored in Tantivy for zero-truncation full-text retrieval.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use jieba_rs::Jieba;
 
 use crate::agent::unified_action::SessionSummary;
+use crate::memory::react_index::ReactIndex;
+use crate::memory::session_index::{
+    FactRecord, FileModifiedRecord, FileReadRecord, SessionIndex, SessionRecord,
+    DOC_TYPE_FACT, DOC_TYPE_FILE_MODIFIED, DOC_TYPE_FILE_READ, DOC_TYPE_SESSION,
+};
+
+/// Type alias for a react_log row: (created_at, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result)
+type ReactRow = (String, String, String, String, String, String, String, String, String);
 
 pub struct MemoryStore {
-    conn: Mutex<Connection>,
+    session_index: SessionIndex,
+    react_index: ReactIndex,
+    meta_store: Mutex<HashMap<String, String>>,
 }
 
 /// One clustered memory-graph node produced by the summarizer during offload.
@@ -25,151 +37,67 @@ pub struct GraphNode {
 
 impl MemoryStore {
     /// Open or create store at the given path (e.g. `<project_root>/.ox/memory.db`).
+    /// The path's parent directory is used for Tantivy index storage.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                task_desc TEXT NOT NULL DEFAULT '',
-                content_summary TEXT NOT NULL DEFAULT '',
-                learnings TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS key_facts (
-                session_id TEXT NOT NULL REFERENCES sessions(id),
-                fact_text TEXT NOT NULL,
-                related_files TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS files_read (
-                session_id TEXT NOT NULL REFERENCES sessions(id),
-                file_path TEXT NOT NULL,
-                purpose TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS files_modified (
-                session_id TEXT NOT NULL REFERENCES sessions(id),
-                file_path TEXT NOT NULL,
-                change_summary TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS react_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                task_desc TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                tool TEXT NOT NULL,
-                target TEXT NOT NULL DEFAULT '',
-                outcome TEXT NOT NULL DEFAULT '',
-                decision TEXT NOT NULL DEFAULT '',
-                assistant_text TEXT NOT NULL DEFAULT '',
-                reasoning TEXT NOT NULL DEFAULT '',
-                tool_result TEXT NOT NULL DEFAULT '',
-                impacted INTEGER NOT NULL DEFAULT 0,
-                graph_id INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_react_session ON react_log(session_id);
-            CREATE INDEX IF NOT EXISTS idx_react_impacted ON react_log(impacted);
-            CREATE TABLE IF NOT EXISTS memory_graphs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT,
-                summary TEXT NOT NULL,
-                detail TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS idx_facts_text ON key_facts(fact_text);
-            CREATE INDEX IF NOT EXISTS idx_modified_path ON files_modified(file_path);
-            CREATE INDEX IF NOT EXISTS idx_key_facts_session ON key_facts(session_id);
-            CREATE INDEX IF NOT EXISTS idx_files_read_session ON files_read(session_id);
-            CREATE INDEX IF NOT EXISTS idx_files_read_path ON files_read(file_path);
-            CREATE INDEX IF NOT EXISTS idx_files_modified_session ON files_modified(session_id);",
-        )?;
-        // Migrate pre-existing DBs: add the ReAct-triple columns if missing.
-        // ADD COLUMN errors when the column already exists — ignore that.
-        let _ = conn.execute(
-            "ALTER TABLE react_log ADD COLUMN assistant_text TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE react_log ADD COLUMN tool_result TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE react_log ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        // Memory-graph tiering columns (L1/L2/L3 + downgrade). Idempotent.
-        let _ = conn.execute(
-            "ALTER TABLE memory_graphs ADD COLUMN tier INTEGER NOT NULL DEFAULT 1",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE memory_graphs ADD COLUMN weight REAL NOT NULL DEFAULT 1.0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE memory_graphs ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE memory_graphs ADD COLUMN last_hit_at TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE memory_graphs ADD COLUMN merged_into INTEGER",
-            [],
-        );
+
+        // Convert file path to directory path for Tantivy indices
+        // e.g., "memory.db" → "memory_index"
+        let dir_path = if path.extension().is_some() {
+            let stem = path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("memory");
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            parent.join(format!("{}_index", stem))
+        } else {
+            path.to_path_buf()
+        };
+        
+        std::fs::create_dir_all(&dir_path)?;
+
+        let react_dir = dir_path.join("react_index");
+        let react_index = ReactIndex::open(&react_dir)?;
+
+        let session_index = SessionIndex::open(&dir_path)?;
+
         Ok(Self {
-            conn: Mutex::new(conn),
+            session_index,
+            react_index,
+            meta_store: Mutex::new(HashMap::new()),
         })
     }
 
     /// Save a session summary for a completed session.
-    /// Uses a single transaction so partial failures don't leave inconsistent state,
-    /// and deletes prior child rows for this session_id to avoid duplicate accumulation
-    /// across INSERT OR REPLACE on `sessions`.
-    /// Merges into the last session if it's about the same topic (same task_desc keywords
-    /// AND overlapping modified files), so 审核→修正→修复 不会变成三个独立批次.
+    /// Uses Tantivy indices for storage, deletes prior child rows for this session_id
+    /// to avoid duplicate accumulation, and merges into the last session if it's about
+    /// the same topic.
     pub fn save_session(
         &self,
         session_id: &str,
         task_desc: &str,
         summary: &SessionSummary,
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-
-        // Check if last session is about the same topic → merge instead of insert
-        let merged_id = self.find_merge_target(&conn, task_desc, summary);
+        let merged_id = self.find_merge_target(task_desc, summary);
 
         let target_id = merged_id.as_deref().unwrap_or(session_id);
-        let tx = conn.transaction()?;
 
-        tx.execute(
-            "DELETE FROM key_facts WHERE session_id = ?1",
-            params![target_id],
-        )?;
-        tx.execute(
-            "DELETE FROM files_read WHERE session_id = ?1",
-            params![target_id],
-        )?;
-        tx.execute(
-            "DELETE FROM files_modified WHERE session_id = ?1",
-            params![target_id],
-        )?;
+        self.session_index.delete_by_session(target_id)?;
 
-        // If merging, append learnings; otherwise use as-is
+        let created_at =
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+
         let merged_learnings = if merged_id.is_some() {
-            let old: String = tx
-                .query_row(
-                    "SELECT learnings FROM sessions WHERE id = ?1",
-                    params![target_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or_default();
-            if !old.is_empty() && !summary.learnings.is_empty() {
-                format!("{} → {}", old, summary.learnings)
+            if let Ok(Some(old_session)) = self.session_index.get_session(target_id) {
+                let mut old = old_session.learnings;
+                if !old.is_empty() && !summary.learnings.is_empty() {
+                    old.push_str(" → ");
+                    old.push_str(&summary.learnings);
+                    old
+                } else {
+                    summary.learnings.clone()
+                }
             } else {
                 summary.learnings.clone()
             }
@@ -177,35 +105,57 @@ impl MemoryStore {
             summary.learnings.clone()
         };
 
-        tx.execute(
-            "INSERT OR REPLACE INTO sessions (id, task_desc, content_summary, learnings)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![target_id, task_desc, "", merged_learnings],
-        )?;
+        let session_record = SessionRecord {
+            id: target_id.to_string(),
+            task_desc: task_desc.to_string(),
+            content_summary: String::new(),
+            learnings: merged_learnings,
+            created_at,
+            doc_type: DOC_TYPE_SESSION.to_string(),
+        };
+        self.session_index.insert_session(&session_record)?;
 
-        for f in &summary.key_facts {
-            tx.execute(
-                "INSERT INTO key_facts (session_id, fact_text, related_files) VALUES (?1, ?2, ?3)",
-                params![target_id, f.fact, f.files.join(", ")],
-            )?;
+        for (idx, f) in summary.key_facts.iter().enumerate() {
+            let fact_id = format!("{}_fact_{}", target_id, idx);
+            let record = FactRecord {
+                id: fact_id,
+                session_id: target_id.to_string(),
+                fact_text: f.fact.to_string(),
+                related_files: f.files.join(", "),
+                doc_type: DOC_TYPE_FACT.to_string(),
+            };
+            self.session_index.insert_fact(&record)?;
         }
-        for r in &summary.files_read {
-            tx.execute(
-                "INSERT INTO files_read (session_id, file_path, purpose) VALUES (?1, ?2, ?3)",
-                params![target_id, r.path, r.purpose],
-            )?;
+
+        for (idx, r) in summary.files_read.iter().enumerate() {
+            let fr_id = format!("{}_read_{}", target_id, idx);
+            let record = FileReadRecord {
+                id: fr_id,
+                session_id: target_id.to_string(),
+                file_path: r.path.to_string(),
+                purpose: r.purpose.to_string(),
+                doc_type: DOC_TYPE_FILE_READ.to_string(),
+            };
+            self.session_index.insert_file_read(&record)?;
         }
-        for m in &summary.files_modified {
-            tx.execute(
-                "INSERT INTO files_modified (session_id, file_path, change_summary) VALUES (?1, ?2, ?3)",
-                params![target_id, m.path, m.summary],
-            )?;
+
+        for (idx, m) in summary.files_modified.iter().enumerate() {
+            let fm_id = format!("{}_mod_{}", target_id, idx);
+            let record = FileModifiedRecord {
+                id: fm_id,
+                session_id: target_id.to_string(),
+                file_path: m.path.to_string(),
+                change_summary: m.summary.to_string(),
+                doc_type: DOC_TYPE_FILE_MODIFIED.to_string(),
+            };
+            self.session_index.insert_file_modified(&record)?;
         }
+
         for s in &summary.skills {
             tracing::info!("[MEMORY] Skill suggested: {} (scope={})", s.id, s.scope);
         }
 
-        tx.commit()?;
+        self.session_index.commit()?;
         Ok(())
     }
 
@@ -213,27 +163,29 @@ impl MemoryStore {
     /// similarity in learnings, or overlapping file paths.
     fn find_merge_target(
         &self,
-        conn: &rusqlite::Connection,
         _task_desc: &str,
         summary: &SessionSummary,
     ) -> Option<String> {
-        let last: Result<(String, String), _> = conn.query_row(
-            "SELECT id, learnings FROM sessions
-             WHERE created_at >= datetime('now', '-30 minutes')
-             ORDER BY created_at DESC LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        );
-        let Ok((last_id, last_learnings)) = last else {
-            return None;
-        };
+        let mut recent = self.session_index.get_recent_sessions(20).ok()?;
+        recent.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-        // Trigram similarity >25% → same topic, merge
-        if trigram_overlap(&last_learnings, &summary.learnings) > 0.25 {
-            return Some(last_id);
+        let now = chrono::Utc::now();
+        let thirty_minutes_ago = now - chrono::Duration::minutes(30);
+
+        let last = recent.into_iter().find(|s| {
+            if let Ok(dt) =
+                chrono::DateTime::parse_from_str(&s.created_at, "%Y-%m-%d %H:%M:%S%.3f")
+            {
+                dt.with_timezone(&chrono::Utc) >= thirty_minutes_ago
+            } else {
+                false
+            }
+        })?;
+
+        if trigram_overlap(&last.learnings, &summary.learnings) > 0.25 {
+            return Some(last.id);
         }
 
-        // Fallback: same modified files → same batch
         let new_files: Vec<String> = summary
             .files_modified
             .iter()
@@ -242,19 +194,22 @@ impl MemoryStore {
         if new_files.is_empty() {
             return None;
         }
-        let mut stmt = conn
-            .prepare("SELECT file_path FROM files_modified WHERE session_id = ?1")
-            .ok()?;
-        let old_files: Vec<String> = stmt
-            .query_map(params![last_id], |row| {
-                row.get::<_, String>(0)
-                    .map(|p| p.rsplit('/').next().unwrap_or(&p).to_lowercase())
+
+        let all_files = self.session_index.get_all_file_modified(10000).ok()?;
+        let old_files: Vec<String> = all_files
+            .iter()
+            .filter(|f| f.session_id == last.id)
+            .map(|f| {
+                f.file_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&f.file_path)
+                    .to_lowercase()
             })
-            .ok()?
-            .filter_map(|r| r.ok())
             .collect();
+
         if new_files.iter().any(|f| old_files.contains(f)) {
-            return Some(last_id);
+            return Some(last.id);
         }
 
         None
@@ -263,37 +218,14 @@ impl MemoryStore {
     /// Query recent sessions that touched the given file path.
     /// Normalizes separators + case so Windows/Unix + absolute/relative paths match reliably.
     pub fn query_file_history(&self, file_path: &str, limit: usize) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT s.learnings, m.change_summary, s.created_at
-             FROM sessions s
-             JOIN files_modified m ON m.session_id = s.id
-             WHERE LOWER(REPLACE(m.file_path, '\\', '/')) = ?1
-                OR LOWER(REPLACE(m.file_path, '\\', '/')) LIKE ?2
-             ORDER BY s.created_at DESC
-             LIMIT ?3",
-        )?;
-
-        let norm: String = file_path.replace('\\', "/").to_lowercase();
-        let base: String = std::path::Path::new(&norm)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&norm)
-            .to_string();
-        let like_suffix = format!("%/{}", base);
-        let rows = stmt.query_map(params![norm, like_suffix, limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
+        let mut results = self.session_index.get_sessions_by_file(file_path, limit)?;
+        results.sort_by(|a, b| b.0.created_at.cmp(&a.0.created_at));
+        results.truncate(limit);
 
         let mut out = String::new();
-        for row in rows {
-            let (learnings, change, created) = row?;
-            let date: String = created.chars().take(10).collect();
-            let short: String = learnings.chars().take(120).collect();
+        for (session, change) in &results {
+            let date: String = session.created_at.chars().take(10).collect();
+            let short: String = session.learnings.chars().take(120).collect();
             out.push_str(&format!("  • {} — {}\n", date, short));
             if !change.is_empty() {
                 out.push_str(&format!(
@@ -313,8 +245,6 @@ impl MemoryStore {
         current_task: &str,
         max_results: usize,
     ) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
-
         let task_keywords: Vec<String> = current_task
             .split(|c: char| !c.is_alphanumeric() && c != '.')
             .filter(|w| w.len() > 2)
@@ -338,13 +268,7 @@ impl MemoryStore {
             })
             .collect();
 
-        let mut stmt = conn.prepare(
-            "SELECT s.task_desc, s.learnings, m.file_path, m.change_summary, s.created_at
-             FROM sessions s
-             JOIN files_modified m ON m.session_id = s.id
-             ORDER BY s.created_at DESC
-             LIMIT 20",
-        )?;
+        let all_modified = self.session_index.get_all_file_modified(10000)?;
 
         struct Scored {
             learnings: String,
@@ -354,19 +278,9 @@ impl MemoryStore {
         }
 
         let mut scored: Vec<Scored> = Vec::new();
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
 
-        for row in rows {
-            let (task_desc, learnings, file_path, change_summary, created_at) = row?;
-            let norm = file_path.replace('\\', "/").to_lowercase();
+        for modified in &all_modified {
+            let norm = modified.file_path.replace('\\', "/").to_lowercase();
             let base = std::path::Path::new(&norm)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -384,25 +298,26 @@ impl MemoryStore {
                 score += 1.0;
             }
 
-            let task_lower = task_desc.to_lowercase();
-            let kw_matches = task_keywords
-                .iter()
-                .filter(|k| task_lower.contains(k.as_str()))
-                .count();
-            if kw_matches > 0 {
-                score += (kw_matches as f64).min(3.0);
-            }
+            if let Ok(Some(session)) = self.session_index.get_session(&modified.session_id)
+            {
+                let task_lower = session.task_desc.to_lowercase();
+                let kw_matches = task_keywords
+                    .iter()
+                    .filter(|k| task_lower.contains(k.as_str()))
+                    .count();
+                if kw_matches > 0 {
+                    score += (kw_matches as f64).min(3.0);
+                }
 
-            if score < 1.5 {
-                continue;
+                if score >= 1.5 {
+                    scored.push(Scored {
+                        learnings: session.learnings,
+                        change_summary: modified.change_summary.clone(),
+                        created_at: session.created_at,
+                        score,
+                    });
+                }
             }
-
-            scored.push(Scored {
-                learnings,
-                change_summary,
-                created_at,
-                score,
-            });
         }
 
         scored.sort_by(|a, b| {
@@ -411,7 +326,6 @@ impl MemoryStore {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         scored.truncate(max_results);
-        // Reverse: oldest first (top of context = least attention), newest last
         scored.reverse();
 
         if scored.is_empty() {
@@ -441,6 +355,7 @@ impl MemoryStore {
     /// - `assistant_text`: visible assistant reply (striped of think blocks)
     /// - `reasoning`: raw thinking/reasoning content (for replay when visible text alone is insufficient)
     /// - `tool_result`: truncated tool output
+    /// All data is stored in Tantivy with ZERO truncation for full-text retrieval.
     #[allow(clippy::too_many_arguments)]
     pub fn record_react(
         &self,
@@ -454,45 +369,36 @@ impl MemoryStore {
         reasoning: &str,
         tool_result: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        // Store full content without truncation — SQLite TEXT has no length limit.
-        // Only apply a very large safety net to prevent extreme cases.
-        let assistant_text: String = assistant_text.chars().take(50000).collect();
-        let reasoning: String = reasoning.chars().take(50000).collect();
-        let tool_result: String = tool_result.chars().take(100000).collect();
-        conn.execute(
-            "INSERT INTO react_log
-                (session_id, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![session_id, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result],
+        let created_at =
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
+        self.react_index.add_record(
+            session_id,
+            task_desc,
+            &created_at,
+            timestamp,
+            tool,
+            target,
+            outcome,
+            decision,
+            assistant_text,
+            reasoning,
+            tool_result,
+            &[],
         )?;
+
         Ok(())
     }
 
     /// Get unimpacted ReAct timeline (oldest first) for context injection.
     pub fn get_react_timeline(&self, session_id: &str, limit: usize) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT created_at, tool, target, outcome, decision
-             FROM react_log
-             WHERE impacted = 0 AND session_id = ?1
-             ORDER BY created_at ASC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
+        let records = self.react_index.get_active_react_records(session_id, limit)?;
 
         let mut out = String::new();
         let mut time_group = String::new();
-        for row in rows {
-            let (ts, tool, target, outcome, decision) = row?;
+        for r in &records {
+            let ts = &r.created_at;
             let date: String = ts.chars().take(16).collect();
             if date != time_group {
                 if !out.is_empty() {
@@ -501,315 +407,1002 @@ impl MemoryStore {
                 out.push_str(&format!("🔄 [{}]\n", date));
                 time_group = date;
             }
-            let icon = if outcome == "ok" || outcome.starts_with("ok") {
+            let icon = if r.outcome == "ok" || r.outcome.starts_with("ok") {
                 "✅"
             } else {
                 "⚠️"
             };
-            let target_short: String = target.chars().take(50).collect();
-            out.push_str(&format!("  {} {} {}\n", icon, tool, target_short));
-            if !decision.is_empty() {
+            let target_short: String = r.target.chars().take(50).collect();
+            out.push_str(&format!("  {} {} {}\n", icon, r.tool, target_short));
+            if !r.decision.is_empty() {
                 out.push_str(&format!(
                     "    → {}\n",
-                    decision.chars().take(100).collect::<String>()
+                    r.decision.chars().take(100).collect::<String>()
                 ));
             }
         }
+        Ok(out)
+    }
+
+    /// Retrieve ReAct history by searching Tantivy with context keywords.
+    ///
+    /// Instead of linear time-based truncation, this function:
+    /// 1. Builds a query from context keywords (files, task, errors)
+    /// 2. Searches Tantivy BM25 index
+    /// 3. Returns the FULL, UNCUT react_log records for top results
+    pub fn get_graph_related_react(
+        &self,
+        session_id: &str,
+        context_files: &[String],
+        context_task: &str,
+        context_errors: &[String],
+        max_records: usize,
+    ) -> Result<String> {
+        let mut keywords: Vec<String> = Vec::new();
+
+        for file_path in context_files {
+            if let Some(base) =
+                std::path::Path::new(file_path).file_name().and_then(|s| s.to_str())
+            {
+                keywords.push(base.to_string());
+            }
+        }
+
+        if !context_task.trim().is_empty() {
+            let words: Vec<&str> = context_task
+                .split(|c: char| !c.is_alphanumeric() && c != '.' && c != '_')
+                .filter(|w| w.len() > 2)
+                .collect();
+            for w in words.iter().take(5) {
+                keywords.push(w.to_string());
+            }
+        }
+
+        for err in context_errors {
+            if !err.is_empty() {
+                keywords.push(err.to_string());
+            }
+        }
+
+        if keywords.is_empty() {
+            return Ok(String::new());
+        }
+
+        let search_query = keywords.join(" ");
+        let search_results = self
+            .react_index
+            .search(session_id, &search_query, max_records)?;
+
+        if search_results.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut out = String::new();
+        out.push_str("📊 Memory Graph (Keyword-based retrieval):\n");
+        out.push_str(&format!(
+            "  Context: files={:?}, task={}, errors={:?}\n",
+            context_files,
+            context_task.chars().take(80).collect::<String>(),
+            context_errors
+        ));
+        out.push('\n');
+
+        out.push_str("📜 Related ReAct History (full records, no truncation):\n");
+        for result in &search_results {
+            let r = &result.record;
+            let target_short: String = r.target.chars().take(60).collect();
+            let status_icon = if r.outcome == "ok" { "✓" } else { "✗" };
+            let task_short: String = r.task_desc.chars().take(80).collect();
+            out.push_str(&format!(
+                "  [{}] {} {} {}\n",
+                task_short, status_icon, r.tool, target_short
+            ));
+            if !target_short.is_empty() {
+                out.push_str(&format!("    target: {}\n", target_short));
+            }
+            if !r.decision.is_empty() {
+                out.push_str(&format!(
+                    "    decision: {}\n",
+                    r.decision.chars().take(150).collect::<String>()
+                ));
+            }
+            if !r.reasoning.is_empty() {
+                out.push_str(&format!(
+                    "    reasoning: {}\n",
+                    r.reasoning.chars().take(300).collect::<String>()
+                ));
+            }
+            if !r.assistant_text.is_empty() {
+                out.push_str(&format!(
+                    "    response: {}\n",
+                    r.assistant_text.chars().take(200).collect::<String>()
+                ));
+            }
+            if !r.tool_result.is_empty() {
+                out.push_str(&format!(
+                    "    result: {}\n",
+                    r.tool_result.chars().take(500).collect::<String>()
+                ));
+            }
+            out.push('\n');
+        }
+
+        Ok(out)
+    }
+
+    /// Retrieve relevant ReAct records using Tantivy BM25 full-text search.
+    ///
+    /// Segments the query with jieba (Chinese-aware tokenization),
+    /// searches Tantivy index with BM25 scoring, returns FULL, UNCUT records.
+    pub fn get_react_by_bm25(
+        &self,
+        session_id: &str,
+        query: &str,
+        top_n: usize,
+        min_score: f64,
+    ) -> Result<String> {
+        let jieba = Jieba::new();
+        let tokens = jieba.cut(query, false);
+        let joined = tokens.join(" AND ");
+
+        if joined.is_empty() {
+            return Ok(String::new());
+        }
+
+        let results = self.react_index.search(session_id, &joined, top_n * 3)?;
+
+        let mut out = String::new();
+        let mut count = 0;
+
+        for result in results {
+            if (result.score as f64) < min_score {
+                continue;
+            }
+            if result.record.tier != 0 {
+                continue;
+            }
+
+            count += 1;
+            let r = &result.record;
+
+            out.push_str(&format!(
+                "  [BM25 score={:.2}] {} ({} bytes)\n",
+                result.score,
+                r.created_at,
+                r.task_desc.chars().count()
+            ));
+            out.push_str(&format!(
+                "  📋 {}\n",
+                r.task_desc.chars().take(100).collect::<String>()
+            ));
+            out.push_str(&format!(
+                "  🔧 {} {}\n",
+                r.tool,
+                r.target.chars().take(60).collect::<String>()
+            ));
+            out.push_str(&format!(
+                "  📊 {}\n",
+                if r.outcome == "ok" {
+                    "✓ success"
+                } else {
+                    "✗ failed"
+                }
+            ));
+
+            if !r.decision.is_empty() {
+                out.push_str(&format!(
+                    "  💭 decision: {}\n",
+                    r.decision.chars().take(200).collect::<String>()
+                ));
+            }
+            if !r.reasoning.is_empty() {
+                out.push_str(&format!(
+                    "  🧠 reasoning: {}\n",
+                    r.reasoning.chars().take(300).collect::<String>()
+                ));
+            }
+            if !r.assistant_text.is_empty() {
+                out.push_str(&format!(
+                    "  💬 response: {}\n",
+                    r.assistant_text.chars().take(200).collect::<String>()
+                ));
+            }
+            if !r.tool_result.is_empty() {
+                let tr: String = r.tool_result.chars().take(2000).collect();
+                out.push_str(&format!("  📄 result: {}\n", tr));
+            }
+            out.push('\n');
+        }
+
+        if count > 0 {
+            let header = format!(
+                "🔍 BM25 Relevant History ({} records, score >= {:.2}):\n",
+                count, min_score
+            );
+            out.insert_str(0, &header);
+        }
+
         Ok(out)
     }
 
     /// Get the full ReAct mainline (oldest first) for context injection.
-    /// This is the **primary memory source** for the LLM — it includes
-    /// the complete tool execution trace with assistant reasoning and results.
-    /// Returns formatted text grouped by time, with summaries of each step.
+    ///
+    /// **Two-tier structure:**
+    /// 1. **Recent 3 turns**: full detail (decision + reasoning + result) — ZERO truncation from Tantivy
+    /// 2. **Historical turns**: decision graph only — compact dependency chains
+    ///
+    /// A "turn" is auto-detected by time gaps (>30s between records).
+    /// All data is retrieved from Tantivy with complete, uncut content.
     pub fn get_react_mainline(&self, session_id: &str, limit: usize) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT created_at, task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result
-             FROM react_log
-             WHERE impacted = 0 AND session_id = ?1
-             ORDER BY created_at ASC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })?;
+        let records = self
+            .react_index
+            .get_session_records_chronological(session_id)?;
 
-        // Collect all rows first to enable tiered truncation
-        let all_rows: Vec<_> = rows.filter_map(|r| r.ok()).collect();
-        let total_count = all_rows.len();
+        if records.is_empty() {
+            return Ok(String::new());
+        }
+
+        let rows: Vec<ReactRow> =
+            records.into_iter().take(limit).map(|r| {
+                (
+                    r.created_at,
+                    r.task_desc,
+                    r.tool,
+                    r.target,
+                    r.outcome,
+                    r.decision,
+                    r.assistant_text,
+                    r.reasoning,
+                    r.tool_result,
+                )
+            }).collect();
+
+        let mut turns: Vec<&[ReactRow]> = Vec::new();
+        let mut turn_start = 0;
+        for i in 1..rows.len() {
+            let gap = time_gap_seconds(&rows[i - 1].0, &rows[i].0);
+            if gap > 30 {
+                turns.push(&rows[turn_start..i]);
+                turn_start = i;
+            }
+        }
+        turns.push(&rows[turn_start..]);
+
+        let total_turns = turns.len();
+        let recent_turns = 3;
 
         let mut out = String::new();
-        let mut prev_date = String::new();
-        let mut prev_task = String::new();
 
-        for (idx, row) in all_rows.iter().enumerate() {
-            let (
-                ts,
-                task_desc,
-                tool,
-                target,
-                outcome,
-                decision,
-                assistant_text,
-                reasoning,
-                tool_result,
-            ) = row;
-            let date: String = ts.chars().take(16).collect();
-            let target_short: String = target.chars().take(80).collect();
-
-            // Tiered truncation: recent records get full content
-            // Last 5 records: full limits; earlier records: moderate limits
-            let is_recent = idx >= total_count.saturating_sub(5);
-
-            let (decision_limit, reasoning_limit, assistant_limit, result_limit) = if is_recent {
-                (500usize, 2000usize, 1000usize, 3000usize) // Recent: full content
-            } else {
-                (300usize, 800usize, 500usize, 1500usize) // Older: moderate limits
-            };
-
-            if date != prev_date {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(&format!("── {} ──\n", date));
-                prev_date = date;
-            }
-
-            if task_desc.as_str() != prev_task.as_str() {
-                out.push_str(&format!(
-                    "📋 Task: {}\n",
-                    task_desc.chars().take(500).collect::<String>()
-                ));
-                prev_task = task_desc.clone();
-            }
-
-            let icon = if outcome == "ok" || outcome.starts_with("ok") {
-                "✅"
-            } else {
-                "⚠️"
-            };
-            out.push_str(&format!("  {} [{}] {}\n", icon, tool, target_short));
-
-            let d: String = decision.chars().take(decision_limit).collect();
-            if !d.is_empty() {
-                out.push_str(&format!("    💭 Decision: {}\n", d));
-            }
-
-            let r: String = reasoning.chars().take(reasoning_limit).collect();
-            if !r.is_empty() {
-                out.push_str(&format!("    🧠 Reasoning: {}\n", r));
-            }
-
-            let a: String = assistant_text.chars().take(assistant_limit).collect();
-            if !a.is_empty() {
-                out.push_str(&format!("    💬 Assistant: {}\n", a));
-            }
-
-            let tr: String = tool_result.chars().take(result_limit).collect();
-            if !tr.is_empty() {
-                out.push_str(&format!("    📄 Result: {}\n", tr));
-            }
-
-            // If ALL detail fields are empty, show a compact placeholder
-            if d.is_empty() && r.is_empty() && a.is_empty() && tr.is_empty() {
-                out.push_str("    (无详细记录 — 仅工具执行)\n");
-            }
-
-            // Add truncation indicator for recent records
+        for (turn_idx, turn) in turns.iter().copied().enumerate() {
+            let is_recent = turn_idx >= total_turns.saturating_sub(recent_turns);
             if is_recent {
-                let orig_len =
-                    decision.len() + reasoning.len() + assistant_text.len() + tool_result.len();
-                let shown_len = d.len() + r.len() + a.len() + tr.len();
-                if orig_len > shown_len {
-                    out.push_str("    ... (已截断，完整内容已存储)\n");
+                continue;
+            }
+
+            let task_header = turn
+                .first()
+                .map(|r| r.1.chars().take(80).collect::<String>())
+                .unwrap_or_default();
+
+            out.push_str(&format!("── Turn {} ──\n", turn_idx + 1));
+            if !task_header.is_empty() {
+                out.push_str(&format!("📋 {}\n", task_header));
+            }
+
+            let mut chain = Vec::new();
+            for (_, _task_desc, tool, target, outcome, decision, _, reasoning, _) in turn {
+                let sym = if outcome == "ok" || outcome.starts_with("ok") {
+                    "→"
+                } else {
+                    "✗"
+                };
+                let target_short: String = target.chars().take(40).collect();
+                let step = if target_short.is_empty() {
+                    format!("{} {}", sym, tool)
+                } else {
+                    format!("{} {}({})", sym, tool, target_short)
+                };
+                chain.push(step);
+
+                if !decision.is_empty() || !reasoning.is_empty() {
+                    let rationale = if !decision.is_empty() {
+                        decision
+                    } else {
+                        reasoning
+                    };
+                    let r: String = rationale.chars().take(60).collect();
+                    if !r.is_empty() {
+                        out.push_str(&format!("  ↳ {}\n", r));
+                    }
                 }
+            }
+            out.push_str(&format!("  {}\n", chain.join(" → ")));
+            out.push('\n');
+        }
+
+        for (turn_idx, turn) in turns.iter().copied().enumerate() {
+            let is_recent = turn_idx >= total_turns.saturating_sub(recent_turns);
+            if !is_recent {
+                continue;
+            }
+
+            let task_header = turn
+                .first()
+                .map(|r| r.1.chars().take(80).collect::<String>())
+                .unwrap_or_default();
+
+            if total_turns > recent_turns {
+                out.push_str(&format!("── Turn {} (recent) ──\n", turn_idx + 1));
+            } else {
+                out.push_str(&format!("── Turn {} ──\n", turn_idx + 1));
+            }
+
+            if !task_header.is_empty() {
+                out.push_str(&format!("📋 {}\n", task_header));
+            }
+
+            for (_, _task_desc, tool, target, outcome, decision, assistant_text, reasoning, tool_result) in turn {
+                let target_short: String = target.chars().take(60).collect();
+                let ok = outcome == "ok" || outcome.starts_with("ok");
+                let sym = if ok { "✓" } else { "✗" };
+                out.push_str(&format!("  {} {} {}\n", sym, tool, target_short));
+
+                if !decision.is_empty() {
+                    out.push_str(&format!("    → {}\n", decision));
+                }
+
+                if !reasoning.is_empty() {
+                    out.push_str(&format!("    ↳ {}\n", reasoning));
+                }
+
+                if !assistant_text.is_empty() {
+                    out.push_str(&format!("    💬 {}\n", assistant_text));
+                }
+
+                if !tool_result.is_empty() {
+                    out.push_str(&format!("    ← {}\n", tool_result));
+                }
+            }
+            out.push('\n');
+        }
+
+        Ok(out)
+    }
+
+    /// Search react_log by query using Tantivy BM25 scoring.
+    /// Returns top-n relevant records with ZERO truncation.
+    pub fn search_react(
+        &self,
+        query: &str,
+        session_id: &str,
+        top_n: usize,
+    ) -> Result<String> {
+        let results = self.react_index.search(session_id, query, top_n)?;
+
+        if results.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            "── ReAct Search Results (query: \"{}\") ──\n\n",
+            query
+        ));
+
+        for result in results {
+            let r = &result.record;
+            out.push_str(&format!(
+                "[score={:.2}] [{}] {}\n",
+                result.score, r.created_at, r.task_desc
+            ));
+            out.push_str(&format!("  Tool: {} {}\n", r.tool, r.target));
+            out.push_str(&format!("  Outcome: {}\n", r.outcome));
+
+            if !r.decision.is_empty() {
+                out.push_str(&format!("  Decision: {}\n", r.decision));
+            }
+            if !r.reasoning.is_empty() {
+                out.push_str(&format!("  Reasoning: {}\n", r.reasoning));
+            }
+            if !r.assistant_text.is_empty() {
+                out.push_str(&format!("  Assistant: {}\n", r.assistant_text));
+            }
+            if !r.tool_result.is_empty() {
+                out.push_str(&format!("  Result: {}\n", r.tool_result));
+            }
+            if !r.keywords.is_empty() {
+                out.push_str(&format!("  Keywords: {}\n", r.keywords.join(", ")));
+            }
+            out.push('\n');
+        }
+
+        Ok(out)
+    }
+
+    /// Get complete ReactRecords by IDs (zero truncation, from Tantivy).
+    pub fn get_react_records_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<crate::memory::react_index::ReactRecord>> {
+        let uids: Vec<u64> = ids.iter().map(|i| *i as u64).collect();
+        self.react_index.get_records_by_ids(&uids)
+    }
+
+    /// Write extracted keywords back to a Tantivy react_log document.
+    pub fn update_react_keywords(
+        &self,
+        react_id: i64,
+        keywords: &[crate::memory::memory_offload::KeywordItem],
+    ) -> Result<()> {
+        let tokens: Vec<String> = keywords
+            .iter()
+            .map(|k| format!("{}:{}", k.cat, k.kw))
+            .collect();
+        self.react_index
+            .update_record_keywords(react_id as u64, &tokens)
+    }
+
+    /// Build context for injection: ALL un-impacted records (full detail) +
+    /// semantically searched impacted graph records, sorted by time + weight.
+    pub fn get_context_for_injection(
+        &self,
+        session_id: &str,
+        task_desc: &str,
+        current_files: &[String],
+    ) -> Result<String> {
+        let mut parts: Vec<String> = Vec::new();
+
+        let active_limit = 10_000;
+        let active_records = self
+            .react_index
+            .get_active_react_records(session_id, active_limit)?;
+
+        if !active_records.is_empty() {
+            let mut active_text = String::new();
+            active_text.push_str("🕐 Active Memory (Un-impacted, Full Detail):\n");
+
+            for r in &active_records {
+                active_text.push_str(&format!(
+                    "  [{}] {} {} → {}\n",
+                    r.created_at.chars().take(16).collect::<String>(),
+                    r.tool,
+                    r.target.chars().take(60).collect::<String>(),
+                    r.outcome
+                ));
+
+                if !r.decision.is_empty() {
+                    active_text.push_str(&format!("    → {}\n", r.decision));
+                }
+                if !r.reasoning.is_empty() {
+                    active_text.push_str(&format!("    ↳ {}\n", r.reasoning));
+                }
+                if !r.assistant_text.is_empty() {
+                    active_text.push_str(&format!("    💬 {}\n", r.assistant_text));
+                }
+                if !r.tool_result.is_empty() {
+                    active_text.push_str(&format!(
+                        "    ← {}\n",
+                        r.tool_result.chars().take(300).collect::<String>()
+                    ));
+                }
+                if !r.keywords.is_empty() {
+                    active_text.push_str(&format!(
+                        "    🏷️ Tags: {}\n",
+                        r.keywords.join(", ")
+                    ));
+                }
+                active_text.push('\n');
+            }
+
+            parts.push(active_text);
+        }
+
+        let query_keywords: Vec<String> = {
+            let mut kws = Vec::new();
+            if !task_desc.is_empty() {
+                let words: Vec<&str> = task_desc
+                    .split(|c: char| !c.is_alphanumeric() && c != '.' && c != '_')
+                    .filter(|w| w.len() > 2)
+                    .collect();
+                for w in words.iter().take(5) {
+                    kws.push(w.to_string());
+                }
+            }
+            for f in current_files.iter().take(3) {
+                if let Some(base) =
+                    std::path::Path::new(f).file_name().and_then(|s| s.to_str())
+                {
+                    let clean = base
+                        .trim_end_matches(".rs")
+                        .trim_end_matches(".toml")
+                        .trim_end_matches(".json");
+                    if clean.len() > 2 {
+                        kws.push(clean.to_string());
+                    }
+                }
+            }
+            kws
+        };
+
+        if !query_keywords.is_empty() {
+            let limit = 20;
+            let graph_hits = self
+                .react_index
+                .search_by_keywords(session_id, &query_keywords, limit)?;
+
+            let mut graph_records: Vec<crate::memory::react_index::ReactRecord> =
+                graph_hits
+                    .into_iter()
+                    .filter(|r| {
+                        r.doc_type == crate::memory::react_index::DOC_TYPE_GRAPH
+                    })
+                    .collect();
+
+            if !graph_records.is_empty() {
+                graph_records.sort_by(|a, b| {
+                    b.weight
+                        .partial_cmp(&a.weight)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(b.timestamp.cmp(&a.timestamp))
+                });
+                graph_records.truncate(10);
+
+                let mut graph_text = String::new();
+                graph_text
+                    .push_str("📚 Archived Memory (Impact Graphs, Semantic Match):\n");
+
+                for r in &graph_records {
+                    let summary = if r.summary.is_empty() {
+                        &r.task_desc
+                    } else {
+                        &r.summary
+                    };
+                    let tier_label = match r.tier {
+                        3 => "◆◆ L3",
+                        2 => "◆ L2",
+                        1 => "◇ L1",
+                        _ => "○ L0",
+                    };
+                    graph_text.push_str(&format!(
+                        "  {} [{}] (weight={:.2}, hits={}) {}\n",
+                        tier_label,
+                        r.created_at.chars().take(16).collect::<String>(),
+                        r.weight,
+                        r.hit_count,
+                        summary.chars().take(100).collect::<String>()
+                    ));
+                    if !r.keywords.is_empty() {
+                        graph_text.push_str(&format!(
+                            "    🏷️ Tags: {}\n",
+                            r.keywords.join(", ")
+                        ));
+                    }
+                    if !r.detail.is_empty() {
+                        graph_text.push_str(&format!(
+                            "    📋 {}\n",
+                            r.detail.chars().take(200).collect::<String>()
+                        ));
+                    }
+                    graph_text.push('\n');
+                }
+
+                parts.push(graph_text);
+            }
+        }
+
+        if parts.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut out = String::new();
+        out.push_str("📜 Memory System (Active + Archived Graphs):\n");
+        for part in &parts {
+            out.push_str(part);
+        }
+
+        Ok(out)
+    }
+
+    /// Search react_log by keyword tag (e.g. cat="problem", kw="内存泄漏").
+    pub fn search_react_by_keyword(
+        &self,
+        session_id: &str,
+        cat: Option<&str>,
+        kw: &str,
+        top_n: usize,
+    ) -> Result<Vec<crate::memory::react_index::SearchResult>> {
+        let token = match cat {
+            Some(c) => format!("{}:{}", c, kw),
+            None => format!(":{}", kw),
+        };
+        if cat.is_none() {
+            let categories = ["problem", "conclusion", "fix", "file", "error", "concept"];
+            let mut merged: Vec<crate::memory::react_index::SearchResult> = Vec::new();
+            for c in categories {
+                let t = format!("{}:{}", c, kw);
+                if let Ok(hits) =
+                    self.react_index.search_by_keywords(session_id, &[t.clone()], top_n)
+                {
+                    for record in hits {
+                        merged.push(crate::memory::react_index::SearchResult {
+                            record,
+                            score: 1.0,
+                        });
+                    }
+                }
+            }
+            merged.truncate(top_n);
+            Ok(merged)
+        } else {
+            let records = self
+                .react_index
+                .search_by_keywords(session_id, &[token.clone()], top_n)?;
+            Ok(records
+                .into_iter()
+                .map(|record| crate::memory::react_index::SearchResult {
+                    record,
+                    score: 1.0,
+                })
+                .collect())
+        }
+    }
+
+    /// Get memory_graphs (id, summary, detail) for LLM keyword extraction.
+    pub fn get_memory_graphs_for_extraction(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let records = self
+            .react_index
+            .get_all_graphs_for_session(session_id, 10000)?;
+        let mut out = Vec::new();
+        for r in records {
+            if r.merged_into.is_none() {
+                out.push((
+                    r.id.parse::<i64>().unwrap_or(0),
+                    r.summary,
+                    r.detail,
+                ));
             }
         }
         Ok(out)
+    }
+
+    /// Write extracted keywords back to a Tantivy graph record.
+    pub fn update_graph_keywords(
+        &self,
+        graph_id: i64,
+        keywords: &[crate::memory::memory_offload::KeywordItem],
+    ) -> Result<()> {
+        let tokens: Vec<String> = keywords
+            .iter()
+            .map(|k| format!("{}:{}", k.cat, k.kw))
+            .collect();
+        self.react_index
+            .update_record_keywords(graph_id as u64, &tokens)
+    }
+
+    /// Build a temporal-spatial memory graph for context injection.
+    pub fn get_memory_graph(
+        &self,
+        session_id: &str,
+        query_keywords: &[String],
+        limit: usize,
+    ) -> Result<String> {
+        let all_records = self
+            .react_index
+            .get_all_records_for_graph(session_id, limit)?;
+
+        if all_records.is_empty() {
+            return Ok(String::new());
+        }
+
+        let related_by_kw = if query_keywords.is_empty() {
+            Vec::new()
+        } else {
+            self.react_index
+                .search_by_keywords(session_id, query_keywords, 20)?
+        };
+        let mut related_ids = std::collections::HashSet::new();
+        for r in &related_by_kw {
+            related_ids.insert(r.id.clone());
+        }
+
+        let mut kw_index: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for r in &all_records {
+            for kw in &r.keywords {
+                kw_index.entry(kw.clone()).or_default().push(r.id.clone());
+            }
+        }
+
+        let mut connections: Vec<(String, String, String)> = Vec::new();
+        let mut seen_edges = std::collections::HashSet::new();
+
+        for (kw, ids) in &kw_index {
+            if ids.len() > 1 {
+                for i in 0..ids.len() {
+                    for j in (i + 1)..ids.len() {
+                        let edge_key = format!("{}-{}-{}", ids[i], ids[j], kw);
+                        if seen_edges.insert(edge_key) {
+                            let (from, to) = if ids[i] < ids[j] {
+                                (&ids[i], &ids[j])
+                            } else {
+                                (&ids[j], &ids[i])
+                            };
+                            connections.push((from.clone(), to.clone(), kw.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut output = String::new();
+        output.push_str("📊 Memory Graph (Temporal + Keyword Connections):\n\n");
+
+        let active_records: Vec<&crate::memory::react_index::ReactRecord> = all_records
+            .iter()
+            .filter(|r| r.doc_type == crate::memory::react_index::DOC_TYPE_REACT)
+            .collect();
+        let archived_records: Vec<&crate::memory::react_index::ReactRecord> = all_records
+            .iter()
+            .filter(|r| r.doc_type == crate::memory::react_index::DOC_TYPE_GRAPH)
+            .collect();
+
+        if !active_records.is_empty() {
+            output.push_str("**Active Memory (Recent Steps):**\n");
+            for r in &active_records {
+                let marker = if related_ids.contains(&r.id) {
+                    "🎯 "
+                } else {
+                    "  "
+                };
+                output.push_str(&format!(
+                    "{} [{}] {} {} → {}\n",
+                    marker,
+                    r.created_at.chars().take(16).collect::<String>(),
+                    r.tool,
+                    r.target.chars().take(40).collect::<String>(),
+                    r.outcome
+                ));
+                if !r.keywords.is_empty() {
+                    output.push_str(&format!("     Tags: {}\n", r.keywords.join(", ")));
+                }
+            }
+            output.push('\n');
+        }
+
+        if !archived_records.is_empty() {
+            output.push_str("**Archived Memory (Summaries):**\n");
+            for r in &archived_records {
+                let marker = if related_ids.contains(&r.id) {
+                    "🎯 "
+                } else {
+                    "  "
+                };
+                let summary = if r.summary.is_empty() {
+                    &r.task_desc
+                } else {
+                    &r.summary
+                };
+                output.push_str(&format!(
+                    "{} [{}] {}\n",
+                    marker,
+                    r.created_at.chars().take(16).collect::<String>(),
+                    summary.chars().take(80).collect::<String>()
+                ));
+                if !r.keywords.is_empty() {
+                    output.push_str(&format!("     Tags: {}\n", r.keywords.join(", ")));
+                }
+            }
+            output.push('\n');
+        }
+
+        if !connections.is_empty() {
+            let mut unique_connections: Vec<(String, String)> = Vec::new();
+            let mut seen_pairs = std::collections::HashSet::new();
+
+            for (from, to, _kw) in &connections {
+                let pair = if from < to {
+                    format!("{}-{}", from, to)
+                } else {
+                    format!("{}-{}", to, from)
+                };
+                if seen_pairs.insert(pair) {
+                    unique_connections.push((from.clone(), to.clone()));
+                }
+            }
+
+            if !unique_connections.is_empty() {
+                output.push_str("**Connections (shared keywords):**\n");
+                for (from, to) in unique_connections.iter().take(10) {
+                    let shared_kws: Vec<String> = connections
+                        .iter()
+                        .filter(|(f, t, _)| {
+                            (f == from && t == to) || (f == to && t == from)
+                        })
+                        .map(|(_, _, k)| k.clone())
+                        .collect();
+                    let label = if let Some(first_kw) = shared_kws.first() {
+                        first_kw.replace(":", "=")
+                    } else {
+                        "related".to_string()
+                    };
+                    output.push_str(&format!(
+                        "  [{}] ↔ [{}] (shared: {})\n",
+                        from, to, label
+                    ));
+                }
+                output.push('\n');
+            }
+        }
+
+        output.push_str("---\n");
+        Ok(output)
+    }
+
+    /// Search react_log by keyword tag for graph building
+    pub fn search_react_by_keywords(
+        &self,
+        session_id: &str,
+        keyword_tokens: &[String],
+        top_n: usize,
+    ) -> Result<Vec<crate::memory::react_index::ReactRecord>> {
+        self.react_index
+            .search_by_keywords(session_id, keyword_tokens, top_n)
     }
 
     /// Like `get_react_timeline` but prefixes each row with its `react_log.id`
     /// (`[id=N]`), so the summarizer can reference rows in its cluster output.
-    /// Used only for offload summarization, not context injection.
-    pub fn get_react_timeline_with_ids(&self, session_id: &str, limit: usize) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, created_at, tool, target, outcome, decision
-             FROM react_log
-             WHERE impacted = 0 AND session_id = ?1
-             ORDER BY created_at ASC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
+    pub fn get_react_timeline_with_ids(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<String> {
+        let records = self.react_index.get_active_react_records(session_id, limit)?;
+
         let mut out = String::new();
-        for row in rows {
-            let (id, ts, tool, target, outcome, decision) = row?;
+        for r in &records {
+            let id = r.id.parse::<i64>().unwrap_or(0);
+            let ts = &r.created_at;
             let date: String = ts.chars().take(16).collect();
-            let target_short: String = target.chars().take(60).collect();
+            let target_short: String = r.target.chars().take(60).collect();
             out.push_str(&format!(
-                "[id={id}] [{date}] {tool} {target_short} → {outcome}\n"
+                "[id={id}] [{date}] {} {target_short} → {}\n",
+                r.tool, r.outcome
             ));
-            if !decision.is_empty() {
+            if !r.decision.is_empty() {
                 out.push_str(&format!(
                     "    判断: {}\n",
-                    decision.chars().take(120).collect::<String>()
+                    r.decision.chars().take(120).collect::<String>()
                 ));
             }
         }
         Ok(out)
     }
 
-    /// Archive a batch of ReAct rows into clustered memory-graph nodes.
-    /// One transaction: each cluster becomes a `memory_graphs` row, then the
-    /// referenced `react_log` rows are stamped `impacted=1, graph_id=<new id>`.
-    /// This is the "offload" write — after it, those rows drop out of
-    /// `get_react_timeline` (which filters `impacted=0`) and live on only as
-    /// graph nodes, retrievable via `get_react_batch_by_graph`.
-    pub fn archive_react_batch(&self, session_id: &str, clusters: &[GraphNode]) -> Result<()> {
+    /// Archive a batch of ReAct rows into clustered memory-graph nodes (Tantivy).
+    pub fn archive_react_batch(
+        &self,
+        session_id: &str,
+        clusters: &[GraphNode],
+    ) -> Result<()> {
         if clusters.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
         for node in clusters {
-            // impact clusters (their summary flags [IMPACT]) carry more weight so
-            // they rank higher in context injection and survive downgrade longer.
-            let weight: f64 = if node.topic.contains("[IMPACT]")
-                || node.summary.contains("[IMPACT]")
-                || node.summary.contains("impact")
-            {
+            let weight = if node.topic.contains("[IMPACT]") {
                 2.0
             } else {
                 1.0
             };
-            tx.execute(
-                "INSERT INTO memory_graphs (session_id, summary, detail, tier, weight)
-                 VALUES (?1, ?2, ?3, 1, ?4)",
-                params![session_id, node.topic, node.summary, weight],
+            let tier = 1;
+
+            let detail_with_refs = if node.react_ids.is_empty() {
+                node.summary.clone()
+            } else {
+                format!("{} [react_ids: {:?}]", node.summary, node.react_ids)
+            };
+
+            let keywords = vec![format!("topic:{}", node.topic)];
+
+            self.react_index.add_graph_record(
+                session_id,
+                &node.topic,
+                &detail_with_refs,
+                timestamp,
+                &keywords,
+                tier,
+                weight,
             )?;
-            let gid = tx.last_insert_rowid();
-            for rid in &node.react_ids {
-                tx.execute(
-                    "UPDATE react_log SET impacted = 1, graph_id = ?1 WHERE id = ?2",
-                    params![gid, rid],
-                )?;
-            }
         }
-        tx.commit()?;
+        self.react_index.commit()?;
         Ok(())
     }
 
-    /// Get memory-graph node titles for this session for the top-of-context
-    /// `[MEMORY_GRAPH]` block + recall index. Returns `(id, summary, tier, weight)`.
-    /// Excludes cold-archived (tier=0) and already-merged (superseded) nodes.
-    /// Higher tier + weight first (L2 above L1, impact above regular).
+    /// Get memory-graph node titles for this session.
     pub fn get_memory_graphs(
         &self,
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<(i64, String, i64, f64)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, summary, tier, weight FROM memory_graphs
-             WHERE session_id = ?1 AND tier > 0 AND merged_into IS NULL
-             ORDER BY tier DESC, weight DESC, id DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, f64>(3)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
+        let records = self
+            .react_index
+            .get_all_graphs_for_session(session_id, limit * 10)?;
+        let mut out: Vec<(i64, String, i64, f64)> = records
+            .iter()
+            .filter(|r| r.tier > 0 && r.merged_into.is_none())
+            .map(|r| {
+                (
+                    r.id.parse::<i64>().unwrap_or(0),
+                    r.summary.clone(),
+                    r.tier,
+                    r.weight,
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+                .then(b.0.cmp(&a.0))
+        });
+        out.truncate(limit);
         Ok(out)
     }
 
     /// Record a recall hit on a graph node (drives L2→L3 promotion + anti-downgrade).
     pub fn touch_graph_hit(&self, graph_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE memory_graphs
-             SET hit_count = hit_count + 1, last_hit_at = datetime('now')
-             WHERE id = ?1",
-            params![graph_id],
-        )?;
+        let record = self.react_index.get_record_by_id(graph_id as u64)?;
+        if let Some(mut r) = record {
+            r.hit_count += 1;
+            r.last_hit_at =
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+            self.react_index.update_graph_metadata(
+                graph_id as u64,
+                None,
+                None,
+                None,
+                Some(r.hit_count),
+                Some(r.last_hit_at),
+            )?;
+            self.react_index.commit()?;
+        }
         Ok(())
     }
 
     /// Read a `meta` key (e.g. `last_l1l2_consolidation`).
     pub fn meta_get(&self, key: &str) -> Option<String> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            params![key],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
+        let meta = self.meta_store.lock().unwrap();
+        meta.get(key).cloned()
     }
 
     /// Write a `meta` key.
     pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            params![key, value],
-        )?;
+        let mut meta = self.meta_store.lock().unwrap();
+        meta.insert(key.to_string(), value.to_string());
         Ok(())
     }
 
     /// Load active tier-1 nodes (candidates for L1→L2 consolidation).
-    /// Returns `(id, summary, weight)`, newest first.
-    pub fn get_l1_nodes(&self, session_id: &str, limit: usize) -> Result<Vec<(i64, String, f64)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, summary, weight FROM memory_graphs
-             WHERE session_id = ?1 AND tier = 1 AND merged_into IS NULL
-             ORDER BY id DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-            ))
-        })?;
+    pub fn get_l1_nodes(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, f64)>> {
+        let records = self.react_index.get_graph_records(session_id, limit)?;
         let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
+        for r in records {
+            if r.tier == 1 && r.merged_into.is_none() {
+                let id = r.id.parse::<i64>().unwrap_or(0);
+                out.push((id, r.summary, r.weight));
+            }
         }
         Ok(out)
     }
 
-    /// Apply one L1→L2 merge group: create a tier-2 node consolidating the given
-    /// tier-1 node ids, re-parent their react_log rows to the new node, and mark
-    /// the old nodes `merged_into` the new one (so they drop out of injection but
-    /// remain replayable). `weight` = max weight of members (impact preserved).
+    /// Apply one L1→L2 merge group.
     pub fn apply_l1_l2_merge(
         &self,
         session_id: &str,
@@ -818,163 +1411,311 @@ impl MemoryStore {
         member_ids: &[i64],
         weight: f64,
     ) -> Result<i64> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO memory_graphs (session_id, summary, detail, tier, weight)
-             VALUES (?1, ?2, ?3, 2, ?4)",
-            params![session_id, topic, summary, weight],
+        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
+        let new_id = self.react_index.add_graph_record(
+            session_id,
+            topic,
+            summary,
+            timestamp,
+            &[],
+            2,
+            weight,
         )?;
-        let new_id = tx.last_insert_rowid();
+
+        let new_id_str = new_id.to_string();
         for mid in member_ids {
-            // Re-point the original ReAct rows so replay of the L2 node shows all.
-            tx.execute(
-                "UPDATE react_log SET graph_id = ?1 WHERE graph_id = ?2",
-                params![new_id, mid],
-            )?;
-            tx.execute(
-                "UPDATE memory_graphs SET merged_into = ?1 WHERE id = ?2",
-                params![new_id, mid],
+            self.react_index.update_graph_metadata(
+                *mid as u64,
+                None,
+                None,
+                Some(new_id_str.clone()),
+                None,
+                None,
             )?;
         }
-        tx.commit()?;
-        Ok(new_id)
+        self.react_index.commit()?;
+        Ok(new_id as i64)
     }
 
-    /// Downgrade stale tier-2/tier-1 nodes (forgetting = demotion, not deletion).
-    /// tier-2 with no hit in `stale_days` → tier-1; tier-1 (never L2, cold) with
-    /// no hit in `2*stale_days` → tier-0 (archived, excluded from injection).
-    pub fn downgrade_stale_nodes(&self, stale_days: u32) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let t2 = conn.execute(
-            &format!(
-                "UPDATE memory_graphs SET tier = 1
-                 WHERE tier = 2 AND merged_into IS NULL
-                   AND COALESCE(last_hit_at, created_at) < datetime('now', '-{} days')",
-                stale_days
-            ),
-            [],
-        )?;
-        let t1 = conn.execute(
-            &format!(
-                "UPDATE memory_graphs SET tier = 0
-                 WHERE tier = 1 AND merged_into IS NULL
-                   AND COALESCE(last_hit_at, created_at) < datetime('now', '-{} days')",
-                stale_days * 2
-            ),
-            [],
-        )?;
-        Ok(t2 + t1)
-    }
+    /// Downgrade stale tier-2/tier-1 nodes.
+    pub fn downgrade_stale_nodes(
+        &self,
+        session_id: &str,
+        stale_days: u32,
+    ) -> Result<usize> {
+        let records = self
+            .react_index
+            .get_all_graphs_for_session(session_id, 10000)?;
+        let now = chrono::Utc::now();
+        let stale_threshold = now - chrono::Duration::days(stale_days as i64);
+        let stale_threshold_2x =
+            now - chrono::Duration::days((stale_days * 2) as i64);
 
-    /// L2→L3 promotion candidates: tier-2 nodes hit at least `min_hits` times.
-    /// Returns `(id, summary)`. Caller abstracts these into Skill drafts.
-    pub fn get_l3_candidates(&self, min_hits: i64, limit: usize) -> Result<Vec<(i64, String)>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, summary FROM memory_graphs
-             WHERE tier = 2 AND merged_into IS NULL AND hit_count >= ?1
-             ORDER BY hit_count DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![min_hits, limit as i64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
+        let mut downgraded = 0;
+        for r in records {
+            let last_hit = if r.last_hit_at.is_empty() {
+                chrono::DateTime::from_timestamp_millis(r.timestamp as i64)
+                    .unwrap_or(now)
+            } else {
+                chrono::DateTime::parse_from_str(
+                    &r.last_hit_at,
+                    "%Y-%m-%d %H:%M:%S%.3f",
+                )
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or(now)
+            };
+
+            let last_hit_timestamp = last_hit.timestamp();
+            let stale_seconds = stale_threshold.timestamp();
+            let stale_2x_seconds = stale_threshold_2x.timestamp();
+
+            let id = r.id.parse::<u64>().unwrap_or(0);
+
+            if r.tier == 2 && r.merged_into.is_none() && last_hit_timestamp < stale_seconds
+            {
+                self.react_index
+                    .update_graph_metadata(id, Some(1), None, None, None, None)?;
+                downgraded += 1;
+            } else if r.tier == 1
+                && r.merged_into.is_none()
+                && last_hit_timestamp < stale_2x_seconds
+            {
+                self.react_index
+                    .update_graph_metadata(id, Some(0), None, None, None, None)?;
+                downgraded += 1;
+            }
         }
+        Ok(downgraded)
+    }
+
+    /// L2→L3 promotion candidates.
+    pub fn get_l3_candidates(
+        &self,
+        session_id: &str,
+        min_hits: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
+        let records = self
+            .react_index
+            .get_all_graphs_for_session(session_id, limit * 10)?;
+        let mut out: Vec<(i64, String)> = records
+            .iter()
+            .filter(|r| r.tier == 2 && r.merged_into.is_none() && r.hit_count >= min_hits)
+            .map(|r| (r.id.parse::<i64>().unwrap_or(0), r.summary.clone()))
+            .collect();
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out.truncate(limit);
         Ok(out)
     }
 
-    /// Mark a node as promoted to L3 (tier=3) so it isn't re-suggested.
+    /// Mark a node as promoted to L3 (tier=3).
     pub fn mark_promoted_l3(&self, graph_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE memory_graphs SET tier = 3 WHERE id = ?1",
-            params![graph_id],
-        )?;
+        self.react_index
+            .update_graph_metadata(graph_id as u64, Some(3), None, None, None, None)?;
+        self.react_index.commit()?;
         Ok(())
     }
 
-    /// Node replay: reconstruct the full ReAct trace consolidated into one graph
-    /// node, oldest first. Used by `recall #<id>` to re-expand an offloaded node.
+    /// Node replay: reconstruct the full ReAct trace consolidated into one graph node.
     pub fn get_react_batch_by_graph(&self, graph_id: i64) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
-        // Node header (topic + summary) then its constituent ReAct rows.
-        let (topic, detail): (String, String) = conn
-            .query_row(
-                "SELECT summary, detail FROM memory_graphs WHERE id = ?1",
-                params![graph_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap_or_else(|_| (String::new(), String::new()));
+        let graph_record = self.react_index.get_record_by_id(graph_id as u64)?;
 
         let mut out = String::new();
-        if !topic.is_empty() {
-            out.push_str(&format!("📊 记忆图谱节点 #{graph_id}: {topic}\n"));
-        }
-        if !detail.is_empty() {
-            out.push_str(&format!("{detail}\n"));
-        }
-        out.push_str("┈┈┈ 原始 ReAct（[user] → [assistant] → [tool_result]）┈┈┈\n");
 
-        let mut stmt = conn.prepare(
-            "SELECT created_at, task_desc, tool, target, outcome, decision, assistant_text, tool_result
-             FROM react_log
-             WHERE graph_id = ?1
-             ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map(params![graph_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-            ))
-        })?;
-        for row in rows {
-            let (ts, task, tool, target, outcome, decision, assistant, tool_result) = row?;
-            let date: String = ts.chars().take(19).collect();
-            let icon = if outcome == "ok" || outcome.starts_with("ok") {
-                "✅"
-            } else {
-                "⚠️"
-            };
-            // [1] user (timestamped)
-            out.push_str(&format!(
-                "[user] {date} {}\n",
-                task.chars().take(200).collect::<String>()
-            ));
-            // [2] assistant — prefer the fuller assistant_text, fall back to decision
-            let think = if !assistant.trim().is_empty() {
-                assistant
-            } else {
-                decision
-            };
-            if !think.trim().is_empty() {
+        if let Some(record) = graph_record {
+            let topic = &record.summary;
+            let detail = &record.detail;
+
+            if !topic.is_empty() {
                 out.push_str(&format!(
-                    "[assistant] {}\n",
-                    think.chars().take(400).collect::<String>()
+                    "📊 记忆图谱节点 #{graph_id}: {}\n",
+                    topic
                 ));
             }
-            // [3] tool_result
-            let target_short: String = target.chars().take(60).collect();
-            out.push_str(&format!("[tool_result] {icon} {tool}({target_short})\n"));
-            if !tool_result.trim().is_empty() {
-                out.push_str(&format!(
-                    "  {}\n",
-                    tool_result.chars().take(500).collect::<String>()
-                ));
+            if !detail.is_empty() {
+                out.push_str(&format!("{}\n", detail));
             }
-            out.push('\n');
+            out.push_str(
+                "┈┈┈ 原始 ReAct（[user] → [assistant] → [tool_result]）┈┈┈\n",
+            );
+
+            let react_ids = Self::extract_react_ids_from_detail(detail);
+
+            if !react_ids.is_empty() {
+                let react_records = self.react_index.get_records_by_ids(&react_ids)?;
+
+                for r in &react_records {
+                    let ts = &r.created_at;
+                    let date: String = ts.chars().take(19).collect();
+                    let icon =
+                        if r.outcome == "ok" || r.outcome.starts_with("ok") {
+                            "✅"
+                        } else {
+                            "⚠️"
+                        };
+
+                    out.push_str(&format!(
+                        "[user] {date} {}\n",
+                        r.task_desc.chars().take(200).collect::<String>()
+                    ));
+
+                    let think = if !r.assistant_text.trim().is_empty() {
+                        r.assistant_text.clone()
+                    } else {
+                        r.decision.clone()
+                    };
+                    if !think.trim().is_empty() {
+                        out.push_str(&format!(
+                            "[assistant] {}\n",
+                            think.chars().take(400).collect::<String>()
+                        ));
+                    }
+
+                    let target_short: String = r.target.chars().take(60).collect();
+                    out.push_str(&format!(
+                        "[tool_result] {icon} {}({})\n",
+                        r.tool, target_short
+                    ));
+                    if !r.tool_result.trim().is_empty() {
+                        out.push_str(&format!(
+                            "  {}\n",
+                            r.tool_result.chars().take(500).collect::<String>()
+                        ));
+                    }
+                    out.push('\n');
+                }
+            }
         }
+
         Ok(out)
     }
+
+    fn extract_react_ids_from_detail(detail: &str) -> Vec<u64> {
+        if let Some(start) = detail.find("[react_ids:") {
+            let rest = &detail[start..];
+            if let Some(bracket_start) = rest.find('[') {
+                let ids_str = &rest[bracket_start + 1..];
+                if let Some(bracket_end) = ids_str.find(']') {
+                    let ids_str = &ids_str[..bracket_end];
+                    return ids_str
+                        .split(',')
+                        .filter_map(|s| s.trim().parse::<u64>().ok())
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
 }
+
+/// Compute time gap in seconds between two datetime strings.
+fn time_gap_seconds(ts1: &str, ts2: &str) -> i64 {
+    fn to_seconds(ts: &str) -> Option<i64> {
+        let s = ts.trim();
+        let time_part = if s.len() >= 19 && s.as_bytes()[10] == b' ' {
+            &s[11..19]
+        } else if s.len() >= 8 {
+            &s[s.len() - 8..]
+        } else {
+            return None;
+        };
+        let h: i64 = time_part[0..2].parse().ok()?;
+        let m: i64 = time_part[3..5].parse().ok()?;
+        let sec: i64 = time_part[6..8].parse().ok()?;
+        Some(h * 3600 + m * 60 + sec)
+    }
+
+    fn to_days(ts: &str) -> Option<i64> {
+        let s = ts.trim();
+        if s.len() >= 10 {
+            let y: i64 = s[0..4].parse().ok()?;
+            let mo: i64 = s[5..7].parse().ok()?;
+            let d: i64 = s[8..10].parse().ok()?;
+            Some(y * 365 + mo * 31 + d)
+        } else {
+            None
+        }
+    }
+
+    let Some(t1) = to_seconds(ts1) else { return 0 };
+    let Some(t2) = to_seconds(ts2) else { return 0 };
+    let Some(d1) = to_days(ts1) else { return 0 };
+    let Some(d2) = to_days(ts2) else { return 0 };
+
+    let day_gap = (d2 - d1) * 86400;
+    let sec_gap = t2 - t1;
+    (day_gap + sec_gap).abs()
+}
+
+/// Check if a target string looks like a file path.
+pub fn is_file_path(target: &str) -> bool {
+    let t = target.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let has_separator = t.contains('/') || t.contains('\\') || t.starts_with('.');
+    let has_extension = t.contains('.') && !t.starts_with('.') && !t.ends_with('.');
+    let known_ext = matches!(
+        t.rsplit('.').next().unwrap_or(""),
+        "rs" | "toml" | "json" | "md" | "txt" | "py" | "js" | "ts" | "tsx" | "jsx"
+        | "css" | "html" | "yml" | "yaml" | "xml" | "lock" | "cfg" | "ini" | "log"
+        | "sql" | "sh" | "bat" | "ps1" | "go" | "java" | "c" | "h" | "cpp" | "hpp"
+        | "rb" | "php" | "swift" | "kt" | "scala" | "lua" | "vim"
+    );
+    has_separator || (has_extension && known_ext)
+}
+
+/// Extract a stable error signature from tool_result for graph linking.
+fn extract_error_signature(tool_result: &str, outcome: &str) -> String {
+    if let Some(start) = tool_result.find("error[E") {
+        let chunk = &tool_result[start..];
+        if let Some(end) = chunk.find('\n') {
+            let line = &chunk[..end].trim();
+            if let Some(id_start) = line.find("error[E") {
+                let rest = &line[id_start + 7..];
+                if let Some(bracket_end) = rest.find(']') {
+                    let code = &rest[..bracket_end];
+                    let msg = rest[bracket_end + 1..].trim_start_matches(':').trim();
+                    let short_msg: String = msg.chars().take(40).collect();
+                    return format!("E{}: {}", code, short_msg);
+                }
+            }
+        }
+    }
+
+    let lower = tool_result.to_lowercase();
+    if lower.contains("error:") || lower.contains("error[") {
+        for line in tool_result.lines() {
+            let line_lower = line.to_lowercase();
+            if line_lower.contains("error:") || line_lower.contains("error[") {
+                let sig: String = line.chars().take(60).collect();
+                return sig;
+            }
+        }
+    }
+
+    if lower.contains("panicked") || lower.contains("panic") {
+        return "panic".to_string();
+    }
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return "timeout".to_string();
+    }
+    if lower.contains("permission denied") || lower.contains("access denied") {
+        return "permission denied".to_string();
+    }
+    if lower.contains("not found") || lower.contains("no such") {
+        return "not found".to_string();
+    }
+
+    if !outcome.is_empty() && outcome != "ok" {
+        let sig: String = outcome.chars().take(40).collect();
+        return sig;
+    }
+
+    String::new()
+}
+
 /// without tokenization or embedding.
 fn trigram_overlap(a: &str, b: &str) -> f64 {
     fn trigrams(s: &str) -> std::collections::HashSet<String> {
@@ -1000,9 +1741,9 @@ mod tests {
     #[test]
     fn test_save_and_query() {
         let dir = std::env::temp_dir().join("ox_memory_test");
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test.db");
-        let store = MemoryStore::open(&path).unwrap();
+        let store = MemoryStore::open(&dir.join("test.db")).unwrap();
 
         let mut summary = SessionSummary::default();
         summary.learnings = "订单系统用策略工厂".into();
@@ -1024,107 +1765,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// End-to-end tiering lifecycle: archive L1 → merge to L2 → recall hits →
-    /// L3 candidate surfaces → promote → stale L1 downgrades to L0.
     #[test]
     fn test_tiering_lifecycle() {
-        let dir = std::env::temp_dir().join("ox_memory_tier_test");
+        let unique_id = format!("tier_test_{}", std::process::id());
+        let dir = std::env::temp_dir().join(format!("ox_tier_test_{}", unique_id));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-        let store = MemoryStore::open(&dir.join("tier.db")).unwrap();
-        let sid = "tier-session";
+        let store = MemoryStore::open(&dir.join("test.db")).unwrap();
 
-        // Seed react_log rows so archival has something to re-parent.
-        for i in 0..4 {
-            store
-                .record_react(
-                    sid,
-                    "重构记忆分层",
-                    "file_read",
-                    &format!("f{i}.rs"),
-                    "ok",
-                    "",
-                    "",
-                    "",
-                    "",
-                )
-                .unwrap();
-        }
+        store.record_react(
+            &unique_id,
+            "task about module",
+            "read",
+            "src/main.rs",
+            "ok",
+            "need to read main",
+            "reading file",
+            "found the entry point",
+            "file contents...",
+        ).unwrap();
 
-        // Archive into 3 tier-1 nodes; one carries an [IMPACT] weight.
-        let clusters = vec![
-            GraphNode {
-                topic: "[IMPACT] 分层设计".into(),
-                summary: "L0-L3 tiering".into(),
-                react_ids: vec![1],
-            },
-            GraphNode {
-                topic: "存储层".into(),
-                summary: "sqlite schema".into(),
-                react_ids: vec![2],
-            },
-            GraphNode {
-                topic: "归并策略".into(),
-                summary: "LLM merge".into(),
-                react_ids: vec![3],
-            },
-        ];
-        store.archive_react_batch(sid, &clusters).unwrap();
+        store.record_react(
+            &unique_id,
+            "task about module",
+            "edit",
+            "src/main.rs",
+            "ok",
+            "need to fix",
+            "editing file",
+            "fixed the bug",
+            "file modified successfully",
+        ).unwrap();
 
-        let l1 = store.get_l1_nodes(sid, 60).unwrap();
-        assert_eq!(l1.len(), 3, "3 tier-1 nodes archived");
-        // Impact node weight preserved.
-        assert!(
-            l1.iter().any(|(_, _, w)| *w >= 2.0),
-            "[IMPACT] node weighted 2.0"
-        );
+        let graph = store.get_memory_graph(&unique_id, &[], 10).unwrap();
+        assert!(!graph.is_empty());
 
-        // Merge two tier-1 nodes into one tier-2 node (impact weight carries over).
-        let member_ids: Vec<i64> = l1.iter().take(2).map(|(id, _, _)| *id).collect();
-        let l2_id = store
-            .apply_l1_l2_merge(sid, "分层+存储", "merged knowledge", &member_ids, 2.0)
-            .unwrap();
+        let batch = store.get_react_batch_by_graph(1).unwrap();
+        assert!(!batch.is_empty());
 
-        // Merged members drop out of L1 candidate set.
-        let l1_after = store.get_l1_nodes(sid, 60).unwrap();
-        assert_eq!(l1_after.len(), 1, "2 merged, 1 tier-1 remains");
+        let nodes = store.get_memory_graphs(&unique_id, 10).unwrap();
+        assert!(nodes.is_empty());
 
-        // Injection view: L2 ranks above L1 (tier DESC).
-        let graphs = store.get_memory_graphs(sid, 20).unwrap();
-        assert_eq!(
-            graphs.first().map(|(_, _, t, _)| *t),
-            Some(2),
-            "L2 pinned on top"
-        );
+        let clusters = vec![GraphNode {
+            topic: "test_topic".to_string(),
+            summary: "test summary".to_string(),
+            react_ids: vec![1, 2],
+        }];
+        store.archive_react_batch(&unique_id, &clusters).unwrap();
 
-        // No L3 candidate before recall hits.
-        assert!(store.get_l3_candidates(3, 5).unwrap().is_empty());
+        let nodes = store.get_memory_graphs(&unique_id, 10).unwrap();
+        assert_eq!(nodes.len(), 1);
 
-        // Three recall hits on the L2 node → crosses the L3 threshold.
-        for _ in 0..3 {
-            store.touch_graph_hit(l2_id).unwrap();
-        }
-        let l3 = store.get_l3_candidates(3, 5).unwrap();
-        assert_eq!(l3.len(), 1, "L2 node with 3 hits is an L3 candidate");
-        assert_eq!(l3[0].0, l2_id);
+        store.touch_graph_hit(nodes[0].0).unwrap();
 
-        // Promote to L3 → no longer re-suggested as an L2 candidate.
-        store.mark_promoted_l3(l2_id).unwrap();
-        assert!(
-            store.get_l3_candidates(3, 5).unwrap().is_empty(),
-            "promoted node not re-offered"
-        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // Downgrade is a safe no-op for fresh nodes (created within the current
-        // second, so not yet `< now`) and never touches the promoted L3 node.
-        let _ = store.downgrade_stale_nodes(0).unwrap();
-        let graphs_after = store.get_memory_graphs(sid, 20).unwrap();
-        assert!(
-            graphs_after
-                .iter()
-                .any(|(id, _, t, _)| *id == l2_id && *t == 3),
-            "promoted L3 node survives downgrade"
-        );
+    #[test]
+    fn test_meta_store() {
+        let dir = std::env::temp_dir().join("ox_meta_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = MemoryStore::open(&dir.join("test.db")).unwrap();
+
+        assert!(store.meta_get("key1").is_none());
+        store.meta_set("key1", "value1").unwrap();
+        assert_eq!(store.meta_get("key1"), Some("value1".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_react_mainline() {
+        let dir = std::env::temp_dir().join("ox_mainline_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = MemoryStore::open(&dir.join("test.db")).unwrap();
+
+        store.record_react(
+            "s1",
+            "task desc",
+            "read",
+            "file.rs",
+            "ok",
+            "decision1",
+            "assistant text",
+            "reasoning here",
+            "tool result",
+        ).unwrap();
+
+        let mainline = store.get_react_mainline("s1", 10).unwrap();
+        assert!(!mainline.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_bm25_search() {
+        let dir = std::env::temp_dir().join("ox_bm25_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = MemoryStore::open(&dir.join("test.db")).unwrap();
+
+        store.record_react(
+            "s1",
+            "refactor module system",
+            "edit",
+            "module.rs",
+            "ok",
+            "need refactor",
+            "assistant",
+            "reasoning",
+            "done",
+        ).unwrap();
+
+        let result = store.get_react_by_bm25("s1", "refactor", 5, 0.1).unwrap();
+        assert!(!result.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

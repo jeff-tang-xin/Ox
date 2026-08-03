@@ -57,9 +57,6 @@ pulldown-cmark = "0.12"
 # Unicode width calculation
 unicode-width = "0.2"
 
-# Database
-rusqlite = { version = "0.32", features = ["bundled"] }
-
 
 # ox-core
 ox-core = { path = "crates/ox-core" }

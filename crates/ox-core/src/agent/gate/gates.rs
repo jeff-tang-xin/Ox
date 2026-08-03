@@ -135,32 +135,27 @@ impl Gate for ScopeGate {
     }
 
     fn check(&self, ctx: &GateCtx) -> GateOutcome {
+        // Simplified gate: always allow confirmation regardless of find_json status.
+        // completion_receipt is now optional — LLM can initiate confirmation at any time.
         let Some(store) = findings::load_or_migrate(ctx.engine) else {
             return GateOutcome::Pass;
         };
         if store.findings.is_empty() {
             return GateOutcome::Pass;
         }
-        // Review-only ## Done (no edits yet): receipt not required — but not during implement.
-        if !ctx.had_code_changes
-            && crate::agent::phase::get(ctx.engine)
-                != crate::agent::phase::SingleFlowPhase::Implement
-        {
-            return GateOutcome::Pass;
+
+        // If completion_receipt is present and valid, pass with no feedback
+        if let Some(receipt) = completion::extract_from_text(ctx.assistant_text) {
+            if let Err(e) = completion::validate(ctx.engine, &receipt) {
+                // Invalid receipt → still pass but with feedback
+                return GateOutcome::PassFeedback {
+                    feedback: format!("⚠️ completion_receipt 无效: {} (但不阻塞确认)", e),
+                };
+            }
         }
-        match completion::extract_from_text(ctx.assistant_text) {
-            Some(receipt) => match completion::validate(ctx.engine, &receipt) {
-                Ok(()) => GateOutcome::Pass,
-                Err(e) => GateOutcome::Fail { feedback: e },
-            },
-            None => GateOutcome::Fail {
-                feedback: format!(
-                    "❌ 存在 {} 条审查项，## Done 必须附 completion_receipt JSON：\n{}",
-                    store.findings.len(),
-                    completion::COMPLETION_RECEIPT_SCHEMA
-                ),
-            },
-        }
+
+        // No completion_receipt — still pass (simplified gate)
+        GateOutcome::Pass
     }
 }
 
@@ -362,10 +357,12 @@ mod tests {
             "_findings_store",
             r#"{"summary":"ok","findings":[{"index":1,"severity":"high","file":"a.rs","symbol":"","issue":"x","recommendation":"","status":"open","user_notes":[],"dispute":null,"impl_log":[]}],"active_indices":[1]}"#.into(),
         );
-        match ScopeGate.check(&ctx(&e, "## Done\n改好了", false)) {
-            GateOutcome::Fail { .. } => {}
-            other => panic!("expected fail, got {other:?}"),
-        }
+        // Simplified gate: now passes even without completion_receipt
+        // (requirement: "简化审查门禁要求的find_json 不管有无都可以发起确认")
+        assert_eq!(
+            ScopeGate.check(&ctx(&e, "## Done\n改好了", false)),
+            GateOutcome::Pass
+        );
     }
 
     #[test]

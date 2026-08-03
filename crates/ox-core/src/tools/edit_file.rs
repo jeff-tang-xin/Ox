@@ -91,21 +91,33 @@ impl Tool for EditFileTool {
             }
         };
 
-        let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
-            std::path::PathBuf::from(&path_str)
-        } else {
-            ctx.working_dir.join(&path_str)
+        // 📌 Resolve relative paths against the STABLE project root (path_base),
+        // NOT ctx.working_dir — which can be mutated by `/cd` and would break
+        // the LLM's "paths are relative to the project root" mental model.
+        //
+        // Auto-fallback: if LLM passes just a basename (e.g. "openai.rs"),
+        // search the project root and auto-resolve when exactly one match is found.
+        let path_base = ctx.path_base();
+        let (resolved_path, _was_auto_resolved) = match crate::safety::resolve_short_path(&path_str, &path_base) {
+            Some((p, auto)) => (p, auto),
+            None => {
+                if std::path::Path::new(&path_str).is_absolute() {
+                    (std::path::PathBuf::from(&path_str), false)
+                } else {
+                    (path_base.join(&path_str), false)
+                }
+            }
         };
 
         let path =
-            match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
+            match crate::safety::validate_path_within_workdir(&resolved_path, &path_base) {
                 Ok(p) => p,
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
             };
 
         // ── Existence check with path-correction hint ──
         if !path.exists() {
-            let hint = crate::safety::suggest_path_correction(&path, &ctx.working_dir)
+            let hint = crate::safety::suggest_path_correction(&path, &path_base)
                 .map(|s| format!("\n\n{s}"))
                 .unwrap_or_default();
             return ToolOutput::error(format!("❌ File not found: {}{hint}", path.display()));
@@ -114,10 +126,25 @@ impl Tool for EditFileTool {
         // ── Determine mode: single or multi ──
         let is_multi = args.get("edits").is_some();
 
+        // 📌 Always show canonical path in output — calibrates LLM mental model.
+        // Replaces the old `was_auto_resolved`-only notification: now EVERY edit
+        // shows the canonical project-relative path, so the LLM learns the correct
+        // path regardless of whether it passed a short or long path.
+        let canonical = crate::tools::canonical_rel_path(&resolved_path, &path_base);
+        let path_header = format!("📄 {canonical}\n\n");
+
         if is_multi {
-            self.execute_multi(&path, &args, ctx).await
+            let mut out = self.execute_multi(&path, &args, ctx).await;
+            if !out.is_error {
+                out.content = format!("{path_header}{}", out.content);
+            }
+            out
         } else {
-            self.execute_single(&path, &args, ctx).await
+            let mut out = self.execute_single(&path, &args, ctx).await;
+            if !out.is_error {
+                out.content = format!("{path_header}{}", out.content);
+            }
+            out
         }
     }
 }
@@ -318,10 +345,7 @@ impl EditFileTool {
         .await;
 
         match result {
-            Ok(Ok(msg)) => {
-                // AST syntax check removed — KnowledgeEngine disabled
-                ToolOutput::success(msg)
-            }
+            Ok(Ok(msg)) => ToolOutput::success(msg),
             Ok(Err(e)) => ToolOutput::error(e),
             Err(join_err) => ToolOutput::error(format!("Edit task panicked: {join_err}")),
         }

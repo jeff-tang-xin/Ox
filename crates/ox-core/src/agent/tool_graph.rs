@@ -38,7 +38,7 @@ fn route_spec(engine: &WorkflowEngine) -> ToolRouteSpec {
                 "git_diff",
             ],
             vec!["edit_file", "file_write", "delete_range", "shell_exec"],
-            "本轮已收尾 — 等用户新输入；如需继续可只读探索。",
+            "本轮已收尾 — 等用户新输入。编辑工具存在但本轮已结束，用户新输入后会重新可用。",
         ),
         SingleFlowPhase::AwaitUser => {
             if super::gate::business_gate::scope_implementation_unlocked(engine) {
@@ -99,7 +99,7 @@ fn route_spec(engine: &WorkflowEngine) -> ToolRouteSpec {
                         "edit_file",
                         "file_write",
                     ],
-                    "审查报告已提交 — 补全 ## Done / findings，或等待用户 /fix。",
+                    "审查报告已提交 — 补全 ## Done / findings，或等待用户 /fix。编辑工具(edit_file/file_write)存在但当前阶段禁用；用户 /fix 后进入实施阶段即可使用。",
                 )
             } else {
                 (
@@ -118,7 +118,7 @@ fn route_spec(engine: &WorkflowEngine) -> ToolRouteSpec {
                         "git_diff",
                     ],
                     vec!["edit_file", "file_write", "delete_range"],
-                    "审查(只读)：探索后输出 findings + ## Done；禁止改代码。",
+                    "审查(只读)：探索后输出 findings + ## Done。编辑工具(edit_file/file_write/delete_range)存在但当前阶段禁用——完成审查并经用户确认后进入实施阶段即可使用。",
                 )
             }
         }

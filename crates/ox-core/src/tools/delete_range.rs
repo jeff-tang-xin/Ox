@@ -60,17 +60,34 @@ impl Tool for DeleteRangeTool {
             }
         };
 
-        let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
-            std::path::PathBuf::from(&path_str)
-        } else {
-            ctx.working_dir.join(&path_str)
+        // 📌 Resolve relative paths against the STABLE project root (path_base).
+        // Auto-fallback: if LLM passes just a basename, search project root.
+        let path_base = ctx.path_base();
+        let (resolved_path, _was_auto_resolved) = match crate::safety::resolve_short_path(&path_str, &path_base) {
+            Some((p, auto)) => (p, auto),
+            None => {
+                if std::path::Path::new(&path_str).is_absolute() {
+                    (std::path::PathBuf::from(&path_str), false)
+                } else {
+                    (path_base.join(&path_str), false)
+                }
+            }
         };
 
         let path =
-            match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
+            match crate::safety::validate_path_within_workdir(&resolved_path, &path_base) {
                 Ok(p) => p,
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
             };
+
+        // 📌 ENOENT 带候选列表 — 与 file_read/edit_file 一致的兜底。
+        if !path.exists() {
+            let canonical = crate::tools::canonical_rel_path(&path, &path_base);
+            let hint = crate::safety::suggest_path_correction(&path, &path_base)
+                .map(|s| format!("\n\n{s}"))
+                .unwrap_or_default();
+            return ToolOutput::error(format!("❌ File not found: {canonical}{hint}"));
+        }
 
         let start_anchor = match args.get("start_anchor").and_then(|s| s.as_str()) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -85,7 +102,10 @@ impl Tool for DeleteRangeTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let display_path = path.display().to_string();
+        // 📌 Use canonical project-relative path for all display — calibrates LLM.
+        let canonical = crate::tools::canonical_rel_path(&resolved_path, &path_base);
+        let display_path = canonical.clone();
+        let path_header = format!("📄 {canonical}\n\n");
 
         let result = tokio::task::spawn_blocking(move || {
             let content = match std::fs::read_to_string(&path) {
@@ -231,7 +251,7 @@ impl Tool for DeleteRangeTool {
         .await;
 
         match result {
-            Ok(Ok(msg)) => ToolOutput::success(msg),
+            Ok(Ok(msg)) => ToolOutput::success(format!("{path_header}{msg}")),
             Ok(Err(e)) => ToolOutput::error(e),
             Err(e) => ToolOutput::error(format!("Delete task panicked: {e}")),
         }

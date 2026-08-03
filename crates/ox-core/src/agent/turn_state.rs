@@ -149,32 +149,24 @@ mod tests {
     }
 
     #[test]
-    fn exhaustion_delegates_to_converge_mode_ceilings() {
+    fn exhaustion_never_triggers() {
+        // 不再有硬限制，持续探索也不会耗尽
         let mut b = TurnBudget::new();
-        for _ in 0..6 {
-            b.on_explore();
-        }
-        assert!(b.explore_exhausted(ConvergeMode::Answer));
-        assert!(!b.explore_exhausted(ConvergeMode::DirectEdit));
-        assert!(!b.explore_exhausted(ConvergeMode::SubmitPlan));
-
-        for _ in 0..4 {
-            b.on_explore();
-        }
-        assert!(b.explore_exhausted(ConvergeMode::DirectEdit));
-        assert!(!b.explore_exhausted(ConvergeMode::SubmitPlan));
-
-        b.on_explore();
-        b.on_explore();
-        assert!(b.explore_exhausted(ConvergeMode::SubmitPlan));
-    }
-
-    #[test]
-    fn exhaustion_false_just_below_ceiling() {
-        let mut b = TurnBudget::new();
-        for _ in 0..5 {
+        for _ in 0..100 {
             b.on_explore();
         }
         assert!(!b.explore_exhausted(ConvergeMode::Answer));
+        assert!(!b.explore_exhausted(ConvergeMode::DirectEdit));
+        assert!(!b.explore_exhausted(ConvergeMode::SubmitPlan));
+    }
+
+    #[test]
+    fn exhaustion_never_triggers_even_after_many() {
+        let mut b = TurnBudget::new();
+        for _ in 0..1000 {
+            b.on_explore();
+        }
+        // 即使 1000 轮也不会触发
+        assert!(!b.explore_exhausted(ConvergeMode::SubmitPlan));
     }
 }

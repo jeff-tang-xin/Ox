@@ -44,25 +44,15 @@ pub const REFLECT_AT: u32 = 3;
 /// Further read-only turns after reflection before handing back to the user.
 pub const STOP_AFTER_REFLECT: u32 = 2;
 
-/// Absolute ceiling on **total** exploration turns in a single pre-implementation
-/// stretch, regardless of information gain. The low-gain streak ([`REFLECT_AT`])
-/// catches *circling* — repeated reads of the same thing — but a model that reads
-/// a fresh file every turn keeps resetting that streak and could wander the whole
-/// repo unbounded. This ceiling is the backstop: only real progress (an edit or
-/// `finish`) clears it; discovering new files does NOT.
-///
-/// Reduced 20 → 12: 20 rounds of read-only tool calls almost always means
-/// breadth-first wandering, not focused investigation. Fix / Qa tasks use even
-/// tighter effective ceilings via [`effective_ceiling`], so the plan-submission
-/// path (Review) retains the widest budget.
-pub const TOTAL_EXPLORE_CEILING: u32 = 12;
+/// Absolute ceiling on **total** exploration turns — 已移除硬限制，改为仅提示。
+/// LLM 可以自由探索，系统只告知轮次信息。
+pub const TOTAL_EXPLORE_CEILING: u32 = 999999;
 
-/// Q&A / explanation ceiling — answering rarely needs deep investigation.
-pub const QA_EXPLORE_CEILING: u32 = 6;
+/// Q&A / explanation ceiling — no longer enforced, just informational.
+pub const QA_EXPLORE_CEILING: u32 = 999999;
 
-/// Fix / DirectEdit ceiling — once the bug is understood the model should
-/// implement, not keep reading.
-pub const FIX_EXPLORE_CEILING: u32 = 10;
+/// Fix / DirectEdit ceiling — no longer enforced, just informational.
+pub const FIX_EXPLORE_CEILING: u32 = 999999;
 
 /// Consecutive no-edit turns **during the implementation phase** before an
 /// implementation-reflection prompt is injected. Far tighter than exploration:
@@ -150,49 +140,27 @@ pub fn budget_gauge(
             return String::new();
         }
         return format!(
-            "🛠️ 实施预算: 已连续 {impl_streak}/{IMPL_REFLECT_AT} 轮未改代码 · 下轮请 edit_file/file_write 或 finish\n"
+            "🛠️ 实施预算: 已连续 {impl_streak}/{IMPL_REFLECT_AT} 轮未改代码 · 建议 edit_file/file_write 或 finish\n"
         );
     }
     if explore_streak == 0 && total_explore == 0 {
         return String::new();
     }
 
-    // Convergence action differs by task: a review submits a plan; a fix/general
-    // task edits directly; a Q&A answers. Keep the gauge honest to the task so it
-    // never nags a fix task to "submit a plan and wait".
-    let converge_short = gauge_converge_hint(converge);
     let mode_label = mode_label(converge, intent_reason);
-
     let mut out = String::new();
-    // Low-gain circling line (only when a streak is building).
+    
+    // 仅显示轮次信息，不再警告/强制收敛
     if explore_streak > 0 {
-        let stop_at = REFLECT_AT + STOP_AFTER_REFLECT;
-        if explore_streak >= REFLECT_AT {
-            let left = stop_at.saturating_sub(explore_streak);
-            out.push_str(&format!(
-                "🔍 探索预算 [{mode_label}]: {explore_streak}/{REFLECT_AT}（连续无新发现，已超阈值）· ⚠️ 再 {left} 轮仍无进展将交还用户 — {converge_short}\n"
-            ));
-        } else {
-            let left = REFLECT_AT.saturating_sub(explore_streak);
-            out.push_str(&format!(
-                "🔍 探索预算 [{mode_label}]: 连续 {explore_streak}/{REFLECT_AT} 轮无新发现（重复读/重复搜）· 再 {left} 轮空转将强制收敛（信息够了就{converge_short}；读新文件不计入）\n"
-            ));
-        }
-    }
-    // Cumulative ceiling line — always shown once exploration has begun; nudges
-    // toward focus even while reading new files. Highlight when close.
-    if total_explore > 0 {
-        let ceiling = converge.ceiling();
-        let left = ceiling.saturating_sub(total_explore);
-        let warn = if total_explore * 4 >= ceiling * 3 {
-            "⚠️ "
-        } else {
-            ""
-        };
         out.push_str(&format!(
-            "🧭 {warn}累计探索 [{mode_label}]: {total_explore}/{ceiling} 轮 · 再 {left} 轮（含读新文件）仍不收敛将强制收敛 — {converge_short}\n"
+            "📊 探索统计 [{mode_label}]: 连续 {explore_streak} 轮无新发现 · 共 {total_explore} 轮探索\n"
+        ));
+    } else if total_explore > 0 {
+        out.push_str(&format!(
+            "📊 探索统计 [{mode_label}]: 共 {total_explore} 轮探索\n"
         ));
     }
+    
     out
 }
 
@@ -300,20 +268,8 @@ pub fn evaluate(
         return ReflectAction::Continue;
     }
 
-    // This turn is pure exploration — it always counts toward the hard ceiling,
-    // whether or not it discovered anything new. Ceiling is per-mode: Qa tasks
-    // stop earliest (answer, don't spelunk); Fix/DirectEdit next (implement,
-    // don't keep reading); Review keeps the widest budget (a full plan is
-    // expected).
+    // 不再强制停止，改为仅提示
     *total_explore += 1;
-    let ceiling = converge.ceiling();
-    if *total_explore >= ceiling {
-        // Reset so a user "continue" starts a fresh ceiling window.
-        *total_explore = 0;
-        *streak = 0;
-        *reflected = false;
-        return ReflectAction::Stop(ceiling_message(ceiling));
-    }
 
     // Discovery resets only the low-gain (circling) streak, not the ceiling.
     if made_discovery {
@@ -324,9 +280,11 @@ pub fn evaluate(
 
     *streak += 1;
 
+    // 反思只是提示，不再强制 Stop
     if *reflected {
         if *streak >= REFLECT_AT + STOP_AFTER_REFLECT {
-            return ReflectAction::Stop(stop_message(*streak));
+            // 只提示，不停止
+            return ReflectAction::Continue;
         }
         return ReflectAction::Continue;
     }
@@ -398,7 +356,7 @@ fn impl_reflect_message(streak: u32, user_task: &str) -> String {
 fn reflect_message(streak: u32, user_task: &str, converge: ConvergeMode) -> String {
     let task: String = user_task.chars().take(300).collect();
     let header = format!(
-        "🪞 **反思检查点**：你已连续 {streak} 轮探索却没有新发现（在重复读/重复搜同样的内容），也没有收尾。\n"
+        "🪞 **反思检查点**：你已连续 {streak} 轮探索却没有新发现（在重复读/重复搜同样的内容）。\n"
     );
     let body = match converge {
         ConvergeMode::SubmitPlan => {
@@ -472,23 +430,20 @@ mod tests {
     #[test]
     fn gauge_shows_remaining_budget_before_threshold() {
         let g = budget_gauge(2, 2, 0, false, ConvergeMode::SubmitPlan, None);
-        assert!(g.contains("2/"));
-        assert!(g.contains("无新发现"));
-        assert!(g.contains(&format!("再 {} 轮空转", REFLECT_AT - 2)));
-        // Review-mode convergence action is submitting a plan.
-        assert!(g.contains("finding_json"));
+        assert!(g.contains("2"));
+        assert!(g.contains("探索"));
     }
 
     #[test]
     fn gauge_direct_edit_mode_says_edit_not_plan() {
-        // A fix/general task must be told to edit directly, never to submit a plan.
+        // 不再检查具体建议，只检查轮次信息
         let g = budget_gauge(2, 2, 0, false, ConvergeMode::DirectEdit, None);
-        assert!(g.contains("edit_file"));
-        assert!(!g.contains("finding_json"));
+        assert!(g.contains("2"));
     }
 
     #[test]
     fn gauge_warns_past_threshold() {
+        // 不再有警告，只显示统计
         let g = budget_gauge(
             REFLECT_AT,
             REFLECT_AT,
@@ -497,18 +452,13 @@ mod tests {
             ConvergeMode::SubmitPlan,
             None,
         );
-        assert!(g.contains("超阈值"));
-        assert!(g.contains("交还用户"));
+        assert!(g.contains("探索统计"));
     }
 
     #[test]
     fn gauge_shows_cumulative_ceiling_even_without_low_gain_streak() {
-        // Discovering every turn keeps explore_streak at 0, but the cumulative
-        // line must still show so breadth-first wandering stays visible.
         let g = budget_gauge(0, 8, 0, false, ConvergeMode::SubmitPlan, None);
-        assert!(g.contains("累计探索"));
-        assert!(g.contains(&format!("8/{TOTAL_EXPLORE_CEILING}")));
-        assert!(!g.contains("无新发现")); // no low-gain line
+        assert!(g.contains("8"));
     }
 
     #[test]
@@ -550,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn reflects_at_threshold_then_stops() {
+    fn reflects_at_threshold_then_continues() {
         let mut streak = 0;
         let mut reflected = false;
         let mut total = 0;
@@ -571,7 +521,7 @@ mod tests {
                 ReflectAction::Continue
             );
         }
-        // Turn REFLECT_AT: reflect.
+        // Turn REFLECT_AT: reflect (only once).
         match evaluate(
             &mut streak,
             &mut reflected,
@@ -585,8 +535,8 @@ mod tests {
             ReflectAction::Reflect(_) => {}
             other => panic!("expected Reflect, got {other:?}"),
         }
-        // Continues until the stop threshold.
-        for _ in 0..(STOP_AFTER_REFLECT - 1) {
+        // After reflection, just continues — no more stops.
+        for _ in 0..5 {
             assert_eq!(
                 evaluate(
                     &mut streak,
@@ -600,19 +550,6 @@ mod tests {
                 ),
                 ReflectAction::Continue
             );
-        }
-        match evaluate(
-            &mut streak,
-            &mut reflected,
-            &mut total,
-            &reads,
-            false,
-            false,
-            "task",
-            ConvergeMode::SubmitPlan,
-        ) {
-            ReflectAction::Stop(_) => {}
-            other => panic!("expected Stop, got {other:?}"),
         }
     }
 
@@ -654,15 +591,14 @@ mod tests {
     }
 
     #[test]
-    fn discovery_resets_low_gain_but_ceiling_still_trips() {
-        // Reading NEW files every turn keeps the low-gain streak at 0, but the
-        // cumulative ceiling must eventually stop the breadth-first wander.
+    fn discovery_does_not_stop_anymore() {
+        // 不再有天花板限制，持续探索
         let mut streak = 0;
         let mut reflected = false;
         let mut total = 0;
         let reads = names(&["file_read"]);
-        // Up to the ceiling minus one: always Continue, low-gain streak stays 0.
-        for _ in 0..(TOTAL_EXPLORE_CEILING - 1) {
+        // 持续探索，不会停止
+        for _ in 0..20 {
             assert_eq!(
                 evaluate(
                     &mut streak,
@@ -676,24 +612,9 @@ mod tests {
                 ),
                 ReflectAction::Continue
             );
-            assert_eq!(streak, 0);
         }
-        // The ceiling turn stops regardless of discovery.
-        match evaluate(
-            &mut streak,
-            &mut reflected,
-            &mut total,
-            &reads,
-            false,
-            true,
-            "task",
-            ConvergeMode::SubmitPlan,
-        ) {
-            ReflectAction::Stop(_) => {}
-            other => panic!("expected Stop at ceiling, got {other:?}"),
-        }
-        // Counters reset so a user "continue" starts a fresh window.
-        assert_eq!(total, 0);
+        // 持续增加
+        assert_eq!(total, 20);
     }
 
     #[test]

@@ -739,6 +739,7 @@ pub async fn run_agent_turn(
             unified_tool_mode,
             &mut api_error_recovery_streak,
             MAX_API_ERROR_RECOVERY,
+            active_provider.context_window_size(),
         )
         .await;
         let (full_text, reasoning_content, mut tool_calls, last_prompt_tokens) = match collect {
@@ -882,7 +883,7 @@ pub async fn run_agent_turn(
 
         // ── Context Offloader: created once and reused across all tools in this iteration ──
         let mut offloader = crate::context::context_offloader::ContextOffloader::new(
-            &tool_ctx.working_dir,
+            &tool_ctx.path_base(),
             &format!("session_{}", iteration),
         );
 
@@ -1101,14 +1102,14 @@ pub async fn run_agent_turn(
             );
 
             // Record read/symbol queries to workflow engine (extracted to record_read_queries)
-            record_read_queries(tc, &result, &workflow_engine);
+            record_read_queries(tc, &result, &workflow_engine, &tool_ctx.path_base());
 
             // Snapshot + record tool result to turn memory (extracted to snapshot_and_record_turn)
             snapshot_and_record_turn(
                 tc,
                 &result,
                 &result_content,
-                &tool_ctx.working_dir,
+                &tool_ctx.path_base(),
                 &workflow_engine,
                 &mut turn_memory,
             );
@@ -1438,10 +1439,10 @@ async fn dispatch_llm(
         let engine = engine_arc.lock().await;
         if !engine.allows_tool_execution() {
             Vec::new()
-        } else if engine.is_single_step() {
-            let allowed = crate::agent::tool_graph::allowed_tool_names(&engine);
-            crate::agent::tool_graph::filter_tool_schemas(tool_schemas, &allowed)
         } else {
+            // 📌 所有工具始终暴露给 LLM — 不再按 Review/Implement 阶段过滤 schema。
+            // 阶段性工具过滤会导致 LLM 误以为"没有编辑工具"，增加认知负担。
+            // 安全控制由 unified_safety_gate() 在工具执行时拦截，而非在 schema 层移除。
             tool_schemas.to_vec()
         }
     } else {
@@ -1476,7 +1477,14 @@ async fn dispatch_llm(
     let mut llm_opts = crate::llm::StreamOptions::default();
     if !schemas.is_empty() {
         llm_opts.tool_choice = Some(crate::llm::ToolChoice::Auto);
-        llm_opts.parallel_tool_calls = Some(true);
+        // Unified mode uses a single tool出口 (complete_and_check) with sequential
+        // execution (for tc in &tool_calls). Parallel calls encourage the LLM to
+        // batch multiple actions in one response, which leads to:
+        //   - stale dependencies (later call uses pre-edit state)
+        //   - confirmation interleaving
+        //   - read_guard false-positive dedup
+        // Disable parallel to enforce one-action-at-a-time in unified mode.
+        llm_opts.parallel_tool_calls = Some(!unified_tool_mode);
     }
     let cancel_clone = cancel_token.clone();
     let llm_tx_err = llm_tx.clone();
@@ -1521,6 +1529,7 @@ async fn collect_response(
     unified_tool_mode: bool,
     api_error_recovery_streak: &mut u32,
     max_api_error_recovery: u32,
+    context_window: u32,
 ) -> LlmCollectOutcome {
     const LLM_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
@@ -1625,16 +1634,36 @@ async fn collect_response(
             LlmStreamEvent::ToolCallEnd { .. } => {}
             LlmStreamEvent::Done { usage } => {
                 last_stream_completion_tokens = usage.completion_tokens;
-                tracing::info!(
-                    "[AGENT] ✅ LLM stream completed (prompt: {}, completion: {}, total: {})",
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens
-                );
-                total_usage.prompt_tokens += usage.prompt_tokens;
-                total_usage.completion_tokens += usage.completion_tokens;
-                total_usage.total_tokens += usage.total_tokens;
-                last_prompt_tokens = usage.prompt_tokens;
+
+                // 🛡️ Defensive: Some compatible APIs (e.g. deepseek) return
+                // cumulative session token counts in usage.prompt_tokens
+                // instead of per-request values. When detected:
+                // - Log the original anomalous value for diagnostics
+                // - DO NOT update last_prompt_tokens (keep previous normal value)
+                // - DO NOT add to total_usage (would corrupt cumulative stats)
+                // This prevents cascading false-positive offload triggers.
+                if usage.prompt_tokens > context_window {
+                    tracing::warn!(
+                        "[AGENT] Anomalous prompt_tokens ({}) exceeds context_window ({}). \
+                         API likely returned cumulative session tokens. \
+                         Skipping token tracking this turn — will use previous known-good value.",
+                        usage.prompt_tokens,
+                        context_window
+                    );
+                    // Don't update last_prompt_tokens — keep previous normal value.
+                    // Don't add to total_usage — would corrupt cumulative stats.
+                } else {
+                    tracing::info!(
+                        "[AGENT] ✅ LLM stream completed (prompt: {}, completion: {}, total: {})",
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.total_tokens
+                    );
+                    total_usage.prompt_tokens += usage.prompt_tokens;
+                    total_usage.completion_tokens += usage.completion_tokens;
+                    total_usage.total_tokens += usage.total_tokens;
+                    last_prompt_tokens = usage.prompt_tokens;
+                }
 
                 // 📝 LOG RESPONSE SUMMARY (debug level)
                 tracing::debug!("\n{}", "-".repeat(80));
@@ -2218,8 +2247,10 @@ async fn check_safety_gate(
     let path_outside =
         if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
             if let Some(path_str) = args_val.get("path").and_then(|v| v.as_str()) {
-                let resolved = tool_ctx.working_dir.join(path_str);
-                !crate::safety::is_path_within_workdir(&resolved, &tool_ctx.working_dir)
+                // 📌 Use stable path_base (project root) for sandbox check.
+                let path_base = tool_ctx.path_base();
+                let resolved = path_base.join(path_str);
+                !crate::safety::is_path_within_workdir(&resolved, &path_base)
             } else {
                 false
             }
@@ -2568,6 +2599,24 @@ async fn check_workflow_validation(
             });
             return true;
         }
+        if matches!(tc.name.as_str(), "find_symbol" | "code_search" | "file_search")
+            && let Some(cached) =
+                crate::agent::gate::read_guard::cached_search_response(&engine, &tc.name, &args_value)
+        {
+            let result_msg = Message::ToolResult {
+                tool_call_id: tc.id.clone(),
+                content: cached.clone(),
+            };
+            new_messages.push(result_msg.clone());
+            messages.push(result_msg);
+            turn_memory.record_tool(&tc.name, &tc.arguments, true);
+            let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+                name: tc.name.clone(),
+                output: cached,
+                is_error: false,
+            });
+            return true;
+        }
         let result_msg = Message::ToolResult {
             tool_call_id: tc.id.clone(),
             content: format!("❌ {e}"),
@@ -2696,6 +2745,10 @@ fn lookup_tool_or_error<'a>(
 /// Parse tool-call arguments into a `serde_json::Value`.
 /// Returns `Ok(value)` on success, or `Err(())` if parsing failed
 /// (error already pushed to messages/new_messages/ui_tx).
+///
+/// Applies a layered repair strategy before giving up:
+/// 1. Try syntax repair (single quotes → double, unquoted keys, trailing commas)
+/// 2. Try direct-tool shape repair (bare strings, positional arrays, param aliases)
 fn parse_tool_args(
     tc: &ToolCall,
     messages: &mut Vec<Message>,
@@ -2708,36 +2761,84 @@ fn parse_tool_args(
     }
     // Clean think tags from arguments before parsing
     let cleaned_args = clean_think_tags(&tc.arguments);
-    match serde_json::from_str(&cleaned_args) {
-        Ok(v) => Ok(v),
-        Err(parse_err) => {
-            let error_msg = build_arg_parse_error(&tc.name, &parse_err);
-            tracing::warn!(
-                "Tool argument parse error for '{}': {} | Raw: {}",
-                tc.name,
-                parse_err,
-                {
-                    if tc.arguments.chars().count() > 100 {
-                        tc.arguments.chars().take(100).collect::<String>()
-                    } else {
-                        tc.arguments.clone()
-                    }
-                }
+
+    // Layer 1: direct JSON parse
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&cleaned_args) {
+        return Ok(v);
+    }
+
+    // Layer 2: try syntax repair first (single quotes, unquoted keys, trailing commas)
+    let syntax_repaired = crate::agent::tool_args_repair::repair_direct_tool_arguments(
+        &tc.name,
+        &cleaned_args,
+    );
+    if let Some(ref repaired) = syntax_repaired {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(repaired) {
+            tracing::info!(
+                "[PARSE_TOOL_ARGS] Syntax/shape repair succeeded for `{}`",
+                tc.name
             );
-            let result_msg = Message::ToolResult {
-                tool_call_id: tc.id.clone(),
-                content: error_msg.clone(),
-            };
-            new_messages.push(result_msg.clone());
-            messages.push(result_msg);
-            let _ = ui_tx.send(AgentToUiEvent::ToolResult {
-                name: tc.name.clone(),
-                output: error_msg,
-                is_error: true,
-            });
-            Err(())
+            return Ok(v);
         }
     }
+
+    // Layer 3: get the original parse error for the helpful message
+    let parse_err = match serde_json::from_str::<serde_json::Value>(&cleaned_args) {
+        Ok(_) => unreachable!("layer 1 would have caught this"),
+        Err(e) => e,
+    };
+
+    // Build a helpful error that includes what we tried
+    let mut suggestions: Vec<&str> = Vec::new();
+    suggestions.push("使用正确的 JSON 格式，对象键和字符串必须用双引号包裹");
+    if !cleaned_args.contains("\"") {
+        suggestions.push("疑似使用了单引号或无引号：将 'key' 改为 \"key\"");
+    }
+    if cleaned_args.ends_with(",}") || cleaned_args.ends_with(", }") {
+        suggestions.push("删除最后一个键值对后面的尾逗号");
+    }
+    suggestions.push("参考工具 schema 中定义的参数名（不要拼错参数名）");
+
+    let error_msg = format!(
+        "❌ 工具 `{}` 的参数 JSON 解析失败：{}\n\
+         原始参数（前150字）：{}\n\
+         建议：{}",
+        tc.name,
+        parse_err,
+        {
+            let raw = &cleaned_args;
+            if raw.chars().count() > 150 {
+                raw.chars().take(150).collect::<String>() + "…"
+            } else {
+                raw.clone()
+            }
+        },
+        suggestions.join("；")
+    );
+    tracing::warn!(
+        "Tool argument parse error for '{}': {} | Raw: {}",
+        tc.name,
+        parse_err,
+        {
+            if tc.arguments.chars().count() > 100 {
+                tc.arguments.chars().take(100).collect::<String>()
+            } else {
+                tc.arguments.clone()
+            }
+        }
+    );
+    let result_msg = Message::ToolResult {
+        tool_call_id: tc.id.clone(),
+        content: error_msg.clone(),
+    };
+    new_messages.push(result_msg.clone());
+    messages.push(result_msg);
+    let _ = ui_tx.send(AgentToUiEvent::ToolResult {
+        name: tc.name.clone(),
+        output: error_msg,
+        is_error: true,
+    });
+    Err(())
 }
 
 // ── Tool execution + retry extraction ──────────────────────────────────────────
@@ -2786,7 +2887,8 @@ async fn execute_tool_with_retry(
                 progress_percent: progress.progress_percent,
             });
         },
-    ));
+    )
+    .with_path_guard(tool_ctx.path_guard.clone()));
 
     tracing::info!("[AGENT] Executing tool.execute() for: {}", tc.name);
     let mut result = tool.execute(args.clone(), &tool_ctx_with_progress).await;
@@ -2856,7 +2958,8 @@ fn post_tool_log_and_sanitize(
             tool_ctx.runtime.clone(),
             new_dir.clone(),
             tool_ctx.config.clone(),
-        );
+        )
+        .with_path_guard(tool_ctx.path_guard.clone());
         let _ = ui_tx.send(AgentToUiEvent::WorkingDirChanged(new_dir));
         Some(ctx)
     } else {
@@ -2965,6 +3068,7 @@ fn record_read_queries(
     tc: &ToolCall,
     result: &crate::tools::ToolOutput,
     workflow_engine: &Option<Arc<tokio::sync::Mutex<crate::agent::engine::WorkflowEngine>>>,
+    path_base: &std::path::Path,
 ) {
     if tc.name == "file_read"
         && !result.is_error
@@ -2975,23 +3079,32 @@ fn record_read_queries(
             if let Some(engine_arc) = workflow_engine
                 && let Ok(engine) = engine_arc.try_lock()
             {
-                crate::agent::gate::read_guard::record_file_read(&engine, path);
+                // 📌 Record BOTH canonical and raw path (see unified_handler.rs for rationale).
+                let canonical = crate::agent::gate::read_guard::canonicalize_for_record(
+                    path, path_base,
+                );
+                crate::agent::gate::read_guard::record_file_read(&engine, &canonical);
+                if crate::agent::plan_tracker::normalize_path(path)
+                    != crate::agent::plan_tracker::normalize_path(&canonical)
+                {
+                    crate::agent::gate::read_guard::record_file_read(&engine, path);
+                }
                 crate::agent::tool_digest::record_read(
                     &engine,
-                    path,
+                    &canonical,
                     &result.content,
                     offset,
                     None,
                 );
             }
         }
-    } else if matches!(tc.name.as_str(), "find_symbol" | "code_search")
+    } else if matches!(tc.name.as_str(), "find_symbol" | "code_search" | "file_search")
         && !result.is_error
         && let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
         && let Some(engine_arc) = workflow_engine
         && let Ok(engine) = engine_arc.try_lock()
     {
-        crate::agent::gate::read_guard::record_symbol_query(&engine, &tc.name, &args);
+        crate::agent::gate::read_guard::record_symbol_query(&engine, &tc.name, &args, &result.content);
     }
 }
 
@@ -3459,23 +3572,57 @@ async fn handle_unified_tool_call(
     full_text: &str,
     reasoning_content: &str,
 ) -> UnifiedDispatchOutcome {
-    if !unified_tool_mode || tc.name != crate::agent::unified_action::TOOL_NAME {
+    // 直接工具调用模式：将原生 tool_call 转换为 UnifiedActionRequest
+    let (effective_tc, action_hint) = if !unified_tool_mode {
+        // 直接工具调用模式：先修复 arguments（bare string / pos array / syntax error / aliases）
+        // 注意：recover_tool_call_arguments 已经在 repair_and_extract_tool_calls 被调用过，
+        // 但这里再调用一次作为兜底 + 解析 args_value 时也走修复路径
+        let repaired_args = crate::agent::tool_args_repair::recover_tool_call_arguments(
+            &tc.name,
+            &tc.arguments,
+            &[],
+        );
+        let args_value: serde_json::Value = serde_json::from_str(&repaired_args)
+            .unwrap_or_else(|_| {
+                // Last-ditch: try shape repair (bare string to object)
+                crate::agent::tool_args_repair::repair_direct_tool_arguments(&tc.name, &repaired_args)
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
+            });
+        if let Some(req) = crate::agent::unified_action::tool_call_to_unified_request(&tc.name, &args_value) {
+            // 创建虚拟的 ToolCall 对象，格式化为 complete_and_check 格式
+            let new_arguments = serde_json::to_string(&req).unwrap_or_default();
+            let virtual_tc = ToolCall {
+                id: tc.id.clone(),
+                name: crate::agent::unified_action::TOOL_NAME.to_string(),
+                arguments: new_arguments,
+            };
+            let hint = req.action.clone();
+            (virtual_tc, hint)
+        } else {
+            return UnifiedDispatchOutcome::NotHandled;
+        }
+    } else if tc.name == crate::agent::unified_action::TOOL_NAME {
+        // 原有 unified 模式：直接使用
+        let action_hint = crate::agent::unified_action::parse_request(&tc.arguments)
+            .map(|r| r.action)
+            .unwrap_or_else(|_| "?".into());
+        (tc.clone(), action_hint)
+    } else {
         return UnifiedDispatchOutcome::NotHandled;
-    }
-    let action_hint = crate::agent::unified_action::parse_request(&tc.arguments)
-        .map(|r| r.action)
-        .unwrap_or_else(|_| "?".into());
+    };
+    
     let _ = ui_tx.send(AgentToUiEvent::ToolStart {
         name: format!("{}:{action_hint}", crate::agent::unified_action::TOOL_NAME),
         id: tc.id.clone(),
-        detail: Some(tc.arguments.chars().take(200).collect()),
+        detail: Some(effective_tc.arguments.chars().take(200).collect()),
     });
 
     tracing::info!("[UNIFIED_CALL] Entering handle_complete_and_check...");
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(300),
         crate::agent::unified_handler::handle_complete_and_check(
-            tc,
+            &effective_tc,
             tool_registry,
             tool_ctx,
             trust_manager,
@@ -3558,7 +3705,7 @@ async fn handle_unified_tool_call(
             } else {
                 content.clone()
             };
-            let args_preview: String = tc.arguments.chars().take(500).collect();
+            let args_preview: String = effective_tc.arguments.chars().take(500).collect();
             tracing::debug!(
                 "[UNIFIED_IO] complete_and_check | args={} | error={} | result={}",
                 args_preview,
@@ -3659,7 +3806,7 @@ async fn handle_unified_tool_call(
                         full_text,
                         reasoning_content,
                         unified_tool_mode,
-                        &tc.arguments,
+                        &effective_tc.arguments,
                         &content,
                     )
                     .await;
@@ -4680,36 +4827,6 @@ fn build_truncation_error(name: &str, arguments: &str) -> String {
     }
 }
 
-/// Build a contextual error message for tool arguments that failed JSON parsing.
-fn build_arg_parse_error(name: &str, parse_err: &serde_json::Error) -> String {
-    let example = match name {
-        "file_read" => "{\"path\": \"src/main.rs\", \"limit\": 100}",
-        "file_write" => "{\"path\": \"output.txt\", \"content\": \"Hello World\"}",
-        "edit_file" => {
-            "{\"path\": \"src/lib.rs\", \"old_string\": \"...\", \"new_string\": \"...\"}"
-        }
-        "shell_exec" => "{\"command\": \"ls -la\", \"timeout_ms\": 5000}",
-        "file_search" => "{\"pattern\": \"*.rs\", \"path\": \"src/\"}",
-        "code_search" => "{\"pattern\": \"fn main\", \"path\": \"src/\"}",
-        "code_graph" => {
-            "{\"op\": \"impact\", \"target\": \"funcName\", \"direction\": \"upstream\"}"
-        }
-        _ => "{ /* check tool documentation */ }",
-    };
-    format!(
-        "❌ JSON Parse Error for tool '{}':\n{}\n\n\
-         💡 How to fix:\n\
-         • Ensure valid JSON syntax (no trailing commas)\n\
-         • Quote all keys and string values with double quotes\n\
-         • Escape special characters in strings\n\
-         • Check for missing brackets or braces\n\n\
-         📝 Correct format example:\n\
-         {}\n\n\
-         Please retry with corrected arguments.",
-        name, parse_err, example
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4824,23 +4941,4 @@ mod tests {
         assert!(msg.contains("code_search"));
     }
 
-    #[test]
-    fn arg_parse_error_known_tool() {
-        let args = "{bad json}";
-        let err = serde_json::from_str::<serde_json::Value>(args).unwrap_err();
-        let msg = build_arg_parse_error("file_read", &err);
-        assert!(msg.contains("JSON Parse Error"));
-        assert!(msg.contains("file_read"));
-        assert!(msg.contains("src/main.rs"));
-    }
-
-    #[test]
-    fn arg_parse_error_unknown_tool() {
-        let args = "{bad json}";
-        let err = serde_json::from_str::<serde_json::Value>(args).unwrap_err();
-        let msg = build_arg_parse_error("my_custom_tool", &err);
-        assert!(msg.contains("JSON Parse Error"));
-        assert!(msg.contains("my_custom_tool"));
-        assert!(msg.contains("check tool documentation"));
-    }
 }

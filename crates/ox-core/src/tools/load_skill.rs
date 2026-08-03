@@ -57,9 +57,10 @@ impl Tool for LoadSkillTool {
         };
 
         // Search through known skill directories
+        let path_base = ctx.path_base();
         let search_dirs = [
-            // Project skills (.ox/skills/)
-            ctx.working_dir.join(".ox").join("skills"),
+            // Project skills (.ox/skills/) — use stable path_base, not working_dir
+            path_base.join(".ox").join("skills"),
             // Global skills (~/.ox/skills/)
             dirs::home_dir()
                 .unwrap_or_default()

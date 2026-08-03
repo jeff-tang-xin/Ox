@@ -27,7 +27,7 @@ pub(crate) fn is_path_explored(engine: &WorkflowEngine, tool: &str, path: &str) 
 
 pub(crate) fn record_exploration_result(
     engine: &WorkflowEngine,
-    working_dir: &Path,
+    path_base: &Path,
     tool: &str,
     target: &str,
     raw_result: &str,
@@ -39,7 +39,7 @@ pub(crate) fn record_exploration_result(
     let mut entries = get_exploration_entries(engine);
     crate::agent::exploration_snapshot::merge_entry(
         &mut entries,
-        working_dir,
+        path_base,
         tool,
         target,
         &content,
@@ -66,7 +66,7 @@ pub(crate) fn get_exploration_entries(
 
 pub(crate) fn lookup_exploration_cache(
     engine: &WorkflowEngine,
-    working_dir: &Path,
+    base_dir: &Path,
     tool: &str,
     target: &str,
 ) -> Option<String> {
@@ -76,7 +76,7 @@ pub(crate) fn lookup_exploration_cache(
         if crate::agent::exploration_snapshot::find_file_read_entry(&entries, path).is_some() {
             let args = serde_json::json!({ "path": path }).to_string();
             return Some(crate::agent::exploration_snapshot::resolve_file_read_cache(
-                working_dir,
+                base_dir,
                 &entries,
                 path,
                 &args,
@@ -102,7 +102,7 @@ pub(crate) fn lookup_exploration_cache(
 
 pub(crate) fn lookup_execute_exploration_cache(
     engine: &WorkflowEngine,
-    working_dir: &Path,
+    base_dir: &Path,
     tool: &str,
     arguments: &str,
 ) -> Option<String> {
@@ -116,20 +116,20 @@ pub(crate) fn lookup_execute_exploration_cache(
             || is_path_explored(engine, "file_read", path)
         {
             return Some(crate::agent::exploration_snapshot::resolve_file_read_cache(
-                working_dir,
+                base_dir,
                 &entries,
                 path,
                 arguments,
             ));
         }
     }
-    if let Some(hit) = lookup_exploration_cache(engine, working_dir, tool, &target) {
+    if let Some(hit) = lookup_exploration_cache(engine, base_dir, tool, &target) {
         return Some(hit);
     }
     if matches!(tool, "code_search" | "find_symbol" | "file_search")
         && is_path_explored(engine, tool, &target)
     {
-        return lookup_exploration_cache(engine, working_dir, tool, &target);
+        return lookup_exploration_cache(engine, base_dir, tool, &target);
     }
     None
 }

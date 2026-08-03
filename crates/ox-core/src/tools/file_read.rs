@@ -323,18 +323,44 @@ impl Tool for FileReadTool {
                 );
             }
         };
-        let resolved_path = if std::path::Path::new(&path_str).is_absolute() {
-            std::path::PathBuf::from(&path_str)
-        } else {
-            ctx.working_dir.join(&path_str)
+        // 📌 Resolve relative paths against the STABLE project root (path_base),
+        // NOT ctx.working_dir — which can be mutated by `/cd` and would break
+        // the LLM's "paths are relative to the project root" mental model.
+        //
+        // Auto-fallback: if LLM passes just a basename (e.g. "openai.rs"),
+        // search the project root and auto-resolve when exactly one match is found.
+        let path_base = ctx.path_base();
+        let (resolved_path, _was_auto_resolved) = match crate::safety::resolve_short_path(&path_str, &path_base) {
+            Some((p, auto)) => (p, auto),
+            None => {
+                if std::path::Path::new(&path_str).is_absolute() {
+                    (std::path::PathBuf::from(&path_str), false)
+                } else {
+                    (path_base.join(&path_str), false)
+                }
+            }
         };
         let display_path = resolved_path.clone();
 
+        // Auto-resolve notification is no longer needed — the canonical path is
+        // always shown in the output header via format_path_header / canonical_rel_path.
+
         let path =
-            match crate::safety::validate_path_within_workdir(&resolved_path, &ctx.working_dir) {
+            match crate::safety::validate_path_within_workdir(&resolved_path, &path_base) {
                 Ok(p) => p,
                 Err(e) => return ToolOutput::error(format!("Path validation failed: {e}")),
             };
+
+        // 📌 ENOENT 带候选列表 — 文件不存在时返回相似文件，让 LLM 纠正路径而不是盲猜。
+        // 这是 harness 层路径防线的最后一道兜底：prompt 约束 + 目录树 + basename 自动解析
+        // 都失效时，ENOENT 反馈带候选让 LLM 一次纠正成功。
+        if !path.exists() {
+            let canonical = crate::tools::canonical_rel_path(&path, &path_base);
+            let hint = crate::safety::suggest_path_correction(&path, &path_base)
+                .map(|s| format!("\n\n{s}"))
+                .unwrap_or_default();
+            return ToolOutput::error(format!("❌ File not found: {canonical}{hint}"));
+        }
 
         let offset = args
             .get("offset")
@@ -401,8 +427,16 @@ impl Tool for FileReadTool {
                 let _ = path.to_path_buf();
                 // KnowledgeEngine auto-index removed (embedding disabled)
 
-                let output = format_read_output(&path_str, content, offset, limit, total_lines);
-                ToolOutput::success(output)
+                // 📌 Always show the canonical project-relative path as the first line.
+                // This calibrates the LLM's mental model: even if it passed a short
+                // path like "openai.rs", it sees the full "crates/ox-core/src/llm/openai.rs"
+                // and will use that correct path next time. This closes the feedback loop
+                // that was missing before (auto-resolved paths were only sometimes shown).
+                let canonical = crate::tools::canonical_rel_path(&resolved_path, &path_base);
+                let output = format_read_output(&canonical, content, offset, limit, total_lines);
+                // Prepend the path header so the LLM sees the canonical path first.
+                let final_output = format!("📄 {canonical}\n\n{output}");
+                ToolOutput::success(final_output)
             }
             Err(e) => ToolOutput::error(format!("Failed to read {}: {e}", display_path.display())),
         }

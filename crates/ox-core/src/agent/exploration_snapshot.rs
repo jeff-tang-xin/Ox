@@ -184,8 +184,8 @@ fn persisted_body(stored: &str) -> &str {
 }
 
 /// Load full payload previously written under `.ox/exploration/`.
-pub fn load_persisted_full(working_dir: &Path, rel: &str) -> Option<String> {
-    let path = working_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+pub fn load_persisted_full(base_dir: &Path, rel: &str) -> Option<String> {
+    let path = base_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
     let stored = fs::read_to_string(&path).ok()?;
     Some(persisted_body(&stored).to_string())
 }
@@ -216,7 +216,7 @@ fn file_read_offset_limit(arguments: &str) -> (usize, usize) {
 
 /// When exploration cache blocks a duplicate `file_read`, return real file bytes — not a preview.
 pub fn resolve_file_read_cache(
-    working_dir: &Path,
+    base_dir: &Path,
     entries: &[ExplorationEntry],
     path: &str,
     arguments: &str,
@@ -224,7 +224,7 @@ pub fn resolve_file_read_cache(
     let (offset, limit) = file_read_offset_limit(arguments);
     let entry = find_file_read_entry(entries, path);
 
-    if let Ok(body) = crate::tools::file_read::read_file_slice(working_dir, path, offset, limit) {
+    if let Ok(body) = crate::tools::file_read::read_file_slice(base_dir, path, offset, limit) {
         return format!(
             "✅ 【快照恢复】`{path}` 已探索过；以下为磁盘完整内容（offset={offset}，非预览）\n\n{body}"
         );
@@ -232,7 +232,7 @@ pub fn resolve_file_read_cache(
 
     if let Some(e) = entry {
         if let Some(ref rel) = e.ref_path
-            && let Some(full) = load_persisted_full(working_dir, rel)
+            && let Some(full) = load_persisted_full(base_dir, rel)
         {
             let lines: Vec<&str> = full.lines().collect();
             let total = lines.len();
@@ -272,7 +272,7 @@ fn should_preview_only(_tool: &str, content: &str, threshold: usize) -> bool {
     content.chars().count() > threshold
 }
 
-fn exploration_ref_path(working_dir: &Path, tool: &str, target: &str) -> PathBuf {
+fn exploration_ref_path(base_dir: &Path, tool: &str, target: &str) -> PathBuf {
     let safe: String = target
         .chars()
         .map(|c| {
@@ -288,19 +288,19 @@ fn exploration_ref_path(working_dir: &Path, tool: &str, target: &str) -> PathBuf
     } else {
         format!("{tool}_{safe}")
     };
-    working_dir
+    base_dir
         .join(".ox")
         .join("exploration")
         .join(format!("{name}.md"))
 }
 
 fn persist_full_content(
-    working_dir: &Path,
+    base_dir: &Path,
     tool: &str,
     target: &str,
     content: &str,
 ) -> Option<String> {
-    let path = exploration_ref_path(working_dir, tool, target);
+    let path = exploration_ref_path(base_dir, tool, target);
     if let Some(parent) = path.parent()
         && fs::create_dir_all(parent).is_err()
     {
@@ -313,7 +313,7 @@ fn persist_full_content(
     if fs::write(&path, &doc).is_err() {
         return None;
     }
-    path.strip_prefix(working_dir)
+    path.strip_prefix(base_dir)
         .ok()
         .map(|p| p.to_string_lossy().replace('\\', "/"))
 }
@@ -442,7 +442,7 @@ fn entry_key(tool: &str, target: &str) -> String {
 /// Merge a new tool result into the snapshot (dedupe by tool+target).
 pub fn merge_entry(
     entries: &mut Vec<ExplorationEntry>,
-    working_dir: &Path,
+    base_dir: &Path,
     tool: &str,
     target: &str,
     content: &str,
@@ -455,7 +455,7 @@ pub fn merge_entry(
     let full_chars = trimmed.chars().count();
     let threshold = inline_threshold(tool);
     let (ref_path, preview) = if should_preview_only(tool, trimmed, threshold) {
-        let rel = persist_full_content(working_dir, tool, target, trimmed);
+        let rel = persist_full_content(base_dir, tool, target, trimmed);
         let preview = build_preview(tool, target, trimmed, PREVIEW_MAX_CHARS);
         (rel, preview)
     } else {

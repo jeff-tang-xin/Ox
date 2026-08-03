@@ -124,6 +124,9 @@ impl RuntimeEnvironment {
 
 /// Detect the full runtime environment. Called once at startup.
 pub fn detect_runtime() -> RuntimeEnvironment {
+    // 📌 清空路径纠偏历史（新会话开始时重置）
+    crate::tools::path_guard::clear_global_corrections();
+
     let os = match std::env::consts::OS {
         "windows" => Os::Windows,
         "linux" => Os::Linux,
